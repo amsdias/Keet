@@ -40,3 +40,7 @@ coreaudio-sys = "0.2"
 # Windows icon embedding
 [target.'cfg(target_os = "windows")'.build-dependencies]
 winresource = "0.1"
+
+[profile.release]
+strip = true
+lto = true

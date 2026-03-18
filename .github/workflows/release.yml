@@ -54,11 +54,6 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
-      # Strip binaries (Linux/macOS)
-      - name: Strip binary
-        if: matrix.os != 'windows-latest'
-        run: strip target/${{ matrix.target }}/release/${{ matrix.bin }}
-
       - name: Prepare artifact
         run: |
           mkdir dist
