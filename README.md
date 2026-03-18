@@ -177,7 +177,7 @@ Press `F` to toggle between post-fader (shows volume-adjusted levels) and pre-fa
 The spectrum analyzer features:
 - 31-band ISO 1/3-octave analysis (20Hz - 20kHz)
 - Per-channel L/R FFT processing (4096-point)
-- IEC 61672 A-weighting with proper PSD normalization
+- Unweighted display (no A-weighting — accurate for spectrum analysis)
 - Fractional bin edge weighting for accurate low-frequency bands
 - Hann window correction and dBFS-calibrated scale
 - Spectral tilt correction (+3dB/octave relative to 1kHz)

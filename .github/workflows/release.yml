@@ -62,19 +62,19 @@ jobs:
       - name: Prepare artifact
         run: |
           mkdir dist
-          cp target/${{ matrix.target }}/release/${{ matrix.bin }} dist/${{ matrix.out }}
+          cp target/${{ matrix.target }}/release/${{ matrix.bin }} dist/${{ matrix.bin }}
 
       - name: Compress (Linux/macOS)
         if: matrix.os != 'windows-latest'
         run: |
           cd dist
-          tar -czf ${{ matrix.out }}.tar.gz ${{ matrix.out }}
+          tar -czf ${{ matrix.out }}.tar.gz ${{ matrix.bin }}
 
       - name: Compress (Windows)
         if: matrix.os == 'windows-latest'
         run: |
           cd dist
-          powershell Compress-Archive -Path ${{ matrix.out }} -DestinationPath ${{ matrix.out }}.zip
+          powershell Compress-Archive -Path ${{ matrix.bin }} -DestinationPath ${{ matrix.out }}.zip
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

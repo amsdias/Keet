@@ -279,15 +279,13 @@ impl VizAnalyser {
 
             let rms_power = if weight_sum > 0.0 { sum_power / weight_sum } else { 0.0 };
 
-            let f2 = center_freq * center_freq;
-            let ra = (12194.0 * 12194.0 * f2 * f2) /
-                    ((f2 + 20.6 * 20.6) * ((f2 + 107.7 * 107.7) * (f2 + 737.9 * 737.9)).sqrt() * (f2 + 12194.0 * 12194.0));
-            let a_weight_db = 20.0 * ra.log10() + 2.0;
-
+            // Spectral Tilt Correction (+3dB per octave relative to 1kHz)
+            // Compensates for pink-noise spectral slope, no A-weighting
+            // (A-weighting is for SPL meters, not spectrum analyzers)
             let tilt_db = (center_freq / 1000.0).log2() * 3.0;
 
             let raw_db = 10.0 * (rms_power + 1e-12).log10();
-            let processed_db = raw_db + a_weight_db + tilt_db;
+            let processed_db = raw_db + tilt_db;
 
             bands[band_idx] = ((processed_db + 90.0) / 90.0).clamp(0.0, 1.0);
         }
