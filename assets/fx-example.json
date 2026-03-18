@@ -1,0 +1,10 @@
+{
+  "name": "Concert Hall",
+  "reverb": {
+    "room_size": 0.85,
+    "damping": 0.5,
+    "wet": 3.0,
+    "dry": 1.0,
+    "width": 1.0
+  }
+}

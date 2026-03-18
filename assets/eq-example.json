@@ -1,0 +1,15 @@
+{
+  "name": "Custom Example",
+  "bands": [
+    {"freq": 32, "gain": 3.0, "q": 0.8},
+    {"freq": 64, "gain": 2.0, "q": 0.8},
+    {"freq": 125, "gain": 0.0},
+    {"freq": 250, "gain": -1.0},
+    {"freq": 500, "gain": 0.0},
+    {"freq": 1000, "gain": 1.5},
+    {"freq": 2000, "gain": 2.0},
+    {"freq": 4000, "gain": 3.0, "q": 1.2},
+    {"freq": 8000, "gain": 1.0},
+    {"freq": 16000, "gain": -2.0, "q": 0.8}
+  ]
+}

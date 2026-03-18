@@ -1,0 +1,42 @@
+[package]
+name = "keet"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# cpal - Cross-platform audio I/O library
+cpal = "0.17"
+
+# symphonia - Pure Rust audio decoding
+symphonia = { version = "0.5.5", features = ["mp3", "flac", "wav", "ogg", "aac", "alac", "aiff"] }
+
+# rubato - High-quality audio resampling
+rubato = "1.0"
+audioadapter-buffers = "2.0"
+
+# crossterm - Cross-platform terminal input/output
+crossterm = "0.29"
+
+# rtrb - Lock-free ring buffer for audio
+rtrb = "0.3"
+
+# sysinfo - CPU and memory monitoring
+sysinfo = "0.32"
+
+# realfft - FFT for real signals (audio spectrum analysis)
+realfft = "3.4"
+
+# JSON parsing for EQ presets
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# OS media transport controls (media keys, AirPods, Bluetooth headphones)
+souvlaki = "0.8"
+
+# macOS CoreAudio bindings for sample rate switching
+[target.'cfg(target_os = "macos")'.dependencies]
+coreaudio-sys = "0.2"
+
+# Windows icon embedding
+[target.'cfg(target_os = "windows")'.build-dependencies]
+winresource = "0.1"
