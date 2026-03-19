@@ -16,7 +16,8 @@ A high-performance, low-CPU terminal audio player with real-time spectrum visual
 - **Format-colored icons**: File type indicated by icon color (green=MP3, cyan=FLAC, yellow=WAV, etc.)
 - **Smart audio processing**: Automatic sample rate switching (macOS), Bluetooth detection, conditional resampling, seamless device switching
 - **Volume control**: Adjustable 0-150% with per-sample gain
-- **Playlist features**: Shuffle, repeat, recursive folder scanning with rescan on repeat
+- **Playlist features**: Shuffle, repeat, recursive folder scanning, playlist view with search, M3U import/export, folder rescan, multiple source paths with deduplication
+- **Resume playback**: Save and restore last session (track, position, volume, EQ, effects) automatically
 - **HQ resampler mode**: Optional `--quality` flag for audiophile-grade resampling
 - **Resilient playback**: Silently skips missing/corrupt files, recovers from device disconnection
 - **Terminal-safe UI**: Output adapts to terminal width, no line-wrapping artifacts
@@ -30,6 +31,15 @@ cargo run --release -- song.flac
 # Play a folder (recursive)
 cargo run --release -- ~/Music/
 
+# Multiple folders
+cargo run --release -- ~/Music/Jazz ~/Music/Rock
+
+# Mix M3U playlist with a folder
+keet ~/Music/favorites.m3u ~/Music/NewAlbum
+
+# Multiple files and folders (duplicates removed automatically)
+keet song.flac ~/Music/Jazz ~/Music/Rock
+
 # With shuffle, repeat, and HQ resampler
 cargo run --release -- ~/Music/ --shuffle --repeat --quality
 
@@ -38,6 +48,12 @@ cargo run --release -- ~/Music/ --eq "Bass Boost"
 
 # With Concert Hall reverb and 3-second crossfade
 cargo run --release -- ~/Music/ --fx "Concert Hall" --crossfade 3
+
+# Resume last session (no arguments)
+keet
+
+# Play an M3U playlist
+keet ~/Music/favorites.m3u
 ```
 
 **Note**: Release mode (`--release`) is required for acceptable performance.
@@ -51,14 +67,31 @@ cargo run --release -- ~/Music/ --fx "Concert Hall" --crossfade 3
 | `Down` | Previous track |
 | `Right` | Seek forward 10s |
 | `Left` | Seek backward 10s |
+| `L` | Toggle playlist view |
 | `V` | Cycle visualization modes |
 | `B` | Toggle visualization style (bars/dots) |
 | `E` | Cycle EQ presets |
-| `R` | Cycle effects presets |
+| `X` | Cycle effects presets |
+| `R` | Rescan folders for changes |
+| `S` | Save playlist as M3U |
 | `F` | Toggle pre/post-fader metering |
 | `+` / `=` | Volume up (5%) |
 | `-` | Volume down (5%) |
 | `Q` / `Esc` | Quit |
+
+### Playlist View Controls
+
+Press `L` to open the playlist view, which replaces the visualization area with a scrollable track list.
+
+| Key | Action |
+|-----|--------|
+| `↑` / `↓` | Scroll track list |
+| `Enter` | Jump to selected track |
+| `/` | Search/filter by filename |
+| `S` | Save playlist as M3U |
+| `Esc` / `L` | Close playlist view |
+
+While searching (`/`), type to filter tracks by filename (case-insensitive). Press `Enter` to jump to the selected match, or `Esc` to cancel.
 
 ## EQ Presets
 
@@ -145,7 +178,7 @@ Drop JSON files into `~/.config/keet/effects/` (macOS/Linux) or `%APPDATA%\keet\
 }
 ```
 
-All effect sections are optional — omit any to disable that effect. Custom presets appear when cycling with `R`.
+All effect sections are optional — omit any to disable that effect. Custom presets appear when cycling with `X`.
 
 Processing order: chorus → delay → reverb.
 
@@ -208,6 +241,7 @@ src/
 ├── eq.rs        Biquad EQ filters, preset loading, JSON parsing
 ├── effects.rs   Reverb, chorus, delay effects with preset loading
 ├── playlist.rs  Playlist builder, metadata reader, shuffle
+├── resume.rs    Resume state persistence (save/restore sessions)
 ├── viz.rs       VizAnalyser, StatsMonitor, spectrum rendering
 ├── media_keys.rs  OS media transport controls (souvlaki)
 └── ui.rs        Terminal UI, keyboard input, progress display
@@ -223,16 +257,18 @@ src/
 ## Command Line
 
 ```
-keet <file-or-folder> [options]
+keet <file-or-folder>... [options]
 
 Options:
   --shuffle, -s     Randomize playlist order (re-shuffles on each repeat)
-  --repeat, -r      Loop playlist (rescans folder for new files each cycle)
+  --repeat, -r      Loop playlist (rescans sources for new files each cycle)
   --quality, -q     HQ resampler (higher CPU, inaudible difference)
   --eq, -e <name>   Start with EQ preset by name or JSON file path
   --fx <name>       Start with effects preset by name or JSON file path
   --crossfade, -x <secs>  Crossfade duration between tracks (0 = disabled)
 ```
+
+Multiple files, folders, and M3U playlists can be passed as arguments. Duplicates are removed automatically. Running `keet` with no arguments resumes the last session.
 
 ## Dependencies
 

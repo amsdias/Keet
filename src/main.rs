@@ -16,10 +16,11 @@ mod ui;
 mod eq;
 mod effects;
 mod media_keys;
+mod resume;
 
 use std::env;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::thread;
@@ -30,12 +31,36 @@ use cpal::StreamConfig;
 use crossterm::terminal;
 use rtrb::RingBuffer;
 
-use state::{PlayerState, VizMode, RING_BUFFER_SIZE, VIZ_BUFFER_SIZE};
+use state::{PlayerState, UiState, VizMode, RING_BUFFER_SIZE, VIZ_BUFFER_SIZE};
 use viz::{StatsMonitor, VizAnalyser};
 use audio::{build_stream, set_output_sample_rate, probe_sample_rate, fix_bluetooth_sample_rate};
 use decode::decode_track;
 use playlist::{build_playlist, shuffle_list, read_metadata};
 use ui::{print_status, poll_input, format_time};
+use resume::{ResumeState, save_state, load_state};
+
+fn build_resume_state(
+    ui: &state::UiState,
+    playlist: &[std::path::PathBuf],
+    player_state: &state::PlayerState,
+    shuffle: bool,
+    repeat: bool,
+    eq_presets: &[eq::EqPreset],
+    fx_presets: &[effects::EffectsPreset],
+) -> ResumeState {
+    ResumeState {
+        source_paths: ui.source_paths.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
+        track_path: playlist.get(ui.current)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        position_secs: player_state.time_secs(),
+        shuffle,
+        repeat,
+        volume: player_state.volume.load(std::sync::atomic::Ordering::Relaxed),
+        eq_preset: eq_presets[player_state.eq_index()].name.clone(),
+        effects_preset: fx_presets[player_state.effects_index()].name.clone(),
+    }
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Ensure terminal is in normal mode (cleanup from previous crashed runs)
@@ -51,20 +76,73 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = terminal::disable_raw_mode();
         print!("\x1B[?25h"); // Show cursor
         let _ = io::stdout().flush();
+
+        // Write crash log to ~/.config/keet/crash.log
+        if let Some(config_dir) = playlist::keet_config_dir() {
+            let _ = std::fs::create_dir_all(&config_dir);
+            let log_path = config_dir.join("crash.log");
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let entry = format!("[{}] {}\n", timestamp, info);
+            // Append to log file
+            use std::io::Write as _;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+                let _ = f.write_all(entry.as_bytes());
+            }
+        }
+
         default_panic(info);
     }));
 
     let args: Vec<String> = env::args().collect();
 
-    if args.len() < 2 {
-        eprintln!("Usage: {} <file-or-folder> [--shuffle] [--repeat] [--quality] [--eq <name>] [--fx <name>] [--crossfade <secs>]", args[0]);
-        eprintln!("Controls: Space=Pause ↑↓=Tracks ←→=Seek V=Viz E=EQ R=FX F=Fader +/-=Vol Q=Quit");
-        std::process::exit(1);
-    }
-
-    let path = Path::new(&args[1]);
-    let shuffle = args.iter().any(|a| a == "--shuffle" || a == "-s");
-    let repeat = args.iter().any(|a| a == "--repeat" || a == "-r");
+    let flags = ["--shuffle", "-s", "--repeat", "-r", "--quality", "-q", "--eq", "-e", "--fx", "--crossfade", "-x"];
+    let (source_paths, shuffle, repeat) = if args.len() < 2 {
+        // Try resume from saved state
+        match load_state() {
+            Some(rs) => {
+                let paths: Vec<PathBuf> = rs.source_paths.iter()
+                    .filter_map(|s| {
+                        let p = PathBuf::from(s);
+                        if p.exists() { Some(p) } else {
+                            eprintln!("Saved path not found, skipping: {}", s);
+                            None
+                        }
+                    })
+                    .collect();
+                if paths.is_empty() {
+                    eprintln!("No saved paths found");
+                    std::process::exit(1);
+                }
+                (paths, rs.shuffle, rs.repeat)
+            }
+            None => {
+                eprintln!("Usage: {} <file-or-folder>... [--shuffle] [--repeat] [--quality] [--eq <name>] [--fx <name>] [--crossfade <secs>]", args[0]);
+                eprintln!("Controls: Space=Pause ↑↓=Tracks ←→=Seek V=Viz E=EQ X=FX L=List R=Rescan +/-=Vol Q=Quit");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        let s = args.iter().any(|a| a == "--shuffle" || a == "-s");
+        let r = args.iter().any(|a| a == "--repeat" || a == "-r");
+        // Collect positional args (not flags, not values after flag options)
+        let mut positional = Vec::new();
+        let value_flags = ["--eq", "-e", "--fx", "--crossfade", "-x"];
+        let mut skip_next = false;
+        for arg in &args[1..] {
+            if skip_next { skip_next = false; continue; }
+            if value_flags.contains(&arg.as_str()) { skip_next = true; continue; }
+            if flags.contains(&arg.as_str()) { continue; }
+            positional.push(PathBuf::from(arg));
+        }
+        if positional.is_empty() {
+            eprintln!("No input files or folders specified");
+            std::process::exit(1);
+        }
+        (positional, s, r)
+    };
     let hq_resampler = args.iter().any(|a| a == "--quality" || a == "-q");
     let eq_arg = args.iter().position(|a| a == "--eq" || a == "-e")
         .and_then(|i| args.get(i + 1).cloned());
@@ -75,7 +153,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
 
-    let mut playlist = build_playlist(path, shuffle)?;
+    let mut playlist = {
+        let mut combined = Vec::new();
+        for src in &source_paths {
+            match build_playlist(src, false) {
+                Ok(tracks) => combined.extend(tracks),
+                Err(e) => {
+                    if source_paths.len() == 1 {
+                        return Err(e);
+                    }
+                    eprintln!("Skipping {}: {}", src.display(), e);
+                }
+            }
+        }
+        if combined.is_empty() {
+            return Err("No audio files found".into());
+        }
+        // Deduplicate by canonical path
+        let mut seen = std::collections::HashSet::new();
+        combined.retain(|p| {
+            let key = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+            seen.insert(key)
+        });
+        if shuffle { shuffle_list(&mut combined); }
+        combined
+    };
     let state = Arc::new(PlayerState::new());
     state.total_tracks.store(playlist.len(), Ordering::Relaxed);
 
@@ -97,8 +199,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let eq_presets = Arc::new(eq_presets);
-
     // Load effects presets (built-in + custom from ~/.config/keet/effects/)
     let mut fx_presets = effects::builtin_presets();
     fx_presets.extend(effects::load_custom_presets());
@@ -116,8 +216,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let fx_presets = Arc::new(fx_presets);
     state.crossfade_secs.store(crossfade_secs, Ordering::Relaxed);
+
+    // Restore resume state if resuming
+    let resume_state_loaded = if args.len() < 2 { load_state() } else { None };
+    let mut resume_position: i64 = 0;
+
+    if let Some(ref rs) = resume_state_loaded {
+        state.volume.store(rs.volume, Ordering::Relaxed);
+        resume_position = rs.position_secs.round() as i64;
+
+        // Restore EQ preset by name
+        if let Some(idx) = eq_presets.iter().position(|p| p.name == rs.eq_preset) {
+            state.eq_preset_index.store(idx, Ordering::Relaxed);
+        }
+        // Restore FX preset by name
+        if let Some(idx) = fx_presets.iter().position(|p| p.name == rs.effects_preset) {
+            state.effects_preset_index.store(idx, Ordering::Relaxed);
+        }
+    }
+
+    let eq_presets = Arc::new(eq_presets);
+    let fx_presets = Arc::new(fx_presets);
 
     let inner_w = 57;
     let title = "Keet";
@@ -170,7 +290,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // OS media transport controls (media keys, AirPods, Bluetooth headphones)
     let mut media_controls = media_keys::setup(Arc::clone(&state));
 
-    println!("\n[Space] Pause  [↑↓] Track  [←→] Seek  [V/B] Viz  [E] EQ  [R] FX  [F] Fader  [+/-] Vol  [Q] Quit\n");
+    println!("\n[Space] Pause  [↑↓] Track  [←→] Seek  [V/B] Viz  [E] EQ  [X] FX  [F] Fader  [L] List  [+/-] Vol  [Q] Quit\n");
 
     terminal::enable_raw_mode()?;
 
@@ -178,32 +298,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     print!("\x1B[?25l");
     io::stdout().flush().ok();
 
-    let mut current = 0usize;
+    let mut ui = UiState::new(source_paths);
+
+    // Set starting track for resume
+    if let Some(ref rs) = resume_state_loaded {
+        if let Some(idx) = playlist.iter().position(|p| p.to_string_lossy() == rs.track_path.as_str()) {
+            ui.current = idx;
+        }
+    }
+
     let mut prev_viz_lines: usize = usize::MAX;
     let mut crossfade_tail: Option<Vec<f32>> = None;
 
     'playlist: loop {
         if state.should_quit() { break; }
 
-        if current >= playlist.len() {
+        if ui.current >= playlist.len() {
             if repeat {
-                // Rescan folder to pick up new files and drop deleted ones
-                if path.is_dir() {
-                    if let Ok(new_list) = build_playlist(path, shuffle) {
-                        playlist = new_list;
+                // Rescan sources to pick up new files and drop deleted ones
+                let has_dir = ui.source_paths.iter().any(|p| p.is_dir());
+                if has_dir {
+                    let mut combined = Vec::new();
+                    for src in &ui.source_paths {
+                        if let Ok(tracks) = build_playlist(src, false) {
+                            combined.extend(tracks);
+                        }
+                    }
+                    if !combined.is_empty() {
+                        let mut seen = std::collections::HashSet::new();
+                        combined.retain(|p| {
+                            let key = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+                            seen.insert(key)
+                        });
+                        if shuffle { shuffle_list(&mut combined); }
+                        playlist = combined;
                         state.total_tracks.store(playlist.len(), Ordering::Relaxed);
                     }
                 } else if shuffle {
                     shuffle_list(&mut playlist);
                 }
-                current = 0;
+                ui.current = 0;
             } else {
                 break;
             }
         }
 
         // Reset for new track
-        state.current_track.store(current, Ordering::Relaxed);
+        state.current_track.store(ui.current, Ordering::Relaxed);
         state.producer_done.store(false, Ordering::Relaxed);
         state.track_info_ready.store(false, Ordering::Relaxed);
         state.skip_next.store(false, Ordering::Relaxed);
@@ -211,7 +352,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         state.buffer_level.store(0, Ordering::Relaxed);
         if let Ok(mut err) = state.decode_error.lock() { *err = None; }
 
-        let track_path = &playlist[current];
+        let track_path = &playlist[ui.current];
         let filename = read_metadata(track_path)
             .unwrap_or_else(|| track_path.file_name().unwrap_or_default().to_string_lossy().into_owned());
         let track_ext = track_path.extension()
@@ -224,7 +365,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             None => {
                 // No output device available — wait and retry
                 thread::sleep(Duration::from_secs(1));
-                current += 1;
+                ui.current += 1;
                 continue 'playlist;
             }
         };
@@ -317,12 +458,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(s) => s,
             Err(_) => {
                 thread::sleep(Duration::from_millis(500));
-                current += 1;
+                ui.current += 1;
                 continue 'playlist;
             }
         };
         if stream.play().is_err() {
-            current += 1;
+            ui.current += 1;
             continue 'playlist;
         }
 
@@ -370,17 +511,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
               && !state.should_quit()
               && !state.is_skip_requested()
         {
-            poll_input(&state);
+            poll_input(&state, &mut ui, &mut playlist);
             thread::sleep(Duration::from_millis(20));
         }
 
         // If skip requested during wait, advance without printing
         if state.is_skip_requested() {
             producer_handle.join().ok();
-            if state.take_skip_next() {
-                current += 1;
+            if let Some(target) = state.take_jump() {
+                ui.current = target;
+            } else if state.take_skip_next() {
+                ui.current += 1;
             } else if state.take_skip_prev() {
-                current = current.saturating_sub(1);
+                ui.current = ui.current.saturating_sub(1);
             }
             continue 'playlist;
         }
@@ -390,8 +533,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
            && !state.track_info_ready.load(Ordering::Relaxed)
         {
             producer_handle.join().ok();
-            current += 1;
+            ui.current += 1;
             continue 'playlist;
+        }
+
+        // Resume: seek to saved position (only on first track after resume)
+        if resume_position > 0 {
+            state.seek(resume_position);
+            resume_position = 0;
         }
 
         // Build track info string
@@ -425,7 +574,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         loop {
             // Input (non-blocking)
-            if poll_input(&state) {
+            if poll_input(&state, &mut ui, &mut playlist) {
                 print!("\x1B[?25h");
                 if prev_viz_lines != usize::MAX {
                     let up = 2 + prev_viz_lines;
@@ -433,6 +582,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 print!("\x1B[J"); // Clear from cursor to end of screen
                 io::stdout().flush().ok();
+                save_state(&build_resume_state(&ui, &playlist, &state, shuffle, repeat, &eq_presets, &fx_presets));
                 producer_handle.join().ok();
                 break 'playlist;
             }
@@ -471,7 +621,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 stats.update();
                 let current_eq = &eq_presets[state.eq_index()];
                 let current_fx = &fx_presets[state.effects_index()].name;
-                prev_viz_lines = print_status(&state, &filename, &track_info, &track_ext, current_eq, current_fx, &mut stats, prev_viz_lines);
+                prev_viz_lines = print_status(&state, &mut ui, &filename, &track_info, &track_ext, current_eq, current_fx, &mut stats, prev_viz_lines, &playlist);
 
                 // Update OS media transport with playback position
                 if let Some(ref mut mc) = media_controls {
@@ -500,13 +650,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             crossfade_tail = tail;
         }
 
+        // Save resume state on track change
+        save_state(&build_resume_state(&ui, &playlist, &state, shuffle, repeat, &eq_presets, &fx_presets));
+
         // Handle track transition
-        if state.take_skip_next() {
-            current += 1;
+        if let Some(target) = state.take_jump() {
+            ui.current = target;
+        } else if state.take_skip_next() {
+            ui.current += 1;
         } else if state.take_skip_prev() {
-            current = current.saturating_sub(1);
+            ui.current = ui.current.saturating_sub(1);
         } else {
-            current += 1;
+            ui.current += 1;
         }
     }
 

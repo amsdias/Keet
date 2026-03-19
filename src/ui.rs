@@ -1,4 +1,5 @@
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::time::Duration;
 use std::sync::atomic::Ordering;
 
@@ -8,6 +9,7 @@ use crossterm::terminal;
 use crate::state::{
     PlayerState, VizMode, VizStyle, RING_BUFFER_SIZE,
     C_RESET, C_BOLD, C_DIM, C_CYAN, C_GREEN, C_YELLOW, C_MAGENTA, C_RED,
+    ViewMode, InputMode, UiState,
 };
 use crate::viz::{
     StatsMonitor, render_vu_meter, render_spectrum_horizontal,
@@ -58,7 +60,7 @@ fn truncate_ansi(s: &str, max_width: usize) -> String {
     result
 }
 
-pub fn print_status(state: &PlayerState, name: &str, track_info: &str, ext: &str, eq_preset: &crate::eq::EqPreset, fx_name: &str, stats: &mut StatsMonitor, prev_viz_lines: usize) -> usize {
+pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_info: &str, ext: &str, eq_preset: &crate::eq::EqPreset, fx_name: &str, stats: &mut StatsMonitor, prev_viz_lines: usize, playlist: &[PathBuf]) -> usize {
     let viz_mode = state.viz_mode();
     let viz_style = state.viz_style();
     let eq_name = &eq_preset.name;
@@ -155,12 +157,103 @@ pub fn print_status(state: &PlayerState, name: &str, track_info: &str, ext: &str
         print!("\n\r\x1B[K{}", eq_curve);
     }
 
-    // Separation line
+    // Separation line and content area
+    if ui.view_mode == ViewMode::Playlist {
+        let term_h = terminal::size().map(|(_, h)| h as usize).unwrap_or(24);
+        let header_lines = 2 + if eq_line { 1 } else { 0 };
+        let footer_lines = 2;
+        let visible_rows = term_h.saturating_sub(header_lines + footer_lines + 6).max(1);
+
+        // Separator
+        print!("\n\r\x1B[K  {C_DIM}{}{C_RESET}", "─".repeat(term_w.saturating_sub(2)));
+
+        // Ensure cursor is visible
+        if ui.cursor >= ui.scroll_offset + visible_rows {
+            ui.scroll_offset = ui.cursor.saturating_sub(visible_rows - 1);
+        }
+        if ui.cursor < ui.scroll_offset {
+            ui.scroll_offset = ui.cursor;
+        }
+
+        let search_active = matches!(&ui.input_mode, InputMode::Search(q) if !q.is_empty());
+        let items: Vec<usize> = if search_active && ui.filtered_indices.is_empty() {
+            Vec::new()
+        } else if !search_active && ui.filtered_indices.is_empty() {
+            (0..playlist.len()).collect()
+        } else {
+            ui.filtered_indices.clone()
+        };
+
+        if items.is_empty() && search_active {
+            print!("\n\r\x1B[K  {C_DIM}(no matches){C_RESET}");
+            for _ in 1..visible_rows {
+                print!("\n\r\x1B[K");
+            }
+        } else {
+            let display_items: Vec<usize> = items.iter()
+                .skip(ui.scroll_offset)
+                .take(visible_rows)
+                .copied()
+                .collect();
+
+            for (row, &track_idx) in display_items.iter().enumerate() {
+                let list_pos = ui.scroll_offset + row;
+                let is_playing = track_idx == ui.current;
+                let is_cursor = list_pos == ui.cursor;
+                let fname = playlist[track_idx].file_name()
+                    .unwrap_or_default().to_string_lossy();
+
+                let marker = if is_playing { "▶" } else { " " };
+                let num = format!("{:>4}", track_idx + 1);
+
+                let line = if is_cursor && is_playing {
+                    format!(" {marker} {C_BOLD}{C_GREEN}{num}  {fname}{C_RESET}")
+                } else if is_cursor {
+                    format!(" {marker} \x1B[7m{num}  {fname}\x1B[27m")
+                } else if is_playing {
+                    format!(" {marker} {C_GREEN}{num}  {fname}{C_RESET}")
+                } else {
+                    format!(" {marker} {C_DIM}{num}{C_RESET}  {fname}")
+                };
+
+                print!("\n\r\x1B[K{}", truncate_ansi(&line, term_w));
+            }
+
+            // Pad remaining rows
+            for _ in display_items.len()..visible_rows {
+                print!("\n\r\x1B[K");
+            }
+        }
+
+        // Search prompt or hint line
+        let footer = match &ui.input_mode {
+            InputMode::Search(query) => {
+                format!("  / {}{C_DIM}_{C_RESET}", query)
+            }
+            InputMode::SavePlaylist(name) => {
+                format!("  Save playlist as: {}{C_DIM}_{C_RESET}", name)
+            }
+            InputMode::Normal => {
+                if let Some(msg) = ui.take_status() {
+                    format!("  {C_GREEN}{msg}{C_RESET}")
+                } else {
+                    format!("  {C_DIM}[L] close  [↑↓] scroll  [Enter] play  [/] search  [S] save{C_RESET}")
+                }
+            }
+        };
+        print!("\n\r\x1B[K{}", truncate_ansi(&footer, term_w));
+
+        let total_lines = 1 + visible_rows + 1; // separator + rows + footer
+        print!("\x1B[J");
+        io::stdout().flush().ok();
+        return total_lines;
+    }
+
+    // Original Player mode rendering below
     if viz_mode != VizMode::None {
         print!("\n\r\x1B[K  {C_DIM}{}{C_RESET}", "─".repeat(term_w.saturating_sub(2)));
     }
 
-    // Render visualization
     match viz_mode {
         VizMode::None => {}
         VizMode::VuMeter => {
@@ -180,19 +273,67 @@ pub fn print_status(state: &PlayerState, name: &str, track_info: &str, ext: &str
         }
     }
 
-    // Clear any leftover lines from previous wider viz mode
-    print!("\x1B[J");
+    // Show status message in Player mode
+    if let Some(msg) = ui.take_status() {
+        print!("\n\r\x1B[K  {C_GREEN}{msg}{C_RESET}");
+        print!("\x1B[J");
+        io::stdout().flush().ok();
+        return viz_lines + 1;
+    }
 
+    print!("\x1B[J");
     io::stdout().flush().ok();
     viz_lines
 }
 
-pub fn poll_input(state: &PlayerState) -> bool {
+pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<PathBuf>) -> bool {
     if event::poll(Duration::ZERO).unwrap_or(false) {
         if let Ok(Event::Key(k)) = event::read() {
             if k.kind != KeyEventKind::Press {
                 return false;
             }
+
+            // In text input mode, route to text handler
+            match &ui.input_mode {
+                InputMode::Search(_) | InputMode::SavePlaylist(_) => {
+                    return handle_text_input(state, ui, playlist, k);
+                }
+                InputMode::Normal => {}
+            }
+
+            // Playlist view keys (when in Normal input mode)
+            if ui.view_mode == ViewMode::Playlist {
+                match k {
+                    KeyEvent { code: KeyCode::Up, .. } => {
+                        playlist_cursor_up(ui);
+                        return false;
+                    }
+                    KeyEvent { code: KeyCode::Down, .. } => {
+                        playlist_cursor_down(ui, playlist);
+                        return false;
+                    }
+                    KeyEvent { code: KeyCode::Enter, .. } => {
+                        let target = if ui.filtered_indices.is_empty() {
+                            ui.cursor
+                        } else {
+                            ui.filtered_indices.get(ui.cursor).copied().unwrap_or(ui.cursor)
+                        };
+                        state.jump_to(target);
+                        return false;
+                    }
+                    KeyEvent { code: KeyCode::Char('/'), .. } => {
+                        ui.input_mode = InputMode::Search(String::new());
+                        return false;
+                    }
+                    KeyEvent { code: KeyCode::Esc, .. } => {
+                        ui.view_mode = ViewMode::Player;
+                        return false;
+                    }
+                    _ => {} // Fall through to global keys
+                }
+            }
+
+            // Global keys (work in all view modes)
             match k {
                 KeyEvent { code: KeyCode::Char(' '), .. } => state.toggle_pause(),
                 KeyEvent { code: KeyCode::Up, .. } => state.next(),
@@ -204,9 +345,25 @@ pub fn poll_input(state: &PlayerState) -> bool {
                 KeyEvent { code: KeyCode::Char('='), .. } => state.volume_up(),
                 KeyEvent { code: KeyCode::Char('-'), .. } => state.volume_down(),
                 KeyEvent { code: KeyCode::Char('e'), .. } => state.cycle_eq(),
-                KeyEvent { code: KeyCode::Char('r'), .. } => state.cycle_effects(),
+                KeyEvent { code: KeyCode::Char('x'), .. } => state.cycle_effects(),
                 KeyEvent { code: KeyCode::Char('f'), .. } => state.toggle_pre_fader(),
                 KeyEvent { code: KeyCode::Char('b'), .. } => state.toggle_viz_style(),
+                KeyEvent { code: KeyCode::Char('l'), .. } => {
+                    ui.view_mode = match ui.view_mode {
+                        ViewMode::Player => {
+                            ui.cursor = ui.current;
+                            ensure_cursor_visible(ui, playlist);
+                            ViewMode::Playlist
+                        }
+                        ViewMode::Playlist => ViewMode::Player,
+                    };
+                }
+                KeyEvent { code: KeyCode::Char('s'), .. } => {
+                    ui.input_mode = InputMode::SavePlaylist(String::new());
+                }
+                KeyEvent { code: KeyCode::Char('r'), .. } => {
+                    rescan(state, ui, playlist);
+                }
                 KeyEvent { code: KeyCode::Char('q'), .. } |
                 KeyEvent { code: KeyCode::Esc, .. } => { state.quit(); return true; }
                 KeyEvent { code: KeyCode::Char('c'), modifiers: KeyModifiers::CONTROL, .. } => {
@@ -217,4 +374,184 @@ pub fn poll_input(state: &PlayerState) -> bool {
         }
     }
     false
+}
+
+fn handle_text_input(state: &PlayerState, ui: &mut UiState, _playlist: &mut Vec<PathBuf>, key: KeyEvent) -> bool {
+    match &mut ui.input_mode {
+        InputMode::Search(ref mut query) => {
+            match key.code {
+                KeyCode::Esc => {
+                    ui.input_mode = InputMode::Normal;
+                    ui.filtered_indices.clear();
+                    ui.cursor = 0;
+                    ui.scroll_offset = 0;
+                }
+                KeyCode::Enter => {
+                    let target = if ui.filtered_indices.is_empty() {
+                        ui.cursor
+                    } else {
+                        ui.filtered_indices.get(ui.cursor).copied().unwrap_or(0)
+                    };
+                    state.jump_to(target);
+                    ui.input_mode = InputMode::Normal;
+                    ui.filtered_indices.clear();
+                    ui.cursor = 0;
+                    ui.scroll_offset = 0;
+                }
+                KeyCode::Backspace => {
+                    query.pop();
+                    rebuild_filter(ui, _playlist);
+                }
+                KeyCode::Char(c) => {
+                    query.push(c);
+                    rebuild_filter(ui, _playlist);
+                }
+                KeyCode::Up => {
+                    playlist_cursor_up(ui);
+                }
+                KeyCode::Down => {
+                    playlist_cursor_down(ui, _playlist);
+                }
+                _ => {}
+            }
+        }
+        InputMode::SavePlaylist(ref mut name) => {
+            match key.code {
+                KeyCode::Esc => {
+                    ui.input_mode = InputMode::Normal;
+                }
+                KeyCode::Enter => {
+                    let save_name = name.clone();
+                    ui.input_mode = InputMode::Normal;
+                    if !save_name.is_empty() {
+                        match crate::playlist::save_m3u(_playlist, &save_name) {
+                            Ok(path) => {
+                                let fname = path.file_name().unwrap_or_default().to_string_lossy();
+                                ui.set_status(format!("Saved {} tracks to {}", _playlist.len(), fname));
+                            }
+                            Err(e) => {
+                                ui.set_status(format!("Save failed: {}", e));
+                            }
+                        }
+                    }
+                }
+                KeyCode::Backspace => {
+                    name.pop();
+                }
+                KeyCode::Char(c) => {
+                    name.push(c);
+                }
+                _ => {}
+            }
+        }
+        InputMode::Normal => {}
+    }
+    false
+}
+
+fn rebuild_filter(ui: &mut UiState, playlist: &[PathBuf]) {
+    let query = match &ui.input_mode {
+        InputMode::Search(q) => q.to_lowercase(),
+        _ => return,
+    };
+
+    if query.is_empty() {
+        ui.filtered_indices.clear();
+        ui.cursor = 0;
+        ui.scroll_offset = 0;
+        return;
+    }
+
+    ui.filtered_indices = playlist.iter()
+        .enumerate()
+        .filter(|(_, p)| {
+            p.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_lowercase()
+                .contains(&query)
+        })
+        .map(|(i, _)| i)
+        .collect();
+
+    ui.cursor = 0;
+    ui.scroll_offset = 0;
+}
+
+fn playlist_cursor_up(ui: &mut UiState) {
+    if ui.cursor > 0 {
+        ui.cursor -= 1;
+        if ui.cursor < ui.scroll_offset {
+            ui.scroll_offset = ui.cursor;
+        }
+    }
+}
+
+fn playlist_cursor_down(ui: &mut UiState, playlist: &[PathBuf]) {
+    let max = if ui.filtered_indices.is_empty() {
+        playlist.len().saturating_sub(1)
+    } else {
+        ui.filtered_indices.len().saturating_sub(1)
+    };
+    if ui.cursor < max {
+        ui.cursor += 1;
+    }
+}
+
+fn ensure_cursor_visible(ui: &mut UiState, _playlist: &[PathBuf]) {
+    if ui.cursor < ui.scroll_offset {
+        ui.scroll_offset = ui.cursor;
+    }
+}
+
+fn rescan(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<PathBuf>) {
+    use std::sync::atomic::Ordering;
+
+    let current_track_path = playlist.get(ui.current).cloned();
+    let mut total_added = 0usize;
+    let mut total_removed = 0usize;
+    let mut had_error = false;
+
+    for source in ui.source_paths.clone() {
+        match crate::playlist::rescan_playlist(
+            &source,
+            playlist,
+            current_track_path.as_deref(),
+        ) {
+            Ok((added, removed)) => {
+                total_added += added;
+                total_removed += removed;
+            }
+            Err(_) => { had_error = true; }
+        }
+    }
+
+    // Deduplicate after rescan
+    let mut seen = std::collections::HashSet::new();
+    playlist.retain(|p| {
+        let key = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+        seen.insert(key)
+    });
+
+    // Find current track's new index
+    if let Some(ref track_path) = current_track_path {
+        if let Some(new_idx) = playlist.iter().position(|p| p == track_path) {
+            ui.current = new_idx;
+        } else {
+            ui.current = ui.current.min(playlist.len().saturating_sub(1));
+        }
+    }
+
+    state.total_tracks.store(playlist.len(), Ordering::Relaxed);
+    state.current_track.store(ui.current, Ordering::Relaxed);
+
+    if playlist.is_empty() || (playlist.len() == 1 && total_removed > 0 && current_track_path.is_some()) {
+        ui.set_status("All files removed, finishing current track".to_string());
+    } else if total_added == 0 && total_removed == 0 && !had_error {
+        ui.set_status("No changes found".to_string());
+    } else if had_error && total_added == 0 && total_removed == 0 {
+        ui.set_status("Rescan failed for some sources".to_string());
+    } else {
+        ui.set_status(format!("+{} added, -{} removed", total_added, total_removed));
+    }
 }

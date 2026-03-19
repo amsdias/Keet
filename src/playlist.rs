@@ -77,6 +77,18 @@ pub fn shuffle_list(list: &mut [PathBuf]) {
 }
 
 pub fn build_playlist(path: &Path, shuffle: bool) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    // Check for M3U playlist file
+    if let Some(ext) = path.extension() {
+        let ext_lower = ext.to_string_lossy().to_lowercase();
+        if ext_lower == "m3u" || ext_lower == "m3u8" {
+            let mut list = parse_m3u(path)?;
+            if shuffle {
+                shuffle_list(&mut list);
+            }
+            return Ok(list);
+        }
+    }
+
     let mut list = Vec::new();
 
     if path.is_file() {
@@ -110,4 +122,128 @@ pub fn build_playlist(path: &Path, shuffle: bool) -> Result<Vec<PathBuf>, Box<dy
         return Err("No audio files found".into());
     }
     Ok(list)
+}
+
+/// Returns the platform-aware Keet config directory.
+pub fn keet_config_dir() -> Option<PathBuf> {
+    if cfg!(target_os = "windows") {
+        std::env::var("APPDATA").ok().map(|p| PathBuf::from(p).join("keet"))
+    } else {
+        std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".config").join("keet"))
+    }
+}
+
+/// Parse an M3U/M3U8 playlist file into a list of audio file paths.
+pub fn parse_m3u(path: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    let content = fs::read_to_string(path)?;
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let mut list = Vec::new();
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let track_path = if Path::new(line).is_absolute() {
+            PathBuf::from(line)
+        } else {
+            parent.join(line)
+        };
+        if track_path.is_file() {
+            if let Some(ext) = track_path.extension() {
+                if SUPPORTED_EXTENSIONS.contains(&ext.to_string_lossy().to_lowercase().as_str()) {
+                    list.push(track_path);
+                }
+            }
+        }
+    }
+
+    if list.is_empty() {
+        return Err("No audio files found in playlist".into());
+    }
+    Ok(list)
+}
+
+/// Save a playlist as an M3U file.
+/// If `name` contains a path separator, treat it as a full path.
+/// Otherwise, save to ~/.config/keet/playlists/<name>.m3u.
+pub fn save_m3u(playlist: &[PathBuf], name: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let path = if name.contains('/') || name.contains('\\') {
+        let p = PathBuf::from(name);
+        if !p.to_string_lossy().ends_with(".m3u") && !p.to_string_lossy().ends_with(".m3u8") {
+            p.with_extension("m3u")
+        } else {
+            p
+        }
+    } else {
+        let dir = keet_config_dir()
+            .ok_or("Could not determine config directory")?
+            .join("playlists");
+        fs::create_dir_all(&dir)?;
+        let filename = if name.ends_with(".m3u") || name.ends_with(".m3u8") {
+            name.to_string()
+        } else {
+            format!("{}.m3u", name)
+        };
+        dir.join(&filename)
+    };
+
+    // Ensure parent directory exists for arbitrary paths
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut content = String::from("#EXTM3U\n");
+    for track in playlist {
+        content.push_str(&track.to_string_lossy());
+        content.push('\n');
+    }
+    fs::write(&path, &content)?;
+    Ok(path)
+}
+
+/// Rescan source path and diff against current playlist.
+/// Returns (added_count, removed_count).
+pub fn rescan_playlist(
+    source_path: &Path,
+    playlist: &mut Vec<PathBuf>,
+    current_track_path: Option<&Path>,
+) -> Result<(usize, usize), Box<dyn std::error::Error>> {
+    let fresh = if source_path.extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .map(|e| e == "m3u" || e == "m3u8")
+        .unwrap_or(false)
+    {
+        parse_m3u(source_path)?
+    } else {
+        build_playlist(source_path, false)?
+    };
+
+    let current_set: std::collections::HashSet<PathBuf> = playlist.iter().cloned().collect();
+    let fresh_set: std::collections::HashSet<PathBuf> = fresh.iter().cloned().collect();
+
+    // Find new files (in fresh but not in current)
+    let mut added: Vec<PathBuf> = fresh.iter()
+        .filter(|p| !current_set.contains(*p))
+        .cloned()
+        .collect();
+    let added_count = added.len();
+
+    // Find removed files (in current but not in fresh)
+    let removed_set: std::collections::HashSet<PathBuf> = current_set.difference(&fresh_set).cloned().collect();
+    let removed_count = removed_set.len();
+
+    // Remove missing files (preserve order, skip currently playing track)
+    playlist.retain(|p| {
+        if removed_set.contains(p) {
+            current_track_path.map(|c| c == p.as_path()).unwrap_or(false)
+        } else {
+            true
+        }
+    });
+
+    // Append new files to tail
+    playlist.append(&mut added);
+
+    Ok((added_count, removed_count))
 }

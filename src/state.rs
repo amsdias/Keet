@@ -1,5 +1,7 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, AtomicU8, AtomicU32, AtomicU64, AtomicI64, Ordering};
+use std::time::Instant;
+use std::path::PathBuf;
 
 pub const SUPPORTED_EXTENSIONS: &[&str] = &["mp3", "flac", "wav", "ogg", "aac", "m4a", "aiff", "aif"];
 pub const RING_BUFFER_SIZE: usize = 48000 * 2 * 4; // ~4 sec stereo
@@ -95,6 +97,7 @@ pub struct PlayerState {
     pub(crate) skip_next: AtomicBool,
     pub(crate) skip_prev: AtomicBool,
     pub(crate) seek_request: AtomicI64,
+    pub(crate) jump_to_track: AtomicI64,
 
     // Track info
     pub(crate) current_track: AtomicUsize,
@@ -164,6 +167,7 @@ impl PlayerState {
             skip_next: AtomicBool::new(false),
             skip_prev: AtomicBool::new(false),
             seek_request: AtomicI64::new(0),
+            jump_to_track: AtomicI64::new(-1),
             current_track: AtomicUsize::new(0),
             total_tracks: AtomicUsize::new(0),
             sample_rate: AtomicU64::new(44100),
@@ -206,7 +210,18 @@ impl PlayerState {
     pub fn next(&self) { self.skip_next.store(true, Ordering::Relaxed); }
     pub fn prev(&self) { self.skip_prev.store(true, Ordering::Relaxed); }
     pub fn is_skip_requested(&self) -> bool {
-        self.skip_next.load(Ordering::Relaxed) || self.skip_prev.load(Ordering::Relaxed)
+        self.skip_next.load(Ordering::Relaxed)
+            || self.skip_prev.load(Ordering::Relaxed)
+            || self.jump_to_track.load(Ordering::Relaxed) >= 0
+    }
+
+    pub fn jump_to(&self, index: usize) {
+        self.jump_to_track.store(index as i64, Ordering::Relaxed);
+    }
+
+    pub fn take_jump(&self) -> Option<usize> {
+        let val = self.jump_to_track.swap(-1, Ordering::Relaxed);
+        if val >= 0 { Some(val as usize) } else { None }
     }
     pub fn take_skip_next(&self) -> bool { self.skip_next.swap(false, Ordering::Relaxed) }
     pub fn take_skip_prev(&self) -> bool { self.skip_prev.swap(false, Ordering::Relaxed) }
@@ -345,5 +360,58 @@ impl PlayerState {
         let left = f32::from_bits(self.vu_peak_dot_l.load(Ordering::Relaxed));
         let right = f32::from_bits(self.vu_peak_dot_r.load(Ordering::Relaxed));
         (left, right)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    Player,
+    Playlist,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum InputMode {
+    Normal,
+    Search(String),
+    SavePlaylist(String),
+}
+
+pub struct UiState {
+    pub view_mode: ViewMode,
+    pub input_mode: InputMode,
+    pub scroll_offset: usize,
+    pub cursor: usize,
+    pub filtered_indices: Vec<usize>,
+    pub current: usize,
+    pub source_paths: Vec<PathBuf>,
+    pub status_message: Option<(String, Instant)>,
+}
+
+impl UiState {
+    pub fn new(source_paths: Vec<PathBuf>) -> Self {
+        Self {
+            view_mode: ViewMode::Player,
+            input_mode: InputMode::Normal,
+            scroll_offset: 0,
+            cursor: 0,
+            filtered_indices: Vec::new(),
+            current: 0,
+            source_paths,
+            status_message: None,
+        }
+    }
+
+    pub fn set_status(&mut self, msg: String) {
+        self.status_message = Some((msg, Instant::now()));
+    }
+
+    pub fn take_status(&mut self) -> Option<String> {
+        if let Some((ref msg, when)) = self.status_message {
+            if when.elapsed() < std::time::Duration::from_secs(2) {
+                return Some(msg.clone());
+            }
+            self.status_message = None;
+        }
+        None
     }
 }
