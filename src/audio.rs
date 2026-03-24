@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use cpal::traits::DeviceTrait;
+use cpal::traits::HostTrait;
 use cpal::{Stream, StreamConfig};
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
@@ -44,6 +45,50 @@ pub fn probe_sample_rate(path: &Path) -> Option<u32> {
     track.codec_params.sample_rate
 }
 
+/// Print numbered list of output devices to stdout
+pub fn list_output_devices(host: &cpal::Host) {
+    match host.output_devices() {
+        Ok(devices) => {
+            let default_name = host.default_output_device()
+                .and_then(|d| d.description().ok())
+                .map(|d| d.name().to_string());
+
+            println!("Output devices:");
+            for (i, device) in devices.enumerate() {
+                let name = device.description()
+                    .map(|d| d.name().to_string())
+                    .unwrap_or_else(|_| "Unknown".to_string());
+                let suffix = if default_name.as_ref() == Some(&name) { " (default)" } else { "" };
+                println!("  {}. {}{}", i + 1, name, suffix);
+            }
+        }
+        Err(e) => eprintln!("Cannot enumerate devices: {}", e),
+    }
+}
+
+/// Find an output device by substring match (case-insensitive)
+pub fn find_device_by_name(host: &cpal::Host, name: &str) -> Option<cpal::Device> {
+    let name_lower = name.to_lowercase();
+    host.output_devices().ok()?
+        .find(|d| {
+            d.description()
+                .map(|desc| desc.name().to_lowercase().contains(&name_lower))
+                .unwrap_or(false)
+        })
+}
+
+/// Query the maximum sample rate supported by a device
+pub fn max_supported_rate(device: &cpal::Device) -> u32 {
+    device.supported_output_configs()
+        .map(|configs| {
+            configs.into_iter()
+                .map(|c| c.max_sample_rate())
+                .max()
+                .unwrap_or(48000)
+        })
+        .unwrap_or(48000)
+}
+
 #[cfg(target_os = "macos")]
 #[allow(non_snake_case, non_upper_case_globals)]
 mod macos_audio {
@@ -67,6 +112,20 @@ mod macos_audio {
             inQualifierData: *const c_void,
             ioDataSize: *mut u32,
             outData: *mut c_void,
+        ) -> i32;
+
+        fn AudioObjectGetPropertyDataSize(
+            inObjectID: u32,
+            inAddress: *const AudioObjectPropertyAddress,
+            inQualifierDataSize: u32,
+            inQualifierData: *const c_void,
+            outDataSize: *mut u32,
+        ) -> i32;
+
+        fn AudioObjectIsPropertySettable(
+            inObjectID: u32,
+            inAddress: *const AudioObjectPropertyAddress,
+            outIsSettable: *mut u8,
         ) -> i32;
     }
 
@@ -94,6 +153,8 @@ mod macos_audio {
     const kAudioDeviceTransportTypeBluetooth: u32 = 0x626C7565; // 'blue'
     #[allow(non_upper_case_globals)]
     const kAudioDeviceTransportTypeBluetoothLE: u32 = 0x626C6561; // 'blea'
+    const kAudioDevicePropertyHogMode: u32 = 0x686F676D; // 'hogm'
+    const kAudioHardwarePropertyDevices: u32 = 0x64657623; // 'dev#'
 
     pub fn is_bluetooth_device() -> bool {
         unsafe {
@@ -252,6 +313,189 @@ mod macos_audio {
             Ok(rate_f64 as u32)
         }
     }
+
+    pub fn get_default_device_id() -> Option<u32> {
+        unsafe {
+            let address = AudioObjectPropertyAddress {
+                mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain,
+            };
+            let mut device_id: u32 = 0;
+            let mut size: u32 = std::mem::size_of::<u32>() as u32;
+            let status = AudioObjectGetPropertyData(
+                kAudioObjectSystemObject, &address, 0, std::ptr::null(),
+                &mut size, &mut device_id as *mut u32 as *mut c_void,
+            );
+            if status != 0 { None } else { Some(device_id) }
+        }
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFStringGetLength(theString: *const c_void) -> isize;
+        fn CFStringGetCString(
+            theString: *const c_void,
+            buffer: *mut u8,
+            bufferSize: isize,
+            encoding: u32,
+        ) -> bool;
+        fn CFRelease(cf: *const c_void);
+    }
+
+    const kCFStringEncodingUTF8: u32 = 0x08000100;
+    const kAudioObjectPropertyName: u32 = 0x6C6E616D; // 'lnam'
+
+    fn get_device_name_by_id(device_id: u32) -> Option<String> {
+        unsafe {
+            let address = AudioObjectPropertyAddress {
+                mSelector: kAudioObjectPropertyName,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain,
+            };
+            let mut name_ref: *const c_void = std::ptr::null();
+            let mut size: u32 = std::mem::size_of::<*const c_void>() as u32;
+            let status = AudioObjectGetPropertyData(
+                device_id, &address, 0, std::ptr::null(),
+                &mut size, &mut name_ref as *mut _ as *mut c_void,
+            );
+            if status != 0 || name_ref.is_null() { return None; }
+            let len = CFStringGetLength(name_ref);
+            let buf_size = (len * 4 + 1) as usize;
+            let mut buf = vec![0u8; buf_size];
+            let ok = CFStringGetCString(name_ref, buf.as_mut_ptr(), buf_size as isize, kCFStringEncodingUTF8);
+            CFRelease(name_ref);
+            if ok {
+                let cstr = std::ffi::CStr::from_ptr(buf.as_ptr() as *const std::ffi::c_char);
+                Some(cstr.to_string_lossy().into_owned())
+            } else {
+                None
+            }
+        }
+    }
+
+    pub fn find_device_id_by_name(name: &str) -> Option<u32> {
+        unsafe {
+            let address = AudioObjectPropertyAddress {
+                mSelector: kAudioHardwarePropertyDevices,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain,
+            };
+            let mut size: u32 = 0;
+            let status = AudioObjectGetPropertyDataSize(
+                kAudioObjectSystemObject, &address, 0, std::ptr::null(), &mut size,
+            );
+            if status != 0 { return None; }
+            let count = size as usize / std::mem::size_of::<u32>();
+            let mut device_ids = vec![0u32; count];
+            let status = AudioObjectGetPropertyData(
+                kAudioObjectSystemObject, &address, 0, std::ptr::null(),
+                &mut size, device_ids.as_mut_ptr() as *mut c_void,
+            );
+            if status != 0 { return None; }
+            let name_lower = name.to_lowercase();
+            for &did in &device_ids {
+                if let Some(device_name) = get_device_name_by_id(did) {
+                    if device_name.to_lowercase().contains(&name_lower) {
+                        return Some(did);
+                    }
+                }
+            }
+            None
+        }
+    }
+
+    pub fn set_hog_mode(device_id: u32) -> Result<(), String> {
+        unsafe {
+            let address = AudioObjectPropertyAddress {
+                mSelector: kAudioDevicePropertyHogMode,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain,
+            };
+
+            // Check if hog mode is supported by this device
+            let mut settable: u8 = 0;
+            let has_prop = AudioObjectIsPropertySettable(
+                device_id, &address, &mut settable,
+            );
+            if has_prop != 0 || settable == 0 {
+                return Err("device does not support hog mode (built-in speakers, AirPlay, and virtual devices typically don't)".to_string());
+            }
+
+            let pid = std::process::id() as i32;
+            let status = AudioObjectSetPropertyData(
+                device_id, &address, 0, std::ptr::null(),
+                std::mem::size_of::<i32>() as u32,
+                &pid as *const i32 as *const c_void,
+            );
+            if status != 0 {
+                let code_bytes = status.to_be_bytes();
+                let fourcc: String = code_bytes.iter()
+                    .map(|&b| if b.is_ascii_graphic() { b as char } else { '?' })
+                    .collect();
+                return Err(format!("CoreAudio error '{}' ({})", fourcc, status));
+            }
+            Ok(())
+        }
+    }
+
+    pub fn release_hog_mode(device_id: u32) {
+        unsafe {
+            let address = AudioObjectPropertyAddress {
+                mSelector: kAudioDevicePropertyHogMode,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain,
+            };
+            let pid: i32 = -1;
+            let _ = AudioObjectSetPropertyData(
+                device_id, &address, 0, std::ptr::null(),
+                std::mem::size_of::<i32>() as u32,
+                &pid as *const i32 as *const c_void,
+            );
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn set_device_sample_rate_for_id(device_id: u32, rate: u32) -> Result<(), String> {
+        unsafe {
+            let rate_address = AudioObjectPropertyAddress {
+                mSelector: kAudioDevicePropertyNominalSampleRate,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain,
+            };
+            let rate_f64 = rate as f64;
+            let status = AudioObjectSetPropertyData(
+                device_id, &rate_address, 0, std::ptr::null(),
+                std::mem::size_of::<f64>() as u32,
+                &rate_f64 as *const f64 as *const c_void,
+            );
+            if status != 0 {
+                return Err(format!("Failed to set sample rate to {}: {}", rate, status));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            Ok(())
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn is_bluetooth_device_by_id(device_id: u32) -> bool {
+        unsafe {
+            let transport_address = AudioObjectPropertyAddress {
+                mSelector: kAudioDevicePropertyTransportType,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain,
+            };
+            let mut transport_type: u32 = 0;
+            let mut size: u32 = std::mem::size_of::<u32>() as u32;
+            let status = AudioObjectGetPropertyData(
+                device_id, &transport_address, 0, std::ptr::null(),
+                &mut size, &mut transport_type as *mut u32 as *mut c_void,
+            );
+            if status != 0 { return false; }
+            transport_type == kAudioDeviceTransportTypeBluetooth
+                || transport_type == kAudioDeviceTransportTypeBluetoothLE
+        }
+    }
 }
 
 /// Try to set the system audio output sample rate to match the source.
@@ -322,6 +566,40 @@ pub fn set_output_sample_rate(desired_rate: u32, current_rate: u32, device: &cpa
     }
 }
 
+/// Set exclusive (hog) mode on the output device. macOS only.
+/// Returns the CoreAudio device ID if successful, for later release.
+pub fn set_exclusive_mode(device: &cpal::Device) -> Result<u32, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let device_name = device.description()
+            .map(|d| d.name().to_string())
+            .unwrap_or_default();
+        let device_id = macos_audio::find_device_id_by_name(&device_name)
+            .or_else(|| macos_audio::get_default_device_id())
+            .ok_or_else(|| "Could not find CoreAudio device ID".to_string())?;
+
+        macos_audio::set_hog_mode(device_id)?;
+        Ok(device_id)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = device;
+        Err("Exclusive mode not supported on this platform".to_string())
+    }
+}
+
+/// Release exclusive (hog) mode on the output device. macOS only.
+pub fn release_exclusive_mode(device_id: u32) {
+    #[cfg(target_os = "macos")]
+    {
+        macos_audio::release_hog_mode(device_id);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = device_id;
+    }
+}
+
 pub fn build_stream(
     device: &cpal::Device,
     config: &StreamConfig,
@@ -330,11 +608,7 @@ pub fn build_stream(
     state: Arc<PlayerState>,
 ) -> Result<Stream, Box<dyn std::error::Error>> {
     let channels = config.channels as usize;
-    let sample_rate = config.sample_rate;
-
-    // Local counter for batched updates
-    let mut local_played: u64 = 0;
-    let batch_size = sample_rate as u64 / 4; // Update ~4x per second
+    let err_state = Arc::clone(&state);
 
     let stream = device.build_output_stream(
         config,
@@ -343,7 +617,6 @@ pub fn build_stream(
 
             // Check if seek happened - drain buffer immediately for instant response
             if state.reset_consumer_counter.swap(false, Ordering::Relaxed) {
-                local_played = 0;
                 // Drain all buffered samples instantly
                 let to_drain = consumer.slots();
                 if to_drain > 0 {
@@ -417,7 +690,6 @@ pub fn build_stream(
 
                     out_idx += channels;
                     src_idx += source_channels;
-                    local_played += 1;
                 }
 
                 chunk.commit_all();
@@ -479,13 +751,11 @@ pub fn build_stream(
                 data.fill(0.0);
             }
 
-            // Batch update
-            if local_played >= batch_size {
-                state.samples_played.fetch_add(local_played, Ordering::Relaxed);
-                local_played = 0;
-            }
         },
-        |e| eprintln!("Audio error: {}", e),
+        move |e| {
+            eprintln!("Audio error: {}", e);
+            err_state.stream_error.store(true, std::sync::atomic::Ordering::Relaxed);
+        },
         None,
     )?;
 

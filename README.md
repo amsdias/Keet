@@ -8,16 +8,23 @@ A high-performance, low-CPU terminal audio player with real-time spectrum visual
 - **Low CPU usage**: <0.5% total system CPU (release mode)
 - **Parametric EQ**: Built-in presets (Flat, Bass Boost, Treble Boost, Vocal, Loudness) + custom JSON presets
 - **Audio effects**: Reverb, chorus, delay with built-in environment presets + custom JSON presets
+- **Gapless playback**: Sample-accurate track transitions with continuous audio stream
+- **ReplayGain**: Loudness normalization with peak-based clipping prevention (`--rg-mode track|album|off`)
 - **Crossfade**: Smooth equal-power crossfade between tracks (`--crossfade`)
 - **Pre/post-fader metering**: Toggle between raw signal and volume-adjusted visualization
 - **Media controls**: AirPods stalk controls, Bluetooth headphone buttons, keyboard media keys (macOS/Windows/Linux)
 - **Real-time visualizations**: VU meter, horizontal/vertical spectrum analyzer synced to playback, toggleable bars/dots style
 - **Metadata display**: Reads artist/title from ID3, Vorbis, and MP4 tags
 - **Format-colored icons**: File type indicated by icon color (green=MP3, cyan=FLAC, yellow=WAV, etc.)
+- **Output device selection**: `--device` selects by name, `--list-devices` enumerates
+- **Exclusive mode**: Per-track sample rate matching, macOS hog mode for bit-perfect playback (`--exclusive`)
+- **Headphone crossfeed**: Meier-style frequency-dependent crossfeed with three presets (Light/Medium/Strong)
+- **Balance control**: Stereo balance with `[`/`]` keys (5% steps, -100 to +100)
+- **Clipping indicator**: Red CLIP warning when signal exceeds 0dBFS
 - **Smart audio processing**: Automatic sample rate switching (macOS), Bluetooth detection, conditional resampling, seamless device switching
 - **Volume control**: Adjustable 0-150% with per-sample gain
 - **Playlist features**: Shuffle, repeat, recursive folder scanning, playlist view with search, M3U import/export, folder rescan, multiple source paths with deduplication
-- **Resume playback**: Save and restore last session (track, position, volume, EQ, effects) automatically
+- **Resume playback**: Save and restore last session (track, position, volume, EQ, effects, crossfeed, balance, device, exclusive) automatically
 - **HQ resampler mode**: Optional `--quality` flag for audiophile-grade resampling
 - **Resilient playback**: Silently skips missing/corrupt files, recovers from device disconnection
 - **Terminal-safe UI**: Output adapts to terminal width, no line-wrapping artifacts
@@ -49,6 +56,12 @@ cargo run --release -- ~/Music/ --eq "Bass Boost"
 # With Concert Hall reverb and 3-second crossfade
 cargo run --release -- ~/Music/ --fx "Concert Hall" --crossfade 3
 
+# List available output devices
+keet --list-devices
+
+# Play on a specific device with exclusive mode
+keet ~/Music/ --device "USB Audio DAC" --exclusive
+
 # Resume last session (no arguments)
 keet
 
@@ -75,6 +88,9 @@ keet ~/Music/favorites.m3u
 | `R` | Rescan folders for changes |
 | `S` | Save playlist as M3U |
 | `F` | Toggle pre/post-fader metering |
+| `C` | Cycle crossfeed presets (Off/Light/Medium/Strong) |
+| `[` | Balance left (5% steps) |
+| `]` | Balance right (5% steps) |
 | `+` / `=` | Volume up (5%) |
 | `-` | Volume down (5%) |
 | `Q` / `Esc` | Quit |
@@ -88,6 +104,7 @@ Press `L` to open the playlist view, which replaces the visualization area with 
 | `↑` / `↓` | Scroll track list |
 | `Enter` | Jump to selected track |
 | `/` | Search/filter by filename |
+| `D` | Remove selected track |
 | `S` | Save playlist as M3U |
 | `Esc` / `L` | Close playlist view |
 
@@ -161,18 +178,18 @@ Drop JSON files into `~/.config/keet/effects/` (macOS/Linux) or `%APPDATA%\keet\
 {
   "name": "My Environment",
   "reverb": {
-    "mix": 0.3,
+    "wet": 0.5,
     "room_size": 0.7,
     "damping": 0.5
   },
   "chorus": {
-    "mix": 0.3,
+    "wet": 0.3,
     "rate": 1.5,
-    "depth": 0.003
+    "depth": 3.0
   },
   "delay": {
-    "mix": 0.2,
-    "time": 0.4,
+    "wet": 0.2,
+    "delay_ms": 400.0,
     "feedback": 0.3
   }
 }
@@ -222,13 +239,15 @@ The spectrum analyzer features:
 +-----------+    +------------------+   Ring Buffer   +------------------+
 | Main      |    | Producer Thread  | --------------> | Audio Callback   |
 | Thread    |    | (decode/resample)|   (lock-free)   | (playback/gain)  |
-|           |    | (EQ/FX/xfade)   |                 +--------+---------+
-| UI/input  |    +------------------+                          |
-| viz/stats |    Viz Ring Buffer (stereo tap)                   |
+|           |    | (EQ/FX/RG/CF/BAL/xfade)|           +--------+---------+
+| UI/input  |    | (gapless loop)  |                          |
+| viz/stats |    +------------------+  Viz Ring Buffer         |
 |           | <------------------------------------------------+
 +-----------+
-              All shared state via atomics (Relaxed ordering)
+              All shared state via atomics (Release/Acquire for transitions)
 ```
+
+DSP chain: `decode → resample → EQ → effects → RG gain → crossfeed → balance → crossfade → clipping check → ring buffer → volume → output`
 
 ### Source Layout
 
@@ -237,10 +256,11 @@ src/
 ├── main.rs      Entry point, CLI args, playlist loop
 ├── state.rs     PlayerState, VizMode, constants, ANSI colors
 ├── audio.rs     Audio stream, sample rate switching, CoreAudio FFI
-├── decode.rs    Decoder thread, resampling, sample conversion
+├── decode.rs    Continuous decoder thread, gapless playback, ReplayGain, resampling
 ├── eq.rs        Biquad EQ filters, preset loading, JSON parsing
 ├── effects.rs   Reverb, chorus, delay effects with preset loading
 ├── playlist.rs  Playlist builder, metadata reader, shuffle
+├── crossfeed.rs Meier-style headphone crossfeed filter
 ├── resume.rs    Resume state persistence (save/restore sessions)
 ├── viz.rs       VizAnalyser, StatsMonitor, spectrum rendering
 ├── media_keys.rs  OS media transport controls (souvlaki)
@@ -266,6 +286,10 @@ Options:
   --eq, -e <name>   Start with EQ preset by name or JSON file path
   --fx <name>       Start with effects preset by name or JSON file path
   --crossfade, -x <secs>  Crossfade duration between tracks (0 = disabled)
+  --rg-mode <mode>  ReplayGain mode: track (default), album, or off
+  --device <name>   Select output device by name (substring match)
+  --list-devices    List available output devices and exit
+  --exclusive       Exclusive mode: per-track rate matching, device lock (macOS)
 ```
 
 Multiple files, folders, and M3U playlists can be passed as arguments. Duplicates are removed automatically. Running `keet` with no arguments resumes the last session.
@@ -286,7 +310,7 @@ Multiple files, folders, and M3U playlists can be passed as arguments. Duplicate
 
 ## Platform Notes
 
-- **macOS**: Automatic sample rate switching via CoreAudio; Bluetooth devices (AirPods etc.) detected and locked to native 48kHz; seamless device switching when audio output changes mid-playback; media keys via MPRemoteCommandCenter
+- **macOS**: Automatic sample rate switching via CoreAudio; exclusive (hog) mode for bit-perfect playback with per-track rate matching; Bluetooth devices (AirPods etc.) detected and locked to native 48kHz; seamless device switching when audio output changes mid-playback; media keys via MPRemoteCommandCenter
 - **Linux**: Works with PipeWire/PulseAudio/ALSA; falls back to device default rate if unsupported; media keys via MPRIS/D-Bus
 - **Windows**: WASAPI shared mode with larger buffer (2048 samples) for lower CPU overhead; media keys via SMTC
 - **WSL**: Auto-detected via `/proc/version`; uses larger buffer (2048 samples) to reduce crackling from PulseAudio virtualization
@@ -330,6 +354,7 @@ The `.exe` automatically includes the app icon when built on Windows.
 
 ## Future Improvements
 
+- **ReplayGain preamp**: `--rg-preamp` flag for adjustable gain offset
 - **GUI file picker**: Native file/folder dialog so the .app bundle can be launched without Terminal arguments
 - **Drag-and-drop**: Drop audio files or folders onto the .app icon to start playback
 

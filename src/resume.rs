@@ -14,6 +14,16 @@ pub struct ResumeState {
     pub volume: u32,
     pub eq_preset: String,
     pub effects_preset: String,
+    #[serde(default)]
+    pub rg_mode: Option<String>,
+    #[serde(default)]
+    pub device: Option<String>,
+    #[serde(default)]
+    pub exclusive: Option<bool>,
+    #[serde(default)]
+    pub crossfeed_preset: Option<String>,
+    #[serde(default)]
+    pub balance: Option<i32>,
 }
 
 fn state_file_path() -> Option<PathBuf> {

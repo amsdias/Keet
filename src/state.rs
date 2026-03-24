@@ -1,5 +1,6 @@
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, AtomicU8, AtomicU32, AtomicU64, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, AtomicU8, AtomicU32, AtomicU64, AtomicI32, AtomicI64, Ordering};
+use std::thread::JoinHandle;
 use std::time::Instant;
 use std::path::PathBuf;
 
@@ -43,10 +44,30 @@ impl VizStyle {
         }
     }
 
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RgMode {
+    Track = 0,
+    Album = 1,
+    Off = 2,
+}
+
+impl RgMode {
+    pub fn from_u8(value: u8) -> Self {
+        match value {
+            1 => RgMode::Album,
+            2 => RgMode::Off,
+            _ => RgMode::Track,
+        }
+    }
+
     pub fn name(self) -> &'static str {
         match self {
-            VizStyle::Bars => "Bars",
-            VizStyle::Dots => "Dots",
+            RgMode::Track => "Track",
+            RgMode::Album => "Album",
+            RgMode::Off => "Off",
         }
     }
 }
@@ -80,14 +101,6 @@ impl VizMode {
         }
     }
 
-    pub fn name(self) -> &'static str {
-        match self {
-            VizMode::None => "None",
-            VizMode::VuMeter => "VU Meter",
-            VizMode::SpectrumHorizontal => "Spectrum Horizontal",
-            VizMode::SpectrumVertical => "Spectrum Vertical",
-        }
-    }
 }
 
 pub struct PlayerState {
@@ -157,6 +170,32 @@ pub struct PlayerState {
 
     // Decode error from producer thread (None = no error)
     pub(crate) decode_error: Mutex<Option<String>>,
+
+    // Track transition signaling (gapless playback)
+    pub(crate) track_transition_count: AtomicUsize,
+    pub(crate) producer_track_index: AtomicUsize,
+
+    // ReplayGain mode
+    pub(crate) rg_mode: AtomicU8,
+
+    // Clipping indicator
+    pub(crate) clipping: AtomicBool,
+
+    // Crossfeed preset index and count
+    pub(crate) crossfeed_preset_index: AtomicUsize,
+    pub(crate) crossfeed_preset_count: AtomicUsize,
+    pub(crate) crossfeed_changed: AtomicBool,
+
+    // Stereo balance (-100 to +100, 0 = center)
+    pub(crate) balance: AtomicI32,
+
+    // Exclusive mode
+    pub(crate) exclusive: AtomicBool,
+    pub(crate) rate_change_needed: AtomicBool,
+    pub(crate) next_track_rate: AtomicU32,
+
+    // Stream error (device disconnected etc.)
+    pub(crate) stream_error: AtomicBool,
 }
 
 impl PlayerState {
@@ -200,6 +239,18 @@ impl PlayerState {
             crossfade_secs: AtomicU32::new(0),
             viz_style: AtomicU8::new(VizStyle::Dots as u8),
             decode_error: Mutex::new(None),
+            track_transition_count: AtomicUsize::new(0),
+            producer_track_index: AtomicUsize::new(0),
+            rg_mode: AtomicU8::new(RgMode::Track as u8),
+            clipping: AtomicBool::new(false),
+            crossfeed_preset_index: AtomicUsize::new(0),
+            crossfeed_preset_count: AtomicUsize::new(0),
+            crossfeed_changed: AtomicBool::new(false),
+            balance: AtomicI32::new(0),
+            exclusive: AtomicBool::new(false),
+            rate_change_needed: AtomicBool::new(false),
+            next_track_rate: AtomicU32::new(0),
+            stream_error: AtomicBool::new(false),
         }
     }
 
@@ -209,12 +260,6 @@ impl PlayerState {
     pub fn should_quit(&self) -> bool { self.quit.load(Ordering::Relaxed) }
     pub fn next(&self) { self.skip_next.store(true, Ordering::Relaxed); }
     pub fn prev(&self) { self.skip_prev.store(true, Ordering::Relaxed); }
-    pub fn is_skip_requested(&self) -> bool {
-        self.skip_next.load(Ordering::Relaxed)
-            || self.skip_prev.load(Ordering::Relaxed)
-            || self.jump_to_track.load(Ordering::Relaxed) >= 0
-    }
-
     pub fn jump_to(&self, index: usize) {
         self.jump_to_track.store(index as i64, Ordering::Relaxed);
     }
@@ -310,6 +355,49 @@ impl PlayerState {
         self.viz_style.store(if cur == 0 { 1 } else { 0 }, Ordering::Relaxed);
     }
 
+    pub fn signal_next_track(&self, index: usize) {
+        self.producer_track_index.store(index, Ordering::Relaxed);
+        self.track_transition_count.fetch_add(1, Ordering::Release);
+    }
+
+    pub fn rg_mode(&self) -> RgMode {
+        RgMode::from_u8(self.rg_mode.load(Ordering::Relaxed))
+    }
+
+    pub fn is_clipping(&self) -> bool {
+        self.clipping.swap(false, Ordering::Relaxed)
+    }
+
+    pub fn cycle_crossfeed(&self) {
+        let count = self.crossfeed_preset_count.load(Ordering::Relaxed);
+        if count == 0 { return; }
+        let cur = self.crossfeed_preset_index.load(Ordering::Relaxed);
+        self.crossfeed_preset_index.store((cur + 1) % count, Ordering::Relaxed);
+        self.crossfeed_changed.store(true, Ordering::Relaxed);
+    }
+
+    pub fn crossfeed_index(&self) -> usize {
+        self.crossfeed_preset_index.load(Ordering::Relaxed)
+    }
+
+    pub fn take_crossfeed_changed(&self) -> bool {
+        self.crossfeed_changed.swap(false, Ordering::Relaxed)
+    }
+
+    pub fn balance_left(&self) {
+        let cur = self.balance.load(Ordering::Relaxed);
+        self.balance.store((cur - 5).max(-100), Ordering::Relaxed);
+    }
+
+    pub fn balance_right(&self) {
+        let cur = self.balance.load(Ordering::Relaxed);
+        self.balance.store((cur + 5).min(100), Ordering::Relaxed);
+    }
+
+    pub fn balance_value(&self) -> i32 {
+        self.balance.load(Ordering::Relaxed)
+    }
+
     pub fn set_peaks(&self, left: f32, right: f32) {
         self.peak_left.store(left.to_bits(), Ordering::Relaxed);
         self.peak_right.store(right.to_bits(), Ordering::Relaxed);
@@ -385,10 +473,15 @@ pub struct UiState {
     pub current: usize,
     pub source_paths: Vec<PathBuf>,
     pub status_message: Option<(String, Instant)>,
+    pub metadata_cache: std::sync::Arc<crate::metadata::MetadataCache>,
+    pub scan_handle: Option<JoinHandle<()>>,
+    pub removed_paths: std::collections::HashSet<PathBuf>,
+    pub banner_lines: usize,
+    pub playlist_dirty: bool,
 }
 
 impl UiState {
-    pub fn new(source_paths: Vec<PathBuf>) -> Self {
+    pub fn new(source_paths: Vec<PathBuf>, metadata_cache: std::sync::Arc<crate::metadata::MetadataCache>) -> Self {
         Self {
             view_mode: ViewMode::Player,
             input_mode: InputMode::Normal,
@@ -398,6 +491,11 @@ impl UiState {
             current: 0,
             source_paths,
             status_message: None,
+            metadata_cache,
+            scan_handle: None,
+            removed_paths: std::collections::HashSet::new(),
+            banner_lines: 0,
+            playlist_dirty: false,
         }
     }
 

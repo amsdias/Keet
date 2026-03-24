@@ -17,6 +17,8 @@ mod eq;
 mod effects;
 mod media_keys;
 mod resume;
+mod crossfeed;
+mod metadata;
 
 use std::env;
 use std::io::{self, Write};
@@ -31,10 +33,10 @@ use cpal::StreamConfig;
 use crossterm::terminal;
 use rtrb::RingBuffer;
 
-use state::{PlayerState, UiState, VizMode, RING_BUFFER_SIZE, VIZ_BUFFER_SIZE};
+use state::{PlayerState, UiState, RgMode, VizMode, RING_BUFFER_SIZE, VIZ_BUFFER_SIZE};
 use viz::{StatsMonitor, VizAnalyser};
 use audio::{build_stream, set_output_sample_rate, probe_sample_rate, fix_bluetooth_sample_rate};
-use decode::decode_track;
+use decode::decode_playlist;
 use playlist::{build_playlist, shuffle_list, read_metadata};
 use ui::{print_status, poll_input, format_time};
 use resume::{ResumeState, save_state, load_state};
@@ -47,6 +49,8 @@ fn build_resume_state(
     repeat: bool,
     eq_presets: &[eq::EqPreset],
     fx_presets: &[effects::EffectsPreset],
+    cf_presets: &[crossfeed::CrossfeedPreset],
+    device_name: &Option<String>,
 ) -> ResumeState {
     ResumeState {
         source_paths: ui.source_paths.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
@@ -59,6 +63,11 @@ fn build_resume_state(
         volume: player_state.volume.load(std::sync::atomic::Ordering::Relaxed),
         eq_preset: eq_presets[player_state.eq_index()].name.clone(),
         effects_preset: fx_presets[player_state.effects_index()].name.clone(),
+        rg_mode: Some(player_state.rg_mode().name().to_lowercase()),
+        device: device_name.clone(),
+        exclusive: Some(player_state.exclusive.load(std::sync::atomic::Ordering::Relaxed)),
+        crossfeed_preset: Some(cf_presets[player_state.crossfeed_index()].name.clone()),
+        balance: Some(player_state.balance_value()),
     }
 }
 
@@ -98,7 +107,67 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args: Vec<String> = env::args().collect();
 
-    let flags = ["--shuffle", "-s", "--repeat", "-r", "--quality", "-q", "--eq", "-e", "--fx", "--crossfade", "-x"];
+    // Handle --help (print and exit)
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("\x1B[1mKeet\x1B[0m — Terminal audio player with real-time visualization and parametric EQ");
+        println!();
+        println!("\x1B[1mUSAGE\x1B[0m");
+        println!("  keet <file|folder|playlist>... [options]");
+        println!("  keet                              Resume last session");
+        println!();
+        println!("\x1B[1mOPTIONS\x1B[0m");
+        println!("  -s, --shuffle          Randomize playlist order (re-shuffles on each repeat)");
+        println!("  -r, --repeat           Loop playlist (rescans sources for new files each cycle)");
+        println!("  -q, --quality          HQ resampler (higher CPU, inaudible difference)");
+        println!("  -e, --eq <name|path>   Start with EQ preset by name or JSON file path");
+        println!("      --fx <name|path>   Start with effects preset by name or JSON file path");
+        println!("  -x, --crossfade <secs> Crossfade duration between tracks (0 = disabled)");
+        println!("      --rg-mode <mode>   ReplayGain: track (default), album, or off");
+        println!("      --device <name>    Output device (substring match)");
+        println!("      --exclusive        Exclusive mode: per-track sample rate, device lock (macOS)");
+        println!("      --list-devices     List available output devices and exit");
+        println!("  -h, --help             Show this help");
+        println!();
+        println!("\x1B[1mFORMATS\x1B[0m  MP3, FLAC, WAV, OGG, AAC/M4A, ALAC, AIFF");
+        println!();
+        println!("\x1B[1mKEYBOARD\x1B[0m");
+        println!("  Space        Pause / resume");
+        println!("  Up / Down    Next / previous track");
+        println!("  Right / Left Seek forward / backward 10s");
+        println!("  + / -        Volume up / down (5% steps, 0–150%)");
+        println!("  V            Cycle visualization (off → VU → spectrum H → spectrum V)");
+        println!("  B            Toggle viz style (dots / bars)");
+        println!("  F            Toggle pre/post-fader metering");
+        println!("  E            Cycle EQ presets");
+        println!("  X            Cycle effects presets");
+        println!("  C            Cycle crossfeed (Off → Light → Medium → Strong)");
+        println!("  [ / ]        Balance left / right (5% steps)");
+        println!("  L            Toggle playlist view");
+        println!("  S            Save playlist as M3U");
+        println!("  R            Rescan folders for new files");
+        println!("  Q / Esc      Quit");
+        println!();
+        println!("\x1B[1mPLAYLIST VIEW\x1B[0m  (press L)");
+        println!("  Up / Down    Scroll track list");
+        println!("  Enter        Jump to selected track");
+        println!("  /            Search / filter by filename");
+        println!("  D            Remove selected track");
+        println!("  Esc / L      Close playlist view");
+        println!();
+        println!("\x1B[1mCUSTOM PRESETS\x1B[0m");
+        println!("  EQ:      ~/.config/keet/eq/*.json");
+        println!("  Effects: ~/.config/keet/effects/*.json");
+        return Ok(());
+    }
+
+    // Handle --list-devices (print and exit)
+    if args.iter().any(|a| a == "--list-devices") {
+        let host = cpal::default_host();
+        audio::list_output_devices(&host);
+        return Ok(());
+    }
+
+    let flags = ["--shuffle", "-s", "--repeat", "-r", "--quality", "-q", "--eq", "-e", "--fx", "--crossfade", "-x", "--rg-mode", "--list-devices", "--device", "--exclusive", "--help", "-h"];
     let (source_paths, shuffle, repeat) = if args.len() < 2 {
         // Try resume from saved state
         match load_state() {
@@ -119,7 +188,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 (paths, rs.shuffle, rs.repeat)
             }
             None => {
-                eprintln!("Usage: {} <file-or-folder>... [--shuffle] [--repeat] [--quality] [--eq <name>] [--fx <name>] [--crossfade <secs>]", args[0]);
+                eprintln!("Usage: {} <file-or-folder>... [--shuffle] [--repeat] [--quality] [--eq <name>] [--fx <name>] [--crossfade <secs>] [--rg-mode track|album|off] [--device <name>] [--exclusive] [--list-devices]", args[0]);
                 eprintln!("Controls: Space=Pause ↑↓=Tracks ←→=Seek V=Viz E=EQ X=FX L=List R=Rescan +/-=Vol Q=Quit");
                 std::process::exit(1);
             }
@@ -129,7 +198,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let r = args.iter().any(|a| a == "--repeat" || a == "-r");
         // Collect positional args (not flags, not values after flag options)
         let mut positional = Vec::new();
-        let value_flags = ["--eq", "-e", "--fx", "--crossfade", "-x"];
+        let value_flags = ["--eq", "-e", "--fx", "--crossfade", "-x", "--rg-mode", "--device"];
         let mut skip_next = false;
         for arg in &args[1..] {
             if skip_next { skip_next = false; continue; }
@@ -152,6 +221,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|i| args.get(i + 1))
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
+    let rg_mode: RgMode = args.iter().position(|a| a == "--rg-mode")
+        .and_then(|i| args.get(i + 1))
+        .map(|s| match s.to_lowercase().as_str() {
+            "album" => RgMode::Album,
+            "off" => RgMode::Off,
+            _ => RgMode::Track,
+        })
+        .unwrap_or(RgMode::Track);
+    let device_arg: Option<String> = args.iter().position(|a| a == "--device")
+        .and_then(|i| args.get(i + 1).cloned());
+    let exclusive = args.iter().any(|a| a == "--exclusive");
 
     let mut playlist = {
         let mut combined = Vec::new();
@@ -217,6 +297,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     state.crossfade_secs.store(crossfade_secs, Ordering::Relaxed);
+    state.rg_mode.store(rg_mode as u8, Ordering::Relaxed);
+    state.exclusive.store(exclusive, Ordering::Relaxed);
+
+    // Load crossfeed presets (built-in only)
+    let cf_presets = crossfeed::builtin_presets();
+    state.crossfeed_preset_count.store(cf_presets.len(), Ordering::Relaxed);
+    let cf_presets = Arc::new(cf_presets);
 
     // Restore resume state if resuming
     let resume_state_loaded = if args.len() < 2 { load_state() } else { None };
@@ -234,6 +321,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(idx) = fx_presets.iter().position(|p| p.name == rs.effects_preset) {
             state.effects_preset_index.store(idx, Ordering::Relaxed);
         }
+        // Restore RG mode by name
+        if let Some(ref rg_str) = rs.rg_mode {
+            let rg = match rg_str.as_str() {
+                "album" => RgMode::Album,
+                "off" => RgMode::Off,
+                _ => RgMode::Track,
+            };
+            state.rg_mode.store(rg as u8, Ordering::Relaxed);
+        }
+        // Restore crossfeed preset by name
+        if let Some(ref cf_name) = rs.crossfeed_preset {
+            if let Some(idx) = cf_presets.iter().position(|p| p.name.eq_ignore_ascii_case(cf_name)) {
+                state.crossfeed_preset_index.store(idx, Ordering::Relaxed);
+            }
+        }
+        // Restore balance
+        if let Some(bal) = rs.balance {
+            state.balance.store(bal.clamp(-100, 100), Ordering::Relaxed);
+        }
+    }
+
+    // Override device/exclusive from resume state when resuming with no args
+    let mut device_arg = device_arg;
+    let mut exclusive = exclusive;
+    if args.len() < 2 {
+        if let Some(ref rs) = resume_state_loaded {
+            if device_arg.is_none() {
+                device_arg = rs.device.clone();
+            }
+            if !exclusive {
+                exclusive = rs.exclusive.unwrap_or(false);
+            }
+        }
     }
 
     let eq_presets = Arc::new(eq_presets);
@@ -248,39 +368,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let eq_info = if eq_name != "Flat" { format!(" | EQ: {}", eq_name) } else { String::new() };
     let fx_info = if fx_name != "None" { format!(" | FX: {}", fx_name) } else { String::new() };
     let xfade_info = if crossfade_secs > 0 { format!(" | xfade: {}s", crossfade_secs) } else { String::new() };
-    let info = format!("{} tracks{}{}{}{}{}{}",
+    let cf_name = &cf_presets[state.crossfeed_index()].name;
+    let cf_info = if cf_name != "Off" { format!(" | crossfeed: {}", cf_name) } else { String::new() };
+    let bal_val = state.balance_value();
+    let bal_info = if bal_val != 0 {
+        if bal_val < 0 { format!(" | bal: L{}%", -bal_val) } else { format!(" | bal: R{}%", bal_val) }
+    } else { String::new() };
+    let info = format!("{} tracks{}{}{}{}{}{}{}{}",
         playlist.len(),
         if shuffle { " | shuffled" } else { "" },
         if repeat { " | repeat" } else { "" },
         if hq_resampler { " | HQ resampler" } else { "" },
-        eq_info, fx_info, xfade_info);
+        eq_info, fx_info, xfade_info, cf_info, bal_info);
     let info_display_len = info.len();
     let info_pad = inner_w.saturating_sub(info_display_len + 2);
-    println!("╔{}╗", "═".repeat(inner_w));
-    println!("║{}{}{}║", " ".repeat(pad_left), title, " ".repeat(pad_right));
-    println!("╠{}╣", "═".repeat(inner_w));
-    println!("║  {}{}║", info, " ".repeat(info_pad));
-    println!("╚{}╝", "═".repeat(inner_w));
+    let mut banner_lines: usize = 0;
+    println!("╔{}╗", "═".repeat(inner_w)); banner_lines += 1;
+    println!("║{}{}{}║", " ".repeat(pad_left), title, " ".repeat(pad_right)); banner_lines += 1;
+    println!("╠{}╣", "═".repeat(inner_w)); banner_lines += 1;
+    println!("║  {}{}║", info, " ".repeat(info_pad)); banner_lines += 1;
+    println!("╚{}╝", "═".repeat(inner_w)); banner_lines += 1;
 
     // Audio setup
     let host = cpal::default_host();
-    let mut current_output_rate = {
-        let device = host.default_output_device().ok_or("No output device")?;
+    let current_output_rate = {
+        let device = if let Some(ref dev_name) = device_arg {
+            audio::find_device_by_name(&host, dev_name).unwrap_or_else(|| {
+                eprintln!("Warning: Device '{}' not found, using default", dev_name);
+                host.default_output_device().expect("No output device")
+            })
+        } else {
+            host.default_output_device().ok_or("No output device")?
+        };
         let device_name = device.description()
             .map(|d| d.name().to_string())
             .unwrap_or_else(|_| "Unknown device".to_string());
-        println!("\nDevice: {}", device_name);
+        println!("\nDevice: {}", device_name); banner_lines += 2; // blank + device
 
         // Fix stale sample rate on Bluetooth devices (CoreAudio can get stuck at wrong rate)
         let bt_rate = fix_bluetooth_sample_rate();
         if let Some(rate) = bt_rate {
             println!("Bluetooth device detected, using native {}Hz", rate);
+            banner_lines += 1;
         }
 
         let default_config = device.default_output_config()?;
         let rate = bt_rate.unwrap_or_else(|| default_config.sample_rate());
         let default_channels = default_config.channels();
-        println!("Initial output: {}Hz (device default: {}ch)", rate, default_channels);
+        println!("Initial output: {}Hz (device default: {}ch)", rate, default_channels); banner_lines += 1;
         rate
     };
 
@@ -290,7 +425,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // OS media transport controls (media keys, AirPods, Bluetooth headphones)
     let mut media_controls = media_keys::setup(Arc::clone(&state));
 
-    println!("\n[Space] Pause  [↑↓] Track  [←→] Seek  [V/B] Viz  [E] EQ  [X] FX  [F] Fader  [L] List  [+/-] Vol  [Q] Quit\n");
+    println!("\n{0}{{Space}}{1} Pause  {0}{{↑/↓}}{1} Track  {0}{{←/→}}{1} Seek  {0}{{+/-}}{1} Vol  {0}{{[/]}}{1} Bal  {0}{{Q}}{1} Quit",
+        "\x1B[2m", "\x1B[0m"); banner_lines += 2; // blank + controls line 1
+    println!("{0}{{E}}{1} EQ  {0}{{X}}{1} FX  {0}{{C}}{1} Crossfeed  {0}{{F}}{1} Fader  {0}{{V/B}}{1} Viz  {0}{{L}}{1} List\n",
+        "\x1B[2m", "\x1B[0m"); banner_lines += 2; // controls line 2 + trailing blank
 
     terminal::enable_raw_mode()?;
 
@@ -298,7 +436,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     print!("\x1B[?25l");
     io::stdout().flush().ok();
 
-    let mut ui = UiState::new(source_paths);
+    let metadata_cache = metadata::MetadataCache::new(playlist.len());
+    let mut ui = UiState::new(source_paths, std::sync::Arc::clone(&metadata_cache));
+    ui.banner_lines = banner_lines;
+    ui.scan_handle = Some(metadata::spawn_metadata_scan(
+        playlist.clone(),
+        std::sync::Arc::clone(&metadata_cache),
+    ));
 
     // Set starting track for resume
     if let Some(ref rs) = resume_state_loaded {
@@ -308,14 +452,90 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut prev_viz_lines: usize = usize::MAX;
-    let mut crossfade_tail: Option<Vec<f32>> = None;
+
+    // --- Persistent audio setup (created once, reused across all tracks) ---
+    let mut device = if let Some(ref dev_name) = device_arg {
+        audio::find_device_by_name(&host, dev_name).unwrap_or_else(|| {
+            eprintln!("Warning: Device '{}' not found, using default", dev_name);
+            host.default_output_device().expect("No output device")
+        })
+    } else {
+        host.default_output_device().ok_or("No output device")?
+    };
+
+    // Probe first track's sample rate to set output rate
+    let source_rate = probe_sample_rate(&playlist[ui.current]).unwrap_or(44100);
+    let persistent_output_rate = set_output_sample_rate(source_rate, current_output_rate, &device);
+    let actual_device_rate = match device.default_output_config() {
+        Ok(config) => config.sample_rate(),
+        Err(_) => persistent_output_rate,
+    };
+    let mut stream_rate = {
+        let channels = 2u16;
+        let rate_supported = device.supported_output_configs()
+            .map(|configs| {
+                configs.into_iter().any(|c| {
+                    c.channels() == channels
+                        && c.min_sample_rate() <= actual_device_rate
+                        && actual_device_rate <= c.max_sample_rate()
+                })
+            })
+            .unwrap_or(false);
+        if rate_supported { actual_device_rate } else {
+            device.default_output_config()
+                .map(|c| c.sample_rate())
+                .unwrap_or(48000)
+        }
+    };
+    state.output_rate.store(stream_rate as u64, Ordering::Relaxed);
+
+    let is_wsl = cfg!(target_os = "linux") && std::fs::read_to_string("/proc/version")
+        .map(|v| v.contains("microsoft") || v.contains("WSL"))
+        .unwrap_or(false);
+    let buffer_size = if cfg!(target_os = "windows") || is_wsl {
+        cpal::BufferSize::Fixed(2048)
+    } else {
+        cpal::BufferSize::Default
+    };
+
+    let saved_buffer_size = buffer_size;
+    let stream_config = StreamConfig {
+        channels: 2,
+        sample_rate: stream_rate,
+        buffer_size,
+    };
+
+    let (mut prod, cons) = RingBuffer::<f32>::new(RING_BUFFER_SIZE);
+    let (viz_prod, mut viz_cons) = RingBuffer::<f32>::new(VIZ_BUFFER_SIZE);
+
+    let mut stream = build_stream(&device, &stream_config, cons, viz_prod, Arc::clone(&state))?;
+    stream.play()?;
+
+    // Set exclusive mode if requested
+    let mut hog_device_id: Option<u32> = None;
+    if exclusive {
+        match audio::set_exclusive_mode(&device) {
+            Ok(id) => {
+                hog_device_id = Some(id);
+                println!("Exclusive mode: hog + per-track rate switching");
+            }
+            Err(e) => {
+                eprintln!("Note: Hog mode unavailable ({}). Per-track rate switching is still active.", e);
+                // Don't disable exclusive — rate switching is the main feature
+            }
+        }
+    }
+
+    let mut last_transition_count: usize = 0;
 
     'playlist: loop {
         if state.should_quit() { break; }
 
+        // Repeat-cycle check
         if ui.current >= playlist.len() {
             if repeat {
-                // Rescan sources to pick up new files and drop deleted ones
+                let old_playlist = playlist.clone();
+
                 let has_dir = ui.source_paths.iter().any(|p| p.is_dir());
                 if has_dir {
                     let mut combined = Vec::new();
@@ -330,20 +550,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let key = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
                             seen.insert(key)
                         });
+                        // Filter out tracks the user removed during this session
+                        if !ui.removed_paths.is_empty() {
+                            combined.retain(|p| {
+                                let key = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+                                !ui.removed_paths.contains(&key)
+                            });
+                        }
                         if shuffle { shuffle_list(&mut combined); }
                         playlist = combined;
                         state.total_tracks.store(playlist.len(), Ordering::Relaxed);
                     }
-                } else if shuffle {
-                    shuffle_list(&mut playlist);
+                } else {
+                    // Non-directory sources: filter removed tracks from existing playlist
+                    if !ui.removed_paths.is_empty() {
+                        playlist.retain(|p| {
+                            let key = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+                            !ui.removed_paths.contains(&key)
+                        });
+                        state.total_tracks.store(playlist.len(), Ordering::Relaxed);
+                    }
+                    if shuffle { shuffle_list(&mut playlist); }
                 }
+
+                // Reindex metadata cache
+                ui.metadata_cache.cancel.store(true, Ordering::Relaxed);
+                if let Some(h) = ui.scan_handle.take() {
+                    h.join().ok();
+                }
+                ui.metadata_cache.reindex(&playlist, &old_playlist);
+                ui.metadata_cache.cancel.store(false, Ordering::Relaxed);
+                ui.scan_handle = Some(metadata::spawn_metadata_scan(
+                    playlist.clone(),
+                    std::sync::Arc::clone(&ui.metadata_cache),
+                ));
+
                 ui.current = 0;
             } else {
                 break;
             }
         }
 
-        // Reset for new track
+        // Reset state for new producer
         state.current_track.store(ui.current, Ordering::Relaxed);
         state.producer_done.store(false, Ordering::Relaxed);
         state.track_info_ready.store(false, Ordering::Relaxed);
@@ -353,186 +601,61 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Ok(mut err) = state.decode_error.lock() { *err = None; }
 
         let track_path = &playlist[ui.current];
-        let filename = read_metadata(track_path)
+        let mut filename = read_metadata(track_path)
             .unwrap_or_else(|| track_path.file_name().unwrap_or_default().to_string_lossy().into_owned());
-        let track_ext = track_path.extension()
+        let mut track_ext = track_path.extension()
             .map(|e| e.to_string_lossy().to_lowercase())
             .unwrap_or_default();
 
-        // Re-acquire default device each track (handles device changes like AirPods disconnect)
-        let device = match host.default_output_device() {
-            Some(d) => d,
-            None => {
-                // No output device available — wait and retry
-                thread::sleep(Duration::from_secs(1));
-                ui.current += 1;
-                continue 'playlist;
-            }
-        };
-
-        // Probe source sample rate and try to switch output to match
-        let source_rate = probe_sample_rate(track_path).unwrap_or(44100);
-        let output_rate = set_output_sample_rate(source_rate, current_output_rate, &device);
-
-        // Always verify the actual device rate from cpal's config.
-        let actual_device_rate = match device.default_output_config() {
-            Ok(config) => config.sample_rate(),
-            Err(_) => output_rate,
-        };
-
-        #[cfg(debug_assertions)]
-        eprintln!("DEBUG: source_rate={}, output_rate={}, actual_device_rate={}",
-                  source_rate, output_rate, actual_device_rate);
-
-        // If rate changed, update our tracking
-        if actual_device_rate != current_output_rate {
-            current_output_rate = actual_device_rate;
-        }
-
-        // Store output rate for time calculations
-        state.output_rate.store(actual_device_rate as u64, Ordering::Relaxed);
-
-        // Try the desired rate first; if the device rejects it, fall back
-        let mut stream_rate = actual_device_rate;
-
-        // Determine channel count for current device
-        let channels = {
-            let default_ch = device.default_output_config()
-                .map(|c| c.channels())
-                .unwrap_or(2);
-            if let Ok(configs) = device.supported_output_configs() {
-                let has_stereo = configs.into_iter().any(|c| {
-                    c.channels() == 2
-                        && c.min_sample_rate() <= stream_rate
-                        && stream_rate <= c.max_sample_rate()
-                });
-                if has_stereo { 2 } else { default_ch }
-            } else {
-                default_ch
-            }
-        };
-
-        // Test if the device accepts this rate by checking supported configs
-        let rate_supported = device.supported_output_configs()
-            .map(|configs| {
-                configs.into_iter().any(|c| {
-                    c.channels() == channels
-                        && c.min_sample_rate() <= stream_rate
-                        && stream_rate <= c.max_sample_rate()
-                })
-            })
-            .unwrap_or(false);
-
-        if !rate_supported {
-            let fallback = device.default_output_config()
-                .map(|c| c.sample_rate())
-                .unwrap_or(48000);
-            stream_rate = fallback;
-            current_output_rate = fallback;
-            state.output_rate.store(fallback as u64, Ordering::Relaxed);
-        }
-
-        // Larger buffer on Windows and WSL to reduce crackling.
-        // WSL detection: /proc/version contains "microsoft" or "WSL".
-        let is_wsl = cfg!(target_os = "linux") && std::fs::read_to_string("/proc/version")
-            .map(|v| v.contains("microsoft") || v.contains("WSL"))
-            .unwrap_or(false);
-        let buffer_size = if cfg!(target_os = "windows") || is_wsl {
-            cpal::BufferSize::Fixed(2048)
-        } else {
-            cpal::BufferSize::Default
-        };
-
-        let stream_config = StreamConfig {
-            channels,
-            sample_rate: stream_rate,
-            buffer_size,
-        };
-
-        // Create ring buffers: main audio + viz tap
-        let (prod, cons) = RingBuffer::<f32>::new(RING_BUFFER_SIZE);
-        let (viz_prod, mut viz_cons) = RingBuffer::<f32>::new(VIZ_BUFFER_SIZE);
-
-        // Start audio stream (retry with fresh device if it fails)
-        let stream = match build_stream(&device, &stream_config, cons, viz_prod, Arc::clone(&state)) {
-            Ok(s) => s,
-            Err(_) => {
-                thread::sleep(Duration::from_millis(500));
-                ui.current += 1;
-                continue 'playlist;
-            }
-        };
-        if stream.play().is_err() {
-            ui.current += 1;
-            continue 'playlist;
-        }
-
-        // Load current EQ and effects presets for this track
-        let mut eq_chain = eq::EqChain::new();
-        eq_chain.load_preset(&eq_presets[state.eq_index()], stream_rate as f32);
-        let mut fx_chain = effects::EffectsChain::new(stream_rate as f32);
-        fx_chain.load_preset(&fx_presets[state.effects_index()], stream_rate as f32);
-
-        // Crossfade setup
-        let xfade_in = crossfade_tail.take();
-        let xfade_samples = crossfade_secs as usize * stream_rate as usize * 2; // stereo samples
-
-        // Start producer thread
-        let path_clone = track_path.clone();
+        // Spawn producer thread (continuous — decodes multiple tracks)
+        let playlist_snapshot = playlist.clone();
+        let start_idx = ui.current;
         let state_clone = Arc::clone(&state);
         let eq_presets_clone = Arc::clone(&eq_presets);
         let fx_presets_clone = Arc::clone(&fx_presets);
-        let mut prod = prod;
-        let producer_handle = thread::spawn(move || -> Option<Vec<f32>> {
-            match decode_track(
-                &path_clone, &mut prod, &state_clone, stream_rate, hq_resampler,
+        let cf_presets_clone = Arc::clone(&cf_presets);
+        let hq = hq_resampler;
+        let sr = stream_rate;
+        let xfade = crossfade_secs;
+        let mut prod_for_thread = prod;
+
+        let producer_handle = thread::spawn(move || {
+            let mut eq_chain = eq::EqChain::new();
+            eq_chain.load_preset(&eq_presets_clone[state_clone.eq_index()], sr as f32);
+            let mut fx_chain = effects::EffectsChain::new(sr as f32);
+            fx_chain.load_preset(&fx_presets_clone[state_clone.effects_index()], sr as f32);
+            let mut cf_filter = crossfeed::CrossfeedFilter::new();
+            cf_filter.load_preset(&cf_presets_clone[state_clone.crossfeed_index()], sr as f32);
+
+            decode_playlist(
+                &playlist_snapshot, start_idx,
+                &mut prod_for_thread, &state_clone, sr, hq,
                 &mut eq_chain, &eq_presets_clone,
                 &mut fx_chain, &fx_presets_clone,
-                xfade_in.as_deref(), xfade_samples,
-            ) {
-                Ok(tail) => {
-                    state_clone.producer_done.store(true, Ordering::Relaxed);
-                    tail
-                }
-                Err(e) => {
-                    if let Ok(mut err) = state_clone.decode_error.lock() {
-                        *err = Some(e);
-                    }
-                    state_clone.producer_done.store(true, Ordering::Relaxed);
-                    None
-                }
-            }
+                xfade,
+                &mut cf_filter, &cf_presets_clone,
+            );
+            prod_for_thread // Return producer ownership
         });
 
-        // Wait for track info and initial buffer fill (also process input for fast skipping)
+        // Wait for track info and initial buffer fill
         while (!state.track_info_ready.load(Ordering::Relaxed)
                || state.buffer_level.load(Ordering::Relaxed) < RING_BUFFER_SIZE / 4)
               && !state.producer_done.load(Ordering::Relaxed)
               && !state.should_quit()
-              && !state.is_skip_requested()
         {
             poll_input(&state, &mut ui, &mut playlist);
             thread::sleep(Duration::from_millis(20));
         }
 
-        // If skip requested during wait, advance without printing
-        if state.is_skip_requested() {
-            producer_handle.join().ok();
-            if let Some(target) = state.take_jump() {
-                ui.current = target;
-            } else if state.take_skip_next() {
-                ui.current += 1;
-            } else if state.take_skip_prev() {
-                ui.current = ui.current.saturating_sub(1);
-            }
-            continue 'playlist;
-        }
-
-        // If decode failed before track info was set, skip this track
+        // If producer failed before track info, skip
         if state.producer_done.load(Ordering::Relaxed)
            && !state.track_info_ready.load(Ordering::Relaxed)
         {
-            producer_handle.join().ok();
+            match producer_handle.join() {
+                Ok(p) => prod = p,
+                Err(_) => break 'playlist,
+            }
             ui.current += 1;
             continue 'playlist;
         }
@@ -557,45 +680,213 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             format!("{}Hz", src_rate)
         };
-        let track_info = format!("{} • {}bit {} • {}", format_time(state.total_secs()), bits, ch_str, rate_str);
+        let mut track_info = format!("{} • {}bit {} • {}", format_time(state.total_secs()), bits, ch_str, rate_str);
 
-        // Update OS media transport with track metadata
+        // Update OS media transport
         if let Some(ref mut mc) = media_controls {
             media_keys::update_metadata(mc, &filename, state.total_secs());
             media_keys::update_playback(mc, state.is_paused(), 0.0);
         }
 
-        // Visualization analyzer (runs on main thread, fed by audio callback)
+        // Visualization analyzer
         let mut viz_analyser = VizAnalyser::new(stream_rate);
         let mut viz_scratch = Vec::with_capacity(VIZ_BUFFER_SIZE);
 
-        // Playback loop
+        // Playback loop (stays here across natural track transitions)
         let mut last_ui = Instant::now();
 
         loop {
-            // Input (non-blocking)
+            // Input
             if poll_input(&state, &mut ui, &mut playlist) {
                 print!("\x1B[?25h");
                 if prev_viz_lines != usize::MAX {
                     let up = 2 + prev_viz_lines;
                     print!("\x1B[{}F", up);
                 }
-                print!("\x1B[J"); // Clear from cursor to end of screen
+                print!("\x1B[J");
                 io::stdout().flush().ok();
-                save_state(&build_resume_state(&ui, &playlist, &state, shuffle, repeat, &eq_presets, &fx_presets));
-                producer_handle.join().ok();
+                save_state(&build_resume_state(&ui, &playlist, &state, shuffle, repeat, &eq_presets, &fx_presets, &cf_presets, &device_arg));
+                if let Some(id) = hog_device_id {
+                    audio::release_exclusive_mode(id);
+                }
+                // Producer will exit when state.should_quit() is true
+                let _ = producer_handle.join();
                 break 'playlist;
             }
 
-            // Skip handling
-            if state.is_skip_requested() {
-                break;
+            // Check for track transitions from the producer
+            let current_count = state.track_transition_count.load(Ordering::Acquire);
+            if current_count != last_transition_count {
+                let new_index = state.producer_track_index.load(Ordering::Relaxed);
+                last_transition_count = current_count;
+
+                // Playlist was modified — producer snapshot is stale, restart with fresh playlist
+                if ui.playlist_dirty {
+                    ui.playlist_dirty = false;
+                    // Use jump_to to signal producer exit and restart via the skip/jump handler
+                    state.jump_to(ui.current);
+                }
+
+                if new_index < playlist.len() {
+                    ui.current = new_index;
+                    state.current_track.store(ui.current, Ordering::Relaxed);
+
+                    // Update display info for new track
+                    let new_path = &playlist[ui.current];
+                    filename = read_metadata(new_path)
+                        .unwrap_or_else(|| new_path.file_name().unwrap_or_default().to_string_lossy().into_owned());
+                    track_ext = new_path.extension()
+                        .map(|e| e.to_string_lossy().to_lowercase())
+                        .unwrap_or_default();
+
+                    let src_rate = state.sample_rate.load(Ordering::Relaxed) as u32;
+                    let channels = state.channels.load(Ordering::Relaxed);
+                    let bits = state.bits_per_sample.load(Ordering::Relaxed);
+                    let ch_str = match channels {
+                        1 => "mono".to_string(),
+                        2 => "stereo".to_string(),
+                        n => format!("{}ch", n),
+                    };
+                    let rate_str = if src_rate != stream_rate {
+                        format!("{}→{}Hz", src_rate, stream_rate)
+                    } else {
+                        format!("{}Hz", src_rate)
+                    };
+                    track_info = format!("{} • {}bit {} • {}", format_time(state.total_secs()), bits, ch_str, rate_str);
+
+                    if let Some(ref mut mc) = media_controls {
+                        media_keys::update_metadata(mc, &filename, state.total_secs());
+                        media_keys::update_playback(mc, state.is_paused(), 0.0);
+                    }
+
+                    save_state(&build_resume_state(&ui, &playlist, &state, shuffle, repeat, &eq_presets, &fx_presets, &cf_presets, &device_arg));
+                }
             }
 
-            // UI update: 20fps when visualizing, 4fps when idle
+            // Skip-prev or jump: join producer, respawn
+            if state.skip_prev.load(Ordering::Relaxed) || state.jump_to_track.load(Ordering::Relaxed) >= 0 {
+                match producer_handle.join() {
+                    Ok(p) => prod = p,
+                    Err(_) => break 'playlist,
+                }
+                // Flush ring buffer
+                let buffered = RING_BUFFER_SIZE - prod.slots();
+                if buffered > 0 {
+                    state.discard_samples.store(buffered as u64, Ordering::Relaxed);
+                    state.reset_consumer_counter.store(true, Ordering::Relaxed);
+                }
+                if let Some(target) = state.take_jump() {
+                    ui.current = target;
+                } else if state.take_skip_prev() {
+                    ui.current = ui.current.saturating_sub(1);
+                }
+                continue 'playlist;
+            }
+
+            // Exclusive mode: rate change needed (producer detected different sample rate)
+            if state.rate_change_needed.swap(false, Ordering::Relaxed) {
+                // Wait for buffer to drain so current track finishes
+                while state.buffer_level.load(Ordering::Relaxed) > 0 && !state.should_quit() && !state.is_paused() {
+                    thread::sleep(Duration::from_millis(10));
+                }
+
+                match producer_handle.join() {
+                    Ok(_) => {} // Old producer dropped; new ring buffer below
+                    Err(_) => break 'playlist,
+                }
+
+                let new_rate = state.next_track_rate.load(Ordering::Relaxed);
+                let max_rate = audio::max_supported_rate(&device);
+                let target_rate = new_rate.min(max_rate);
+                let actual_rate = set_output_sample_rate(target_rate, stream_rate, &device);
+                stream_rate = actual_rate;
+                state.output_rate.store(stream_rate as u64, Ordering::Relaxed);
+
+                // Drop old stream before creating new ring buffer
+                drop(stream);
+
+                // Rebuild ring buffer and stream
+                let (new_prod, new_cons) = RingBuffer::<f32>::new(RING_BUFFER_SIZE);
+                let (new_viz_prod, new_viz_cons) = RingBuffer::<f32>::new(VIZ_BUFFER_SIZE);
+                prod = new_prod;
+                viz_cons = new_viz_cons;
+
+                let new_config = StreamConfig {
+                    channels: 2,
+                    sample_rate: stream_rate,
+                    buffer_size: saved_buffer_size,
+                };
+                stream = build_stream(&device, &new_config, new_cons, new_viz_prod, Arc::clone(&state))?;
+                stream.play()?;
+
+                // Continue playlist from the track that needs the new rate
+                // (viz_analyser is re-created at the top of each 'playlist iteration)
+                let new_idx = state.producer_track_index.load(Ordering::Relaxed);
+                if new_idx < playlist.len() {
+                    ui.current = new_idx;
+                }
+                continue 'playlist;
+            }
+
+            // Stream error recovery (device disconnected, AirPods removed, etc.)
+            if state.stream_error.swap(false, Ordering::Relaxed) {
+                // Try to switch to the current default output device
+                if let Some(new_device) = host.default_output_device() {
+                    match producer_handle.join() {
+                        Ok(_) => {} // Old producer dropped
+                        Err(_) => break 'playlist,
+                    }
+                    drop(stream);
+
+                    device = new_device;
+                    let new_rate = device.default_output_config()
+                        .map(|c| c.sample_rate())
+                        .unwrap_or(48000);
+                    stream_rate = new_rate;
+                    state.output_rate.store(stream_rate as u64, Ordering::Relaxed);
+
+                    let (new_prod, new_cons) = RingBuffer::<f32>::new(RING_BUFFER_SIZE);
+                    let (new_viz_prod, new_viz_cons) = RingBuffer::<f32>::new(VIZ_BUFFER_SIZE);
+                    prod = new_prod;
+                    viz_cons = new_viz_cons;
+
+                    let new_config = StreamConfig {
+                        channels: 2,
+                        sample_rate: stream_rate,
+                        buffer_size: saved_buffer_size,
+                    };
+                    match build_stream(&device, &new_config, new_cons, new_viz_prod, Arc::clone(&state)) {
+                        Ok(s) => {
+                            stream = s;
+                            if stream.play().is_err() {
+                                break 'playlist;
+                            }
+                        }
+                        Err(_) => break 'playlist,
+                    }
+                    // Resume from current track
+                    continue 'playlist;
+                }
+            }
+
+            // Producer done (playlist exhausted or error)
+            if state.producer_done.load(Ordering::Relaxed)
+               && state.buffer_level.load(Ordering::Relaxed) == 0
+            {
+                thread::sleep(Duration::from_millis(200));
+                match producer_handle.join() {
+                    Ok(p) => prod = p,
+                    Err(_) => break 'playlist,
+                }
+
+                save_state(&build_resume_state(&ui, &playlist, &state, shuffle, repeat, &eq_presets, &fx_presets, &cf_presets, &device_arg));
+                ui.current = playlist.len(); // Will trigger repeat-cycle or exit
+                continue 'playlist;
+            }
+
+            // UI update
             let ui_interval = if state.viz_mode() == VizMode::None { 250 } else { 50 };
             if last_ui.elapsed() >= Duration::from_millis(ui_interval) {
-                // Process viz samples from audio callback (synced to playback)
                 if state.viz_mode() != VizMode::None {
                     let viz_available = viz_cons.slots();
                     if viz_available > 0 {
@@ -609,7 +900,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 } else {
-                    // Drain viz buffer when not visualizing
                     let viz_available = viz_cons.slots();
                     if viz_available > 0 {
                         if let Ok(chunk) = viz_cons.read_chunk(viz_available) {
@@ -621,9 +911,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 stats.update();
                 let current_eq = &eq_presets[state.eq_index()];
                 let current_fx = &fx_presets[state.effects_index()].name;
-                prev_viz_lines = print_status(&state, &mut ui, &filename, &track_info, &track_ext, current_eq, current_fx, &mut stats, prev_viz_lines, &playlist);
+                let current_cf = &cf_presets[state.crossfeed_index()].name;
+                prev_viz_lines = print_status(&state, &mut ui, &filename, &track_info, &track_ext, current_eq, current_fx, current_cf, &mut stats, prev_viz_lines, &playlist);
 
-                // Update OS media transport with playback position
                 if let Some(ref mut mc) = media_controls {
                     media_keys::update_playback(mc, state.is_paused(), state.time_secs());
                 }
@@ -631,37 +921,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 last_ui = Instant::now();
             }
 
-            // Track finished?
-            if state.producer_done.load(Ordering::Relaxed)
-               && state.buffer_level.load(Ordering::Relaxed) == 0
-            {
-                thread::sleep(Duration::from_millis(200));
-                break;
-            }
-
-            // Pump OS event loop for media key dispatch
             media_keys::poll();
-
-            // Sleep - main thread does very little
             thread::sleep(Duration::from_millis(50));
-        }
-
-        if let Ok(tail) = producer_handle.join() {
-            crossfade_tail = tail;
-        }
-
-        // Save resume state on track change
-        save_state(&build_resume_state(&ui, &playlist, &state, shuffle, repeat, &eq_presets, &fx_presets));
-
-        // Handle track transition
-        if let Some(target) = state.take_jump() {
-            ui.current = target;
-        } else if state.take_skip_next() {
-            ui.current += 1;
-        } else if state.take_skip_prev() {
-            ui.current = ui.current.saturating_sub(1);
-        } else {
-            ui.current += 1;
         }
     }
 
@@ -675,6 +936,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     print!("\x1B[J"); // Clear from cursor to end of screen
     println!("✓ Done");
+
+    // Release exclusive mode
+    if let Some(id) = hog_device_id {
+        audio::release_exclusive_mode(id);
+    }
 
     Ok(())
 }

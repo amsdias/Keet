@@ -315,8 +315,8 @@ pub struct ReverbParams {
 }
 
 fn default_room() -> f32 { 0.5 }
-fn default_wet() -> f32 { 2.0 }
-fn default_dry() -> f32 { 1.0 }
+fn default_wet() -> f32 { 0.5 }
+fn default_dry() -> f32 { 0.85 }
 fn default_width() -> f32 { 1.0 }
 
 #[derive(Deserialize, Clone, Default)]
@@ -416,6 +416,15 @@ impl EffectsChain {
         if self.has_chorus { self.chorus.process_stereo(samples); }
         if self.has_delay { self.delay.process_stereo(samples); }
         if self.has_reverb { self.reverb.process_stereo(samples); }
+
+        // Safety limiter: prevent effects from exceeding 0dBFS
+        let peak = samples.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        if peak > 1.0 {
+            let scale = 1.0 / peak;
+            for s in samples.iter_mut() {
+                *s *= scale;
+            }
+        }
     }
 }
 
@@ -430,25 +439,25 @@ pub fn builtin_presets() -> Vec<EffectsPreset> {
         },
         EffectsPreset {
             name: "Small Room".to_string(),
-            reverb: Some(ReverbParams { room_size: 0.3, damping: 0.8, wet: 1.5, dry: 1.0, width: 0.8 }),
+            reverb: Some(ReverbParams { room_size: 0.3, damping: 0.8, wet: 0.4, dry: 0.85, width: 0.8 }),
             chorus: None,
             delay: None,
         },
         EffectsPreset {
             name: "Concert Hall".to_string(),
-            reverb: Some(ReverbParams { room_size: 0.85, damping: 0.5, wet: 3.0, dry: 1.0, width: 1.0 }),
+            reverb: Some(ReverbParams { room_size: 0.85, damping: 0.5, wet: 0.7, dry: 0.75, width: 1.0 }),
             chorus: None,
             delay: None,
         },
         EffectsPreset {
             name: "Cathedral".to_string(),
-            reverb: Some(ReverbParams { room_size: 0.95, damping: 0.3, wet: 4.0, dry: 1.0, width: 1.0 }),
+            reverb: Some(ReverbParams { room_size: 0.95, damping: 0.3, wet: 0.6, dry: 0.7, width: 1.0 }),
             chorus: None,
             delay: Some(DelayParams { delay_ms: 300.0, feedback: 0.2, wet: 0.1 }),
         },
         EffectsPreset {
             name: "Studio".to_string(),
-            reverb: Some(ReverbParams { room_size: 0.25, damping: 0.85, wet: 1.2, dry: 1.0, width: 0.6 }),
+            reverb: Some(ReverbParams { room_size: 0.25, damping: 0.85, wet: 0.35, dry: 0.9, width: 0.6 }),
             chorus: None,
             delay: None,
         },

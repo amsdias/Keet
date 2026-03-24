@@ -60,7 +60,7 @@ fn truncate_ansi(s: &str, max_width: usize) -> String {
     result
 }
 
-pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_info: &str, ext: &str, eq_preset: &crate::eq::EqPreset, fx_name: &str, stats: &mut StatsMonitor, prev_viz_lines: usize, playlist: &[PathBuf]) -> usize {
+pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_info: &str, ext: &str, eq_preset: &crate::eq::EqPreset, fx_name: &str, cf_name: &str, stats: &mut StatsMonitor, prev_viz_lines: usize, playlist: &[PathBuf]) -> usize {
     let viz_mode = state.viz_mode();
     let viz_style = state.viz_style();
     let eq_name = &eq_preset.name;
@@ -147,9 +147,24 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
     let fader = if state.is_pre_fader() { "pre" } else { "post" };
     let eq_display = if eq_name == "Flat" { String::new() } else { format!(" eq:{}", eq_name) };
     let fx_display = if fx_name == "None" { String::new() } else { format!(" fx:{}", fx_name) };
-    let style_name = viz_style.name();
-    let line2 = format!("  {icon_color}{icon}{C_RESET} {C_BOLD}[{cur}/{tot}]{C_RESET} {C_GREEN}{bar_filled}{C_RESET} {C_DIM}vol:{vol}%{eq_display}{fx_display} {fader} buf:{buf_pct}% cpu:{:.1}% mem:{:.0}M [V]:{} [B]:{style_name}{C_RESET}",
-           stats.cpu_usage, stats.memory_mb, viz_mode.name());
+    let cf_display = if cf_name != "Off" { format!(" cf:{}", cf_name) } else { String::new() };
+    let clip_display = if state.is_clipping() { format!(" {C_RED}CLIP{C_RESET}") } else { String::new() };
+    let bal = state.balance_value();
+    let bal_display = if bal != 0 {
+        if bal < 0 { format!(" BAL:L{}%", -bal) } else { format!(" BAL:R{}%", bal) }
+    } else { String::new() };
+    let next_viz = match viz_mode.next() {
+        VizMode::None => "Off",
+        VizMode::VuMeter => "VU",
+        VizMode::SpectrumHorizontal => "SpecH",
+        VizMode::SpectrumVertical => "SpecV",
+    };
+    let next_style = match viz_style {
+        VizStyle::Dots => "Bars",
+        VizStyle::Bars => "Dots",
+    };
+    let line2 = format!("  {icon_color}{icon}{C_RESET} {C_BOLD}[{cur}/{tot}]{C_RESET} {C_GREEN}{bar_filled}{C_RESET} {C_DIM}vol:{vol}%{eq_display}{fx_display}{cf_display}{clip_display}{bal_display} {fader} buf:{buf_pct}% cpu:{:.1}% mem:{:.0}M {{V}}:{next_viz} {{B}}:{next_style}{C_RESET}",
+           stats.cpu_usage, stats.memory_mb);
     print!("\r\x1B[K{}", truncate_ansi(&line2, term_w));
 
     // EQ curve visualization (when non-Flat preset is active)
@@ -161,8 +176,8 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
     if ui.view_mode == ViewMode::Playlist {
         let term_h = terminal::size().map(|(_, h)| h as usize).unwrap_or(24);
         let header_lines = 2 + if eq_line { 1 } else { 0 };
-        let footer_lines = 2;
-        let visible_rows = term_h.saturating_sub(header_lines + footer_lines + 6).max(1);
+        let footer_lines = 2; // separator + footer
+        let visible_rows = term_h.saturating_sub(header_lines + footer_lines + ui.banner_lines).max(1);
 
         // Separator
         print!("\n\r\x1B[K  {C_DIM}{}{C_RESET}", "─".repeat(term_w.saturating_sub(2)));
@@ -200,14 +215,13 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
                 let list_pos = ui.scroll_offset + row;
                 let is_playing = track_idx == ui.current;
                 let is_cursor = list_pos == ui.cursor;
-                let fname = playlist[track_idx].file_name()
-                    .unwrap_or_default().to_string_lossy();
+                let fname = ui.metadata_cache.display_name(track_idx, &playlist[track_idx]);
 
                 let marker = if is_playing { "▶" } else { " " };
                 let num = format!("{:>4}", track_idx + 1);
 
                 let line = if is_cursor && is_playing {
-                    format!(" {marker} {C_BOLD}{C_GREEN}{num}  {fname}{C_RESET}")
+                    format!(" {marker} \x1B[7m{C_GREEN}{num}  {fname}{C_RESET}")
                 } else if is_cursor {
                     format!(" {marker} \x1B[7m{num}  {fname}\x1B[27m")
                 } else if is_playing {
@@ -237,7 +251,7 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
                 if let Some(msg) = ui.take_status() {
                     format!("  {C_GREEN}{msg}{C_RESET}")
                 } else {
-                    format!("  {C_DIM}[L] close  [↑↓] scroll  [Enter] play  [/] search  [S] save{C_RESET}")
+                    format!("  {C_DIM}[L] close  [↑↓] scroll  [Enter] play  [/] search  [D] remove  [S] save{C_RESET}")
                 }
             }
         };
@@ -287,10 +301,11 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
 }
 
 pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<PathBuf>) -> bool {
-    if event::poll(Duration::ZERO).unwrap_or(false) {
+    // Drain all pending key events for responsive input
+    while event::poll(Duration::ZERO).unwrap_or(false) {
         if let Ok(Event::Key(k)) = event::read() {
             if k.kind != KeyEventKind::Press {
-                return false;
+                continue;
             }
 
             // In text input mode, route to text handler
@@ -306,11 +321,11 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
                 match k {
                     KeyEvent { code: KeyCode::Up, .. } => {
                         playlist_cursor_up(ui);
-                        return false;
+                        continue; // Drain remaining events for smooth scrolling
                     }
                     KeyEvent { code: KeyCode::Down, .. } => {
                         playlist_cursor_down(ui, playlist);
-                        return false;
+                        continue;
                     }
                     KeyEvent { code: KeyCode::Enter, .. } => {
                         let target = if ui.filtered_indices.is_empty() {
@@ -323,6 +338,11 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
                     }
                     KeyEvent { code: KeyCode::Char('/'), .. } => {
                         ui.input_mode = InputMode::Search(String::new());
+                        return false;
+                    }
+                    KeyEvent { code: KeyCode::Char('d'), .. } |
+                    KeyEvent { code: KeyCode::Delete, .. } => {
+                        remove_track(state, ui, playlist);
                         return false;
                     }
                     KeyEvent { code: KeyCode::Esc, .. } => {
@@ -369,6 +389,9 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
                 KeyEvent { code: KeyCode::Char('c'), modifiers: KeyModifiers::CONTROL, .. } => {
                     state.quit(); return true;
                 }
+                KeyEvent { code: KeyCode::Char('c'), .. } => state.cycle_crossfeed(),
+                KeyEvent { code: KeyCode::Char('['), .. } => state.balance_left(),
+                KeyEvent { code: KeyCode::Char(']'), .. } => state.balance_right(),
                 _ => {}
             }
         }
@@ -462,14 +485,11 @@ fn rebuild_filter(ui: &mut UiState, playlist: &[PathBuf]) {
         return;
     }
 
+    let cache = &ui.metadata_cache;
     ui.filtered_indices = playlist.iter()
         .enumerate()
-        .filter(|(_, p)| {
-            p.file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_lowercase()
-                .contains(&query)
+        .filter(|(i, p)| {
+            cache.search_matches(*i, p, &query)
         })
         .map(|(i, _)| i)
         .collect();
@@ -504,9 +524,70 @@ fn ensure_cursor_visible(ui: &mut UiState, _playlist: &[PathBuf]) {
     }
 }
 
+fn remove_track(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<PathBuf>) {
+    if playlist.len() <= 1 {
+        ui.set_status("Can't remove the last track".to_string());
+        return;
+    }
+
+    // Resolve cursor to actual playlist index
+    let track_idx = if ui.filtered_indices.is_empty() {
+        ui.cursor
+    } else {
+        match ui.filtered_indices.get(ui.cursor) {
+            Some(&idx) => idx,
+            None => return,
+        }
+    };
+    if track_idx >= playlist.len() { return; }
+
+    let removed_name = ui.metadata_cache.display_name(track_idx, &playlist[track_idx]);
+
+    // Track removed path so repeat cycle doesn't bring it back
+    if let Ok(canon) = std::fs::canonicalize(&playlist[track_idx]) {
+        ui.removed_paths.insert(canon);
+    } else {
+        ui.removed_paths.insert(playlist[track_idx].clone());
+    }
+
+    // Remove from playlist and metadata cache
+    playlist.remove(track_idx);
+    ui.metadata_cache.remove_at(track_idx);
+
+    // Adjust current track index
+    if track_idx == ui.current {
+        // Removing current track: skip it and restart with fresh playlist
+        ui.current = ui.current.min(playlist.len().saturating_sub(1));
+        state.next(); // Signal producer to skip current track
+    } else if track_idx < ui.current {
+        ui.current -= 1;
+    }
+
+    state.total_tracks.store(playlist.len(), Ordering::Relaxed);
+    state.current_track.store(ui.current, Ordering::Relaxed);
+    // Producer snapshot is stale — next transition will restart with fresh playlist
+    ui.playlist_dirty = true;
+
+    // Rebuild filter if searching, otherwise just adjust cursor
+    if !ui.filtered_indices.is_empty() {
+        rebuild_filter(ui, playlist);
+    }
+    let max_cursor = if ui.filtered_indices.is_empty() {
+        playlist.len().saturating_sub(1)
+    } else {
+        ui.filtered_indices.len().saturating_sub(1)
+    };
+    if ui.cursor > max_cursor {
+        ui.cursor = max_cursor;
+    }
+
+    ui.set_status(format!("Removed: {}", removed_name));
+}
+
 fn rescan(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<PathBuf>) {
     use std::sync::atomic::Ordering;
 
+    let old_playlist = playlist.clone();
     let current_track_path = playlist.get(ui.current).cloned();
     let mut total_added = 0usize;
     let mut total_removed = 0usize;
@@ -544,6 +625,18 @@ fn rescan(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<PathBuf>) {
 
     state.total_tracks.store(playlist.len(), Ordering::Relaxed);
     state.current_track.store(ui.current, Ordering::Relaxed);
+
+    // Reindex metadata cache: cancel old scan, remap entries, spawn new scan
+    ui.metadata_cache.cancel.store(true, Ordering::Relaxed);
+    if let Some(h) = ui.scan_handle.take() {
+        h.join().ok();
+    }
+    ui.metadata_cache.reindex(playlist, &old_playlist);
+    ui.metadata_cache.cancel.store(false, Ordering::Relaxed);
+    ui.scan_handle = Some(crate::metadata::spawn_metadata_scan(
+        playlist.clone(),
+        std::sync::Arc::clone(&ui.metadata_cache),
+    ));
 
     if playlist.is_empty() || (playlist.len() == 1 && total_removed > 0 && current_track_path.is_some()) {
         ui.set_status("All files removed, finishing current track".to_string());
