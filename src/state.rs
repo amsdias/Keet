@@ -477,8 +477,10 @@ pub struct UiState {
     pub scan_handle: Option<JoinHandle<()>>,
     pub removed_paths: std::collections::HashSet<PathBuf>,
     pub banner_lines: usize,
+    pub banner_text: String,
     pub playlist_dirty: bool,
     pub current_track_removed: bool,
+    pub terminal_resized: bool,
 }
 
 impl UiState {
@@ -496,8 +498,10 @@ impl UiState {
             scan_handle: None,
             removed_paths: std::collections::HashSet::new(),
             banner_lines: 0,
+            banner_text: String::new(),
             playlist_dirty: false,
             current_track_removed: false,
+            terminal_resized: false,
         }
     }
 

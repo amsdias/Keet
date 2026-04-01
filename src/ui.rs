@@ -301,12 +301,22 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
 }
 
 pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<PathBuf>) -> bool {
-    // Drain all pending key events for responsive input
+    // Drain all pending events for responsive input
     while event::poll(Duration::ZERO).unwrap_or(false) {
-        if let Ok(Event::Key(k)) = event::read() {
-            if k.kind != KeyEventKind::Press {
-                continue;
-            }
+        let ev = match event::read() { Ok(e) => e, Err(_) => continue };
+
+        if let Event::Resize(_, _) = ev {
+            ui.terminal_resized = true;
+            continue;
+        }
+
+        let k = match ev {
+            Event::Key(k) => k,
+            _ => continue,
+        };
+        if k.kind != KeyEventKind::Press {
+            continue;
+        }
 
             // In text input mode, route to text handler
             match &ui.input_mode {
@@ -394,7 +404,6 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
                 KeyEvent { code: KeyCode::Char(']'), .. } => state.balance_right(),
                 _ => {}
             }
-        }
     }
     false
 }

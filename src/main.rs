@@ -386,12 +386,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eq_info, fx_info, xfade_info, cf_info, bal_info);
     let info_display_len = info.len();
     let info_pad = inner_w.saturating_sub(info_display_len + 2);
-    let mut banner_lines: usize = 0;
-    println!("╔{}╗", "═".repeat(inner_w)); banner_lines += 1;
-    println!("║{}{}{}║", " ".repeat(pad_left), title, " ".repeat(pad_right)); banner_lines += 1;
-    println!("╠{}╣", "═".repeat(inner_w)); banner_lines += 1;
-    println!("║  {}{}║", info, " ".repeat(info_pad)); banner_lines += 1;
-    println!("╚{}╝", "═".repeat(inner_w)); banner_lines += 1;
+    let mut banner = String::new();
+    use std::fmt::Write as FmtWrite;
+    writeln!(banner, "╔{}╗", "═".repeat(inner_w)).ok();
+    writeln!(banner, "║{}{}{}║", " ".repeat(pad_left), title, " ".repeat(pad_right)).ok();
+    writeln!(banner, "╠{}╣", "═".repeat(inner_w)).ok();
+    writeln!(banner, "║  {}{}║", info, " ".repeat(info_pad)).ok();
+    writeln!(banner, "╚{}╝", "═".repeat(inner_w)).ok();
 
     // Audio setup
     let host = cpal::default_host();
@@ -407,19 +408,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let device_name = device.description()
             .map(|d| d.name().to_string())
             .unwrap_or_else(|_| "Unknown device".to_string());
-        println!("\nDevice: {}", device_name); banner_lines += 2; // blank + device
+        writeln!(banner, "\nDevice: {}", device_name).ok();
 
         // Fix stale sample rate on Bluetooth devices (CoreAudio can get stuck at wrong rate)
         let bt_rate = fix_bluetooth_sample_rate();
         if let Some(rate) = bt_rate {
-            println!("Bluetooth device detected, using native {}Hz", rate);
-            banner_lines += 1;
+            writeln!(banner, "Bluetooth device detected, using native {}Hz", rate).ok();
         }
 
         let default_config = device.default_output_config()?;
         let rate = bt_rate.unwrap_or_else(|| default_config.sample_rate());
         let default_channels = default_config.channels();
-        println!("Initial output: {}Hz (device default: {}ch)", rate, default_channels); banner_lines += 1;
+        writeln!(banner, "Initial output: {}Hz (device default: {}ch)", rate, default_channels).ok();
         rate
     };
 
@@ -429,10 +429,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // OS media transport controls (media keys, AirPods, Bluetooth headphones)
     let mut media_controls = media_keys::setup(Arc::clone(&state));
 
-    println!("\n{0}{{Space}}{1} Pause  {0}{{↑/↓}}{1} Track  {0}{{←/→}}{1} Seek  {0}{{+/-}}{1} Vol  {0}{{[/]}}{1} Bal  {0}{{Q}}{1} Quit",
-        "\x1B[2m", "\x1B[0m"); banner_lines += 2; // blank + controls line 1
-    println!("{0}{{E}}{1} EQ  {0}{{X}}{1} FX  {0}{{C}}{1} Crossfeed  {0}{{F}}{1} Fader  {0}{{V/B}}{1} Viz  {0}{{L}}{1} List\n",
-        "\x1B[2m", "\x1B[0m"); banner_lines += 2; // controls line 2 + trailing blank
+    writeln!(banner, "\n{0}{{Space}}{1} Pause  {0}{{↑/↓}}{1} Track  {0}{{←/→}}{1} Seek  {0}{{+/-}}{1} Vol  {0}{{[/]}}{1} Bal  {0}{{Q}}{1} Quit",
+        "\x1B[2m", "\x1B[0m").ok();
+    writeln!(banner, "{0}{{E}}{1} EQ  {0}{{X}}{1} FX  {0}{{C}}{1} Crossfeed  {0}{{F}}{1} Fader  {0}{{V/B}}{1} Viz  {0}{{L}}{1} List\n",
+        "\x1B[2m", "\x1B[0m").ok();
+
+    // Print banner and count its lines
+    print!("{}", banner);
+    let banner_lines = banner.lines().count();
 
     terminal::enable_raw_mode()?;
 
@@ -443,6 +447,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let metadata_cache = metadata::MetadataCache::new(playlist.len());
     let mut ui = UiState::new(source_paths, std::sync::Arc::clone(&metadata_cache));
     ui.banner_lines = banner_lines;
+    ui.banner_text = banner;
     ui.scan_handle = Some(metadata::spawn_metadata_scan(
         playlist.clone(),
         std::sync::Arc::clone(&metadata_cache),
@@ -926,6 +931,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 stats.update();
+
+                if ui.terminal_resized {
+                    ui.terminal_resized = false;
+                    // Clear entire screen and reprint banner (old lines may
+                    // have wrapped at the previous terminal width).
+                    // In raw mode \n doesn't imply \r, so use \r\n.
+                    print!("\x1B[0m\x1B[2J\x1B[H{}", ui.banner_text.replace('\n', "\r\n"));
+                    prev_viz_lines = usize::MAX;
+                }
+
                 let current_eq = &eq_presets[state.eq_index()];
                 let current_fx = &fx_presets[state.effects_index()].name;
                 let current_cf = &cf_presets[state.crossfeed_index()].name;
