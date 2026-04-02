@@ -854,8 +854,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if state.stream_error.swap(false, Ordering::Relaxed) {
                 // Try to switch to the current default output device
                 if let Some(new_device) = host.default_output_device() {
+                    // Signal the producer to exit — it may be stuck in the
+                    // buffer-full sleep loop since the audio callback stopped
+                    // draining the ring buffer.
+                    state.jump_to(ui.current);
                     match producer_handle.join() {
-                        Ok(_) => {} // Old producer dropped
+                        Ok(_) => {}
                         Err(_) => break 'playlist,
                     }
                     drop(stream);
@@ -907,7 +911,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // UI update
-            let ui_interval = if state.viz_mode() == VizMode::None { 250 } else { 50 };
+            let ui_interval: u64 = 50;
             if last_ui.elapsed() >= Duration::from_millis(ui_interval) {
                 if state.viz_mode() != VizMode::None {
                     let viz_available = viz_cons.slots();

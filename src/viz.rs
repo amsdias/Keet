@@ -89,18 +89,20 @@ fn process_stats() -> (u64, u64) {
     use std::ffi::c_void;
     #[repr(C)]
     struct FILETIME { low: u32, high: u32 }
+    // Extended version includes PrivateUsage (matches Task Manager's "Memory" column)
     #[repr(C)]
-    struct PROCESS_MEMORY_COUNTERS {
+    struct PROCESS_MEMORY_COUNTERS_EX {
         cb: u32, page_fault_count: u32,
         peak_working_set_size: usize, working_set_size: usize,
         quota_peak_paged_pool_usage: usize, quota_paged_pool_usage: usize,
         quota_peak_non_paged_pool_usage: usize, quota_non_paged_pool_usage: usize,
         pagefile_usage: usize, peak_pagefile_usage: usize,
+        private_usage: usize,
     }
     extern "system" {
         fn GetCurrentProcess() -> *mut c_void;
         fn GetProcessTimes(h: *mut c_void, c: *mut FILETIME, e: *mut FILETIME, k: *mut FILETIME, u: *mut FILETIME) -> i32;
-        fn K32GetProcessMemoryInfo(h: *mut c_void, info: *mut PROCESS_MEMORY_COUNTERS, cb: u32) -> i32;
+        fn K32GetProcessMemoryInfo(h: *mut c_void, info: *mut PROCESS_MEMORY_COUNTERS_EX, cb: u32) -> i32;
     }
     unsafe {
         let h = GetCurrentProcess();
@@ -112,10 +114,10 @@ fn process_stats() -> (u64, u64) {
             (k100 + u100) / 10 // 100ns → µs
         } else { 0 };
 
-        let mut mi: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
-        mi.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        let mut mi: PROCESS_MEMORY_COUNTERS_EX = std::mem::zeroed();
+        mi.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
         let mem = if K32GetProcessMemoryInfo(h, &mut mi, mi.cb) != 0 {
-            mi.working_set_size as u64
+            mi.private_usage as u64
         } else { 0 };
         (cpu_us, mem)
     }

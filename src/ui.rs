@@ -148,7 +148,11 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
     let eq_display = if eq_name == "Flat" { String::new() } else { format!(" eq:{}", eq_name) };
     let fx_display = if fx_name == "None" { String::new() } else { format!(" fx:{}", fx_name) };
     let cf_display = if cf_name != "Off" { format!(" cf:{}", cf_name) } else { String::new() };
-    let clip_display = if state.is_clipping() { format!(" {C_RED}CLIP{C_RESET}") } else { String::new() };
+    let clip_display = if state.is_clipping() {
+        format!(" {C_RED}●{C_RESET}")
+    } else {
+        format!(" {C_GREEN}●{C_RESET}")
+    };
     let bal = state.balance_value();
     let bal_display = if bal != 0 {
         if bal < 0 { format!(" BAL:L{}%", -bal) } else { format!(" BAL:R{}%", bal) }

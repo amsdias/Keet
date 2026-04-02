@@ -338,6 +338,11 @@ pub fn decode_playlist(
                 broke_for_skip = true;
                 break;
             }
+            // Check quit (also in inner loop so producer isn't stuck when device disconnects)
+            if state.should_quit() {
+                broke_for_skip = true;
+                break;
+            }
             // Check skip-prev and jump — these require producer to exit entirely
             if state.skip_prev.load(Ordering::Relaxed) || state.jump_to_track.load(Ordering::Relaxed) >= 0 {
                 broke_for_skip = true;

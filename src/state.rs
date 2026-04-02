@@ -239,7 +239,7 @@ impl PlayerState {
             effects_preset_count: AtomicUsize::new(0),
             effects_changed: AtomicBool::new(false),
             pre_fader: AtomicBool::new(false),
-            show_stats: AtomicBool::new(true),
+            show_stats: AtomicBool::new(false),
             crossfade_secs: AtomicU32::new(0),
             viz_style: AtomicU8::new(VizStyle::Dots as u8),
             decode_error: Mutex::new(None),
