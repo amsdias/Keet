@@ -272,17 +272,45 @@ pub fn spawn_metadata_scan(
     playlist: Vec<PathBuf>,
     cache: Arc<MetadataCache>,
 ) -> JoinHandle<()> {
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get().min(4))
+        .unwrap_or(2);
+    let shared_playlist = Arc::new(playlist);
+    let next_index = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let mut handles = Vec::with_capacity(num_threads);
+
+    for _ in 0..num_threads {
+        let cache = Arc::clone(&cache);
+        let playlist = Arc::clone(&shared_playlist);
+        let next_index = Arc::clone(&next_index);
+
+        let handle = thread::spawn(move || {
+            loop {
+                if cache.cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                let i = next_index.fetch_add(1, Ordering::Relaxed);
+                if i >= playlist.len() {
+                    break;
+                }
+
+                if cache.is_set(i) {
+                    continue;
+                }
+
+                if let Some(meta) = read_metadata_full(&playlist[i]) {
+                    cache.set(i, meta);
+                }
+            }
+        });
+        handles.push(handle);
+    }
+
     thread::spawn(move || {
-        for (i, path) in playlist.iter().enumerate() {
-            if cache.cancel.load(Ordering::Relaxed) {
-                break;
-            }
-            if cache.is_set(i) {
-                continue;
-            }
-            if let Some(meta) = read_metadata_full(path) {
-                cache.set(i, meta);
-            }
+        for handle in handles {
+            let _ = handle.join();
         }
     })
 }

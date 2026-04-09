@@ -161,23 +161,22 @@ pub fn rescan_playlist(
         build_playlist(source_path, false)?
     };
 
-    let current_set: std::collections::HashSet<PathBuf> = playlist.iter().cloned().collect();
-    let fresh_set: std::collections::HashSet<PathBuf> = fresh.iter().cloned().collect();
+    let current_set: std::collections::HashSet<&std::path::Path> = playlist.iter().map(|p| p.as_path()).collect();
+    let fresh_set: std::collections::HashSet<&std::path::Path> = fresh.iter().map(|p| p.as_path()).collect();
 
     // Find new files (in fresh but not in current)
     let mut added: Vec<PathBuf> = fresh.iter()
-        .filter(|p| !current_set.contains(*p))
+        .filter(|p| !current_set.contains(p.as_path()))
         .cloned()
         .collect();
     let added_count = added.len();
 
     // Find removed files (in current but not in fresh)
-    let removed_set: std::collections::HashSet<PathBuf> = current_set.difference(&fresh_set).cloned().collect();
-    let removed_count = removed_set.len();
+    let removed_count = current_set.difference(&fresh_set).count();
 
     // Remove missing files (preserve order, skip currently playing track)
     playlist.retain(|p| {
-        if removed_set.contains(p) {
+        if !fresh_set.contains(p.as_path()) {
             current_track_path.map(|c| c == p.as_path()).unwrap_or(false)
         } else {
             true

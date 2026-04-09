@@ -190,14 +190,6 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
         // Separator
         print!("\n\r\x1B[K  {C_DIM}{}{C_RESET}", "─".repeat(term_w.saturating_sub(2)));
 
-        // Ensure cursor is visible
-        if ui.cursor >= ui.scroll_offset + visible_rows {
-            ui.scroll_offset = ui.cursor.saturating_sub(visible_rows - 1);
-        }
-        if ui.cursor < ui.scroll_offset {
-            ui.scroll_offset = ui.cursor;
-        }
-
         let search_active = matches!(&ui.input_mode, InputMode::Search(q) if !q.is_empty());
         let items: Vec<usize> = if search_active && ui.filtered_indices.is_empty() {
             Vec::new()
@@ -206,6 +198,20 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
         } else {
             ui.filtered_indices.clone()
         };
+
+        // Ensure cursor is visible with a scroll margin (scrolloff)
+        let scroll_margin = 4.min(visible_rows / 2);
+
+        if ui.cursor >= ui.scroll_offset + visible_rows.saturating_sub(scroll_margin) {
+            ui.scroll_offset = ui.cursor.saturating_sub(visible_rows.saturating_sub(scroll_margin + 1));
+        }
+        if ui.cursor < ui.scroll_offset + scroll_margin {
+            ui.scroll_offset = ui.cursor.saturating_sub(scroll_margin);
+        }
+
+        // Clamp offset to prevent overscroll empty padding at the bottom of the list
+        let max_offset = items.len().saturating_sub(visible_rows);
+        ui.scroll_offset = ui.scroll_offset.min(max_offset);
 
         if items.is_empty() && search_active {
             print!("\n\r\x1B[K  {C_DIM}(no matches){C_RESET}");

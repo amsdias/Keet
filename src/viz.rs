@@ -22,21 +22,35 @@ fn process_stats() -> (u64, u64) {
         system_time: TimeValue,
     }
     #[repr(C)]
-    struct MachTaskBasicInfo {
+    struct TaskVmInfo {
         virtual_size: u64,
+        region_count: i32,
+        page_size: i32,
         resident_size: u64,
-        resident_size_max: u64,
-        user_time: TimeValue,
-        system_time: TimeValue,
-        policy: i32,
-        suspend_count: i32,
+        resident_size_peak: u64,
+        device: u64,
+        device_peak: u64,
+        internal: u64,
+        internal_peak: u64,
+        external: u64,
+        external_peak: u64,
+        reusable: u64,
+        reusable_peak: u64,
+        purgeable_volatile_pmap: u64,
+        purgeable_volatile_resident: u64,
+        purgeable_volatile_virtual: u64,
+        compressed: u64,
+        compressed_peak: u64,
+        compressed_lifetime: u64,
+        phys_footprint: u64,
+        _pad: [u64; 16],
     }
     extern "C" {
         fn mach_task_self() -> u32;
         fn task_info(target: u32, flavor: u32, info: *mut i32, count: *mut u32) -> i32;
     }
     const TASK_THREAD_TIMES_INFO: u32 = 3;
-    const MACH_TASK_BASIC_INFO: u32 = 20;
+    const TASK_VM_INFO: u32 = 22;
     unsafe {
         let task = mach_task_self();
 
@@ -49,12 +63,12 @@ fn process_stats() -> (u64, u64) {
             + times.system_time.seconds as u64 * 1_000_000 + times.system_time.microseconds as u64
         } else { 0 };
 
-        // Memory via MACH_TASK_BASIC_INFO (flavor 20)
-        let mut info: MachTaskBasicInfo = std::mem::zeroed();
-        count = (std::mem::size_of::<MachTaskBasicInfo>() / 4) as u32;
-        let mem = if task_info(task, MACH_TASK_BASIC_INFO,
+        // Memory via TASK_VM_INFO (flavor 22) - Private footprint
+        let mut info: TaskVmInfo = std::mem::zeroed();
+        count = (std::mem::size_of::<TaskVmInfo>() / 4) as u32;
+        let mem = if task_info(task, TASK_VM_INFO,
                                &mut info as *mut _ as *mut i32, &mut count) == 0 {
-            info.resident_size
+            info.phys_footprint
         } else { 0 };
 
         (cpu_us, mem)
@@ -75,7 +89,8 @@ fn process_stats() -> (u64, u64) {
 
     let mem = std::fs::read_to_string("/proc/self/status").ok().and_then(|status| {
         status.lines()
-            .find(|l| l.starts_with("VmRSS:"))
+            .find(|l| l.starts_with("RssAnon:"))
+            .or_else(|| status.lines().find(|l| l.starts_with("VmRSS:")))
             .and_then(|l| l.split_whitespace().nth(1))
             .and_then(|v| v.parse::<u64>().ok())
             .map(|kb| kb * 1024)
@@ -302,9 +317,16 @@ impl VizAnalyser {
         // Process FFT for each channel when enough samples collected
         while self.ch_l.sample_buffer.len() >= FFT_SIZE && self.ch_r.sample_buffer.len() >= FFT_SIZE {
             // Process L channel
-            let l_bands = self.run_fft_and_compute(&self.ch_l.sample_buffer[..FFT_SIZE].to_vec());
+            for (i, (&sample, &w)) in self.ch_l.sample_buffer[..FFT_SIZE].iter().zip(&self.window).enumerate() {
+                self.fft_input[i] = sample * w;
+            }
+            let l_bands = Self::run_fft_and_compute(&*self.fft, &mut self.fft_input, &mut self.fft_output, self.sample_rate);
+            
             // Process R channel
-            let r_bands = self.run_fft_and_compute(&self.ch_r.sample_buffer[..FFT_SIZE].to_vec());
+            for (i, (&sample, &w)) in self.ch_r.sample_buffer[..FFT_SIZE].iter().zip(&self.window).enumerate() {
+                self.fft_input[i] = sample * w;
+            }
+            let r_bands = Self::run_fft_and_compute(&*self.fft, &mut self.fft_input, &mut self.fft_output, self.sample_rate);
 
             // Apply ballistics per channel
             Self::apply_ballistics(&l_bands, &mut self.ch_l.heights, &mut self.ch_l.smoothed);
@@ -338,17 +360,18 @@ impl VizAnalyser {
     }
 
     /// Run FFT on samples and return raw band values (no ballistics)
-    fn run_fft_and_compute(&mut self, samples: &[f32]) -> [f32; SPECTRUM_BANDS] {
-        for (i, (&sample, &w)) in samples.iter().zip(&self.window).enumerate() {
-            self.fft_input[i] = sample * w;
-        }
-
-        if self.fft.process(&mut self.fft_input, &mut self.fft_output).is_err() {
+    fn run_fft_and_compute(
+        fft: &dyn RealToComplex<f32>,
+        fft_input: &mut [f32],
+        fft_output: &mut [realfft::num_complex::Complex<f32>],
+        sample_rate: u32,
+    ) -> [f32; SPECTRUM_BANDS] {
+        if fft.process(fft_input, fft_output).is_err() {
             return [0.0; SPECTRUM_BANDS];
         }
 
-        let nyquist = self.sample_rate as f32 / 2.0;
-        let n_bins = self.fft_output.len();
+        let nyquist = sample_rate as f32 / 2.0;
+        let n_bins = fft_output.len();
         let bin_hz = nyquist / n_bins as f32;
         let n = FFT_SIZE as f32;
         let window_correction = 2.0;
@@ -388,7 +411,7 @@ impl VizAnalyser {
                 let overlap_hi = bin_end.min(bin_hi_exact);
                 let weight = (overlap_hi - overlap_lo).max(0.0);
 
-                let mag = self.fft_output[bin].norm() * window_correction;
+                let mag = fft_output[bin].norm() * window_correction;
                 sum_power += mag * mag * psd_norm * weight;
                 weight_sum += weight;
             }
