@@ -495,6 +495,7 @@ pub struct UiState {
     pub current_track_removed: bool,
     pub terminal_resized: bool,
     pub lyrics: Option<crate::lyrics::Lyrics>,
+    pub lyrics_receiver: Option<std::sync::mpsc::Receiver<Option<crate::lyrics::Lyrics>>>,
     pub lyrics_scroll: usize,
     pub lyrics_auto_scroll: bool,
     pub lyrics_offset: f64, // seconds, positive = lyrics later, negative = lyrics earlier
@@ -520,6 +521,7 @@ impl UiState {
             current_track_removed: false,
             terminal_resized: false,
             lyrics: None,
+            lyrics_receiver: None,
             lyrics_scroll: 0,
             lyrics_auto_scroll: true,
             lyrics_offset: 0.0,

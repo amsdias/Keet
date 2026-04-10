@@ -779,18 +779,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .unwrap_or_default();
 
                     // Load lyrics: embedded tags → LRCLIB service
-                    let dur = { let t = state.total_secs(); if t > 0.0 { Some(t as u32) } else { None } };
                     let raw_lyrics = ui.metadata_cache.lyrics(ui.current)
-                        .or_else(|| metadata::read_lyrics(new_path))
-                        .or_else(|| {
-                            let (artist, title) = ui.metadata_cache.artist_title(ui.current);
-                            if let (Some(a), Some(t)) = (artist, title) {
-                                lyrics::fetch_lrclib(&a, &t, dur)
-                            } else { None }
-                        });
-                    ui.lyrics = raw_lyrics.map(|s| lyrics::parse_lyrics(&s));
+                        .or_else(|| metadata::read_lyrics(new_path));
+
                     ui.lyrics_scroll = 0;
                     ui.lyrics_auto_scroll = true;
+
+                    if let Some(l) = raw_lyrics {
+                        ui.lyrics = Some(lyrics::parse_lyrics(&l));
+                        ui.lyrics_receiver = None; // Cancel any pending fetches
+                    } else {
+                        ui.lyrics = None;
+                        let dur = { let t = state.total_secs(); if t > 0.0 { Some(t as u32) } else { None } };
+                        let (artist, title) = ui.metadata_cache.artist_title(ui.current);
+
+                        if let (Some(a), Some(t)) = (artist, title) {
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            ui.lyrics_receiver = Some(rx);
+
+                            std::thread::spawn(move || {
+                                let res = lyrics::fetch_lrclib(&a, &t, dur)
+                                    .map(|s| lyrics::parse_lyrics(&s));
+                                let _ = tx.send(res);
+                            });
+                        } else {
+                            ui.lyrics_receiver = None;
+                        }
+                    }
 
                     let src_rate = state.sample_rate.load(Ordering::Relaxed) as u32;
                     let channels = state.channels.load(Ordering::Relaxed);
@@ -966,6 +981,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 if state.show_stats() { stats.update(); }
+
+                // Check if background lyrics fetch has completed
+                if let Some(ref rx) = ui.lyrics_receiver {
+                    if let Ok(lyrics) = rx.try_recv() {
+                        if let Some(parsed) = lyrics {
+                            ui.lyrics = Some(parsed);
+                        }
+                        ui.lyrics_receiver = None;
+                    }
+                }
 
                 if ui.terminal_resized {
                     ui.terminal_resized = false;
