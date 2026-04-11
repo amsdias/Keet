@@ -4,7 +4,7 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 use std::path::PathBuf;
 
-pub const SUPPORTED_EXTENSIONS: &[&str] = &["mp3", "flac", "wav", "ogg", "aac", "m4a", "aiff", "aif"];
+pub const SUPPORTED_EXTENSIONS: &[&str] = &["mp3", "flac", "wav", "ogg", "aac", "m4a", "mp4", "m4b", "aiff", "aif"];
 pub const RING_BUFFER_SIZE: usize = 48000 * 2 * 4; // ~4 sec stereo
 pub const VIZ_BUFFER_SIZE: usize = 8192; // Small buffer for viz tap from audio callback
 
@@ -485,6 +485,8 @@ pub struct UiState {
     pub filtered_indices: Vec<usize>,
     pub current: usize,
     pub source_paths: Vec<PathBuf>,
+    pub shuffle: bool,
+    pub repeat: bool,
     pub status_message: Option<(String, Instant)>,
     pub metadata_cache: std::sync::Arc<crate::metadata::MetadataCache>,
     pub scan_handle: Option<JoinHandle<()>>,
@@ -511,6 +513,8 @@ impl UiState {
             filtered_indices: Vec::new(),
             current: 0,
             source_paths,
+            shuffle: false,
+            repeat: false,
             status_message: None,
             metadata_cache,
             scan_handle: None,

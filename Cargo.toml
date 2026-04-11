@@ -8,7 +8,8 @@ edition = "2021"
 cpal = "0.17"
 
 # symphonia - Pure Rust audio decoding
-symphonia = { version = "0.5.5", features = ["mp3", "flac", "wav", "ogg", "aac", "alac", "aiff"] }
+# isomp4 container is required for .m4a/.mp4 alongside the aac/alac codec features.
+symphonia = { version = "0.5.5", features = ["mp3", "flac", "wav", "ogg", "aac", "alac", "aiff", "isomp4"] }
 
 # rubato - High-quality audio resampling
 rubato = "1.0"

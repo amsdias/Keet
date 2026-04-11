@@ -75,6 +75,13 @@ fn build_resume_state(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Ensure terminal is in normal mode (cleanup from previous crashed runs)
     let _ = terminal::disable_raw_mode();
+    // On Windows, legacy conhost/cmd.exe don't enable VT processing by default, which
+    // would leave the entire TUI as raw escape codes. supports_ansi() has the side
+    // effect of calling SetConsoleMode with ENABLE_VIRTUAL_TERMINAL_PROCESSING.
+    #[cfg(target_os = "windows")]
+    {
+        let _ = crossterm::ansi_support::supports_ansi();
+    }
     // Full terminal reset in case previous run crashed mid-draw
     // \x1Bc = RIS (Reset to Initial State) - clears screen, resets charset, tab stops, modes
     print!("\x1Bc");
@@ -147,6 +154,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  Y            Toggle lyrics view (synced LRC auto-scrolls)");
         println!("  S            Save playlist as M3U");
         println!("  R            Rescan folders for new files");
+        println!("  O            Open a new source (type a path)");
+        println!("  P            Pick a new source (native folder dialog)");
         println!("  Q / Esc      Quit");
         println!();
         println!("\x1B[1mPLAYLIST VIEW\x1B[0m  (press L)");
@@ -190,9 +199,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 (paths, rs.shuffle, rs.repeat)
             }
             None => {
-                eprintln!("Usage: {} <file-or-folder>... [--shuffle] [--repeat] [--quality] [--eq <name>] [--fx <name>] [--crossfade <secs>] [--rg-mode track|album|off] [--device <name>] [--exclusive] [--list-devices]", args[0]);
-                eprintln!("Controls: Space=Pause ↑↓=Tracks ←→=Seek V=Viz E=EQ X=FX L=List R=Rescan +/-=Vol Q=Quit");
-                std::process::exit(1);
+                match ui::run_first_launch_picker() {
+                    Some(p) => (vec![p], false, false),
+                    None => {
+                        eprintln!("Usage: {} <file-or-folder>... [--shuffle] [--repeat] [--quality] [--eq <name>] [--fx <name>] [--crossfade <secs>] [--rg-mode track|album|off] [--device <name>] [--exclusive] [--list-devices]", args[0]);
+                        eprintln!("Controls: Space=Pause ↑↓=Tracks ←→=Seek V=Viz E=EQ X=FX L=List R=Rescan O=Open P=Pick +/-=Vol Q=Quit");
+                        std::process::exit(1);
+                    }
+                }
             }
         }
     } else {
@@ -448,6 +462,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let metadata_cache = metadata::MetadataCache::new(playlist.len());
     let mut ui = UiState::new(source_paths, std::sync::Arc::clone(&metadata_cache));
+    ui.shuffle = shuffle;
+    ui.repeat = repeat;
     ui.banner_lines = banner_lines;
     ui.banner_text = banner;
     ui.scan_handle = Some(metadata::spawn_metadata_scan(

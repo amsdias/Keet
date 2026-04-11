@@ -20,17 +20,19 @@ use rtrb::Producer;
 use crate::state::{PlayerState, RING_BUFFER_SIZE};
 use crate::state::RgMode;
 
+fn interleave_f32_planes(buf: &symphonia::core::audio::AudioBuffer<f32>) -> Vec<f32> {
+    let spec = buf.planes();
+    let p = spec.planes();
+    let mut out = Vec::with_capacity(buf.frames() * p.len());
+    for f in 0..buf.frames() {
+        for ch in p { out.push(ch[f]); }
+    }
+    out
+}
+
 fn convert_samples(buf: &AudioBufferRef) -> Vec<f32> {
     match buf {
-        AudioBufferRef::F32(b) => {
-            let spec = b.planes();
-            let p = spec.planes();
-            let mut out = Vec::with_capacity(b.frames() * p.len());
-            for f in 0..b.frames() {
-                for ch in p { out.push(ch[f]); }
-            }
-            out
-        }
+        AudioBufferRef::F32(b) => interleave_f32_planes(b),
         AudioBufferRef::S16(b) => {
             let spec = b.planes();
             let p = spec.planes();
@@ -49,7 +51,9 @@ fn convert_samples(buf: &AudioBufferRef) -> Vec<f32> {
             }
             out
         }
-        _ => vec![],
+        // Catchall for S24/U8/U16/U24/U32/F64: convert via symphonia's make_equivalent.
+        // Previously this returned vec![] which silently starved the ring buffer → clicks/silence.
+        _ => interleave_f32_planes(&buf.make_equivalent::<f32>()),
     }
 }
 
@@ -332,6 +336,9 @@ pub fn decode_playlist(
         let mut rg_buf: Vec<f32> = Vec::with_capacity(chunk_size * channels * 2);
         let mut xfeed_buf: Vec<f32> = Vec::with_capacity(chunk_size * channels * 2);
         let mut bal_buf: Vec<f32> = Vec::with_capacity(chunk_size * channels * 2);
+        // Scratch for crossfade-mixed / limited output. Only touched when samples need
+        // mutation; steady-state playback reads bal_output directly and skips this.
+        let mut final_buf: Vec<f32> = Vec::with_capacity(chunk_size * channels * 2);
 
         // --- Packet decode loop ---
         loop {
@@ -525,13 +532,15 @@ pub fn decode_playlist(
                 cf_output
             };
 
-            // Crossfade mixing with previous track's tail
-            let mut final_output = if let Some(ref tail) = xfade_in {
+            // Crossfade mixing with previous track's tail.
+            // Only populate final_buf when we actually need to mutate samples —
+            // steady-state playback skips this and reads bal_output directly.
+            let mut using_final_buf = false;
+            if let Some(ref tail) = xfade_in {
                 if crossfade_pos < crossfade_samples && crossfade_samples > 0 {
-                    let mut cf_buf = Vec::with_capacity(bal_output.len());
-                    cf_buf.extend_from_slice(bal_output);
-
-                    for sample in cf_buf.iter_mut() {
+                    final_buf.clear();
+                    final_buf.extend_from_slice(bal_output);
+                    for sample in final_buf.iter_mut() {
                         if crossfade_pos < crossfade_samples {
                             let pos_f = crossfade_pos as f32 / crossfade_samples as f32;
                             let fade_in = (pos_f * std::f32::consts::FRAC_PI_2).sin();
@@ -542,45 +551,48 @@ pub fn decode_playlist(
                             crossfade_pos += 1;
                         }
                     }
-                    cf_buf
-                } else {
-                    bal_output.to_vec()
+                    using_final_buf = true;
                 }
-            } else {
-                bal_output.to_vec()
-            };
+            }
 
-            // Clipping check — flag when any sample would exceed 0dBFS after volume
-            if !final_output.is_empty() {
+            // Clipping check — scan whichever buffer holds the current samples
+            if !bal_output.is_empty() {
                 let vol = state.volume.load(Ordering::Relaxed) as f32 / 100.0;
                 let threshold = if vol > 0.0 { 1.0 / vol } else { f32::MAX };
-                let peak = final_output.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+                let scan: &[f32] = if using_final_buf { &final_buf } else { bal_output };
+                let peak = scan.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
                 if peak > threshold {
                     state.clipping.store(true, Ordering::Relaxed);
                     // Peak-limit to prevent hard clipping at the DAC
+                    if !using_final_buf {
+                        final_buf.clear();
+                        final_buf.extend_from_slice(bal_output);
+                        using_final_buf = true;
+                    }
                     let scale = threshold / peak;
-                    for s in final_output.iter_mut() {
+                    for s in final_buf.iter_mut() {
                         *s *= scale;
                     }
                 }
             }
 
             // Push to ring buffer
-            if !final_output.is_empty() {
-                if let Ok(mut chunk) = producer.write_chunk(final_output.len()) {
+            let out: &[f32] = if using_final_buf { &final_buf } else { bal_output };
+            if !out.is_empty() {
+                if let Ok(mut chunk) = producer.write_chunk(out.len()) {
                     let (first, second) = chunk.as_mut_slices();
-                    let first_len = first.len().min(final_output.len());
-                    first[..first_len].copy_from_slice(&final_output[..first_len]);
-                    if first_len < final_output.len() && !second.is_empty() {
-                        let second_len = second.len().min(final_output.len() - first_len);
-                        second[..second_len].copy_from_slice(&final_output[first_len..first_len + second_len]);
+                    let first_len = first.len().min(out.len());
+                    first[..first_len].copy_from_slice(&out[..first_len]);
+                    if first_len < out.len() && !second.is_empty() {
+                        let second_len = second.len().min(out.len() - first_len);
+                        second[..second_len].copy_from_slice(&out[first_len..first_len + second_len]);
                     }
                     chunk.commit_all();
                 }
 
                 // Capture tail for crossfade into next track
                 if capture_tail {
-                    tail_buf.extend(final_output.iter().copied());
+                    tail_buf.extend(out.iter().copied());
                     if tail_buf.len() > crossfade_samples {
                         let excess = tail_buf.len() - crossfade_samples;
                         tail_buf.drain(..excess);

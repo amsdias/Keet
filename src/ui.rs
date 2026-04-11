@@ -520,6 +520,28 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
                 KeyEvent { code: KeyCode::Char('r'), .. } => {
                     rescan(state, ui, playlist);
                 }
+                KeyEvent { code: KeyCode::Char('o'), .. } => {
+                    let picked = prompt_path_line();
+                    let _ = terminal::enable_raw_mode();
+                    // prompt_path_line prints the prompt/echoed chars inline, which
+                    // pushes the UI's cursor-tracking out of sync. Force a full redraw
+                    // on the next frame via the same path as a terminal resize.
+                    ui.terminal_resized = true;
+                    match picked {
+                        Some(p) => switch_source_paths(state, ui, playlist, p),
+                        None => ui.set_status("Cancelled".to_string()),
+                    }
+                }
+                KeyEvent { code: KeyCode::Char('p'), .. } => {
+                    if has_native_picker() {
+                        match pick_folder_native() {
+                            Some(p) => switch_source_paths(state, ui, playlist, p),
+                            None => ui.set_status("Cancelled".to_string()),
+                        }
+                    } else {
+                        ui.set_status("Native picker unavailable; press O to type a path".to_string());
+                    }
+                }
                 KeyEvent { code: KeyCode::Char('q'), .. } |
                 KeyEvent { code: KeyCode::Esc, .. } => { state.quit(); return true; }
                 KeyEvent { code: KeyCode::Char('c'), modifiers: KeyModifiers::CONTROL, .. } => {
@@ -720,6 +742,62 @@ fn remove_track(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<PathBu
     ui.set_status(format!("Removed: {}", removed_name));
 }
 
+/// Replace the current music source with a new path, rebuild the playlist,
+/// reindex the metadata cache, and jump playback to the new first track.
+fn switch_source_paths(
+    state: &PlayerState,
+    ui: &mut UiState,
+    playlist: &mut Vec<PathBuf>,
+    new_path: PathBuf,
+) {
+    use std::sync::atomic::Ordering;
+
+    if !new_path.exists() {
+        ui.set_status(format!("Path not found: {}", new_path.display()));
+        return;
+    }
+
+    // Honor the current session's shuffle setting. Repeat is preserved implicitly —
+    // main.rs's repeat-cycle loop keeps running regardless of source.
+    let new_list = match crate::playlist::build_playlist(&new_path, ui.shuffle) {
+        Ok(list) => list,
+        Err(e) => {
+            ui.set_status(format!("Failed to read source: {}", e));
+            return;
+        }
+    };
+
+    let old_playlist = std::mem::replace(playlist, new_list);
+    ui.source_paths = vec![new_path.clone()];
+    ui.current = 0;
+    ui.cursor = 0;
+    ui.scroll_offset = 0;
+
+    state.total_tracks.store(playlist.len(), Ordering::Relaxed);
+    state.current_track.store(0, Ordering::Relaxed);
+
+    // Reindex metadata cache: cancel old scan, remap entries, spawn fresh scan
+    ui.metadata_cache.cancel.store(true, Ordering::Relaxed);
+    if let Some(h) = ui.scan_handle.take() {
+        h.join().ok();
+    }
+    ui.metadata_cache.reindex(playlist, &old_playlist);
+    ui.metadata_cache.cancel.store(false, Ordering::Relaxed);
+    ui.scan_handle = Some(crate::metadata::spawn_metadata_scan(
+        playlist.clone(),
+        std::sync::Arc::clone(&ui.metadata_cache),
+    ));
+
+    // Signal the producer to break out of the current track and jump to index 0
+    // of the new playlist on its next iteration.
+    state.jump_to(0);
+
+    let name = new_path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| new_path.display().to_string());
+    ui.set_status(format!("Source: {} ({} tracks)", name, playlist.len()));
+}
+
 fn rescan(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<PathBuf>) {
     use std::sync::atomic::Ordering;
 
@@ -782,5 +860,133 @@ fn rescan(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<PathBuf>) {
         ui.set_status("Rescan failed for some sources".to_string());
     } else {
         ui.set_status(format!("+{} added, -{} removed", total_added, total_removed));
+    }
+}
+
+/// Opens a native folder-picker dialog on macOS via AppleScript.
+#[cfg(target_os = "macos")]
+fn pick_folder_native() -> Option<PathBuf> {
+    let output = std::process::Command::new("osascript")
+        .args([
+            "-e",
+            "try\nPOSIX path of (choose folder with prompt \"Select a music folder\")\non error\nreturn \"\"\nend try",
+        ])
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if s.is_empty() { None } else { Some(PathBuf::from(s)) }
+}
+
+/// Opens a native folder-picker dialog on Windows via PowerShell's Shell.Application COM object.
+#[cfg(target_os = "windows")]
+fn pick_folder_native() -> Option<PathBuf> {
+    let script = "$s = New-Object -ComObject Shell.Application; \
+        $f = $s.BrowseForFolder(0, 'Select a music folder', 0, 0); \
+        if ($f) { $f.Self.Path }";
+    let output = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if s.is_empty() { None } else { Some(PathBuf::from(s)) }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn pick_folder_native() -> Option<PathBuf> { None }
+
+fn has_native_picker() -> bool {
+    cfg!(any(target_os = "macos", target_os = "windows"))
+}
+
+/// Prompt for a path in raw mode so Esc can cancel. Enter submits, Backspace edits,
+/// Ctrl-C cancels. On entry/exit this leaves the terminal in cooked mode — the caller
+/// is responsible for re-enabling raw mode if it needs it.
+fn prompt_path_line() -> Option<PathBuf> {
+    let _ = terminal::enable_raw_mode();
+    print!("\n\r  {}Enter path (Esc to cancel):{} ", C_BOLD, C_RESET);
+    io::stdout().flush().ok();
+
+    let mut buf = String::new();
+    let result = loop {
+        match event::read() {
+            Ok(Event::Key(k)) if k.kind != KeyEventKind::Release => match k.code {
+                KeyCode::Esc => break None,
+                KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => break None,
+                KeyCode::Enter => {
+                    let trimmed = buf.trim().to_string();
+                    break if trimmed.is_empty() { None } else { Some(PathBuf::from(trimmed)) };
+                }
+                KeyCode::Backspace => {
+                    if buf.pop().is_some() {
+                        print!("\x08 \x08");
+                        io::stdout().flush().ok();
+                    }
+                }
+                KeyCode::Char(c) => {
+                    buf.push(c);
+                    print!("{}", c);
+                    io::stdout().flush().ok();
+                }
+                _ => {}
+            },
+            Ok(_) => {}
+            Err(_) => break None,
+        }
+    };
+
+    let _ = terminal::disable_raw_mode();
+    print!("\r\n");
+    io::stdout().flush().ok();
+    result
+}
+
+/// Interactive first-launch picker shown when the user runs keet with no args
+/// and no saved session. Returns the selected path or None if the user quit.
+pub fn run_first_launch_picker() -> Option<PathBuf> {
+    let native = has_native_picker();
+    loop {
+        println!();
+        println!("  {}Keet{} — no music source given and no saved session.", C_BOLD, C_RESET);
+        println!();
+        if native {
+            println!("  {}P{}  Pick a folder", C_CYAN, C_RESET);
+        }
+        println!("  {}T{}  Type a path", C_CYAN, C_RESET);
+        println!("  {}Q{}  Quit", C_CYAN, C_RESET);
+        println!();
+        print!("  {}Choose:{} ", C_DIM, C_RESET);
+        io::stdout().flush().ok();
+
+        if terminal::enable_raw_mode().is_err() {
+            return None;
+        }
+        let key = loop {
+            if let Ok(true) = event::poll(Duration::from_millis(500)) {
+                if let Ok(Event::Key(k)) = event::read() {
+                    if k.kind == KeyEventKind::Release { continue; }
+                    break k;
+                }
+            }
+        };
+        let _ = terminal::disable_raw_mode();
+        println!();
+
+        let chosen = match key.code {
+            KeyCode::Char('p') | KeyCode::Char('P') if native => pick_folder_native(),
+            KeyCode::Char('t') | KeyCode::Char('T') => prompt_path_line(),
+            KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => return None,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return None,
+            _ => continue,
+        };
+
+        match chosen {
+            Some(p) if p.exists() => return Some(p),
+            Some(p) => {
+                println!("  {}Path not found:{} {}", C_RED, C_RESET, p.display());
+            }
+            None => {
+                println!("  {}Cancelled{}", C_DIM, C_RESET);
+            }
+        }
     }
 }
