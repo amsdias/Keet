@@ -3,10 +3,6 @@ use std::path::{Path, PathBuf};
 
 use crate::state::SUPPORTED_EXTENSIONS;
 
-pub fn read_metadata(path: &Path) -> Option<String> {
-    crate::metadata::read_metadata_display(path)
-}
-
 pub fn shuffle_list(list: &mut [PathBuf]) {
     let mut rng = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

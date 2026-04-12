@@ -118,7 +118,7 @@ pub fn fetch_lrclib(artist: &str, title: &str, duration_secs: Option<u32>) -> Op
         .build();
     let agent = ureq::Agent::config_builder()
         .tls_config(tls)
-        .timeout_global(Some(std::time::Duration::from_secs(3)))
+        .timeout_global(Some(std::time::Duration::from_secs(8)))
         .user_agent("Keet Audio Player (https://github.com)")
         .build()
         .new_agent();

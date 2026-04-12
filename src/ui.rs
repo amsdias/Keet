@@ -517,8 +517,17 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
                 KeyEvent { code: KeyCode::Char('s'), .. } => {
                     ui.input_mode = InputMode::SavePlaylist(String::new());
                 }
+                KeyEvent { code: KeyCode::Char('r'), modifiers, .. } if modifiers.contains(KeyModifiers::SHIFT) => {
+                    toggle_repeat(ui);
+                }
+                KeyEvent { code: KeyCode::Char('R'), .. } => {
+                    toggle_repeat(ui);
+                }
                 KeyEvent { code: KeyCode::Char('r'), .. } => {
                     rescan(state, ui, playlist);
+                }
+                KeyEvent { code: KeyCode::Char('z'), .. } => {
+                    toggle_shuffle(ui, playlist);
                 }
                 KeyEvent { code: KeyCode::Char('o'), .. } => {
                     let picked = prompt_path_line();
@@ -740,6 +749,44 @@ fn remove_track(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<PathBu
     }
 
     ui.set_status(format!("Removed: {}", removed_name));
+}
+
+/// Toggle runtime shuffle. When turning ON, shuffles the tracks after the current
+/// one (so the now-playing song isn't interrupted). When turning OFF, re-sorts
+/// the playlist by PathBuf order and relocates the current track.
+fn toggle_shuffle(ui: &mut UiState, playlist: &mut Vec<PathBuf>) {
+    let old_playlist = playlist.clone();
+    ui.shuffle = !ui.shuffle;
+    let current_path = playlist.get(ui.current).cloned();
+
+    if ui.shuffle {
+        // Shuffle everything after the currently-playing track
+        let start = ui.current + 1;
+        if start < playlist.len() {
+            let tail = &mut playlist[start..];
+            crate::playlist::shuffle_list(tail);
+        }
+        ui.set_status("Shuffle ON".to_string());
+    } else {
+        // Sort and re-locate the current track
+        playlist.sort();
+        if let Some(ref cp) = current_path {
+            if let Some(idx) = playlist.iter().position(|p| p == cp) {
+                ui.current = idx;
+            }
+        }
+        ui.set_status("Shuffle OFF".to_string());
+    }
+    // Cached metadata is indexed by position — remap it to match the reordered paths.
+    ui.metadata_cache.reindex(playlist, &old_playlist);
+    ui.playlist_dirty = true;
+    ui.banner_dirty = true;
+}
+
+fn toggle_repeat(ui: &mut UiState) {
+    ui.repeat = !ui.repeat;
+    ui.set_status(if ui.repeat { "Repeat ON".to_string() } else { "Repeat OFF".to_string() });
+    ui.banner_dirty = true;
 }
 
 /// Replace the current music source with a new path, rebuild the playlist,

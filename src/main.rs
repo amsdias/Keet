@@ -38,9 +38,39 @@ use state::{PlayerState, UiState, RgMode, VizMode, RING_BUFFER_SIZE, VIZ_BUFFER_
 use viz::{StatsMonitor, VizAnalyser};
 use audio::{build_stream, set_output_sample_rate, probe_sample_rate, fix_bluetooth_sample_rate};
 use decode::decode_playlist;
-use playlist::{build_playlist, shuffle_list, read_metadata};
+use playlist::{build_playlist, shuffle_list};
 use ui::{print_status, poll_input, format_time};
 use resume::{ResumeState, save_state, load_state};
+
+/// Kick off the lyrics loader on a background thread and install its receiver on `ui`.
+/// Reads embedded tags from the file if not already cached, then falls back to LRCLIB.
+/// The main thread never blocks on disk or HTTP.
+fn spawn_lyrics_worker(ui: &mut state::UiState, path: std::path::PathBuf, dur: Option<u32>) {
+    if let Some(l) = ui.metadata_cache.lyrics(ui.current) {
+        ui.lyrics = Some(lyrics::parse_lyrics(&l));
+        ui.lyrics_receiver = None;
+        return;
+    }
+    let (cached_artist, cached_title) = ui.metadata_cache.artist_title(ui.current);
+    ui.lyrics = None;
+    let (tx, rx) = std::sync::mpsc::channel();
+    ui.lyrics_receiver = Some(rx);
+    std::thread::spawn(move || {
+        let (artist, title, embedded) = if cached_artist.is_some() || cached_title.is_some() {
+            (cached_artist, cached_title, metadata::read_lyrics(&path))
+        } else {
+            metadata::read_artist_title_lyrics(&path)
+        };
+        let res = if let Some(l) = embedded {
+            Some(lyrics::parse_lyrics(&l))
+        } else if let (Some(a), Some(t)) = (artist, title) {
+            lyrics::fetch_lrclib(&a, &t, dur).map(|s| lyrics::parse_lyrics(&s))
+        } else {
+            None
+        };
+        let _ = tx.send(res);
+    });
+}
 
 fn build_resume_state(
     ui: &state::UiState,
@@ -154,6 +184,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  Y            Toggle lyrics view (synced LRC auto-scrolls)");
         println!("  S            Save playlist as M3U");
         println!("  R            Rescan folders for new files");
+        println!("  Z            Toggle shuffle");
+        println!("  Shift+R      Toggle repeat");
         println!("  O            Open a new source (type a path)");
         println!("  P            Pick a new source (native folder dialog)");
         println!("  Q / Esc      Quit");
@@ -382,33 +414,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let inner_w = 57;
     let title = "Keet";
-    let pad_left = (inner_w - title.len()) / 2;
-    let pad_right = inner_w - title.len() - pad_left;
-    let eq_name = &eq_presets[state.eq_index()].name;
-    let fx_name = &fx_presets[state.effects_index()].name;
-    let eq_info = if eq_name != "Flat" { format!(" | EQ: {}", eq_name) } else { String::new() };
-    let fx_info = if fx_name != "None" { format!(" | FX: {}", fx_name) } else { String::new() };
-    let xfade_info = if crossfade_secs > 0 { format!(" | xfade: {}s", crossfade_secs) } else { String::new() };
-    let cf_name = &cf_presets[state.crossfeed_index()].name;
-    let cf_info = if cf_name != "Off" { format!(" | crossfeed: {}", cf_name) } else { String::new() };
-    let bal_val = state.balance_value();
-    let bal_info = if bal_val != 0 {
-        if bal_val < 0 { format!(" | bal: L{}%", -bal_val) } else { format!(" | bal: R{}%", bal_val) }
-    } else { String::new() };
-    let info = format!("{}{}{}{}{}{}{}{}",
-        if shuffle { "shuffle" } else { "sequential" },
-        if repeat { " | repeat" } else { "" },
-        if hq_resampler { " | HQ" } else { "" },
-        eq_info, fx_info, xfade_info, cf_info, bal_info);
-    let info_display_len = info.len();
-    let info_pad = inner_w.saturating_sub(info_display_len + 2);
-    let mut banner = String::new();
     use std::fmt::Write as FmtWrite;
-    writeln!(banner, "╔{}╗", "═".repeat(inner_w)).ok();
-    writeln!(banner, "║{}{}{}║", " ".repeat(pad_left), title, " ".repeat(pad_right)).ok();
-    writeln!(banner, "╠{}╣", "═".repeat(inner_w)).ok();
-    writeln!(banner, "║  {}{}║", info, " ".repeat(info_pad)).ok();
-    writeln!(banner, "╚{}╝", "═".repeat(inner_w)).ok();
+
+    let build_banner_box = |shuffle: bool, repeat: bool, state: &PlayerState| -> String {
+        let pad_left = (inner_w - title.len()) / 2;
+        let pad_right = inner_w - title.len() - pad_left;
+        let eq_name = &eq_presets[state.eq_index()].name;
+        let fx_name = &fx_presets[state.effects_index()].name;
+        let eq_info = if eq_name != "Flat" { format!(" | EQ: {}", eq_name) } else { String::new() };
+        let fx_info = if fx_name != "None" { format!(" | FX: {}", fx_name) } else { String::new() };
+        let xfade_info = if crossfade_secs > 0 { format!(" | xfade: {}s", crossfade_secs) } else { String::new() };
+        let cf_name = &cf_presets[state.crossfeed_index()].name;
+        let cf_info = if cf_name != "Off" { format!(" | crossfeed: {}", cf_name) } else { String::new() };
+        let bal_val = state.balance_value();
+        let bal_info = if bal_val != 0 {
+            if bal_val < 0 { format!(" | bal: L{}%", -bal_val) } else { format!(" | bal: R{}%", bal_val) }
+        } else { String::new() };
+        let info = format!("{}{}{}{}{}{}{}{}",
+            if shuffle { "shuffle" } else { "sequential" },
+            if repeat { " | repeat" } else { "" },
+            if hq_resampler { " | HQ" } else { "" },
+            eq_info, fx_info, xfade_info, cf_info, bal_info);
+        let info_pad = inner_w.saturating_sub(info.chars().count() + 2);
+        let mut s = String::new();
+        writeln!(s, "╔{}╗", "═".repeat(inner_w)).ok();
+        writeln!(s, "║{}{}{}║", " ".repeat(pad_left), title, " ".repeat(pad_right)).ok();
+        writeln!(s, "╠{}╣", "═".repeat(inner_w)).ok();
+        writeln!(s, "║  {}{}║", info, " ".repeat(info_pad)).ok();
+        writeln!(s, "╚{}╝", "═".repeat(inner_w)).ok();
+        s
+    };
+
+    let banner_box = build_banner_box(shuffle, repeat, &state);
+    let mut banner_tail = String::new();
 
     // Audio setup
     let host = cpal::default_host();
@@ -424,18 +462,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let device_name = device.description()
             .map(|d| d.name().to_string())
             .unwrap_or_else(|_| "Unknown device".to_string());
-        writeln!(banner, "\nDevice: {}", device_name).ok();
+        writeln!(banner_tail, "\nDevice: {}", device_name).ok();
 
         // Fix stale sample rate on Bluetooth devices (CoreAudio can get stuck at wrong rate)
         let bt_rate = fix_bluetooth_sample_rate();
         if let Some(rate) = bt_rate {
-            writeln!(banner, "Bluetooth device detected, using native {}Hz", rate).ok();
+            writeln!(banner_tail, "Bluetooth device detected, using native {}Hz", rate).ok();
         }
 
         let default_config = device.default_output_config()?;
         let rate = bt_rate.unwrap_or_else(|| default_config.sample_rate());
         let default_channels = default_config.channels();
-        writeln!(banner, "Initial output: {}Hz (device default: {}ch)", rate, default_channels).ok();
+        writeln!(banner_tail, "Initial output: {}Hz (device default: {}ch)", rate, default_channels).ok();
         rate
     };
 
@@ -445,12 +483,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // OS media transport controls (media keys, AirPods, Bluetooth headphones)
     let mut media_controls = media_keys::setup(Arc::clone(&state));
 
-    writeln!(banner, "\n{0}{{Space}}{1} Pause  {0}{{↑/↓}}{1} Track  {0}{{←/→}}{1} Seek  {0}{{+/-}}{1} Vol  {0}{{[/]}}{1} Bal  {0}{{Q}}{1} Quit",
+    writeln!(banner_tail, "\n{0}{{Space}}{1} Pause  {0}{{↑/↓}}{1} Track  {0}{{←/→}}{1} Seek  {0}{{+/-}}{1} Vol  {0}{{[/]}}{1} Bal  {0}{{Q}}{1} Quit",
         "\x1B[2m", "\x1B[0m").ok();
-    writeln!(banner, "{0}{{E}}{1} EQ  {0}{{X}}{1} FX  {0}{{C}}{1} Crossfeed  {0}{{F}}{1} Fader  {0}{{V/B}}{1} Viz  {0}{{I}}{1} Info  {0}{{L}}{1} List  {0}{{Y}}{1} Lyrics\n",
+    writeln!(banner_tail, "{0}{{E}}{1} EQ  {0}{{X}}{1} FX  {0}{{C}}{1} Crossfeed  {0}{{F}}{1} Fader  {0}{{V/B}}{1} Viz  {0}{{I}}{1} Info  {0}{{Y}}{1} Lyrics",
+        "\x1B[2m", "\x1B[0m").ok();
+    writeln!(banner_tail, "{0}{{L}}{1} List  {0}{{R}}{1} Rescan  {0}{{Shift+R}}{1} Repeat  {0}{{Z}}{1} Shuffle  {0}{{O}}{1} Open  {0}{{P}}{1} Pick\n",
         "\x1B[2m", "\x1B[0m").ok();
 
     // Print banner and count its lines
+    let banner = format!("{}{}", banner_box, banner_tail);
     print!("{}", banner);
     let banner_lines = banner.lines().count();
 
@@ -466,6 +507,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ui.repeat = repeat;
     ui.banner_lines = banner_lines;
     ui.banner_text = banner;
+    ui.banner_tail = banner_tail;
     ui.scan_handle = Some(metadata::spawn_metadata_scan(
         playlist.clone(),
         std::sync::Arc::clone(&metadata_cache),
@@ -566,7 +608,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Repeat-cycle check
         if ui.current >= playlist.len() {
-            if repeat {
+            if ui.repeat {
                 let old_playlist = playlist.clone();
 
                 let has_dir = ui.source_paths.iter().any(|p| p.is_dir());
@@ -590,7 +632,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 !ui.removed_paths.contains(&key)
                             });
                         }
-                        if shuffle { shuffle_list(&mut combined); }
+                        if ui.shuffle { shuffle_list(&mut combined); }
                         playlist = combined;
                         state.total_tracks.store(playlist.len(), Ordering::Relaxed);
                     }
@@ -603,7 +645,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         });
                         state.total_tracks.store(playlist.len(), Ordering::Relaxed);
                     }
-                    if shuffle { shuffle_list(&mut playlist); }
+                    if ui.shuffle { shuffle_list(&mut playlist); }
                 }
 
                 // Reindex metadata cache
@@ -634,8 +676,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Ok(mut err) = state.decode_error.lock() { *err = None; }
 
         let track_path = &playlist[ui.current];
-        let mut filename = read_metadata(track_path)
-            .unwrap_or_else(|| track_path.file_name().unwrap_or_default().to_string_lossy().into_owned());
+        let mut filename = ui.metadata_cache.display_name(ui.current, track_path);
         let mut track_ext = track_path.extension()
             .map(|e| e.to_string_lossy().to_lowercase())
             .unwrap_or_default();
@@ -671,14 +712,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             prod_for_thread // Return producer ownership
         });
 
-        // Wait for track info and initial buffer fill
-        while (!state.track_info_ready.load(Ordering::Relaxed)
-               || state.buffer_level.load(Ordering::Relaxed) < RING_BUFFER_SIZE / 4)
+        // Stage 1: wait for the producer to open the file and publish track info
+        // (fast, usually < 50ms). Once this is set, sample rate / bits / duration
+        // are available so we can build track_info and show the new status line
+        // while the buffer fills underneath us.
+        while !state.track_info_ready.load(Ordering::Relaxed)
               && !state.producer_done.load(Ordering::Relaxed)
               && !state.should_quit()
         {
             poll_input(&state, &mut ui, &mut playlist);
-            thread::sleep(Duration::from_millis(20));
+            thread::sleep(Duration::from_millis(10));
         }
 
         // If producer failed before track info, skip
@@ -715,20 +758,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let mut track_info = format!("{} • {}bit {} • {}", format_time(state.total_secs()), bits, ch_str, rate_str);
 
-        // Load lyrics: embedded tags → LRCLIB service (after track info is ready for duration)
-        let track_path = &playlist[ui.current];
+        // Load lyrics off the main thread so skip stays responsive.
         let dur = { let t = state.total_secs(); if t > 0.0 { Some(t as u32) } else { None } };
-        let raw_lyrics = ui.metadata_cache.lyrics(ui.current)
-            .or_else(|| metadata::read_lyrics(track_path))
-            .or_else(|| {
-                let (artist, title) = ui.metadata_cache.artist_title(ui.current);
-                if let (Some(a), Some(t)) = (artist, title) {
-                    lyrics::fetch_lrclib(&a, &t, dur)
-                } else { None }
-            });
-        ui.lyrics = raw_lyrics.map(|s| lyrics::parse_lyrics(&s));
         ui.lyrics_scroll = 0;
         ui.lyrics_auto_scroll = true;
+        let lyrics_path = playlist[ui.current].clone();
+        spawn_lyrics_worker(&mut ui, lyrics_path, dur);
+
+        // Stage 2: wait for the ring buffer to fill enough that the audio callback
+        // won't underrun, while refreshing the status line so the user sees the new
+        // track name immediately instead of staring at the old one.
+        {
+            let current_eq = &eq_presets[state.eq_index()];
+            let current_fx = &fx_presets[state.effects_index()].name;
+            let current_cf = &cf_presets[state.crossfeed_index()].name;
+            while state.buffer_level.load(Ordering::Relaxed) < RING_BUFFER_SIZE / 4
+                  && !state.producer_done.load(Ordering::Relaxed)
+                  && !state.should_quit()
+            {
+                poll_input(&state, &mut ui, &mut playlist);
+                let _ = print_status(&state, &mut ui, &filename, &track_info, &track_ext, current_eq, current_fx, current_cf, &mut stats, prev_viz_lines, &playlist);
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
 
         // Update OS media transport
         if let Some(ref mut mc) = media_controls {
@@ -753,7 +805,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 print!("\x1B[J");
                 io::stdout().flush().ok();
-                save_state(&build_resume_state(&ui, &playlist, &state, shuffle, repeat, &eq_presets, &fx_presets, &cf_presets, &device_arg));
+                save_state(&build_resume_state(&ui, &playlist, &state, ui.shuffle, ui.repeat, &eq_presets, &fx_presets, &cf_presets, &device_arg));
                 if let Some(id) = hog_device_id {
                     audio::release_exclusive_mode(id);
                 }
@@ -788,40 +840,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     // Update display info for new track
                     let new_path = &playlist[ui.current];
-                    filename = read_metadata(new_path)
-                        .unwrap_or_else(|| new_path.file_name().unwrap_or_default().to_string_lossy().into_owned());
+                    filename = ui.metadata_cache.display_name(ui.current, new_path);
                     track_ext = new_path.extension()
                         .map(|e| e.to_string_lossy().to_lowercase())
                         .unwrap_or_default();
 
-                    // Load lyrics: embedded tags → LRCLIB service
-                    let raw_lyrics = ui.metadata_cache.lyrics(ui.current)
-                        .or_else(|| metadata::read_lyrics(new_path));
-
                     ui.lyrics_scroll = 0;
                     ui.lyrics_auto_scroll = true;
-
-                    if let Some(l) = raw_lyrics {
-                        ui.lyrics = Some(lyrics::parse_lyrics(&l));
-                        ui.lyrics_receiver = None; // Cancel any pending fetches
-                    } else {
-                        ui.lyrics = None;
-                        let dur = { let t = state.total_secs(); if t > 0.0 { Some(t as u32) } else { None } };
-                        let (artist, title) = ui.metadata_cache.artist_title(ui.current);
-
-                        if let (Some(a), Some(t)) = (artist, title) {
-                            let (tx, rx) = std::sync::mpsc::channel();
-                            ui.lyrics_receiver = Some(rx);
-
-                            std::thread::spawn(move || {
-                                let res = lyrics::fetch_lrclib(&a, &t, dur)
-                                    .map(|s| lyrics::parse_lyrics(&s));
-                                let _ = tx.send(res);
-                            });
-                        } else {
-                            ui.lyrics_receiver = None;
-                        }
-                    }
+                    let dur = { let t = state.total_secs(); if t > 0.0 { Some(t as u32) } else { None } };
+                    spawn_lyrics_worker(&mut ui, new_path.clone(), dur);
 
                     let src_rate = state.sample_rate.load(Ordering::Relaxed) as u32;
                     let channels = state.channels.load(Ordering::Relaxed);
@@ -843,7 +870,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         media_keys::update_playback(mc, state.is_paused(), 0.0);
                     }
 
-                    save_state(&build_resume_state(&ui, &playlist, &state, shuffle, repeat, &eq_presets, &fx_presets, &cf_presets, &device_arg));
+                    save_state(&build_resume_state(&ui, &playlist, &state, ui.shuffle, ui.repeat, &eq_presets, &fx_presets, &cf_presets, &device_arg));
                 }
             }
 
@@ -967,7 +994,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Err(_) => break 'playlist,
                 }
 
-                save_state(&build_resume_state(&ui, &playlist, &state, shuffle, repeat, &eq_presets, &fx_presets, &cf_presets, &device_arg));
+                save_state(&build_resume_state(&ui, &playlist, &state, ui.shuffle, ui.repeat, &eq_presets, &fx_presets, &cf_presets, &device_arg));
                 ui.current = playlist.len(); // Will trigger repeat-cycle or exit
                 continue 'playlist;
             }
@@ -1008,6 +1035,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
+                if ui.banner_dirty {
+                    ui.banner_dirty = false;
+                    let new_box = build_banner_box(ui.shuffle, ui.repeat, &state);
+                    ui.banner_text = format!("{}{}", new_box, ui.banner_tail);
+                    ui.banner_lines = ui.banner_text.lines().count();
+                    ui.terminal_resized = true;
+                }
+
                 if ui.terminal_resized {
                     ui.terminal_resized = false;
                     // Clear entire screen and reprint banner (old lines may
@@ -1015,6 +1050,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // In raw mode \n doesn't imply \r, so use \r\n.
                     print!("\x1B[0m\x1B[2J\x1B[H{}", ui.banner_text.replace('\n', "\r\n"));
                     prev_viz_lines = usize::MAX;
+                }
+
+                // Refresh filename from the metadata cache once the background
+                // scan has caught up (replaces the raw filename fallback shown
+                // right after a skip).
+                if ui.current < playlist.len() {
+                    let fresh = ui.metadata_cache.display_name(ui.current, &playlist[ui.current]);
+                    if fresh != filename {
+                        filename = fresh;
+                    }
                 }
 
                 let current_eq = &eq_presets[state.eq_index()];
