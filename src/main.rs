@@ -732,7 +732,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(p) => prod = p,
                 Err(_) => break 'playlist,
             }
+            let err_msg = state.decode_error.lock().ok().and_then(|mut e| e.take());
+            if let Some(msg) = err_msg {
+                ui.set_status(format!("Skip: {}", msg));
+            }
             ui.current += 1;
+            // Force a full redraw so the next track's status line starts clean
+            // instead of leaving orphan lines from the previous render.
+            ui.terminal_resized = true;
+            prev_viz_lines = usize::MAX;
             continue 'playlist;
         }
 
@@ -777,7 +785,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                   && !state.should_quit()
             {
                 poll_input(&state, &mut ui, &mut playlist);
-                let _ = print_status(&state, &mut ui, &filename, &track_info, &track_ext, current_eq, current_fx, current_cf, &mut stats, prev_viz_lines, &playlist);
+                prev_viz_lines = print_status(&state, &mut ui, &filename, &track_info, &track_ext, current_eq, current_fx, current_cf, &mut stats, prev_viz_lines, &playlist);
                 thread::sleep(Duration::from_millis(20));
             }
         }
@@ -1089,11 +1097,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     print!("\x1B[J"); // Clear from cursor to end of screen
     println!("✓ Done");
+    io::stdout().flush().ok();
 
     // Release exclusive mode
     if let Some(id) = hog_device_id {
         audio::release_exclusive_mode(id);
     }
 
-    Ok(())
+    // Exit immediately — implicit drops of cpal::Stream (ALSA backend) and
+    // souvlaki::MediaControls (D-Bus) can block indefinitely on Linux, hanging
+    // the process after the user presses Q.
+    std::process::exit(0);
 }
