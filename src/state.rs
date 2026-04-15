@@ -28,6 +28,40 @@ pub const C_YELLOW: &str = "\x1B[33m";
 pub const C_MAGENTA: &str = "\x1B[35m";
 pub const C_RED: &str = "\x1B[31m";
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RepeatMode {
+    Off = 0,
+    All = 1,
+    One = 2,
+}
+
+impl RepeatMode {
+    pub fn from_u8(value: u8) -> Self {
+        match value {
+            1 => RepeatMode::All,
+            2 => RepeatMode::One,
+            _ => RepeatMode::Off,
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            RepeatMode::Off => RepeatMode::All,
+            RepeatMode::All => RepeatMode::One,
+            RepeatMode::One => RepeatMode::Off,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            RepeatMode::Off => "",
+            RepeatMode::All => " | repeat",
+            RepeatMode::One => " | repeat-1",
+        }
+    }
+}
+
 // Visualization style
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -199,6 +233,9 @@ pub struct PlayerState {
 
     // Stream error (device disconnected etc.)
     pub(crate) stream_error: AtomicBool,
+
+    // Repeat mode (Off/All/One) — readable by producer for repeat-one
+    pub(crate) repeat_mode: AtomicU8,
 }
 
 impl PlayerState {
@@ -255,7 +292,12 @@ impl PlayerState {
             rate_change_needed: AtomicBool::new(false),
             next_track_rate: AtomicU32::new(0),
             stream_error: AtomicBool::new(false),
+            repeat_mode: AtomicU8::new(RepeatMode::Off as u8),
         }
+    }
+
+    pub fn repeat_mode(&self) -> RepeatMode {
+        RepeatMode::from_u8(self.repeat_mode.load(Ordering::Relaxed))
     }
 
     pub fn toggle_pause(&self) { self.paused.fetch_xor(true, Ordering::Relaxed); }
@@ -486,7 +528,8 @@ pub struct UiState {
     pub current: usize,
     pub source_paths: Vec<PathBuf>,
     pub shuffle: bool,
-    pub repeat: bool,
+    pub repeat_mode: RepeatMode,
+    pub enqueue_count: usize,
     pub status_message: Option<(String, Instant)>,
     pub metadata_cache: std::sync::Arc<crate::metadata::MetadataCache>,
     pub scan_handle: Option<JoinHandle<()>>,
@@ -516,7 +559,8 @@ impl UiState {
             current: 0,
             source_paths,
             shuffle: false,
-            repeat: false,
+            repeat_mode: RepeatMode::Off,
+            enqueue_count: 0,
             status_message: None,
             metadata_cache,
             scan_handle: None,

@@ -634,6 +634,12 @@ pub fn decode_playlist(
             break; // Exit entire function
         }
 
+        // Repeat-one: replay same track, no crossfade tail
+        if state.repeat_mode() == crate::state::RepeatMode::One && !skipped {
+            crossfade_tail = None;
+            continue;
+        }
+
         // Exclusive mode: check if next track needs a different sample rate
         if state.exclusive.load(Ordering::Relaxed) && track_index + 1 < playlist.len() {
             if let Some(next_rate) = crate::audio::probe_sample_rate(&playlist[track_index + 1]) {

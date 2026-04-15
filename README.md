@@ -24,7 +24,7 @@ A high-performance, low-CPU terminal audio player with real-time spectrum visual
 - **Clipping indicator**: Persistent dot that turns red when signal exceeds 0dBFS, with peak safety limiter
 - **Smart audio processing**: Automatic sample rate switching (macOS), Bluetooth detection, conditional resampling, seamless device switching
 - **Volume control**: Adjustable 0-150% with per-sample gain
-- **Playlist features**: Shuffle, repeat, recursive folder scanning, playlist view with search, M3U import/export, folder rescan, multiple source paths with deduplication
+- **Playlist features**: Shuffle, repeat (all/one), recursive folder scanning, playlist view with search and track durations, play queue (enqueue tracks after current), M3U import/export, folder rescan, multiple source paths with deduplication
 - **Resume playback**: Save and restore last session (track, position, volume, EQ, effects, crossfeed, balance, device, exclusive) automatically
 - **HQ resampler mode**: Optional `--quality` flag for audiophile-grade resampling
 - **Resilient playback**: Silently skips missing/corrupt files, recovers from device disconnection (including USB DAC unplug)
@@ -88,6 +88,7 @@ keet ~/Music/favorites.m3u
 | `B` | Toggle visualization style (bars/dots) |
 | `E` | Cycle EQ presets |
 | `X` | Cycle effects presets |
+| `Shift+R` | Cycle repeat mode (Off → All → One) |
 | `R` | Rescan folders for changes |
 | `S` | Save playlist as M3U |
 | `F` | Toggle pre/post-fader metering |
@@ -107,10 +108,13 @@ Press `L` to open the playlist view, which replaces the visualization area with 
 |-----|--------|
 | `Up` / `Down` | Scroll track list |
 | `Enter` | Jump to selected track |
+| `A` | Enqueue selected track (move it to play next) |
 | `/` | Search/filter by filename |
 | `D` | Remove selected track |
 | `S` | Save playlist as M3U |
 | `Esc` / `L` | Close playlist view |
+
+Track durations are shown in a right-aligned column. The cursor follows the currently playing track on transitions.
 
 While searching (`/`), type to filter tracks by filename (case-insensitive). Press `Enter` to jump to the selected match, or `Esc` to cancel.
 

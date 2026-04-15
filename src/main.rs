@@ -76,21 +76,25 @@ fn build_resume_state(
     ui: &state::UiState,
     playlist: &[std::path::PathBuf],
     player_state: &state::PlayerState,
-    shuffle: bool,
-    repeat: bool,
     eq_presets: &[eq::EqPreset],
     fx_presets: &[effects::EffectsPreset],
     cf_presets: &[crossfeed::CrossfeedPreset],
     device_name: &Option<String>,
 ) -> ResumeState {
+    let repeat_mode_str = match ui.repeat_mode {
+        state::RepeatMode::Off => "off",
+        state::RepeatMode::All => "all",
+        state::RepeatMode::One => "one",
+    };
     ResumeState {
         source_paths: ui.source_paths.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
         track_path: playlist.get(ui.current)
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default(),
         position_secs: player_state.time_secs(),
-        shuffle,
-        repeat,
+        shuffle: ui.shuffle,
+        repeat: ui.repeat_mode != state::RepeatMode::Off,
+        repeat_mode: Some(repeat_mode_str.to_string()),
         volume: player_state.volume.load(std::sync::atomic::Ordering::Relaxed),
         eq_preset: eq_presets[player_state.eq_index()].name.clone(),
         effects_preset: fx_presets[player_state.effects_index()].name.clone(),
@@ -211,7 +215,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let flags = ["--shuffle", "-s", "--repeat", "-r", "--quality", "-q", "--eq", "-e", "--fx", "--crossfade", "-x", "--rg-mode", "--list-devices", "--device", "--exclusive", "--help", "-h"];
-    let (source_paths, shuffle, repeat) = if args.len() < 2 {
+    let (source_paths, shuffle, repeat_mode) = if args.len() < 2 {
         // Try resume from saved state
         match load_state() {
             Some(rs) => {
@@ -228,11 +232,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("No saved paths found");
                     std::process::exit(1);
                 }
-                (paths, rs.shuffle, rs.repeat)
+                let rm = match rs.repeat_mode.as_deref() {
+                    Some("one") => state::RepeatMode::One,
+                    Some("all") => state::RepeatMode::All,
+                    Some("off") => state::RepeatMode::Off,
+                    _ => if rs.repeat { state::RepeatMode::All } else { state::RepeatMode::Off },
+                };
+                (paths, rs.shuffle, rm)
             }
             None => {
                 match ui::run_first_launch_picker() {
-                    Some(p) => (vec![p], false, false),
+                    Some(p) => (vec![p], false, state::RepeatMode::Off),
                     None => {
                         eprintln!("Usage: {} <file-or-folder>... [--shuffle] [--repeat] [--quality] [--eq <name>] [--fx <name>] [--crossfade <secs>] [--rg-mode track|album|off] [--device <name>] [--exclusive] [--list-devices]", args[0]);
                         eprintln!("Controls: Space=Pause ↑↓=Tracks ←→=Seek V=Viz E=EQ X=FX L=List R=Rescan O=Open P=Pick +/-=Vol Q=Quit");
@@ -263,7 +273,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("No input files or folders specified");
             std::process::exit(1);
         }
-        (positional, s, r)
+        (positional, s, if r { state::RepeatMode::All } else { state::RepeatMode::Off })
     };
     let hq_resampler = args.iter().any(|a| a == "--quality" || a == "-q");
     let eq_arg = args.iter().position(|a| a == "--eq" || a == "-e")
@@ -416,7 +426,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let title = "Keet";
     use std::fmt::Write as FmtWrite;
 
-    let build_banner_box = |shuffle: bool, repeat: bool, state: &PlayerState| -> String {
+    let build_banner_box = |shuffle: bool, repeat_mode: state::RepeatMode, state: &PlayerState| -> String {
         let pad_left = (inner_w - title.len()) / 2;
         let pad_right = inner_w - title.len() - pad_left;
         let eq_name = &eq_presets[state.eq_index()].name;
@@ -432,7 +442,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else { String::new() };
         let info = format!("{}{}{}{}{}{}{}{}",
             if shuffle { "shuffle" } else { "sequential" },
-            if repeat { " | repeat" } else { "" },
+            repeat_mode.label(),
             if hq_resampler { " | HQ" } else { "" },
             eq_info, fx_info, xfade_info, cf_info, bal_info);
         let info_pad = inner_w.saturating_sub(info.chars().count() + 2);
@@ -445,7 +455,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         s
     };
 
-    let banner_box = build_banner_box(shuffle, repeat, &state);
+    let banner_box = build_banner_box(shuffle, repeat_mode, &state);
     let mut banner_tail = String::new();
 
     // Audio setup
@@ -504,7 +514,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let metadata_cache = metadata::MetadataCache::new(playlist.len());
     let mut ui = UiState::new(source_paths, std::sync::Arc::clone(&metadata_cache));
     ui.shuffle = shuffle;
-    ui.repeat = repeat;
+    ui.repeat_mode = repeat_mode;
+    state.repeat_mode.store(repeat_mode as u8, Ordering::Relaxed);
     ui.banner_lines = banner_lines;
     ui.banner_text = banner;
     ui.banner_tail = banner_tail;
@@ -608,7 +619,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Repeat-cycle check
         if ui.current >= playlist.len() {
-            if ui.repeat {
+            if ui.repeat_mode != state::RepeatMode::Off {
                 let old_playlist = playlist.clone();
 
                 let has_dir = ui.source_paths.iter().any(|p| p.is_dir());
@@ -813,7 +824,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 print!("\x1B[J");
                 io::stdout().flush().ok();
-                save_state(&build_resume_state(&ui, &playlist, &state, ui.shuffle, ui.repeat, &eq_presets, &fx_presets, &cf_presets, &device_arg));
+                save_state(&build_resume_state(&ui, &playlist, &state, &eq_presets, &fx_presets, &cf_presets, &device_arg));
                 if let Some(id) = hog_device_id {
                     audio::release_exclusive_mode(id);
                 }
@@ -844,7 +855,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 if new_index < playlist.len() {
                     ui.current = new_index;
+                    ui.enqueue_count = 0;
                     state.current_track.store(ui.current, Ordering::Relaxed);
+
+                    if ui.view_mode == state::ViewMode::Playlist && ui.filtered_indices.is_empty() {
+                        ui.cursor = ui.current;
+                    }
 
                     // Update display info for new track
                     let new_path = &playlist[ui.current];
@@ -878,7 +894,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         media_keys::update_playback(mc, state.is_paused(), 0.0);
                     }
 
-                    save_state(&build_resume_state(&ui, &playlist, &state, ui.shuffle, ui.repeat, &eq_presets, &fx_presets, &cf_presets, &device_arg));
+                    save_state(&build_resume_state(&ui, &playlist, &state, &eq_presets, &fx_presets, &cf_presets, &device_arg));
                 }
             }
 
@@ -899,6 +915,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else if state.take_skip_prev() {
                     ui.current = ui.current.saturating_sub(1);
                 }
+                ui.enqueue_count = 0;
                 continue 'playlist;
             }
 
@@ -1002,7 +1019,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Err(_) => break 'playlist,
                 }
 
-                save_state(&build_resume_state(&ui, &playlist, &state, ui.shuffle, ui.repeat, &eq_presets, &fx_presets, &cf_presets, &device_arg));
+                save_state(&build_resume_state(&ui, &playlist, &state, &eq_presets, &fx_presets, &cf_presets, &device_arg));
                 ui.current = playlist.len(); // Will trigger repeat-cycle or exit
                 continue 'playlist;
             }
@@ -1045,7 +1062,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 if ui.banner_dirty {
                     ui.banner_dirty = false;
-                    let new_box = build_banner_box(ui.shuffle, ui.repeat, &state);
+                    let new_box = build_banner_box(ui.shuffle, ui.repeat_mode, &state);
                     ui.banner_text = format!("{}{}", new_box, ui.banner_tail);
                     ui.banner_lines = ui.banner_text.lines().count();
                     ui.terminal_resized = true;

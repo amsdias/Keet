@@ -10,6 +10,7 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::{MetadataOptions, StandardTagKey, Value};
 use symphonia::core::probe::Hint;
 
+#[derive(Clone)]
 struct CachedMeta {
     display: String,
     search_text: String,
@@ -26,6 +27,7 @@ struct CachedMeta {
     #[allow(dead_code)]
     rg_album_peak: Option<f32>,
     lyrics: Option<String>,
+    duration_secs: Option<f64>,
 }
 
 pub struct MetadataCache {
@@ -113,6 +115,19 @@ impl MetadataCache {
         }
     }
 
+    pub fn duration(&self, index: usize) -> Option<f64> {
+        let entries = self.entries.lock().unwrap();
+        entries.get(index).and_then(|e| e.as_ref()).and_then(|m| m.duration_secs)
+    }
+
+    pub fn move_entry(&self, from: usize, to: usize) {
+        let mut entries = self.entries.lock().unwrap();
+        if from >= entries.len() { return; }
+        let meta = entries.remove(from);
+        let dst = to.min(entries.len());
+        entries.insert(dst, meta);
+    }
+
     pub fn is_set(&self, index: usize) -> bool {
         let entries = self.entries.lock().unwrap();
         entries.get(index).map(|e| e.is_some()).unwrap_or(false)
@@ -144,6 +159,18 @@ fn read_metadata_full(path: &Path) -> Option<CachedMeta> {
     let mut probed = symphonia::default::get_probe()
         .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
         .ok()?;
+
+    let duration_secs: Option<f64> = probed.format.tracks().iter()
+        .find(|t| t.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL)
+        .and_then(|t| {
+            if let (Some(n_frames), Some(rate)) = (t.codec_params.n_frames, t.codec_params.sample_rate) {
+                if rate > 0 { return Some(n_frames as f64 / rate as f64); }
+            }
+            if let (Some(tb), Some(n_frames)) = (t.codec_params.time_base, t.codec_params.n_frames) {
+                return Some(n_frames as f64 * tb.numer as f64 / tb.denom as f64);
+            }
+            None
+        });
 
     let mut title: Option<String> = None;
     let mut artist: Option<String> = None;
@@ -233,18 +260,17 @@ fn read_metadata_full(path: &Path) -> Option<CachedMeta> {
         }
     }
 
+    let filename = path.file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
     let display = match (&artist, &title) {
         (Some(a), Some(t)) => format!("{} - {}", a, t),
         (None, Some(t)) => t.clone(),
         (Some(a), None) => a.clone(),
-        (None, None) => return None,
+        (None, None) => filename.to_string(),
     };
 
-    let filename = path.file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_lowercase();
-    let search_text = format!("{}\0{}", display.to_lowercase(), filename);
+    let search_text = format!("{}\0{}", display.to_lowercase(), filename.to_lowercase());
 
     Some(CachedMeta {
         display,
@@ -256,6 +282,7 @@ fn read_metadata_full(path: &Path) -> Option<CachedMeta> {
         rg_album_gain,
         rg_album_peak,
         lyrics,
+        duration_secs,
     })
 }
 

@@ -15,6 +15,8 @@ pub struct ResumeState {
     pub eq_preset: String,
     pub effects_preset: String,
     #[serde(default)]
+    pub repeat_mode: Option<String>,
+    #[serde(default)]
     pub rg_mode: Option<String>,
     #[serde(default)]
     pub device: Option<String>,

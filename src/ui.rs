@@ -60,6 +60,22 @@ fn truncate_ansi(s: &str, max_width: usize) -> String {
     result
 }
 
+fn truncate_plain(s: &str, max_width: usize) -> String {
+    if s.chars().count() <= max_width {
+        s.to_string()
+    } else if max_width > 1 {
+        let mut out: String = s.chars().take(max_width - 1).collect();
+        out.push('…');
+        out
+    } else {
+        s.chars().take(max_width).collect()
+    }
+}
+
+fn visible_len(s: &str) -> usize {
+    s.chars().count()
+}
+
 pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_info: &str, ext: &str, eq_preset: &crate::eq::EqPreset, fx_name: &str, cf_name: &str, stats: &mut StatsMonitor, prev_viz_lines: usize, playlist: &[PathBuf]) -> usize {
     let viz_mode = state.viz_mode();
     let viz_style = state.viz_style();
@@ -230,21 +246,36 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
                 let is_playing = track_idx == ui.current;
                 let is_cursor = list_pos == ui.cursor;
                 let fname = ui.metadata_cache.display_name(track_idx, &playlist[track_idx]);
+                let dur_str = match ui.metadata_cache.duration(track_idx) {
+                    Some(d) => format_time(d),
+                    None => String::new(),
+                };
 
                 let marker = if is_playing { "▶" } else { " " };
                 let num = format!("{:>4}", track_idx + 1);
-
-                let line = if is_cursor && is_playing {
-                    format!(" {marker} \x1B[7m{C_GREEN}{num}  {fname}{C_RESET}")
-                } else if is_cursor {
-                    format!(" {marker} \x1B[7m{num}  {fname}\x1B[27m")
-                } else if is_playing {
-                    format!(" {marker} {C_GREEN}{num}  {fname}{C_RESET}")
+                // prefix: " ▶ 1234  " = 10 visible chars, dur + trailing space = dur_str.len() + 2
+                let prefix_len = 10;
+                let dur_col = if dur_str.is_empty() { 0 } else { dur_str.len() + 2 };
+                let name_budget = term_w.saturating_sub(prefix_len + dur_col);
+                let truncated_name = truncate_plain(&fname, name_budget);
+                let pad = name_budget.saturating_sub(visible_len(&truncated_name));
+                let dur_part = if dur_str.is_empty() {
+                    String::new()
                 } else {
-                    format!(" {marker} {C_DIM}{num}{C_RESET}  {fname}")
+                    format!("{}{C_DIM}{dur_str}{C_RESET}", " ".repeat(pad + 1))
                 };
 
-                print!("\n\r\x1B[K{}", truncate_ansi(&line, term_w));
+                let line = if is_cursor && is_playing {
+                    format!(" {marker} \x1B[7m{C_GREEN}{num}  {truncated_name}{C_RESET}\x1B[7m{dur_part}\x1B[27m")
+                } else if is_cursor {
+                    format!(" {marker} \x1B[7m{num}  {truncated_name}{dur_part}\x1B[27m")
+                } else if is_playing {
+                    format!(" {marker} {C_GREEN}{num}  {truncated_name}{C_RESET}{dur_part}")
+                } else {
+                    format!(" {marker} {C_DIM}{num}{C_RESET}  {truncated_name}{dur_part}")
+                };
+
+                print!("\n\r\x1B[K{}", line);
             }
 
             // Pad remaining rows
@@ -265,7 +296,7 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
                 if let Some(msg) = ui.take_status() {
                     format!("  {C_GREEN}{msg}{C_RESET}")
                 } else {
-                    format!("  {C_DIM}[L] close  [↑↓] scroll  [Enter] play  [/] search  [D] remove  [S] save{C_RESET}")
+                    format!("  {C_DIM}[L] close  [↑↓] scroll  [Enter] play  [A] enqueue  [/] search  [D] remove  [S] save{C_RESET}")
                 }
             }
         };
@@ -466,6 +497,10 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
                         ui.input_mode = InputMode::Search(String::new());
                         return false;
                     }
+                    KeyEvent { code: KeyCode::Char('a'), .. } => {
+                        enqueue_track(state, ui, playlist);
+                        return false;
+                    }
                     KeyEvent { code: KeyCode::Char('d'), .. } |
                     KeyEvent { code: KeyCode::Delete, .. } => {
                         remove_track(state, ui, playlist);
@@ -518,10 +553,10 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
                     ui.input_mode = InputMode::SavePlaylist(String::new());
                 }
                 KeyEvent { code: KeyCode::Char('r'), modifiers, .. } if modifiers.contains(KeyModifiers::SHIFT) => {
-                    toggle_repeat(ui);
+                    toggle_repeat(ui, state);
                 }
                 KeyEvent { code: KeyCode::Char('R'), .. } => {
-                    toggle_repeat(ui);
+                    toggle_repeat(ui, state);
                 }
                 KeyEvent { code: KeyCode::Char('r'), .. } => {
                     rescan(state, ui, playlist);
@@ -783,10 +818,64 @@ fn toggle_shuffle(ui: &mut UiState, playlist: &mut Vec<PathBuf>) {
     ui.banner_dirty = true;
 }
 
-fn toggle_repeat(ui: &mut UiState) {
-    ui.repeat = !ui.repeat;
-    ui.set_status(if ui.repeat { "Repeat ON".to_string() } else { "Repeat OFF".to_string() });
+fn toggle_repeat(ui: &mut UiState, state: &PlayerState) {
+    ui.repeat_mode = ui.repeat_mode.next();
+    state.repeat_mode.store(ui.repeat_mode as u8, Ordering::Relaxed);
+    let msg = match ui.repeat_mode {
+        crate::state::RepeatMode::Off => "Repeat OFF",
+        crate::state::RepeatMode::All => "Repeat ALL",
+        crate::state::RepeatMode::One => "Repeat ONE",
+    };
+    ui.set_status(msg.to_string());
     ui.banner_dirty = true;
+}
+
+fn enqueue_track(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<PathBuf>) {
+    let track_idx = if ui.filtered_indices.is_empty() {
+        ui.cursor
+    } else {
+        match ui.filtered_indices.get(ui.cursor) {
+            Some(&idx) => idx,
+            None => return,
+        }
+    };
+    if track_idx >= playlist.len() || track_idx == ui.current { return; }
+
+    // Target position: right after current + any previously enqueued tracks
+    let target = ui.current + 1 + ui.enqueue_count;
+    let target = target.min(playlist.len().saturating_sub(1));
+
+    if track_idx == target { return; }
+
+    let name = ui.metadata_cache.display_name(track_idx, &playlist[track_idx]);
+
+    // Move track in playlist and metadata cache
+    let path = playlist.remove(track_idx);
+    let dst = if track_idx < target { target - 1 } else { target };
+    playlist.insert(dst, path);
+    ui.metadata_cache.move_entry(track_idx, dst);
+
+    // Recalculate ui.current — it may have shifted
+    // If we removed before current, current shifted down; if we inserted at/before current, it shifted up
+    if track_idx < ui.current && dst >= ui.current {
+        ui.current -= 1;
+    } else if track_idx > ui.current && dst <= ui.current {
+        ui.current += 1;
+    }
+
+    // Keep cursor on the same logical track
+    if track_idx == ui.cursor {
+        ui.cursor = dst;
+    } else if track_idx < ui.cursor && dst >= ui.cursor {
+        ui.cursor -= 1;
+    } else if track_idx > ui.cursor && dst <= ui.cursor {
+        ui.cursor += 1;
+    }
+
+    ui.enqueue_count += 1;
+    ui.playlist_dirty = true;
+    state.total_tracks.store(playlist.len(), Ordering::Relaxed);
+    ui.set_status(format!("Queued: {}", name));
 }
 
 /// Replace the current music source with a new path, rebuild the playlist,
