@@ -357,65 +357,57 @@ pub struct EffectsPreset {
 // --- Effects Chain ---
 
 pub struct EffectsChain {
-    reverb: Freeverb,
-    chorus: Chorus,
-    delay: Delay,
-    has_reverb: bool,
-    has_chorus: bool,
-    has_delay: bool,
+    reverb: Option<Freeverb>,
+    chorus: Option<Chorus>,
+    delay: Option<Delay>,
 }
 
 impl EffectsChain {
-    pub fn new(sample_rate: f32) -> Self {
-        Self {
-            reverb: Freeverb::new(sample_rate),
-            chorus: Chorus::new(sample_rate),
-            delay: Delay::new(sample_rate),
-            has_reverb: false,
-            has_chorus: false,
-            has_delay: false,
-        }
+    pub fn new(_sample_rate: f32) -> Self {
+        // Lazy: skip the ~44KB reverb/chorus/delay allocations until a preset that
+        // needs them is loaded. The "None" preset keeps this at zero overhead.
+        Self { reverb: None, chorus: None, delay: None }
     }
 
     pub fn load_preset(&mut self, preset: &EffectsPreset, sample_rate: f32) {
-        self.has_reverb = false;
-        self.has_chorus = false;
-        self.has_delay = false;
+        self.reverb = None;
+        self.chorus = None;
+        self.delay = None;
 
         if let Some(ref r) = preset.reverb {
-            self.reverb = Freeverb::new(sample_rate);
-            self.reverb.set_params(r.room_size, r.damping, r.wet, r.dry, r.width);
-            self.has_reverb = true;
+            let mut rv = Freeverb::new(sample_rate);
+            rv.set_params(r.room_size, r.damping, r.wet, r.dry, r.width);
+            self.reverb = Some(rv);
         }
         if let Some(ref c) = preset.chorus {
-            self.chorus = Chorus::new(sample_rate);
-            self.chorus.set_params(c.rate, c.depth, c.wet);
-            self.has_chorus = true;
+            let mut ch = Chorus::new(sample_rate);
+            ch.set_params(c.rate, c.depth, c.wet);
+            self.chorus = Some(ch);
         }
         if let Some(ref d) = preset.delay {
             if d.delay_ms > 0.0 {
-                self.delay = Delay::new(sample_rate);
-                self.delay.set_params(d.delay_ms, d.feedback, d.wet, sample_rate);
-                self.has_delay = true;
+                let mut dl = Delay::new(sample_rate);
+                dl.set_params(d.delay_ms, d.feedback, d.wet, sample_rate);
+                self.delay = Some(dl);
             }
         }
     }
 
     pub fn reset(&mut self) {
-        self.reverb.reset();
-        self.chorus.reset();
-        self.delay.reset();
+        if let Some(r) = self.reverb.as_mut() { r.reset(); }
+        if let Some(c) = self.chorus.as_mut() { c.reset(); }
+        if let Some(d) = self.delay.as_mut() { d.reset(); }
     }
 
     pub fn is_active(&self) -> bool {
-        self.has_reverb || self.has_chorus || self.has_delay
+        self.reverb.is_some() || self.chorus.is_some() || self.delay.is_some()
     }
 
     /// Process interleaved stereo samples: chorus -> delay -> reverb
     pub fn process_stereo(&mut self, samples: &mut [f32]) {
-        if self.has_chorus { self.chorus.process_stereo(samples); }
-        if self.has_delay { self.delay.process_stereo(samples); }
-        if self.has_reverb { self.reverb.process_stereo(samples); }
+        if let Some(c) = self.chorus.as_mut() { c.process_stereo(samples); }
+        if let Some(d) = self.delay.as_mut() { d.process_stereo(samples); }
+        if let Some(r) = self.reverb.as_mut() { r.process_stereo(samples); }
 
         // Safety limiter: prevent effects from exceeding 0dBFS
         let peak = samples.iter().fold(0.0f32, |m, &s| m.max(s.abs()));

@@ -10,6 +10,9 @@ pub struct ResumeState {
     pub track_path: String,
     pub position_secs: f64,
     pub shuffle: bool,
+    /// Legacy field: older state files stored a bool before `repeat_mode` was added.
+    /// Read-only for back-compat; no longer written. Use `repeat_mode` instead.
+    #[serde(default, skip_serializing)]
     pub repeat: bool,
     pub volume: u32,
     pub eq_preset: String,
@@ -38,7 +41,13 @@ pub fn save_state(state: &ResumeState) {
             let _ = std::fs::create_dir_all(parent);
         }
         if let Ok(json) = serde_json::to_string_pretty(state) {
-            let _ = std::fs::write(&path, json);
+            // Write to a sibling temp file then rename, so a crash mid-write
+            // can't leave a truncated state.json behind. fs::rename is atomic
+            // on the same filesystem on both POSIX and Windows.
+            let tmp_path = path.with_extension("json.tmp");
+            if std::fs::write(&tmp_path, json).is_ok() {
+                let _ = std::fs::rename(&tmp_path, &path);
+            }
         }
     }
 }

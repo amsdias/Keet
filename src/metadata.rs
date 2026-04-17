@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use std::thread::{self, JoinHandle};
 
 use symphonia::core::formats::FormatOptions;
@@ -31,7 +31,9 @@ struct CachedMeta {
 }
 
 pub struct MetadataCache {
-    entries: Mutex<Vec<Option<CachedMeta>>>,
+    // RwLock: many concurrent readers (UI playlist render) vs rare writers
+    // (background scan threads). Mutex caused UI stutter on large libraries.
+    entries: RwLock<Vec<Option<CachedMeta>>>,
     pub cancel: AtomicBool,
 }
 
@@ -39,13 +41,13 @@ impl MetadataCache {
     pub fn new(len: usize) -> Arc<Self> {
         let entries: Vec<Option<CachedMeta>> = (0..len).map(|_| None).collect();
         Arc::new(Self {
-            entries: Mutex::new(entries),
+            entries: RwLock::new(entries),
             cancel: AtomicBool::new(false),
         })
     }
 
     pub fn display_name(&self, index: usize, path: &Path) -> String {
-        let entries = self.entries.lock().unwrap();
+        let entries = self.entries.read().unwrap();
         if let Some(Some(meta)) = entries.get(index) {
             meta.display.clone()
         } else {
@@ -60,7 +62,7 @@ impl MetadataCache {
         if query.is_empty() {
             return false;
         }
-        let entries = self.entries.lock().unwrap();
+        let entries = self.entries.read().unwrap();
         if let Some(Some(meta)) = entries.get(index) {
             meta.search_text.contains(query)
         } else {
@@ -73,12 +75,12 @@ impl MetadataCache {
     }
 
     pub fn lyrics(&self, index: usize) -> Option<String> {
-        let entries = self.entries.lock().unwrap();
+        let entries = self.entries.read().unwrap();
         entries.get(index).and_then(|e| e.as_ref()).and_then(|m| m.lyrics.clone())
     }
 
     pub fn artist_title(&self, index: usize) -> (Option<String>, Option<String>) {
-        let entries = self.entries.lock().unwrap();
+        let entries = self.entries.read().unwrap();
         if let Some(Some(meta)) = entries.get(index) {
             (meta.artist.clone(), meta.title.clone())
         } else {
@@ -87,14 +89,14 @@ impl MetadataCache {
     }
 
     fn set(&self, index: usize, meta: CachedMeta) {
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.write().unwrap();
         if index < entries.len() {
             entries[index] = Some(meta);
         }
     }
 
     pub fn reindex(&self, new_playlist: &[PathBuf], old_playlist: &[PathBuf]) {
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.write().unwrap();
         let mut map: HashMap<PathBuf, CachedMeta> = HashMap::new();
         for (i, path) in old_playlist.iter().enumerate() {
             if let Some(meta) = entries.get_mut(i).and_then(|e| e.take()) {
@@ -109,19 +111,19 @@ impl MetadataCache {
     }
 
     pub fn remove_at(&self, index: usize) {
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.write().unwrap();
         if index < entries.len() {
             entries.remove(index);
         }
     }
 
     pub fn duration(&self, index: usize) -> Option<f64> {
-        let entries = self.entries.lock().unwrap();
+        let entries = self.entries.read().unwrap();
         entries.get(index).and_then(|e| e.as_ref()).and_then(|m| m.duration_secs)
     }
 
     pub fn move_entry(&self, from: usize, to: usize) {
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.write().unwrap();
         if from >= entries.len() { return; }
         let meta = entries.remove(from);
         let dst = to.min(entries.len());
@@ -129,7 +131,7 @@ impl MetadataCache {
     }
 
     pub fn is_set(&self, index: usize) -> bool {
-        let entries = self.entries.lock().unwrap();
+        let entries = self.entries.read().unwrap();
         entries.get(index).map(|e| e.is_some()).unwrap_or(false)
     }
 }

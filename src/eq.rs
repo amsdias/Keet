@@ -169,8 +169,7 @@ pub fn render_eq_curve(preset: &EqPreset) -> String {
 
     // Display 20 log-spaced points across 20Hz-20kHz, interpolating gain from all bands
     let n_points = 20;
-    let chars_pos: &[char] = &[' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    let chars_neg: &[char] = &[' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let bars: &[char] = &[' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
     let mut result = format!("  {C_DIM}EQ:{C_RESET} ");
 
@@ -193,10 +192,10 @@ pub fn render_eq_curve(preset: &EqPreset) -> String {
         let (ch, color) = if gain > 0.1 {
             let idx = ((gain / 8.0) * 8.0).clamp(1.0, 8.0) as usize;
             let color = if gain > 5.0 { C_RED } else if gain > 3.0 { C_YELLOW } else { C_GREEN };
-            (chars_pos[idx], color)
+            (bars[idx], color)
         } else if gain < -0.1 {
             let idx = ((-gain / 8.0) * 8.0).clamp(1.0, 8.0) as usize;
-            (chars_neg[idx], C_CYAN)
+            (bars[idx], C_CYAN)
         } else {
             ('·', C_DIM)
         };

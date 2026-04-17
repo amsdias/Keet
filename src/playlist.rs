@@ -4,13 +4,25 @@ use std::path::{Path, PathBuf};
 use crate::state::SUPPORTED_EXTENSIONS;
 
 pub fn shuffle_list(list: &mut [PathBuf]) {
-    let mut rng = std::time::SystemTime::now()
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // A monotonic counter ensures two shuffles within the same clock tick still
+    // get distinct seeds (wall-clock nanos alone isn't enough when called back-to-back).
+    static SEED_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
-        .unwrap_or(12345);
+        .unwrap_or(0x9E3779B97F4A7C15);
+    let counter = SEED_COUNTER.fetch_add(1, Ordering::Relaxed);
+    // SplitMix64 finalizer — scrambles correlated inputs into uncorrelated 64-bit states.
+    let mut seed = nanos ^ counter.wrapping_mul(0x9E3779B97F4A7C15);
+    seed = (seed ^ (seed >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    seed = (seed ^ (seed >> 27)).wrapping_mul(0x94D049BB133111EB);
+    seed ^= seed >> 31;
+
+    let mut rng = seed;
     for i in (1..list.len()).rev() {
-        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
-        list.swap(i, rng as usize % (i + 1));
+        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        list.swap(i, (rng >> 32) as usize % (i + 1));
     }
 }
 

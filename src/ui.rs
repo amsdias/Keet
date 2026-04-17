@@ -137,15 +137,7 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
     // Format: "[N/M] ♪ NAME INFO" — overhead is ~10 + track_info.len()
     let overhead = format!("[{track}/{total}] ♪  ").len() + track_info.len() + 1;
     let max_name = term_w.saturating_sub(overhead).min(35);
-    let display_name = if name.len() > max_name {
-        if max_name > 1 {
-            format!("{}…", &name[..max_name - 1])
-        } else {
-            "…".to_string()
-        }
-    } else {
-        name.to_string()
-    };
+    let display_name = truncate_plain(name, max_name);
 
     // Move cursor back to start of our output area (single atomic escape)
     if prev_viz_lines != usize::MAX {
@@ -207,12 +199,15 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
         print!("\n\r\x1B[K  {C_DIM}{}{C_RESET}", "─".repeat(term_w.saturating_sub(2)));
 
         let search_active = matches!(&ui.input_mode, InputMode::Search(q) if !q.is_empty());
-        let items: Vec<usize> = if search_active && ui.filtered_indices.is_empty() {
-            Vec::new()
-        } else if !search_active && ui.filtered_indices.is_empty() {
-            (0..playlist.len()).collect()
+        // Compute the item count without materializing the full index vector.
+        // When the search filter is empty (and search inactive), iterate `0..playlist.len()`
+        // virtually; otherwise iterate `ui.filtered_indices` directly.
+        let items_len = if search_active && ui.filtered_indices.is_empty() {
+            0
+        } else if ui.filtered_indices.is_empty() {
+            playlist.len()
         } else {
-            ui.filtered_indices.clone()
+            ui.filtered_indices.len()
         };
 
         // Ensure cursor is visible with a scroll margin (scrolloff)
@@ -226,23 +221,24 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
         }
 
         // Clamp offset to prevent overscroll empty padding at the bottom of the list
-        let max_offset = items.len().saturating_sub(visible_rows);
+        let max_offset = items_len.saturating_sub(visible_rows);
         ui.scroll_offset = ui.scroll_offset.min(max_offset);
 
-        if items.is_empty() && search_active {
+        if items_len == 0 && search_active {
             print!("\n\r\x1B[K  {C_DIM}(no matches){C_RESET}");
             for _ in 1..visible_rows {
                 print!("\n\r\x1B[K");
             }
         } else {
-            let display_items: Vec<usize> = items.iter()
-                .skip(ui.scroll_offset)
-                .take(visible_rows)
-                .copied()
-                .collect();
+            let visible_count = visible_rows.min(items_len.saturating_sub(ui.scroll_offset));
 
-            for (row, &track_idx) in display_items.iter().enumerate() {
+            for row in 0..visible_count {
                 let list_pos = ui.scroll_offset + row;
+                let track_idx = if ui.filtered_indices.is_empty() {
+                    list_pos
+                } else {
+                    ui.filtered_indices[list_pos]
+                };
                 let is_playing = track_idx == ui.current;
                 let is_cursor = list_pos == ui.cursor;
                 let fname = ui.metadata_cache.display_name(track_idx, &playlist[track_idx]);
@@ -279,7 +275,7 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
             }
 
             // Pad remaining rows
-            for _ in display_items.len()..visible_rows {
+            for _ in visible_count..visible_rows {
                 print!("\n\r\x1B[K");
             }
         }

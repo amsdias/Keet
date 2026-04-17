@@ -5,7 +5,9 @@ use std::time::Instant;
 use std::path::PathBuf;
 
 pub const SUPPORTED_EXTENSIONS: &[&str] = &["mp3", "flac", "wav", "ogg", "aac", "m4a", "mp4", "m4b", "aiff", "aif"];
-pub const RING_BUFFER_SIZE: usize = 48000 * 2 * 4; // ~4 sec stereo
+// Sized for the worst-case output rate (192 kHz stereo, ~4 sec). At 48 kHz this gives
+// ~16 sec of headroom, which is fine — the producer only fills to a fraction and sleeps.
+pub const RING_BUFFER_SIZE: usize = 192_000 * 2 * 4;
 pub const VIZ_BUFFER_SIZE: usize = 8192; // Small buffer for viz tap from audio callback
 
 // Visualization constants
@@ -163,10 +165,8 @@ pub struct PlayerState {
     // Buffer level (updated by producer, read by UI)
     pub(crate) buffer_level: AtomicUsize,
 
-    // Seek flush: number of samples consumer should discard (for instant seek)
-    pub(crate) discard_samples: AtomicU64,
-
-    // Signal consumer to reset its local counter (for seek)
+    // Signal consumer to drain the ring buffer (for seek/skip).
+    // Triggers an immediate full drain in the audio callback.
     pub(crate) reset_consumer_counter: AtomicBool,
 
     // Visualization state
@@ -258,7 +258,6 @@ impl PlayerState {
             producer_done: AtomicBool::new(false),
             track_info_ready: AtomicBool::new(false),
             buffer_level: AtomicUsize::new(0),
-            discard_samples: AtomicU64::new(0),
             reset_consumer_counter: AtomicBool::new(false),
             viz_mode: AtomicU8::new(VizMode::None as u8),
             peak_left: AtomicU32::new(0),
@@ -546,6 +545,9 @@ pub struct UiState {
     pub lyrics_scroll: usize,
     pub lyrics_auto_scroll: bool,
     pub lyrics_offset: f64, // seconds, positive = lyrics later, negative = lyrics earlier
+    /// Monotonic counter incremented on each lyrics spawn. Workers capture a snapshot
+    /// and abort their slow LRCLIB fetch if the counter has advanced (i.e. user skipped).
+    pub lyrics_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl UiState {
@@ -577,6 +579,7 @@ impl UiState {
             lyrics_scroll: 0,
             lyrics_auto_scroll: true,
             lyrics_offset: 0.0,
+            lyrics_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 

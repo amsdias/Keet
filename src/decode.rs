@@ -20,50 +20,45 @@ use rtrb::Producer;
 use crate::state::{PlayerState, RING_BUFFER_SIZE};
 use crate::state::RgMode;
 
-fn interleave_f32_planes(buf: &symphonia::core::audio::AudioBuffer<f32>) -> Vec<f32> {
+fn interleave_f32_planes_into(buf: &symphonia::core::audio::AudioBuffer<f32>, out: &mut Vec<f32>) {
     let spec = buf.planes();
     let p = spec.planes();
-    let mut out = Vec::with_capacity(buf.frames() * p.len());
+    out.reserve(buf.frames() * p.len());
     for f in 0..buf.frames() {
         for ch in p { out.push(ch[f]); }
     }
-    out
 }
 
-fn convert_samples(buf: &AudioBufferRef) -> Vec<f32> {
+fn convert_samples_into(buf: &AudioBufferRef, out: &mut Vec<f32>) {
     match buf {
-        AudioBufferRef::F32(b) => interleave_f32_planes(b),
+        AudioBufferRef::F32(b) => interleave_f32_planes_into(b, out),
         AudioBufferRef::S16(b) => {
             let spec = b.planes();
             let p = spec.planes();
-            let mut out = Vec::with_capacity(b.frames() * p.len());
+            out.reserve(b.frames() * p.len());
             for f in 0..b.frames() {
                 for ch in p { out.push(ch[f] as f32 / 32768.0); }
             }
-            out
         }
         AudioBufferRef::S32(b) => {
             let spec = b.planes();
             let p = spec.planes();
-            let mut out = Vec::with_capacity(b.frames() * p.len());
+            out.reserve(b.frames() * p.len());
             for f in 0..b.frames() {
                 for ch in p { out.push(ch[f] as f32 / 2147483648.0); }
             }
-            out
         }
         // Catchall for S24/U8/U16/U24/U32/F64: convert via symphonia's make_equivalent.
-        // Previously this returned vec![] which silently starved the ring buffer → clicks/silence.
-        _ => interleave_f32_planes(&buf.make_equivalent::<f32>()),
+        _ => interleave_f32_planes_into(&buf.make_equivalent::<f32>(), out),
     }
 }
 
-fn deinterleave(samples: &[f32], ch: usize) -> Vec<Vec<f32>> {
-    let frames = samples.len() / ch;
-    let mut out = vec![Vec::with_capacity(frames); ch];
+fn deinterleave_into(samples: &[f32], ch: usize, out: &mut Vec<Vec<f32>>) {
+    out.resize_with(ch, Vec::new);
+    for plane in out.iter_mut() { plane.clear(); }
     for (i, &s) in samples.iter().enumerate() {
         out[i % ch].push(s);
     }
-    out
 }
 
 /// ReplayGain tag values parsed from a single track.
@@ -150,7 +145,13 @@ pub fn decode_playlist(
     let mut track_index = start_index;
 
     while track_index < playlist.len() {
-        if state.should_quit() || state.take_skip_prev() || state.take_jump().is_some() {
+        // Non-destructive peek: main.rs is the single consumer of skip_prev / jump_to_track
+        // (via take_skip_prev / take_jump). If producer consumed these here, a race would
+        // let main.rs miss the signal and wrongly advance to the next track.
+        if state.should_quit()
+            || state.skip_prev.load(Ordering::Relaxed)
+            || state.jump_to_track.load(Ordering::Relaxed) >= 0
+        {
             break;
         }
 
@@ -254,7 +255,6 @@ pub fn decode_playlist(
                     break;
                 }
                 if state.take_skip_next() {
-                    state.discard_samples.store(buffered as u64, Ordering::Relaxed);
                     state.reset_consumer_counter.store(true, Ordering::Relaxed);
                     break;
                 }
@@ -331,13 +331,18 @@ pub fn decode_playlist(
         let mut interleaved_out: Vec<f32> = Vec::with_capacity(chunk_size * channels * 2);
         let mut decoded_buf: Vec<f32> = Vec::with_capacity(chunk_size * channels * 2);
         let mut chunk_buf: Vec<f32> = Vec::with_capacity(chunk_size * channels);
+        // Scratch for per-packet symphonia → interleaved f32 conversion. Retained across
+        // iterations so we don't malloc on every packet.
+        let mut raw_buf: Vec<f32> = Vec::with_capacity(chunk_size * channels * 2);
+        // Scratch for resampler flush deinterleave on EOF.
+        let mut flush_planes: Vec<Vec<f32>> = Vec::with_capacity(channels);
         let mut eq_buf: Vec<f32> = Vec::with_capacity(chunk_size * channels * 2);
         let mut fx_buf: Vec<f32> = Vec::with_capacity(chunk_size * channels * 2);
         let mut rg_buf: Vec<f32> = Vec::with_capacity(chunk_size * channels * 2);
         let mut xfeed_buf: Vec<f32> = Vec::with_capacity(chunk_size * channels * 2);
         let mut bal_buf: Vec<f32> = Vec::with_capacity(chunk_size * channels * 2);
-        // Scratch for crossfade-mixed / limited output. Only touched when samples need
-        // mutation; steady-state playback reads bal_output directly and skips this.
+        // Scratch for crossfade-mixed output. Only touched while a tail is being
+        // mixed in; steady-state playback reads bal_output directly and skips this.
         let mut final_buf: Vec<f32> = Vec::with_capacity(chunk_size * channels * 2);
 
         // --- Packet decode loop ---
@@ -353,9 +358,7 @@ pub fn decode_playlist(
             }
             // Check skip-next — flush buffer and advance to next track
             if state.take_skip_next() {
-                let buffered = RING_BUFFER_SIZE - producer.slots();
-                if buffered > 0 {
-                    state.discard_samples.store(buffered as u64, Ordering::Relaxed);
+                if RING_BUFFER_SIZE - producer.slots() > 0 {
                     state.reset_consumer_counter.store(true, Ordering::Relaxed);
                 }
                 skipped = true;
@@ -372,8 +375,6 @@ pub fn decode_playlist(
                 effects.reset();
                 crossfeed.reset();
 
-                let buffered = RING_BUFFER_SIZE - producer.slots();
-                state.discard_samples.store(buffered as u64, Ordering::Relaxed);
                 state.reset_consumer_counter.store(true, Ordering::Relaxed);
 
                 if probed.format.seek(SeekMode::Coarse, SeekTo::Time {
@@ -434,10 +435,11 @@ pub fn decode_playlist(
                 Err(_) => continue,
             };
 
-            let raw = convert_samples(&decoded);
-            if raw.is_empty() { continue; }
+            raw_buf.clear();
+            convert_samples_into(&decoded, &mut raw_buf);
+            if raw_buf.is_empty() { continue; }
 
-            pending.extend_from_slice(&raw);
+            pending.extend_from_slice(&raw_buf);
 
             // Resample if needed
             decoded_buf.clear();
@@ -555,24 +557,16 @@ pub fn decode_playlist(
                 }
             }
 
-            // Clipping check — scan whichever buffer holds the current samples
+            // Clipping detection only — flag for the UI when peak * volume would
+            // exceed 0dBFS at the DAC. Hard prevention happens in the audio
+            // callback (clamp post-gain), since volume can change between this
+            // scan and consumption (~ring-buffer-depth latency).
             if !bal_output.is_empty() {
                 let vol = state.volume.load(Ordering::Relaxed) as f32 / 100.0;
-                let threshold = if vol > 0.0 { 1.0 / vol } else { f32::MAX };
                 let scan: &[f32] = if using_final_buf { &final_buf } else { bal_output };
                 let peak = scan.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
-                if peak > threshold {
+                if peak * vol > 1.0 {
                     state.clipping.store(true, Ordering::Relaxed);
-                    // Peak-limit to prevent hard clipping at the DAC
-                    if !using_final_buf {
-                        final_buf.clear();
-                        final_buf.extend_from_slice(bal_output);
-                        using_final_buf = true;
-                    }
-                    let scale = threshold / peak;
-                    for s in final_buf.iter_mut() {
-                        *s *= scale;
-                    }
                 }
             }
 
@@ -605,9 +599,9 @@ pub fn decode_playlist(
         if let Some(ref mut resampler) = resampler {
             if !pending.is_empty() {
                 pending.resize(chunk_size * channels, 0.0);
-                let input = deinterleave(&pending, channels);
+                deinterleave_into(&pending, channels, &mut flush_planes);
                 let frames_in = chunk_size;
-                if let Ok(adapter_in) = SequentialSliceOfVecs::new(&input, channels, frames_in) {
+                if let Ok(adapter_in) = SequentialSliceOfVecs::new(&flush_planes, channels, frames_in) {
                     if let Ok(resampled) = resampler.process(&adapter_in, 0, None) {
                         let output = resampled.take_data();
                         if let Ok(mut chunk) = producer.write_chunk(output.len()) {

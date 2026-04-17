@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -187,7 +188,7 @@ impl StatsMonitor {
 }
 
 struct ChannelBands {
-    sample_buffer: Vec<f32>,
+    sample_buffer: VecDeque<f32>,
     smoothed: [f32; SPECTRUM_BANDS],
     heights: [f32; SPECTRUM_BANDS],
 }
@@ -195,7 +196,7 @@ struct ChannelBands {
 impl ChannelBands {
     fn new() -> Self {
         Self {
-            sample_buffer: Vec::with_capacity(FFT_SIZE * 2),
+            sample_buffer: VecDeque::with_capacity(FFT_SIZE * 2),
             smoothed: [0.0; SPECTRUM_BANDS],
             heights: [0.0; SPECTRUM_BANDS],
         }
@@ -266,12 +267,12 @@ impl VizAnalyser {
             if channels >= 2 {
                 let r = samples[f * channels + 1].abs();
                 peak_r = peak_r.max(r);
-                self.ch_l.sample_buffer.push(samples[f * channels]);
-                self.ch_r.sample_buffer.push(samples[f * channels + 1]);
+                self.ch_l.sample_buffer.push_back(samples[f * channels]);
+                self.ch_r.sample_buffer.push_back(samples[f * channels + 1]);
             } else {
                 peak_r = peak_l;
-                self.ch_l.sample_buffer.push(samples[f * channels]);
-                self.ch_r.sample_buffer.push(samples[f * channels]);
+                self.ch_l.sample_buffer.push_back(samples[f * channels]);
+                self.ch_r.sample_buffer.push_back(samples[f * channels]);
             }
         }
 
@@ -317,13 +318,13 @@ impl VizAnalyser {
         // Process FFT for each channel when enough samples collected
         while self.ch_l.sample_buffer.len() >= FFT_SIZE && self.ch_r.sample_buffer.len() >= FFT_SIZE {
             // Process L channel
-            for (i, (&sample, &w)) in self.ch_l.sample_buffer[..FFT_SIZE].iter().zip(&self.window).enumerate() {
+            for (i, (&sample, &w)) in self.ch_l.sample_buffer.iter().take(FFT_SIZE).zip(&self.window).enumerate() {
                 self.fft_input[i] = sample * w;
             }
             let l_bands = Self::run_fft_and_compute(&*self.fft, &mut self.fft_input, &mut self.fft_output, self.sample_rate);
-            
+
             // Process R channel
-            for (i, (&sample, &w)) in self.ch_r.sample_buffer[..FFT_SIZE].iter().zip(&self.window).enumerate() {
+            for (i, (&sample, &w)) in self.ch_r.sample_buffer.iter().take(FFT_SIZE).zip(&self.window).enumerate() {
                 self.fft_input[i] = sample * w;
             }
             let r_bands = Self::run_fft_and_compute(&*self.fft, &mut self.fft_input, &mut self.fft_output, self.sample_rate);

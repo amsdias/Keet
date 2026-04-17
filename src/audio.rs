@@ -624,7 +624,6 @@ pub fn build_stream(
                         chunk.commit_all(); // Discard without processing
                     }
                 }
-                state.discard_samples.store(0, Ordering::Relaxed);
                 data.fill(0.0);
                 return;
             }
@@ -671,11 +670,14 @@ pub fn build_stream(
                         continue;
                     }
 
-                    let left = slice[src_idx] * gain;
-                    let right = slice[src_idx + 1] * gain;
+                    // Clamp post-gain to prevent DAC clipping. Producer only
+                    // flags clipping (state.clipping) — can't scale there since
+                    // volume may change between scan and this callback.
+                    let left = (slice[src_idx] * gain).clamp(-1.0, 1.0);
+                    let right = (slice[src_idx + 1] * gain).clamp(-1.0, 1.0);
 
                     if channels == 1 {
-                        data[out_idx] = (left + right) * 0.5;
+                        data[out_idx] = ((left + right) * 0.5).clamp(-1.0, 1.0);
                     } else if out_idx + 1 < data.len() {
                         data[out_idx] = left;
                         data[out_idx + 1] = right;
@@ -756,8 +758,9 @@ pub fn build_stream(
             }
 
         },
-        move |e| {
-            eprintln!("Audio error: {}", e);
+        move |_e| {
+            // cpal's error callback can run on audio-thread adjacent paths; avoid I/O here.
+            // The main loop detects stream_error and reports to the UI.
             err_state.stream_error.store(true, std::sync::atomic::Ordering::Relaxed);
         },
         None,

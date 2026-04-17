@@ -55,6 +55,11 @@ fn spawn_lyrics_worker(ui: &mut state::UiState, path: std::path::PathBuf, dur: O
     ui.lyrics = None;
     let (tx, rx) = std::sync::mpsc::channel();
     ui.lyrics_receiver = Some(rx);
+    // Bump the generation; each worker snapshots this and bails out of the slow
+    // LRCLIB fetch if the user has skipped to another track in the meantime.
+    // This prevents a backlog of blocked HTTP threads during rapid skipping.
+    let gen_snap = ui.lyrics_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let gen_ref = std::sync::Arc::clone(&ui.lyrics_gen);
     std::thread::spawn(move || {
         let (artist, title, embedded) = if cached_artist.is_some() || cached_title.is_some() {
             (cached_artist, cached_title, metadata::read_lyrics(&path))
@@ -64,7 +69,12 @@ fn spawn_lyrics_worker(ui: &mut state::UiState, path: std::path::PathBuf, dur: O
         let res = if let Some(l) = embedded {
             Some(lyrics::parse_lyrics(&l))
         } else if let (Some(a), Some(t)) = (artist, title) {
-            lyrics::fetch_lrclib(&a, &t, dur).map(|s| lyrics::parse_lyrics(&s))
+            // Skip the network round-trip if a newer request has already been issued.
+            if gen_ref.load(std::sync::atomic::Ordering::Relaxed) != gen_snap {
+                None
+            } else {
+                lyrics::fetch_lrclib(&a, &t, dur).map(|s| lyrics::parse_lyrics(&s))
+            }
         } else {
             None
         };
@@ -93,7 +103,7 @@ fn build_resume_state(
             .unwrap_or_default(),
         position_secs: player_state.time_secs(),
         shuffle: ui.shuffle,
-        repeat: ui.repeat_mode != state::RepeatMode::Off,
+        repeat: false, // skipped during serialization; see resume.rs
         repeat_mode: Some(repeat_mode_str.to_string()),
         volume: player_state.volume.load(std::sync::atomic::Ordering::Relaxed),
         eq_preset: eq_presets[player_state.eq_index()].name.clone(),
@@ -631,18 +641,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     if !combined.is_empty() {
+                        // Single pass: canonicalize each path once, then dedupe and
+                        // filter-by-removed in one retain. Previously each retain
+                        // re-ran canonicalize() on every entry.
                         let mut seen = std::collections::HashSet::new();
+                        let removed = &ui.removed_paths;
                         combined.retain(|p| {
                             let key = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+                            if removed.contains(&key) { return false; }
                             seen.insert(key)
                         });
-                        // Filter out tracks the user removed during this session
-                        if !ui.removed_paths.is_empty() {
-                            combined.retain(|p| {
-                                let key = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
-                                !ui.removed_paths.contains(&key)
-                            });
-                        }
                         if ui.shuffle { shuffle_list(&mut combined); }
                         playlist = combined;
                         state.total_tracks.store(playlist.len(), Ordering::Relaxed);
@@ -791,7 +799,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let current_eq = &eq_presets[state.eq_index()];
             let current_fx = &fx_presets[state.effects_index()].name;
             let current_cf = &cf_presets[state.crossfeed_index()].name;
-            while state.buffer_level.load(Ordering::Relaxed) < RING_BUFFER_SIZE / 4
+            // Wait for ~1 second of audio in the buffer before starting the callback.
+            // Using stream_rate (rather than a fraction of the raw ring size) keeps
+            // the startup latency consistent across output rates.
+            let startup_threshold = stream_rate as usize * 2;
+            while state.buffer_level.load(Ordering::Relaxed) < startup_threshold
                   && !state.producer_done.load(Ordering::Relaxed)
                   && !state.should_quit()
             {
@@ -839,21 +851,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let new_index = state.producer_track_index.load(Ordering::Relaxed);
                 last_transition_count = current_count;
 
-                // Playlist was modified — producer snapshot is stale, restart with fresh playlist
+                // Playlist was modified — producer's new_index is from the stale snapshot.
+                // Schedule a jump to the right track; skip the rest of this transition so we
+                // don't display/fetch-lyrics for the wrong file. The jump_to_track check on the
+                // next loop iteration will respawn the producer with the fresh playlist.
                 if ui.playlist_dirty {
                     ui.playlist_dirty = false;
                     let target = if ui.current_track_removed {
-                        // ui.current already points to the correct next track
                         ui.current_track_removed = false;
                         ui.current
                     } else {
-                        // Non-current removal: advance to next track in updated playlist
                         (ui.current + 1).min(playlist.len().saturating_sub(1))
                     };
                     state.jump_to(target);
-                }
-
-                if new_index < playlist.len() {
+                } else if new_index < playlist.len() {
                     ui.current = new_index;
                     ui.enqueue_count = 0;
                     state.current_track.store(ui.current, Ordering::Relaxed);
@@ -905,9 +916,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Err(_) => break 'playlist,
                 }
                 // Flush ring buffer
-                let buffered = RING_BUFFER_SIZE - prod.slots();
-                if buffered > 0 {
-                    state.discard_samples.store(buffered as u64, Ordering::Relaxed);
+                if RING_BUFFER_SIZE - prod.slots() > 0 {
                     state.reset_consumer_counter.store(true, Ordering::Relaxed);
                 }
                 if let Some(target) = state.take_jump() {
@@ -979,6 +988,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     drop(stream);
 
                     device = new_device;
+
+                    // Re-acquire exclusive (hog) mode on the new device if it
+                    // was active before the disconnect. The old hog_device_id
+                    // refers to the (likely gone) previous device — release is
+                    // best-effort and harmless if the device no longer exists.
+                    if state.exclusive.load(Ordering::Relaxed) {
+                        if let Some(old_id) = hog_device_id.take() {
+                            audio::release_exclusive_mode(old_id);
+                        }
+                        if let Ok(id) = audio::set_exclusive_mode(&device) {
+                            hog_device_id = Some(id);
+                        }
+                    }
+
                     let new_rate = device.default_output_config()
                         .map(|c| c.sample_rate())
                         .unwrap_or(48000);

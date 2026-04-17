@@ -8,7 +8,7 @@
 /// High frequencies maintain stereo separation while low frequencies
 /// cross over, simulating speaker listening in a room.
 
-use std::f32::consts::PI;
+use std::f32::consts::{FRAC_1_SQRT_2, PI};
 
 /// Crossfeed preset definition
 pub struct CrossfeedPreset {
@@ -38,7 +38,7 @@ impl BiquadCoeffs {
         }
         let w0 = 2.0 * PI * cutoff / sample_rate;
         let cos_w0 = w0.cos();
-        let alpha = w0.sin() / (2.0 * 0.7071); // Q = 1/sqrt(2) for Butterworth
+        let alpha = w0.sin() / (2.0 * FRAC_1_SQRT_2); // Q = 1/sqrt(2) for Butterworth
 
         let b0 = (1.0 - cos_w0) / 2.0;
         let b1 = 1.0 - cos_w0;
