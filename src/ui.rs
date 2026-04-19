@@ -12,8 +12,9 @@ use crate::state::{
     ViewMode, InputMode, UiState,
 };
 use crate::viz::{
-    StatsMonitor, render_vu_meter, render_spectrum_horizontal,
-    render_spectrum_vertical, get_viz_line_count,
+    StatsMonitor, VizAnalyser, render_vu_meter, render_spectrum_horizontal,
+    render_spectrum_vertical, render_oscilloscope, render_lissajous,
+    render_spectrogram, get_viz_line_count,
 };
 
 pub fn format_time(secs: f64) -> String {
@@ -76,7 +77,7 @@ fn visible_len(s: &str) -> usize {
     s.chars().count()
 }
 
-pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_info: &str, ext: &str, eq_preset: &crate::eq::EqPreset, fx_name: &str, cf_name: &str, stats: &mut StatsMonitor, prev_viz_lines: usize, playlist: &[PathBuf]) -> usize {
+pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_info: &str, ext: &str, eq_preset: &crate::eq::EqPreset, fx_name: &str, cf_name: &str, stats: &mut StatsMonitor, prev_viz_lines: usize, playlist: &[PathBuf], analyser: &VizAnalyser) -> usize {
     let viz_mode = state.viz_mode();
     let viz_style = state.viz_style();
     let eq_name = &eq_preset.name;
@@ -170,6 +171,9 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
         VizMode::VuMeter => "VU",
         VizMode::SpectrumHorizontal => "SpecH",
         VizMode::SpectrumVertical => "SpecV",
+        VizMode::Oscilloscope => "Scope",
+        VizMode::Lissajous => "Vector",
+        VizMode::Spectrogram => "SpecGram",
     };
     let next_style = match viz_style {
         VizStyle::Dots => "Bars",
@@ -242,6 +246,7 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
                 let is_playing = track_idx == ui.current;
                 let is_cursor = list_pos == ui.cursor;
                 let fname = ui.metadata_cache.display_name(track_idx, &playlist[track_idx]);
+                let album = ui.metadata_cache.album(track_idx).unwrap_or_default();
                 let dur_str = match ui.metadata_cache.duration(track_idx) {
                     Some(d) => format_time(d),
                     None => String::new(),
@@ -252,23 +257,38 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
                 // prefix: " ▶ 1234  " = 10 visible chars, dur + trailing space = dur_str.len() + 2
                 let prefix_len = 10;
                 let dur_col = if dur_str.is_empty() { 0 } else { dur_str.len() + 2 };
-                let name_budget = term_w.saturating_sub(prefix_len + dur_col);
+                let content_budget = term_w.saturating_sub(prefix_len + dur_col);
+                // Reserve up to ~30% (or 32 chars max) for album, but only when
+                // the row is wide enough to leave room for a meaningful name.
+                let album_budget = if content_budget >= 50 {
+                    (content_budget * 30 / 100).clamp(12, 32)
+                } else {
+                    0
+                };
+                let name_budget = content_budget.saturating_sub(if album_budget > 0 { album_budget + 2 } else { 0 });
                 let truncated_name = truncate_plain(&fname, name_budget);
-                let pad = name_budget.saturating_sub(visible_len(&truncated_name));
+                let name_pad = name_budget.saturating_sub(visible_len(&truncated_name));
+                let album_part = if album_budget > 0 {
+                    let truncated_album = truncate_plain(&album, album_budget);
+                    let album_pad = album_budget.saturating_sub(visible_len(&truncated_album));
+                    format!("{}{C_DIM}{truncated_album}{C_RESET}{}", " ".repeat(name_pad + 2), " ".repeat(album_pad))
+                } else {
+                    " ".repeat(name_pad)
+                };
                 let dur_part = if dur_str.is_empty() {
                     String::new()
                 } else {
-                    format!("{}{C_DIM}{dur_str}{C_RESET}", " ".repeat(pad + 1))
+                    format!(" {C_DIM}{dur_str}{C_RESET}")
                 };
 
                 let line = if is_cursor && is_playing {
-                    format!(" {marker} \x1B[7m{C_GREEN}{num}  {truncated_name}{C_RESET}\x1B[7m{dur_part}\x1B[27m")
+                    format!(" {marker} \x1B[7m{C_GREEN}{num}  {truncated_name}{C_RESET}\x1B[7m{album_part}{dur_part}\x1B[27m")
                 } else if is_cursor {
-                    format!(" {marker} \x1B[7m{num}  {truncated_name}{dur_part}\x1B[27m")
+                    format!(" {marker} \x1B[7m{num}  {truncated_name}{album_part}{dur_part}\x1B[27m")
                 } else if is_playing {
-                    format!(" {marker} {C_GREEN}{num}  {truncated_name}{C_RESET}{dur_part}")
+                    format!(" {marker} {C_GREEN}{num}  {truncated_name}{C_RESET}{album_part}{dur_part}")
                 } else {
-                    format!(" {marker} {C_DIM}{num}{C_RESET}  {truncated_name}{dur_part}")
+                    format!(" {marker} {C_DIM}{num}{C_RESET}  {truncated_name}{album_part}{dur_part}")
                 };
 
                 print!("\n\r\x1B[K{}", line);
@@ -390,6 +410,21 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
         }
         VizMode::SpectrumVertical => {
             for line in render_spectrum_vertical(state, viz_style) {
+                print!("\n\r\x1B[K{}", line);
+            }
+        }
+        VizMode::Oscilloscope => {
+            for line in render_oscilloscope(analyser, viz_style) {
+                print!("\n\r\x1B[K{}", line);
+            }
+        }
+        VizMode::Lissajous => {
+            for line in render_lissajous(analyser, viz_style) {
+                print!("\n\r\x1B[K{}", line);
+            }
+        }
+        VizMode::Spectrogram => {
+            for line in render_spectrogram(analyser, viz_style) {
                 print!("\n\r\x1B[K{}", line);
             }
         }

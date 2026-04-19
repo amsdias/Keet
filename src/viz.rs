@@ -203,6 +203,12 @@ impl ChannelBands {
     }
 }
 
+// Size of the recent stereo sample ring used by oscilloscope/lissajous.
+// 1024 stereo pairs ≈ 21 ms at 48 kHz — enough trace for a clear pattern.
+pub const WAVEFORM_BUF_SIZE: usize = 1024;
+// Number of spectrogram columns kept in history (time axis).
+pub const SPECTROGRAM_COLS: usize = 60;
+
 pub struct VizAnalyser {
     fft: Arc<dyn RealToComplex<f32>>,
     fft_input: Vec<f32>,
@@ -220,6 +226,10 @@ pub struct VizAnalyser {
     vu_peak_timer_l: u8,
     vu_peak_timer_r: u8,
     sample_rate: u32,
+    // Recent raw (L, R) samples, newest at back. Used by oscilloscope and lissajous.
+    pub(crate) waveform_buf: VecDeque<(f32, f32)>,
+    // History of mono spectrum frames, newest at back. Used by spectrogram.
+    pub(crate) spectrogram_history: VecDeque<[f32; SPECTRUM_BANDS]>,
 }
 
 impl VizAnalyser {
@@ -248,6 +258,8 @@ impl VizAnalyser {
             vu_peak_timer_l: 0,
             vu_peak_timer_r: 0,
             sample_rate,
+            waveform_buf: VecDeque::with_capacity(WAVEFORM_BUF_SIZE),
+            spectrogram_history: VecDeque::with_capacity(SPECTROGRAM_COLS),
         }
     }
 
@@ -262,18 +274,25 @@ impl VizAnalyser {
 
         let frames = samples.len() / channels;
         for f in 0..frames {
-            let l = samples[f * channels].abs();
+            let l_raw = samples[f * channels];
+            let l = l_raw.abs();
             peak_l = peak_l.max(l);
-            if channels >= 2 {
-                let r = samples[f * channels + 1].abs();
-                peak_r = peak_r.max(r);
-                self.ch_l.sample_buffer.push_back(samples[f * channels]);
-                self.ch_r.sample_buffer.push_back(samples[f * channels + 1]);
+            let r_raw = if channels >= 2 {
+                let r = samples[f * channels + 1];
+                peak_r = peak_r.max(r.abs());
+                self.ch_l.sample_buffer.push_back(l_raw);
+                self.ch_r.sample_buffer.push_back(r);
+                r
             } else {
                 peak_r = peak_l;
-                self.ch_l.sample_buffer.push_back(samples[f * channels]);
-                self.ch_r.sample_buffer.push_back(samples[f * channels]);
+                self.ch_l.sample_buffer.push_back(l_raw);
+                self.ch_r.sample_buffer.push_back(l_raw);
+                l_raw
+            };
+            if self.waveform_buf.len() == WAVEFORM_BUF_SIZE {
+                self.waveform_buf.pop_front();
             }
+            self.waveform_buf.push_back((l_raw, r_raw));
         }
 
         // Smooth peak levels with fast attack, slow decay (VU meter behavior)
@@ -353,6 +372,12 @@ impl VizAnalyser {
             state.set_spectrum(&self.ch_l.smoothed);
             state.set_spectrum_r(&self.ch_r.smoothed);
             state.set_dots(&self.peak_hold);
+
+            // Append to spectrogram history (mono = L+R average of the smoothed bands).
+            if self.spectrogram_history.len() == SPECTROGRAM_COLS {
+                self.spectrogram_history.pop_front();
+            }
+            self.spectrogram_history.push_back(mono);
 
             // 50% overlap
             self.ch_l.sample_buffer.drain(..FFT_SIZE / 2);
@@ -651,5 +676,192 @@ pub fn get_viz_line_count(mode: VizMode, style: VizStyle) -> usize {
         VizMode::VuMeter => if matches!(style, VizStyle::Bars) { 4 } else { 3 },
         VizMode::SpectrumHorizontal => 3,
         VizMode::SpectrumVertical => 9,
+        VizMode::Oscilloscope => OSCILLOSCOPE_ROWS + 1,
+        VizMode::Lissajous => LISSAJOUS_ROWS + 1,
+        VizMode::Spectrogram => SPECTROGRAM_ROWS + 1,
     }
+}
+
+// --- Oscilloscope -----------------------------------------------------------
+
+const OSCILLOSCOPE_COLS: usize = 60;   // terminal cells wide
+const OSCILLOSCOPE_ROWS: usize = 8;    // terminal cells tall
+const OSCILLOSCOPE_DOTS_W: usize = OSCILLOSCOPE_COLS * 2; // braille 2 dots/cell
+const OSCILLOSCOPE_DOTS_H: usize = OSCILLOSCOPE_ROWS * 4;
+
+// Bit offsets within a braille cell for dot (px, py) where px∈0..2, py∈0..4.
+const BRAILLE_BITS: [[u32; 4]; 2] = [
+    [0x01, 0x02, 0x04, 0x40],
+    [0x08, 0x10, 0x20, 0x80],
+];
+
+pub fn render_oscilloscope(analyser: &VizAnalyser, _style: VizStyle) -> Vec<String> {
+    let buf = &analyser.waveform_buf;
+    let mut grid = vec![0u32; OSCILLOSCOPE_DOTS_W * OSCILLOSCOPE_DOTS_H];
+    let set = |g: &mut [u32], x: usize, y: usize| {
+        if x < OSCILLOSCOPE_DOTS_W && y < OSCILLOSCOPE_DOTS_H {
+            g[y * OSCILLOSCOPE_DOTS_W + x] = 1;
+        }
+    };
+
+    if !buf.is_empty() {
+        let n = buf.len();
+        let mut prev_y: Option<i32> = None;
+        let mid = (OSCILLOSCOPE_DOTS_H / 2) as i32;
+        for x in 0..OSCILLOSCOPE_DOTS_W {
+            // Map column to sample index (newest on right).
+            let idx = x * (n - 1) / OSCILLOSCOPE_DOTS_W.max(1);
+            let (l, r) = buf[idx];
+            let mono = (l + r) * 0.5;
+            let y = mid - (mono.clamp(-1.0, 1.0) * mid as f32) as i32;
+            let y = y.clamp(0, (OSCILLOSCOPE_DOTS_H - 1) as i32);
+            // Connect previous sample's y to current y so the trace is continuous.
+            let y0 = prev_y.unwrap_or(y);
+            let (lo, hi) = if y0 < y { (y0, y) } else { (y, y0) };
+            for yi in lo..=hi {
+                set(&mut grid, x, yi as usize);
+            }
+            prev_y = Some(y);
+        }
+    }
+
+    // Render grid row-by-row. Color by distance from center (green → yellow → red).
+    let mut lines = Vec::with_capacity(OSCILLOSCOPE_ROWS);
+    for cy in 0..OSCILLOSCOPE_ROWS {
+        let mut line = String::from("  ");
+        let mut last_color = "";
+        for cx in 0..OSCILLOSCOPE_COLS {
+            let mut bits: u32 = 0;
+            for py in 0..4 {
+                for px in 0..2 {
+                    let gx = cx * 2 + px;
+                    let gy = cy * 4 + py;
+                    if grid[gy * OSCILLOSCOPE_DOTS_W + gx] != 0 {
+                        bits |= BRAILLE_BITS[px][py];
+                    }
+                }
+            }
+            // Color by row — rows near the edges are louder, so redder.
+            let from_edge = cy.min(OSCILLOSCOPE_ROWS - 1 - cy);
+            let color = match from_edge {
+                0 => C_RED,
+                1 => C_YELLOW,
+                _ => C_GREEN,
+            };
+            if color != last_color {
+                line.push_str(color);
+                last_color = color;
+            }
+            let ch = char::from_u32(0x2800 + bits).unwrap_or(' ');
+            line.push(ch);
+        }
+        line.push_str(C_RESET);
+        lines.push(line);
+    }
+    lines
+}
+
+// --- Lissajous / Vectorscope ------------------------------------------------
+
+const LISSAJOUS_COLS: usize = 16;
+const LISSAJOUS_ROWS: usize = 8;
+const LISSAJOUS_DOTS_W: usize = LISSAJOUS_COLS * 2;
+const LISSAJOUS_DOTS_H: usize = LISSAJOUS_ROWS * 4;
+
+pub fn render_lissajous(analyser: &VizAnalyser, _style: VizStyle) -> Vec<String> {
+    let buf = &analyser.waveform_buf;
+    let mut grid = vec![0u32; LISSAJOUS_DOTS_W * LISSAJOUS_DOTS_H];
+
+    // Rotated 45° (mid/side): mono signals appear as a vertical line.
+    // X = side = (L - R) / sqrt(2); Y = mid = (L + R) / sqrt(2). Terminal Y grows down.
+    let inv_sqrt2 = std::f32::consts::FRAC_1_SQRT_2;
+    let w_half = (LISSAJOUS_DOTS_W / 2) as f32;
+    let h_half = (LISSAJOUS_DOTS_H / 2) as f32;
+    for &(l, r) in buf.iter() {
+        let side = (l - r) * inv_sqrt2;
+        let mid = (l + r) * inv_sqrt2;
+        let x = (w_half + side.clamp(-1.0, 1.0) * (w_half - 1.0)) as i32;
+        let y = (h_half - mid.clamp(-1.0, 1.0) * (h_half - 1.0)) as i32;
+        if x >= 0 && (x as usize) < LISSAJOUS_DOTS_W && y >= 0 && (y as usize) < LISSAJOUS_DOTS_H {
+            grid[y as usize * LISSAJOUS_DOTS_W + x as usize] = 1;
+        }
+    }
+
+    // Center the box horizontally-ish — align with the rest of the viz (2-space pad).
+    let mut lines = Vec::with_capacity(LISSAJOUS_ROWS);
+    for cy in 0..LISSAJOUS_ROWS {
+        let mut line = String::from("  ");
+        line.push_str(C_CYAN);
+        for cx in 0..LISSAJOUS_COLS {
+            let mut bits: u32 = 0;
+            for py in 0..4 {
+                for px in 0..2 {
+                    let gx = cx * 2 + px;
+                    let gy = cy * 4 + py;
+                    if grid[gy * LISSAJOUS_DOTS_W + gx] != 0 {
+                        bits |= BRAILLE_BITS[px][py];
+                    }
+                }
+            }
+            let ch = char::from_u32(0x2800 + bits).unwrap_or(' ');
+            line.push(ch);
+        }
+        line.push_str(C_RESET);
+        lines.push(line);
+    }
+    lines
+}
+
+// --- Spectrogram ------------------------------------------------------------
+
+const SPECTROGRAM_ROWS: usize = 8;
+
+// 31 bands → 8 rows (top = highest freq). Colors mirror BAND_COLORS by region.
+const SPECTROGRAM_ROW_COLORS: [&str; SPECTROGRAM_ROWS] = [
+    C_MAGENTA, C_RED, C_RED, C_YELLOW,
+    C_YELLOW, C_GREEN, C_GREEN, C_CYAN,
+];
+
+pub fn render_spectrogram(analyser: &VizAnalyser, _style: VizStyle) -> Vec<String> {
+    let hist = &analyser.spectrogram_history;
+    let cols = SPECTROGRAM_COLS;
+
+    // Group 31 bands into 8 rows, top-to-bottom = highest-to-lowest freq.
+    // Row i pulls the max over its band group for snappier high-freq response.
+    let band_groups: [(usize, usize); SPECTROGRAM_ROWS] = [
+        (27, 31), // 10k-20k air
+        (23, 27), // 4k-8k brilliance
+        (19, 23), // 2k-3.15k presence
+        (15, 19), // 630-1.25k upper-mid
+        (11, 15), // 200-500 low-mid
+        (7, 11),  // 100-160 bass
+        (4, 7),   // 50-80 low bass
+        (0, 4),   // 20-40 sub
+    ];
+
+    let mut lines = Vec::with_capacity(SPECTROGRAM_ROWS);
+    for (row, &(lo, hi)) in band_groups.iter().enumerate() {
+        let mut line = String::from("  ");
+        let color = SPECTROGRAM_ROW_COLORS[row];
+        line.push_str(color);
+        // Oldest column on the left, newest on the right. Pad with spaces when history
+        // hasn't filled up yet.
+        let n = hist.len();
+        let pad = cols.saturating_sub(n);
+        for _ in 0..pad {
+            line.push(' ');
+        }
+        for col in 0..n {
+            let frame = &hist[col];
+            let mut v: f32 = 0.0;
+            for b in lo..hi {
+                v = v.max(frame[b]);
+            }
+            let idx = (v * 8.0).clamp(0.0, 8.0) as usize;
+            line.push(SPECTRUM_H_CHARS[idx]);
+        }
+        line.push_str(C_RESET);
+        lines.push(line);
+    }
+    lines
 }

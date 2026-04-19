@@ -19,6 +19,8 @@ struct CachedMeta {
     #[allow(dead_code)]
     title: Option<String>,
     #[allow(dead_code)]
+    album: Option<String>,
+    #[allow(dead_code)]
     rg_track_gain: Option<f32>,
     #[allow(dead_code)]
     rg_track_peak: Option<f32>,
@@ -86,6 +88,20 @@ impl MetadataCache {
         } else {
             (None, None)
         }
+    }
+
+    pub fn artist_album(&self, index: usize) -> (Option<String>, Option<String>) {
+        let entries = self.entries.read().unwrap();
+        if let Some(Some(meta)) = entries.get(index) {
+            (meta.artist.clone(), meta.album.clone())
+        } else {
+            (None, None)
+        }
+    }
+
+    pub fn album(&self, index: usize) -> Option<String> {
+        let entries = self.entries.read().unwrap();
+        entries.get(index).and_then(|e| e.as_ref()).and_then(|m| m.album.clone())
     }
 
     fn set(&self, index: usize, meta: CachedMeta) {
@@ -176,6 +192,7 @@ fn read_metadata_full(path: &Path) -> Option<CachedMeta> {
 
     let mut title: Option<String> = None;
     let mut artist: Option<String> = None;
+    let mut album: Option<String> = None;
     let mut lyrics: Option<String> = None;
     let mut rg_track_gain: Option<f32> = None;
     let mut rg_track_peak: Option<f32> = None;
@@ -190,6 +207,9 @@ fn read_metadata_full(path: &Path) -> Option<CachedMeta> {
                 }
                 Some(StandardTagKey::Artist) => {
                     if let Value::String(ref s) = tag.value { artist = Some(s.clone()); }
+                }
+                Some(StandardTagKey::Album) => {
+                    if let Value::String(ref s) = tag.value { album = Some(s.clone()); }
                 }
                 Some(StandardTagKey::Lyrics) if lyrics.is_none() => {
                     if let Value::String(ref s) = tag.value { lyrics = Some(s.clone()); }
@@ -220,7 +240,7 @@ fn read_metadata_full(path: &Path) -> Option<CachedMeta> {
         }
     }
 
-    if title.is_none() || artist.is_none() || lyrics.is_none() {
+    if title.is_none() || artist.is_none() || album.is_none() || lyrics.is_none() {
         if let Some(meta) = probed.metadata.get() {
             if let Some(rev) = meta.current() {
                 for tag in rev.tags() {
@@ -230,6 +250,9 @@ fn read_metadata_full(path: &Path) -> Option<CachedMeta> {
                         }
                         Some(StandardTagKey::Artist) if artist.is_none() => {
                             if let Value::String(ref s) = tag.value { artist = Some(s.clone()); }
+                        }
+                        Some(StandardTagKey::Album) if album.is_none() => {
+                            if let Value::String(ref s) = tag.value { album = Some(s.clone()); }
                         }
                         Some(StandardTagKey::Lyrics) if lyrics.is_none() => {
                             if let Value::String(ref s) = tag.value { lyrics = Some(s.clone()); }
@@ -279,6 +302,7 @@ fn read_metadata_full(path: &Path) -> Option<CachedMeta> {
         search_text,
         artist,
         title,
+        album,
         rg_track_gain,
         rg_track_peak,
         rg_album_gain,

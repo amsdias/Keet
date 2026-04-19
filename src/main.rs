@@ -20,6 +20,7 @@ mod resume;
 mod crossfeed;
 mod metadata;
 mod lyrics;
+mod cover;
 
 use std::env;
 use std::io::{self, Write};
@@ -80,6 +81,86 @@ fn spawn_lyrics_worker(ui: &mut state::UiState, path: std::path::PathBuf, dur: O
         };
         let _ = tx.send(res);
     });
+}
+
+/// Kick off the album-cover loader on a background thread. Tries embedded,
+/// sidecar, on-disk cache, then iTunes Search (saving result back to cache).
+/// Exits early (before HTTP) if a newer track has been selected.
+fn spawn_cover_worker(ui: &mut state::UiState, path: std::path::PathBuf) {
+    if !ui.cover_enabled {
+        ui.cover = None;
+        ui.cover_receiver = None;
+        return;
+    }
+    let (cached_artist, cached_album) = ui.metadata_cache.artist_album(ui.current);
+    ui.cover = None;
+    let (tx, rx) = std::sync::mpsc::channel();
+    ui.cover_receiver = Some(rx);
+    let gen_snap = ui.cover_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let gen_ref = std::sync::Arc::clone(&ui.cover_gen);
+    std::thread::spawn(move || {
+        // Local sources are cheap — always try them regardless of generation.
+        let local = cover::resolve_local(
+            &path,
+            cached_artist.as_deref(),
+            cached_album.as_deref(),
+        );
+        if let Some(img) = local {
+            let _ = tx.send(Some(img));
+            return;
+        }
+        // Remote fetch is slow (HTTP) — skip if user has already skipped past this track.
+        if gen_ref.load(std::sync::atomic::Ordering::Relaxed) != gen_snap {
+            let _ = tx.send(None);
+            return;
+        }
+        let remote = match (cached_artist, cached_album) {
+            (Some(a), Some(al)) => cover::resolve_remote(&path, &a, &al),
+            _ => None,
+        };
+        let _ = tx.send(remote);
+    });
+}
+
+/// Compose the banner text with the album-cover slot on its left. When no
+/// cover is loaded, fills the slot with a solid black box so the layout
+/// doesn't shift between tracks. Falls back to the plain banner only when
+/// the terminal is too narrow to fit both side-by-side.
+fn compose_banner(banner_text: &str, cover: Option<&cover::CoverImage>, term_w: usize) -> (String, usize) {
+    let cover_cols = cover::COVER_COLS as usize;
+    // Banner box is ~59 cols; need room for cover + 2-space gap + banner.
+    if term_w < cover_cols + 2 + 59 {
+        return (banner_text.to_string(), banner_text.lines().count());
+    }
+    let cover_lines = match cover {
+        Some(img) => cover::render(img),
+        None => cover::placeholder_lines(),
+    };
+    let has_trailing_nl = banner_text.ends_with('\n');
+    let banner_content = if has_trailing_nl {
+        &banner_text[..banner_text.len() - 1]
+    } else {
+        banner_text
+    };
+    let banner_lines: Vec<&str> = banner_content.split('\n').collect();
+    let total = banner_lines.len().max(cover_lines.len());
+    let pad = " ".repeat(cover_cols);
+    let mut out = String::new();
+    for i in 0..total {
+        let left = cover_lines.get(i).map(|s| s.as_str()).unwrap_or(&pad);
+        let right = banner_lines.get(i).copied().unwrap_or("");
+        out.push_str(left);
+        out.push_str("  ");
+        out.push_str(right);
+        if i + 1 < total {
+            out.push('\n');
+        }
+    }
+    if has_trailing_nl {
+        out.push('\n');
+    }
+    let line_count = out.lines().count();
+    (out, line_count)
 }
 
 fn build_resume_state(
@@ -177,6 +258,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("      --rg-mode <mode>   ReplayGain: track (default), album, or off");
         println!("      --device <name>    Output device (substring match)");
         println!("      --exclusive        Exclusive mode: per-track sample rate, device lock (macOS)");
+        println!("      --no-cover         Disable album cover display");
         println!("      --list-devices     List available output devices and exit");
         println!("  -h, --help             Show this help");
         println!();
@@ -224,7 +306,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let flags = ["--shuffle", "-s", "--repeat", "-r", "--quality", "-q", "--eq", "-e", "--fx", "--crossfade", "-x", "--rg-mode", "--list-devices", "--device", "--exclusive", "--help", "-h"];
+    let flags = ["--shuffle", "-s", "--repeat", "-r", "--quality", "-q", "--eq", "-e", "--fx", "--crossfade", "-x", "--rg-mode", "--list-devices", "--device", "--exclusive", "--no-cover", "--help", "-h"];
     let (source_paths, shuffle, repeat_mode) = if args.len() < 2 {
         // Try resume from saved state
         match load_state() {
@@ -305,6 +387,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let device_arg: Option<String> = args.iter().position(|a| a == "--device")
         .and_then(|i| args.get(i + 1).cloned());
     let exclusive = args.iter().any(|a| a == "--exclusive");
+    let cover_enabled = !args.iter().any(|a| a == "--no-cover");
 
     let mut playlist = {
         let mut combined = Vec::new();
@@ -528,6 +611,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     state.repeat_mode.store(repeat_mode as u8, Ordering::Relaxed);
     ui.banner_lines = banner_lines;
     ui.banner_text = banner;
+    ui.cover_enabled = cover_enabled;
     ui.banner_tail = banner_tail;
     ui.scan_handle = Some(metadata::spawn_metadata_scan(
         playlist.clone(),
@@ -790,7 +874,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ui.lyrics_scroll = 0;
         ui.lyrics_auto_scroll = true;
         let lyrics_path = playlist[ui.current].clone();
-        spawn_lyrics_worker(&mut ui, lyrics_path, dur);
+        spawn_lyrics_worker(&mut ui, lyrics_path.clone(), dur);
+        spawn_cover_worker(&mut ui, lyrics_path);
+
+        // Visualization analyzer (created before the startup wait so print_status
+        // can draw the waveform/lissajous/spectrogram viz modes during buffering).
+        let mut viz_analyser = VizAnalyser::new(stream_rate);
+        let mut viz_scratch = Vec::with_capacity(VIZ_BUFFER_SIZE);
 
         // Stage 2: wait for the ring buffer to fill enough that the audio callback
         // won't underrun, while refreshing the status line so the user sees the new
@@ -808,7 +898,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                   && !state.should_quit()
             {
                 poll_input(&state, &mut ui, &mut playlist);
-                prev_viz_lines = print_status(&state, &mut ui, &filename, &track_info, &track_ext, current_eq, current_fx, current_cf, &mut stats, prev_viz_lines, &playlist);
+                prev_viz_lines = print_status(&state, &mut ui, &filename, &track_info, &track_ext, current_eq, current_fx, current_cf, &mut stats, prev_viz_lines, &playlist, &viz_analyser);
                 thread::sleep(Duration::from_millis(20));
             }
         }
@@ -818,10 +908,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             media_keys::update_metadata(mc, &filename, state.total_secs());
             media_keys::update_playback(mc, state.is_paused(), 0.0);
         }
-
-        // Visualization analyzer
-        let mut viz_analyser = VizAnalyser::new(stream_rate);
-        let mut viz_scratch = Vec::with_capacity(VIZ_BUFFER_SIZE);
 
         // Playback loop (stays here across natural track transitions)
         let mut last_ui = Instant::now();
@@ -884,6 +970,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ui.lyrics_auto_scroll = true;
                     let dur = { let t = state.total_secs(); if t > 0.0 { Some(t as u32) } else { None } };
                     spawn_lyrics_worker(&mut ui, new_path.clone(), dur);
+                    spawn_cover_worker(&mut ui, new_path.clone());
 
                     let src_rate = state.sample_rate.load(Ordering::Relaxed) as u32;
                     let channels = state.channels.load(Ordering::Relaxed);
@@ -1083,11 +1170,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
+                // Check if background cover fetch has completed
+                if let Some(ref rx) = ui.cover_receiver {
+                    if let Ok(cover) = rx.try_recv() {
+                        ui.cover = cover;
+                        ui.cover_receiver = None;
+                        ui.banner_dirty = true; // redraw to show new cover or clear stale one
+                    }
+                }
+
                 if ui.banner_dirty {
                     ui.banner_dirty = false;
                     let new_box = build_banner_box(ui.shuffle, ui.repeat_mode, &state);
                     ui.banner_text = format!("{}{}", new_box, ui.banner_tail);
-                    ui.banner_lines = ui.banner_text.lines().count();
                     ui.terminal_resized = true;
                 }
 
@@ -1096,7 +1191,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Clear entire screen and reprint banner (old lines may
                     // have wrapped at the previous terminal width).
                     // In raw mode \n doesn't imply \r, so use \r\n.
-                    print!("\x1B[0m\x1B[2J\x1B[H{}", ui.banner_text.replace('\n', "\r\n"));
+                    let term_w = terminal::size().map(|(w, _)| w as usize).unwrap_or(120);
+                    let (composed, lines) = compose_banner(&ui.banner_text, ui.cover.as_ref(), term_w);
+                    ui.banner_lines = lines;
+                    // Remove any previously-placed kitty graphic before redrawing.
+                    // No-op on terminals that don't speak the protocol.
+                    let kitty_clear = if matches!(cover::detect_protocol(), cover::GraphicsProtocol::Kitty) {
+                        cover::kitty_clear_escape()
+                    } else {
+                        String::new()
+                    };
+                    print!("{}\x1B[0m\x1B[2J\x1B[H{}", kitty_clear, composed.replace('\n', "\r\n"));
                     prev_viz_lines = usize::MAX;
                 }
 
@@ -1113,7 +1218,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let current_eq = &eq_presets[state.eq_index()];
                 let current_fx = &fx_presets[state.effects_index()].name;
                 let current_cf = &cf_presets[state.crossfeed_index()].name;
-                prev_viz_lines = print_status(&state, &mut ui, &filename, &track_info, &track_ext, current_eq, current_fx, current_cf, &mut stats, prev_viz_lines, &playlist);
+                prev_viz_lines = print_status(&state, &mut ui, &filename, &track_info, &track_ext, current_eq, current_fx, current_cf, &mut stats, prev_viz_lines, &playlist, &viz_analyser);
 
                 if let Some(ref mut mc) = media_controls {
                     media_keys::update_playback(mc, state.is_paused(), state.time_secs());
@@ -1131,11 +1236,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     print!("\x1B[?25h");
 
-    if prev_viz_lines != usize::MAX {
-        let up = 2 + prev_viz_lines;
-        print!("\x1B[{}F", up);
+    let _ = prev_viz_lines; // no longer needed: full screen clear below covers everything
+    // Wipe the whole header (banner + status + viz + playlist/lyrics) and any
+    // kitty graphic, leaving only the goodbye line.
+    if matches!(cover::detect_protocol(), cover::GraphicsProtocol::Kitty) {
+        print!("{}", cover::kitty_clear_escape());
     }
-    print!("\x1B[J"); // Clear from cursor to end of screen
+    print!("\x1B[H\x1B[2J");
     println!("✓ Done");
     io::stdout().flush().ok();
 

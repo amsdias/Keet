@@ -116,6 +116,9 @@ pub enum VizMode {
     VuMeter = 1,
     SpectrumHorizontal = 2,
     SpectrumVertical = 3,
+    Oscilloscope = 4,
+    Lissajous = 5,
+    Spectrogram = 6,
 }
 
 impl VizMode {
@@ -124,7 +127,10 @@ impl VizMode {
             VizMode::None => VizMode::VuMeter,
             VizMode::VuMeter => VizMode::SpectrumHorizontal,
             VizMode::SpectrumHorizontal => VizMode::SpectrumVertical,
-            VizMode::SpectrumVertical => VizMode::None,
+            VizMode::SpectrumVertical => VizMode::Oscilloscope,
+            VizMode::Oscilloscope => VizMode::Lissajous,
+            VizMode::Lissajous => VizMode::Spectrogram,
+            VizMode::Spectrogram => VizMode::None,
         }
     }
 
@@ -133,6 +139,9 @@ impl VizMode {
             1 => VizMode::VuMeter,
             2 => VizMode::SpectrumHorizontal,
             3 => VizMode::SpectrumVertical,
+            4 => VizMode::Oscilloscope,
+            5 => VizMode::Lissajous,
+            6 => VizMode::Spectrogram,
             _ => VizMode::None,
         }
     }
@@ -548,6 +557,12 @@ pub struct UiState {
     /// Monotonic counter incremented on each lyrics spawn. Workers capture a snapshot
     /// and abort their slow LRCLIB fetch if the counter has advanced (i.e. user skipped).
     pub lyrics_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
+
+    /// Currently-resolved album cover (half-block pre-rendered lines if decoded).
+    pub cover: Option<crate::cover::CoverImage>,
+    pub cover_receiver: Option<std::sync::mpsc::Receiver<Option<crate::cover::CoverImage>>>,
+    pub cover_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pub cover_enabled: bool,
 }
 
 impl UiState {
@@ -580,6 +595,10 @@ impl UiState {
             lyrics_auto_scroll: true,
             lyrics_offset: 0.0,
             lyrics_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            cover: None,
+            cover_receiver: None,
+            cover_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            cover_enabled: true,
         }
     }
 
