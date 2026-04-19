@@ -37,6 +37,7 @@ const KITTY_IMAGE_ID: u32 = 1;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum GraphicsProtocol {
     Kitty,
+    Iterm2,
     HalfBlock,
 }
 
@@ -46,8 +47,12 @@ pub fn detect_protocol() -> GraphicsProtocol {
     *CACHED.get_or_init(|| {
         if let Ok(tp) = std::env::var("TERM_PROGRAM") {
             let lower = tp.to_ascii_lowercase();
+            // WezTerm speaks Kitty too, prefer it for image-id-based replacement.
             if lower == "ghostty" || lower == "wezterm" {
                 return GraphicsProtocol::Kitty;
+            }
+            if lower == "iterm.app" {
+                return GraphicsProtocol::Iterm2;
             }
         }
         if let Ok(term) = std::env::var("TERM") {
@@ -57,6 +62,11 @@ pub fn detect_protocol() -> GraphicsProtocol {
         }
         if std::env::var("KITTY_WINDOW_ID").is_ok() {
             return GraphicsProtocol::Kitty;
+        }
+        if let Ok(lc) = std::env::var("LC_TERMINAL") {
+            if lc.eq_ignore_ascii_case("iterm2") {
+                return GraphicsProtocol::Iterm2;
+            }
         }
         GraphicsProtocol::HalfBlock
     })
@@ -68,6 +78,8 @@ pub enum CoverImage {
     HalfBlock { width: u32, height: u32, pixels: Vec<u8> },
     /// PNG bytes ready for Kitty-protocol transmission (base64-encoded at render time).
     Kitty { png: Vec<u8> },
+    /// PNG bytes ready for iTerm2 inline image protocol (OSC 1337).
+    Iterm2 { png: Vec<u8> },
 }
 
 /// Escape sequence that removes any placement of our reserved image ID.
@@ -242,6 +254,12 @@ fn decode_and_resize(bytes: &[u8]) -> Option<CoverImage> {
             resized.write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png).ok()?;
             Some(CoverImage::Kitty { png })
         }
+        GraphicsProtocol::Iterm2 => {
+            let resized = img.resize_exact(KITTY_SIZE, KITTY_SIZE, image::imageops::FilterType::Lanczos3);
+            let mut png: Vec<u8> = Vec::new();
+            resized.write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png).ok()?;
+            Some(CoverImage::Iterm2 { png })
+        }
         GraphicsProtocol::HalfBlock => {
             let resized = img.resize_exact(HALF_BLOCK_W, HALF_BLOCK_H, image::imageops::FilterType::Lanczos3);
             let rgb = resized.to_rgb8();
@@ -323,6 +341,7 @@ pub fn render(img: &CoverImage) -> Vec<String> {
             render_half_block(*width, *height, pixels)
         }
         CoverImage::Kitty { png } => render_kitty(png),
+        CoverImage::Iterm2 { png } => render_iterm2(png),
     }
 }
 
@@ -336,6 +355,34 @@ fn render_kitty(png: &[u8]) -> Vec<String> {
     lines.push(first);
     for _ in 1..COVER_ROWS {
         lines.push(blank.clone());
+    }
+    lines
+}
+
+fn render_iterm2(png: &[u8]) -> Vec<String> {
+    let mut lines = Vec::with_capacity(COVER_ROWS as usize);
+    let b64 = base64_encode(png);
+    // Save cursor, emit the image (which would otherwise leave the cursor
+    // in an implementation-defined position), restore cursor, then advance
+    // exactly COVER_COLS cells. The image is "attached" to the cells it
+    // occupies; using \x1B[NC instead of literal spaces avoids overwriting
+    // those image cells on rows 1-9.
+    let mut first = String::with_capacity(b64.len() + 128);
+    first.push_str("\x1B[s\x1B]1337;File=size=");
+    let _ = write!(first, "{}", png.len());
+    let _ = write!(
+        first,
+        ";width={};height={};inline=1;preserveAspectRatio=1:",
+        COVER_COLS, COVER_ROWS
+    );
+    first.push_str(&b64);
+    first.push('\x07');
+    first.push_str("\x1B[u");
+    let _ = write!(first, "\x1B[{}C", COVER_COLS);
+    lines.push(first);
+    let skip = format!("\x1B[{}C", COVER_COLS);
+    for _ in 1..COVER_ROWS {
+        lines.push(skip.clone());
     }
     lines
 }
