@@ -695,7 +695,53 @@ const BRAILLE_BITS: [[u32; 4]; 2] = [
     [0x08, 0x10, 0x20, 0x80],
 ];
 
-pub fn render_oscilloscope(analyser: &VizAnalyser, _style: VizStyle) -> Vec<String> {
+pub fn render_oscilloscope(analyser: &VizAnalyser, style: VizStyle) -> Vec<String> {
+    match style {
+        VizStyle::Dots => render_oscilloscope_dots(analyser),
+        VizStyle::Bars => render_oscilloscope_bars(analyser),
+    }
+}
+
+fn render_oscilloscope_bars(analyser: &VizAnalyser) -> Vec<String> {
+    let buf = &analyser.waveform_buf;
+    let mut col_values = vec![0.0f32; OSCILLOSCOPE_COLS];
+    if !buf.is_empty() {
+        let n = buf.len();
+        for x in 0..OSCILLOSCOPE_COLS {
+            let idx = x * (n - 1) / OSCILLOSCOPE_COLS.max(1);
+            let (l, r) = buf[idx];
+            col_values[x] = ((l + r) * 0.5).clamp(-1.0, 1.0);
+        }
+    }
+    let mid = OSCILLOSCOPE_ROWS as f32 / 2.0;
+    let mut lines = Vec::with_capacity(OSCILLOSCOPE_ROWS);
+    for cy in 0..OSCILLOSCOPE_ROWS {
+        let from_edge = cy.min(OSCILLOSCOPE_ROWS - 1 - cy);
+        let color = match from_edge {
+            0 => C_RED,
+            1 => C_YELLOW,
+            _ => C_GREEN,
+        };
+        let mut line = String::from("  ");
+        line.push_str(color);
+        let cell_top = cy as f32;
+        let cell_bot = (cy + 1) as f32;
+        for &v in &col_values {
+            let bar_top = mid - v * mid;
+            let (lo, hi) = if bar_top < mid { (bar_top, mid) } else { (mid, bar_top) };
+            if hi > cell_top && lo < cell_bot {
+                line.push('█');
+            } else {
+                line.push(' ');
+            }
+        }
+        line.push_str(C_RESET);
+        lines.push(line);
+    }
+    lines
+}
+
+fn render_oscilloscope_dots(analyser: &VizAnalyser) -> Vec<String> {
     let buf = &analyser.waveform_buf;
     let mut grid = vec![0u32; OSCILLOSCOPE_DOTS_W * OSCILLOSCOPE_DOTS_H];
     let set = |g: &mut [u32], x: usize, y: usize| {
@@ -768,7 +814,50 @@ const LISSAJOUS_ROWS: usize = 8;
 const LISSAJOUS_DOTS_W: usize = LISSAJOUS_COLS * 2;
 const LISSAJOUS_DOTS_H: usize = LISSAJOUS_ROWS * 4;
 
-pub fn render_lissajous(analyser: &VizAnalyser, _style: VizStyle) -> Vec<String> {
+pub fn render_lissajous(analyser: &VizAnalyser, style: VizStyle) -> Vec<String> {
+    match style {
+        VizStyle::Dots => render_lissajous_dots(analyser),
+        VizStyle::Bars => render_lissajous_bars(analyser),
+    }
+}
+
+fn render_lissajous_bars(analyser: &VizAnalyser) -> Vec<String> {
+    let buf = &analyser.waveform_buf;
+    let mut counts = vec![0u32; LISSAJOUS_COLS * LISSAJOUS_ROWS];
+    let inv_sqrt2 = std::f32::consts::FRAC_1_SQRT_2;
+    let w_half = LISSAJOUS_COLS as f32 / 2.0;
+    let h_half = LISSAJOUS_ROWS as f32 / 2.0;
+    for &(l, r) in buf.iter() {
+        let side = (l - r) * inv_sqrt2;
+        let mid = (l + r) * inv_sqrt2;
+        let x = (w_half + side.clamp(-1.0, 1.0) * (w_half - 0.5)) as i32;
+        let y = (h_half - mid.clamp(-1.0, 1.0) * (h_half - 0.5)) as i32;
+        if x >= 0 && (x as usize) < LISSAJOUS_COLS && y >= 0 && (y as usize) < LISSAJOUS_ROWS {
+            counts[y as usize * LISSAJOUS_COLS + x as usize] += 1;
+        }
+    }
+    let max = counts.iter().copied().max().unwrap_or(1).max(1) as f32;
+
+    let mut lines = Vec::with_capacity(LISSAJOUS_ROWS);
+    for cy in 0..LISSAJOUS_ROWS {
+        let mut line = String::from("  ");
+        line.push_str(C_CYAN);
+        for cx in 0..LISSAJOUS_COLS {
+            let f = counts[cy * LISSAJOUS_COLS + cx] as f32 / max;
+            let ch = if f == 0.0 { ' ' }
+                else if f < 0.25 { '░' }
+                else if f < 0.5  { '▒' }
+                else if f < 0.75 { '▓' }
+                else { '█' };
+            line.push(ch);
+        }
+        line.push_str(C_RESET);
+        lines.push(line);
+    }
+    lines
+}
+
+fn render_lissajous_dots(analyser: &VizAnalyser) -> Vec<String> {
     let buf = &analyser.waveform_buf;
     let mut grid = vec![0u32; LISSAJOUS_DOTS_W * LISSAJOUS_DOTS_H];
 
@@ -822,9 +911,22 @@ const SPECTROGRAM_ROW_COLORS: [&str; SPECTROGRAM_ROWS] = [
     C_YELLOW, C_GREEN, C_GREEN, C_CYAN,
 ];
 
-pub fn render_spectrogram(analyser: &VizAnalyser, _style: VizStyle) -> Vec<String> {
+// 9-level braille fill, one extra dot per step so each magnitude maps to a
+// visibly distinct glyph (the shared SPECTRUM_H_BRAILLE table has duplicates).
+const SPECTROGRAM_DOTS: &[char] = &[' ', '⡀', '⣀', '⣄', '⣤', '⣦', '⣶', '⣷', '⣿'];
+
+pub fn render_spectrogram(analyser: &VizAnalyser, style: VizStyle) -> Vec<String> {
     let hist = &analyser.spectrogram_history;
     let cols = SPECTROGRAM_COLS;
+    let chars: &[char] = match style {
+        VizStyle::Bars => SPECTRUM_H_CHARS,
+        VizStyle::Dots => SPECTROGRAM_DOTS,
+    };
+    // Per-band magnitudes after FFT post-processing rarely exceed ~0.7; with
+    // a linear mapping the upper glyphs are essentially unreachable. Sqrt
+    // pulls mid-range values upward so the dynamic range actually spans
+    // the palette. Applied for dots only — bars already look fine linearly.
+    let boost = matches!(style, VizStyle::Dots);
 
     // Group 31 bands into 8 rows, top-to-bottom = highest-to-lowest freq.
     // Row i pulls the max over its band group for snappier high-freq response.
@@ -857,8 +959,9 @@ pub fn render_spectrogram(analyser: &VizAnalyser, _style: VizStyle) -> Vec<Strin
             for b in lo..hi {
                 v = v.max(frame[b]);
             }
-            let idx = (v * 8.0).clamp(0.0, 8.0) as usize;
-            line.push(SPECTRUM_H_CHARS[idx]);
+            let v_mapped = if boost { v.sqrt() } else { v };
+            let idx = (v_mapped * 8.0).clamp(0.0, 8.0) as usize;
+            line.push(chars[idx]);
         }
         line.push_str(C_RESET);
         lines.push(line);
