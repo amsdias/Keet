@@ -563,6 +563,8 @@ pub struct UiState {
     pub cover_receiver: Option<std::sync::mpsc::Receiver<Option<crate::cover::CoverImage>>>,
     pub cover_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub cover_enabled: bool,
+    /// Visible playlist rows from the last render — used by PageUp/PageDown.
+    pub last_visible_rows: usize,
 }
 
 impl UiState {
@@ -599,6 +601,7 @@ impl UiState {
             cover_receiver: None,
             cover_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             cover_enabled: true,
+            last_visible_rows: 20,
         }
     }
 

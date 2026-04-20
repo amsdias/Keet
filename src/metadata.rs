@@ -30,6 +30,10 @@ struct CachedMeta {
     rg_album_peak: Option<f32>,
     lyrics: Option<String>,
     duration_secs: Option<f64>,
+    #[allow(dead_code)]
+    track_number: Option<u32>,
+    #[allow(dead_code)]
+    disc_number: Option<u32>,
 }
 
 pub struct MetadataCache {
@@ -102,6 +106,21 @@ impl MetadataCache {
     pub fn album(&self, index: usize) -> Option<String> {
         let entries = self.entries.read().unwrap();
         entries.get(index).and_then(|e| e.as_ref()).and_then(|m| m.album.clone())
+    }
+
+    pub fn track_number(&self, index: usize) -> Option<u32> {
+        let entries = self.entries.read().unwrap();
+        entries.get(index).and_then(|e| e.as_ref()).and_then(|m| m.track_number)
+    }
+
+    pub fn disc_number(&self, index: usize) -> Option<u32> {
+        let entries = self.entries.read().unwrap();
+        entries.get(index).and_then(|e| e.as_ref()).and_then(|m| m.disc_number)
+    }
+
+    pub fn title(&self, index: usize) -> Option<String> {
+        let entries = self.entries.read().unwrap();
+        entries.get(index).and_then(|e| e.as_ref()).and_then(|m| m.title.clone())
     }
 
     fn set(&self, index: usize, meta: CachedMeta) {
@@ -194,6 +213,8 @@ fn read_metadata_full(path: &Path) -> Option<CachedMeta> {
     let mut artist: Option<String> = None;
     let mut album: Option<String> = None;
     let mut lyrics: Option<String> = None;
+    let mut track_number: Option<u32> = None;
+    let mut disc_number: Option<u32> = None;
     let mut rg_track_gain: Option<f32> = None;
     let mut rg_track_peak: Option<f32> = None;
     let mut rg_album_gain: Option<f32> = None;
@@ -213,6 +234,12 @@ fn read_metadata_full(path: &Path) -> Option<CachedMeta> {
                 }
                 Some(StandardTagKey::Lyrics) if lyrics.is_none() => {
                     if let Value::String(ref s) = tag.value { lyrics = Some(s.clone()); }
+                }
+                Some(StandardTagKey::TrackNumber) if track_number.is_none() => {
+                    track_number = parse_leading_u32(&tag.value);
+                }
+                Some(StandardTagKey::DiscNumber) if disc_number.is_none() => {
+                    disc_number = parse_leading_u32(&tag.value);
                 }
                 _ => {}
             }
@@ -256,6 +283,12 @@ fn read_metadata_full(path: &Path) -> Option<CachedMeta> {
                         }
                         Some(StandardTagKey::Lyrics) if lyrics.is_none() => {
                             if let Value::String(ref s) = tag.value { lyrics = Some(s.clone()); }
+                        }
+                        Some(StandardTagKey::TrackNumber) if track_number.is_none() => {
+                            track_number = parse_leading_u32(&tag.value);
+                        }
+                        Some(StandardTagKey::DiscNumber) if disc_number.is_none() => {
+                            disc_number = parse_leading_u32(&tag.value);
                         }
                         _ => {}
                     }
@@ -309,7 +342,22 @@ fn read_metadata_full(path: &Path) -> Option<CachedMeta> {
         rg_album_peak,
         lyrics,
         duration_secs,
+        track_number,
+        disc_number,
     })
+}
+
+/// Parse a numeric prefix from a tag value: "5" → 5, "5/12" → 5, U32(7) → 7.
+fn parse_leading_u32(value: &Value) -> Option<u32> {
+    match value {
+        Value::UnsignedInt(n) => (*n).try_into().ok(),
+        Value::SignedInt(n) => (*n).try_into().ok(),
+        Value::String(s) => {
+            let digits: String = s.trim().chars().take_while(|c| c.is_ascii_digit()).collect();
+            digits.parse().ok()
+        }
+        _ => None,
+    }
 }
 
 /// Read only embedded lyrics from a file (for tracks not yet in the metadata cache).

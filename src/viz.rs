@@ -704,16 +704,37 @@ pub fn render_oscilloscope(analyser: &VizAnalyser, style: VizStyle) -> Vec<Strin
 
 fn render_oscilloscope_bars(analyser: &VizAnalyser) -> Vec<String> {
     let buf = &analyser.waveform_buf;
-    let mut col_values = vec![0.0f32; OSCILLOSCOPE_COLS];
+    // 2× horizontal resolution via quadrant blocks: sample at 2× cell width.
+    const SUB_COLS: usize = OSCILLOSCOPE_COLS * 2;
+    const SUB_ROWS: usize = OSCILLOSCOPE_ROWS * 2;
+    let mut col_values = vec![0.0f32; SUB_COLS];
     if !buf.is_empty() {
         let n = buf.len();
-        for x in 0..OSCILLOSCOPE_COLS {
-            let idx = x * (n - 1) / OSCILLOSCOPE_COLS.max(1);
+        for x in 0..SUB_COLS {
+            let idx = x * (n - 1) / SUB_COLS.max(1);
             let (l, r) = buf[idx];
             col_values[x] = ((l + r) * 0.5).clamp(-1.0, 1.0);
         }
     }
-    let mid = OSCILLOSCOPE_ROWS as f32 / 2.0;
+    // Mark filled sub-cells (2 sub-cols × 2 sub-rows per terminal cell).
+    let mid_sub = SUB_ROWS as f32 / 2.0;
+    let mut sub_grid = vec![false; SUB_ROWS * SUB_COLS];
+    for (x, &v) in col_values.iter().enumerate() {
+        let wave_sub = mid_sub - v * mid_sub;
+        let (lo, hi) = if wave_sub < mid_sub { (wave_sub, mid_sub) } else { (mid_sub, wave_sub) };
+        let lo_i = lo.floor() as usize;
+        let hi_i = (hi.ceil() as usize).min(SUB_ROWS);
+        for sy in lo_i..hi_i {
+            sub_grid[sy * SUB_COLS + x] = true;
+        }
+    }
+    // Quadrant block lookup indexed by (TL, TR, BL, BR) packed as a 4-bit nibble.
+    const QUAD: [char; 16] = [
+        ' ', '▘', '▝', '▀',  // 0000 0001 0010 0011
+        '▖', '▌', '▞', '▛',  // 0100 0101 0110 0111
+        '▗', '▚', '▐', '▜',  // 1000 1001 1010 1011
+        '▄', '▙', '▟', '█',  // 1100 1101 1110 1111
+    ];
     let mut lines = Vec::with_capacity(OSCILLOSCOPE_ROWS);
     for cy in 0..OSCILLOSCOPE_ROWS {
         let from_edge = cy.min(OSCILLOSCOPE_ROWS - 1 - cy);
@@ -724,16 +745,17 @@ fn render_oscilloscope_bars(analyser: &VizAnalyser) -> Vec<String> {
         };
         let mut line = String::from("  ");
         line.push_str(color);
-        let cell_top = cy as f32;
-        let cell_bot = (cy + 1) as f32;
-        for &v in &col_values {
-            let bar_top = mid - v * mid;
-            let (lo, hi) = if bar_top < mid { (bar_top, mid) } else { (mid, bar_top) };
-            if hi > cell_top && lo < cell_bot {
-                line.push('█');
-            } else {
-                line.push(' ');
-            }
+        let top_row = cy * 2;
+        let bot_row = cy * 2 + 1;
+        for cx in 0..OSCILLOSCOPE_COLS {
+            let lx = cx * 2;
+            let rx = cx * 2 + 1;
+            let tl = sub_grid[top_row * SUB_COLS + lx] as u8;
+            let tr = sub_grid[top_row * SUB_COLS + rx] as u8;
+            let bl = sub_grid[bot_row * SUB_COLS + lx] as u8;
+            let br = sub_grid[bot_row * SUB_COLS + rx] as u8;
+            let idx = (tl) | (tr << 1) | (bl << 2) | (br << 3);
+            line.push(QUAD[idx as usize]);
         }
         line.push_str(C_RESET);
         lines.push(line);

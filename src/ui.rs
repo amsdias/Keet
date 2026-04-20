@@ -198,6 +198,7 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
         let header_lines = 2 + if eq_line { 1 } else { 0 };
         let footer_lines = 2; // separator + footer
         let visible_rows = term_h.saturating_sub(header_lines + footer_lines + ui.banner_lines).max(1);
+        ui.last_visible_rows = visible_rows;
 
         // Separator
         print!("\n\r\x1B[K  {C_DIM}{}{C_RESET}", "─".repeat(term_w.saturating_sub(2)));
@@ -461,6 +462,20 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
             continue;
         }
 
+        // macOS terminals translate Cmd+Arrow (and similar shortcuts) into an ESC
+        // byte followed by another char — crossterm hands us two separate events.
+        // If a bare Esc is immediately followed by another pending event, treat
+        // the pair as an unrecognized escape sequence and drop both. Human typing
+        // rarely produces 0ms gaps, so a zero-duration poll returning true here
+        // is a reliable signal.
+        if k.code == KeyCode::Esc
+            && k.modifiers.is_empty()
+            && event::poll(Duration::ZERO).unwrap_or(false)
+        {
+            let _ = event::read();
+            continue;
+        }
+
             // In text input mode, route to text handler
             match &ui.input_mode {
                 InputMode::Search(_) | InputMode::SavePlaylist(_) => {
@@ -514,6 +529,51 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
                     KeyEvent { code: KeyCode::Down, .. } => {
                         playlist_cursor_down(ui, playlist);
                         continue;
+                    }
+                    KeyEvent { code: KeyCode::Home, .. } => {
+                        playlist_cursor_home(ui);
+                        continue;
+                    }
+                    KeyEvent { code: KeyCode::End, .. } => {
+                        playlist_cursor_end(ui, playlist);
+                        continue;
+                    }
+                    KeyEvent { code: KeyCode::PageUp, .. } => {
+                        playlist_cursor_page_up(ui);
+                        continue;
+                    }
+                    KeyEvent { code: KeyCode::PageDown, .. } => {
+                        playlist_cursor_page_down(ui, playlist);
+                        continue;
+                    }
+                    // Vim-style fallbacks for Mac keyboards that lack Home/End/PgUp/PgDn.
+                    KeyEvent { code: KeyCode::Char('g'), modifiers, .. } if !modifiers.contains(KeyModifiers::SHIFT) => {
+                        playlist_cursor_home(ui);
+                        continue;
+                    }
+                    KeyEvent { code: KeyCode::Char('g'), modifiers, .. } if modifiers.contains(KeyModifiers::SHIFT) => {
+                        playlist_cursor_end(ui, playlist);
+                        continue;
+                    }
+                    KeyEvent { code: KeyCode::Char('G'), .. } => {
+                        playlist_cursor_end(ui, playlist);
+                        continue;
+                    }
+                    KeyEvent { code: KeyCode::Char('u'), modifiers, .. } if modifiers.contains(KeyModifiers::CONTROL) => {
+                        playlist_cursor_page_up(ui);
+                        continue;
+                    }
+                    KeyEvent { code: KeyCode::Char('d'), modifiers, .. } if modifiers.contains(KeyModifiers::CONTROL) => {
+                        playlist_cursor_page_down(ui, playlist);
+                        continue;
+                    }
+                    KeyEvent { code: KeyCode::Char('s'), modifiers, .. } if modifiers.contains(KeyModifiers::SHIFT) => {
+                        sort_playlist_by_tags(state, ui, playlist);
+                        return false;
+                    }
+                    KeyEvent { code: KeyCode::Char('S'), .. } => {
+                        sort_playlist_by_tags(state, ui, playlist);
+                        return false;
                     }
                     KeyEvent { code: KeyCode::Enter, .. } => {
                         let target = if ui.filtered_indices.is_empty() {
@@ -668,6 +728,18 @@ fn handle_text_input(state: &PlayerState, ui: &mut UiState, _playlist: &mut Vec<
                 KeyCode::Down => {
                     playlist_cursor_down(ui, _playlist);
                 }
+                KeyCode::Home => {
+                    playlist_cursor_home(ui);
+                }
+                KeyCode::End => {
+                    playlist_cursor_end(ui, _playlist);
+                }
+                KeyCode::PageUp => {
+                    playlist_cursor_page_up(ui);
+                }
+                KeyCode::PageDown => {
+                    playlist_cursor_page_down(ui, _playlist);
+                }
                 _ => {}
             }
         }
@@ -751,6 +823,39 @@ fn playlist_cursor_down(ui: &mut UiState, playlist: &[PathBuf]) {
     }
 }
 
+fn playlist_cursor_home(ui: &mut UiState) {
+    ui.cursor = 0;
+    ui.scroll_offset = 0;
+}
+
+fn playlist_cursor_end(ui: &mut UiState, playlist: &[PathBuf]) {
+    let max = if ui.filtered_indices.is_empty() {
+        playlist.len().saturating_sub(1)
+    } else {
+        ui.filtered_indices.len().saturating_sub(1)
+    };
+    ui.cursor = max;
+}
+
+fn playlist_cursor_page_up(ui: &mut UiState) {
+    // One-line overlap so the old top line becomes the new bottom — easier to track.
+    let page = ui.last_visible_rows.saturating_sub(1).max(1);
+    ui.cursor = ui.cursor.saturating_sub(page);
+    if ui.cursor < ui.scroll_offset {
+        ui.scroll_offset = ui.cursor;
+    }
+}
+
+fn playlist_cursor_page_down(ui: &mut UiState, playlist: &[PathBuf]) {
+    let max = if ui.filtered_indices.is_empty() {
+        playlist.len().saturating_sub(1)
+    } else {
+        ui.filtered_indices.len().saturating_sub(1)
+    };
+    let page = ui.last_visible_rows.saturating_sub(1).max(1);
+    ui.cursor = (ui.cursor + page).min(max);
+}
+
 fn ensure_cursor_visible(ui: &mut UiState, _playlist: &[PathBuf]) {
     if ui.cursor < ui.scroll_offset {
         ui.scroll_offset = ui.cursor;
@@ -815,6 +920,71 @@ fn remove_track(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<PathBu
     }
 
     ui.set_status(format!("Removed: {}", removed_name));
+}
+
+/// Sort the playlist by tag metadata: artist → album → disc → track → title → filename.
+/// Tracks without any tags fall to the bottom (sorted among themselves by filename).
+/// Preserves the currently-playing track's logical position.
+fn sort_playlist_by_tags(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<PathBuf>) {
+    if playlist.len() < 2 {
+        ui.set_status("Nothing to sort".to_string());
+        return;
+    }
+
+    let old_playlist = playlist.clone();
+    let current_path = playlist.get(ui.current).cloned();
+
+    // (bucket, artist, album, disc, track, title, filename). The leading u8
+    // partitions tagged-vs-untagged so tracks without tags cluster at the bottom
+    // rather than mingling alphabetically.
+    type SortKey = (u8, String, String, u32, u32, String, String);
+    let mut keyed: Vec<(SortKey, PathBuf)> =
+        playlist.iter().enumerate().map(|(i, p)| {
+            let (artist, album) = ui.metadata_cache.artist_album(i);
+            let title = ui.metadata_cache.title(i);
+            let track_no = ui.metadata_cache.track_number(i).unwrap_or(0);
+            let disc_no = ui.metadata_cache.disc_number(i).unwrap_or(0);
+            let filename = p.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_lowercase();
+            let bucket = if artist.is_some() || album.is_some() || title.is_some() { 0 } else { 1 };
+            let key = (
+                bucket,
+                artist.unwrap_or_default().to_lowercase(),
+                album.unwrap_or_default().to_lowercase(),
+                disc_no,
+                track_no,
+                title.unwrap_or_default().to_lowercase(),
+                filename,
+            );
+            (key, p.clone())
+        }).collect();
+
+    keyed.sort_by(|a, b| a.0.cmp(&b.0));
+    *playlist = keyed.into_iter().map(|(_, p)| p).collect();
+
+    // Re-locate the playing track in the new ordering.
+    if let Some(ref cp) = current_path {
+        if let Some(idx) = playlist.iter().position(|p| p == cp) {
+            ui.current = idx;
+        }
+    }
+
+    // Sorting invalidates the enqueue queue (positions no longer reflect user intent).
+    ui.enqueue_count = 0;
+
+    ui.metadata_cache.reindex(playlist, &old_playlist);
+    state.current_track.store(ui.current, Ordering::Relaxed);
+    ui.cursor = ui.current;
+    ensure_cursor_visible(ui, playlist);
+    ui.playlist_dirty = true;
+    ui.banner_dirty = true;
+    let was_shuffled = ui.shuffle;
+    ui.shuffle = false;
+    ui.set_status(
+        if was_shuffled { "Sorted by tags (shuffle off)" } else { "Sorted by tags" }.to_string()
+    );
 }
 
 /// Toggle runtime shuffle. When turning ON, shuffles the tracks after the current
