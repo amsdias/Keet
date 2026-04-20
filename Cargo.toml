@@ -37,6 +37,9 @@ ureq = { version = "3", default-features = false, features = ["native-tls", "gzi
 # Album cover decoding + resizing. Default-features off to skip formats we don't need.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 
+# Pure-Rust Sixel encoder for terminals that don't speak Kitty/iTerm2 (Windows Terminal, foot, mlterm).
+icy_sixel = "0.5"
+
 # macOS CoreAudio bindings for sample rate switching
 [target.'cfg(target_os = "macos")'.dependencies]
 coreaudio-sys = "0.2"

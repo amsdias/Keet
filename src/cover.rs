@@ -33,11 +33,16 @@ const HALF_BLOCK_H: u32 = COVER_ROWS * 2;
 const KITTY_SIZE: u32 = 320;
 /// Kitty image ID we reserve. Re-transmitting with the same ID replaces.
 const KITTY_IMAGE_ID: u32 = 1;
+/// Sixel target pixel size. Sixel renders 1:1 pixels, so this needs to fit
+/// the cover slot at typical cell dimensions (~10x20 px on Windows Terminal
+/// default font). 200×200 ≈ 20 cols × 10 rows in those units.
+const SIXEL_SIZE: u32 = 200;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum GraphicsProtocol {
     Kitty,
     Iterm2,
+    Sixel,
     HalfBlock,
 }
 
@@ -59,6 +64,9 @@ pub fn detect_protocol() -> GraphicsProtocol {
             if term.contains("kitty") {
                 return GraphicsProtocol::Kitty;
             }
+            if term == "foot" || term == "foot-extra" || term == "mlterm" {
+                return GraphicsProtocol::Sixel;
+            }
         }
         if std::env::var("KITTY_WINDOW_ID").is_ok() {
             return GraphicsProtocol::Kitty;
@@ -67,6 +75,10 @@ pub fn detect_protocol() -> GraphicsProtocol {
             if lc.eq_ignore_ascii_case("iterm2") {
                 return GraphicsProtocol::Iterm2;
             }
+        }
+        // Windows Terminal sets WT_SESSION; v1.22+ supports sixel natively.
+        if std::env::var("WT_SESSION").is_ok() {
+            return GraphicsProtocol::Sixel;
         }
         GraphicsProtocol::HalfBlock
     })
@@ -80,6 +92,8 @@ pub enum CoverImage {
     Kitty { png: Vec<u8> },
     /// PNG bytes ready for iTerm2 inline image protocol (OSC 1337).
     Iterm2 { png: Vec<u8> },
+    /// Pre-encoded Sixel escape data, ready to print verbatim.
+    Sixel { data: String },
 }
 
 /// Escape sequence that removes any placement of our reserved image ID.
@@ -260,6 +274,18 @@ fn decode_and_resize(bytes: &[u8]) -> Option<CoverImage> {
             resized.write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png).ok()?;
             Some(CoverImage::Iterm2 { png })
         }
+        GraphicsProtocol::Sixel => {
+            let resized = img.resize_exact(SIXEL_SIZE, SIXEL_SIZE, image::imageops::FilterType::Lanczos3);
+            let rgba = resized.to_rgba8();
+            let opts = icy_sixel::EncodeOptions::default();
+            let data = icy_sixel::sixel_encode(
+                rgba.as_raw(),
+                SIXEL_SIZE as usize,
+                SIXEL_SIZE as usize,
+                &opts,
+            ).ok()?;
+            Some(CoverImage::Sixel { data })
+        }
         GraphicsProtocol::HalfBlock => {
             let resized = img.resize_exact(HALF_BLOCK_W, HALF_BLOCK_H, image::imageops::FilterType::Lanczos3);
             let rgb = resized.to_rgb8();
@@ -342,6 +368,7 @@ pub fn render(img: &CoverImage) -> Vec<String> {
         }
         CoverImage::Kitty { png } => render_kitty(png),
         CoverImage::Iterm2 { png } => render_iterm2(png),
+        CoverImage::Sixel { data } => render_sixel(data),
     }
 }
 
@@ -355,6 +382,24 @@ fn render_kitty(png: &[u8]) -> Vec<String> {
     lines.push(first);
     for _ in 1..COVER_ROWS {
         lines.push(blank.clone());
+    }
+    lines
+}
+
+fn render_sixel(data: &str) -> Vec<String> {
+    // Same trick as iTerm2: save cursor, blast the sixel data (which leaves
+    // the cursor in implementation-defined positions), restore, then advance
+    // by COVER_COLS via cursor-right so we don't paint over the image cells.
+    let mut lines = Vec::with_capacity(COVER_ROWS as usize);
+    let mut first = String::with_capacity(data.len() + 16);
+    first.push_str("\x1B[s");
+    first.push_str(data);
+    first.push_str("\x1B[u");
+    let _ = write!(first, "\x1B[{}C", COVER_COLS);
+    lines.push(first);
+    let skip = format!("\x1B[{}C", COVER_COLS);
+    for _ in 1..COVER_ROWS {
+        lines.push(skip.clone());
     }
     lines
 }

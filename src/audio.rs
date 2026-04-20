@@ -707,43 +707,33 @@ pub fn build_stream(
                 let pre_fader = state.is_pre_fader();
                 let viz_scale = if pre_fader && gain > 0.0 { 1.0 / gain } else { 1.0 };
                 if viz_samples > 0 {
-                    let viz_free = viz_producer.slots();
-                    if viz_free >= viz_samples {
+                    if channels == 2 && viz_scale == 1.0 && viz_samples <= data.len() {
+                        // Fast path: post-fader stereo bulk copy
+                        let _ = viz_producer.push_partial_slice(&data[..viz_samples]);
+                    } else if viz_producer.slots() >= viz_samples {
                         if let Ok(mut vchunk) = viz_producer.write_chunk(viz_samples) {
                             let (vfirst, vsecond) = vchunk.as_mut_slices();
                             let viz_total = vfirst.len() + vsecond.len();
 
-                            if channels == 2 && viz_scale == 1.0 && viz_samples <= data.len() {
-                                // Fast path: post-fader stereo bulk copy
-                                let src = &data[..viz_samples];
-                                let first_len = vfirst.len().min(viz_samples);
-                                vfirst[..first_len].copy_from_slice(&src[..first_len]);
-                                if first_len < viz_samples {
-                                    let rem = viz_samples - first_len;
-                                    let rem = rem.min(vsecond.len());
-                                    vsecond[..rem].copy_from_slice(&src[first_len..first_len + rem]);
-                                }
-                            } else {
-                                // Scaled path: extract L/R, apply viz_scale
-                                let mut vi = 0;
-                                for f in 0..frames_written {
-                                    let di = f * channels;
-                                    if di >= data.len() { break; }
-                                    let l = data[di] * viz_scale;
-                                    let r = if channels >= 2 && di + 1 < data.len() {
-                                        data[di + 1] * viz_scale
+                            // Scaled path: extract L/R, apply viz_scale
+                            let mut vi = 0;
+                            for f in 0..frames_written {
+                                let di = f * channels;
+                                if di >= data.len() { break; }
+                                let l = data[di] * viz_scale;
+                                let r = if channels >= 2 && di + 1 < data.len() {
+                                    data[di + 1] * viz_scale
+                                } else {
+                                    l
+                                };
+                                for &val in &[l, r] {
+                                    if vi >= viz_total { break; }
+                                    if vi < vfirst.len() {
+                                        vfirst[vi] = val;
                                     } else {
-                                        l
-                                    };
-                                    for &val in &[l, r] {
-                                        if vi >= viz_total { break; }
-                                        if vi < vfirst.len() {
-                                            vfirst[vi] = val;
-                                        } else {
-                                            vsecond[vi - vfirst.len()] = val;
-                                        }
-                                        vi += 1;
+                                        vsecond[vi - vfirst.len()] = val;
                                     }
+                                    vi += 1;
                                 }
                             }
                             vchunk.commit_all();

@@ -573,16 +573,7 @@ pub fn decode_playlist(
             // Push to ring buffer
             let out: &[f32] = if using_final_buf { &final_buf } else { bal_output };
             if !out.is_empty() {
-                if let Ok(mut chunk) = producer.write_chunk(out.len()) {
-                    let (first, second) = chunk.as_mut_slices();
-                    let first_len = first.len().min(out.len());
-                    first[..first_len].copy_from_slice(&out[..first_len]);
-                    if first_len < out.len() && !second.is_empty() {
-                        let second_len = second.len().min(out.len() - first_len);
-                        second[..second_len].copy_from_slice(&out[first_len..first_len + second_len]);
-                    }
-                    chunk.commit_all();
-                }
+                let _ = producer.push_entire_slice(out);
 
                 // Capture tail for crossfade into next track
                 if capture_tail {
@@ -604,16 +595,7 @@ pub fn decode_playlist(
                 if let Ok(adapter_in) = SequentialSliceOfVecs::new(&flush_planes, channels, frames_in) {
                     if let Ok(resampled) = resampler.process(&adapter_in, 0, None) {
                         let output = resampled.take_data();
-                        if let Ok(mut chunk) = producer.write_chunk(output.len()) {
-                            let (first, second) = chunk.as_mut_slices();
-                            let first_len = first.len().min(output.len());
-                            first[..first_len].copy_from_slice(&output[..first_len]);
-                            if first_len < output.len() && !second.is_empty() {
-                                let second_len = second.len().min(output.len() - first_len);
-                                second[..second_len].copy_from_slice(&output[first_len..first_len + second_len]);
-                            }
-                            chunk.commit_all();
-                        }
+                        let _ = producer.push_entire_slice(&output);
                     }
                 }
             }
