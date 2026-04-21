@@ -35,7 +35,7 @@ use cpal::StreamConfig;
 use crossterm::terminal;
 use rtrb::RingBuffer;
 
-use state::{PlayerState, UiState, RgMode, VizMode, RING_BUFFER_SIZE, VIZ_BUFFER_SIZE};
+use state::{PlayerState, UiState, RgMode, VizMode, ring_capacity_for, VIZ_BUFFER_SIZE};
 use viz::{StatsMonitor, VizAnalyser};
 use audio::{build_stream, set_output_sample_rate, probe_sample_rate, fix_bluetooth_sample_rate};
 use decode::decode_playlist;
@@ -269,7 +269,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  Up / Down    Next / previous track");
         println!("  Right / Left Seek forward / backward 10s");
         println!("  + / -        Volume up / down (5% steps, 0–150%)");
-        println!("  V            Cycle visualization (off → VU → spectrum H → spectrum V)");
+        println!("  V            Cycle visualization (off → VU → spectrum H/V → scope → vector → spectrogram)");
         println!("  B            Toggle viz style (dots / bars)");
         println!("  F            Toggle pre/post-fader metering");
         println!("  E            Cycle EQ presets");
@@ -281,17 +281,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  S            Save playlist as M3U");
         println!("  R            Rescan folders for new files");
         println!("  Z            Toggle shuffle");
-        println!("  Shift+R      Toggle repeat");
+        println!("  Shift+R      Toggle repeat (Off → All → One)");
         println!("  O            Open a new source (type a path)");
         println!("  P            Pick a new source (native folder dialog)");
+        println!("  I            Toggle CPU/memory stats");
         println!("  Q / Esc      Quit");
         println!();
         println!("\x1B[1mPLAYLIST VIEW\x1B[0m  (press L)");
-        println!("  Up / Down    Scroll track list");
-        println!("  Enter        Jump to selected track");
-        println!("  /            Search / filter by filename");
-        println!("  D            Remove selected track");
-        println!("  Esc / L      Close playlist view");
+        println!("  Up / Down       Move cursor");
+        println!("  Home / End      Jump to top / bottom              (also: g / G)");
+        println!("  PgUp / PgDn     Page up / down                    (also: Ctrl+U / Ctrl+D)");
+        println!("  Enter           Jump to selected track");
+        println!("  A               Enqueue selected track (play next)");
+        println!("  Shift+S         Sort by tags (artist → album → disc → track → title)");
+        println!("  /               Search / filter by filename");
+        println!("  D / Delete      Remove selected track");
+        println!("  Esc / L         Close playlist view");
+        println!();
+        println!("\x1B[1mLYRICS VIEW\x1B[0m  (press Y)");
+        println!("  W / S        Scroll up / down (disables auto-scroll)");
+        println!("  A / D        Adjust sync offset −/+ 0.5s");
+        println!("  Esc / Y      Close lyrics view");
         println!();
         println!("\x1B[1mCUSTOM PRESETS\x1B[0m");
         println!("  EQ:      ~/.config/keet/eq/*.json");
@@ -679,7 +689,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         buffer_size,
     };
 
-    let (mut prod, cons) = RingBuffer::<f32>::new(RING_BUFFER_SIZE);
+    let ring_cap = ring_capacity_for(stream_rate);
+    state.ring_capacity.store(ring_cap, Ordering::Relaxed);
+    let (mut prod, cons) = RingBuffer::<f32>::new(ring_cap);
     let (viz_prod, mut viz_cons) = RingBuffer::<f32>::new(VIZ_BUFFER_SIZE);
 
     let mut stream = build_stream(&device, &stream_config, cons, viz_prod, Arc::clone(&state))?;
@@ -1003,7 +1015,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Err(_) => break 'playlist,
                 }
                 // Flush ring buffer
-                if RING_BUFFER_SIZE - prod.slots() > 0 {
+                if state.ring_capacity.load(Ordering::Relaxed) - prod.slots() > 0 {
                     state.reset_consumer_counter.store(true, Ordering::Relaxed);
                 }
                 if let Some(target) = state.take_jump() {
@@ -1038,7 +1050,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 drop(stream);
 
                 // Rebuild ring buffer and stream
-                let (new_prod, new_cons) = RingBuffer::<f32>::new(RING_BUFFER_SIZE);
+                let ring_cap = ring_capacity_for(stream_rate);
+                state.ring_capacity.store(ring_cap, Ordering::Relaxed);
+                let (new_prod, new_cons) = RingBuffer::<f32>::new(ring_cap);
                 let (new_viz_prod, new_viz_cons) = RingBuffer::<f32>::new(VIZ_BUFFER_SIZE);
                 prod = new_prod;
                 viz_cons = new_viz_cons;
@@ -1095,7 +1109,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     stream_rate = new_rate;
                     state.output_rate.store(stream_rate as u64, Ordering::Relaxed);
 
-                    let (new_prod, new_cons) = RingBuffer::<f32>::new(RING_BUFFER_SIZE);
+                    let ring_cap = ring_capacity_for(stream_rate);
+                    state.ring_capacity.store(ring_cap, Ordering::Relaxed);
+                    let (new_prod, new_cons) = RingBuffer::<f32>::new(ring_cap);
                     let (new_viz_prod, new_viz_cons) = RingBuffer::<f32>::new(VIZ_BUFFER_SIZE);
                     prod = new_prod;
                     viz_cons = new_viz_cons;

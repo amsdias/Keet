@@ -8,7 +8,7 @@ use symphonia::core::audio::{AudioBufferRef, Signal};
 use symphonia::core::codecs::DecoderOptions;
 use symphonia::core::formats::{FormatOptions, SeekMode, SeekTo};
 use symphonia::core::io::MediaSourceStream;
-use symphonia::core::meta::MetadataOptions;
+use symphonia::core::meta::{Limit, MetadataOptions};
 use symphonia::core::probe::Hint;
 use symphonia::core::units::Time;
 
@@ -17,7 +17,7 @@ use audioadapter_buffers::direct::SequentialSliceOfVecs;
 
 use rtrb::Producer;
 
-use crate::state::{PlayerState, RING_BUFFER_SIZE};
+use crate::state::PlayerState;
 use crate::state::RgMode;
 
 fn interleave_f32_planes_into(buf: &symphonia::core::audio::AudioBuffer<f32>, out: &mut Vec<f32>) {
@@ -143,6 +143,9 @@ pub fn decode_playlist(
     let crossfade_samples = crossfade_secs as usize * output_rate as usize * 2; // stereo
     let mut crossfade_tail: Option<std::collections::VecDeque<f32>> = None;
     let mut track_index = start_index;
+    // Ring capacity is sized per output rate in main.rs and stored on state before
+    // the producer is spawned, so it's stable for the lifetime of this call.
+    let ring_capacity = state.ring_capacity.load(Ordering::Relaxed);
 
     while track_index < playlist.len() {
         // Non-destructive peek: main.rs is the single consumer of skip_prev / jump_to_track
@@ -176,8 +179,17 @@ pub fn decode_playlist(
             hint.with_extension(ext.to_str().unwrap_or(""));
         }
 
+        // Skip embedded picture (cover art) reads in the decoder thread —
+        // covers are loaded by a dedicated worker (`spawn_cover_worker`) that
+        // re-opens the file. Letting symphonia load a 1 MB+ FLAC PICTURE block
+        // here is just allocator churn we throw away. `Limit::Maximum(0)`
+        // makes the demuxer skip the visual entirely.
+        let meta_opts = MetadataOptions {
+            limit_visual_bytes: Limit::Maximum(0),
+            limit_metadata_bytes: Limit::Default,
+        };
         let mut probed = match symphonia::default::get_probe()
-            .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+            .format(&hint, mss, &FormatOptions::default(), &meta_opts)
         {
             Ok(p) => p,
             Err(e) => {
@@ -247,7 +259,7 @@ pub fn decode_playlist(
         if track_index != start_index {
             let drain_threshold = output_rate as usize; // ~0.5s stereo
             loop {
-                let buffered = RING_BUFFER_SIZE - producer.slots();
+                let buffered = ring_capacity - producer.slots();
                 if buffered <= drain_threshold { break; }
                 if state.should_quit() || state.skip_prev.load(Ordering::Relaxed)
                     || state.jump_to_track.load(Ordering::Relaxed) >= 0 {
@@ -358,7 +370,7 @@ pub fn decode_playlist(
             }
             // Check skip-next — flush buffer and advance to next track
             if state.take_skip_next() {
-                if RING_BUFFER_SIZE - producer.slots() > 0 {
+                if ring_capacity - producer.slots() > 0 {
                     state.reset_consumer_counter.store(true, Ordering::Relaxed);
                 }
                 skipped = true;
@@ -387,7 +399,7 @@ pub fn decode_playlist(
 
             // Throttle when buffer is full
             let free = producer.slots();
-            if free < RING_BUFFER_SIZE / 4 {
+            if free < ring_capacity / 4 {
                 thread::sleep(Duration::from_millis(20));
                 continue;
             }

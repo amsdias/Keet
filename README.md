@@ -1,385 +1,102 @@
-# Keet
+# CLAUDE.md
 
-A high-performance, low-CPU terminal audio player with real-time spectrum visualization, parametric EQ, and synced lyrics.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Features
-
-- **Multi-format support**: MP3, FLAC, WAV, OGG, AAC/M4A, ALAC, AIFF
-- **Low CPU usage**: <0.5% total system CPU (release mode)
-- **Synced lyrics**: Embedded LRC lyrics + automatic fetching from LRCLIB (~3M songs), with adjustable sync offset
-- **Parametric EQ**: Built-in presets (Flat, Bass Boost, Treble Boost, Vocal, Loudness) + custom JSON presets
-- **Audio effects**: Reverb, chorus, delay with built-in environment presets + custom JSON presets
-- **Gapless playback**: Sample-accurate track transitions with continuous audio stream
-- **ReplayGain**: Loudness normalization with peak-based clipping prevention (`--rg-mode track|album|off`)
-- **Crossfade**: Smooth equal-power crossfade between tracks (`--crossfade`)
-- **Pre/post-fader metering**: Toggle between raw signal and volume-adjusted visualization
-- **Media controls**: AirPods stalk controls, Bluetooth headphone buttons, keyboard media keys (macOS/Windows/Linux)
-- **Real-time visualizations**: VU meter, horizontal/vertical spectrum analyzer synced to playback, toggleable bars/dots style
-- **Metadata display**: Reads artist/title from ID3, Vorbis, and MP4 tags
-- **Format-colored icons**: File type indicated by icon color (green=MP3, cyan=FLAC, yellow=WAV, etc.)
-- **Output device selection**: `--device` selects by name, `--list-devices` enumerates
-- **Exclusive mode**: Per-track sample rate matching, macOS hog mode for bit-perfect playback (`--exclusive`)
-- **Headphone crossfeed**: Meier-style frequency-dependent crossfeed with three presets (Light/Medium/Strong)
-- **Balance control**: Stereo balance with `[`/`]` keys (5% steps, -100 to +100)
-- **Clipping indicator**: Persistent dot that turns red when signal exceeds 0dBFS, with peak safety limiter
-- **Smart audio processing**: Automatic sample rate switching (macOS), Bluetooth detection, conditional resampling, seamless device switching
-- **Volume control**: Adjustable 0-150% with per-sample gain
-- **Playlist features**: Shuffle, repeat (all/one), recursive folder scanning, playlist view with search and track durations, play queue (enqueue tracks after current), M3U import/export, folder rescan, multiple source paths with deduplication
-- **Resume playback**: Save and restore last session (track, position, volume, EQ, effects, crossfeed, balance, device, exclusive) automatically
-- **HQ resampler mode**: Optional `--quality` flag for audiophile-grade resampling
-- **Resilient playback**: Silently skips missing/corrupt files, recovers from device disconnection (including USB DAC unplug)
-- **Terminal-safe UI**: Output adapts to terminal width, handles terminal resize gracefully
-- **Process stats**: Lightweight CPU/memory monitoring via direct platform syscalls (toggle with `I`)
-
-## Quick Start
+## Build & Run
 
 ```bash
-# Play a single file
-cargo run --release -- song.flac
-
-# Play a folder (recursive)
-cargo run --release -- ~/Music/
-
-# Multiple folders
-cargo run --release -- ~/Music/Jazz ~/Music/Rock
-
-# Mix M3U playlist with a folder
-keet ~/Music/favorites.m3u ~/Music/NewAlbum
-
-# Multiple files and folders (duplicates removed automatically)
-keet song.flac ~/Music/Jazz ~/Music/Rock
-
-# With shuffle, repeat, and HQ resampler
-cargo run --release -- ~/Music/ --shuffle --repeat --quality
-
-# Start with Bass Boost EQ
-cargo run --release -- ~/Music/ --eq "Bass Boost"
-
-# With Concert Hall reverb and 3-second crossfade
-cargo run --release -- ~/Music/ --fx "Concert Hall" --crossfade 3
-
-# List available output devices
-keet --list-devices
-
-# Play on a specific device with exclusive mode
-keet ~/Music/ --device "USB Audio DAC" --exclusive
-
-# Resume last session (no arguments)
-keet
-
-# Play an M3U playlist
-keet ~/Music/favorites.m3u
+cargo build --release          # Release mode required for acceptable audio performance
+cargo run --release -- ~/Music # Play a folder
+cargo clippy --all-targets     # Lint (treat warnings as informational, errors must be fixed)
+cargo test                     # Run tests (currently minimal)
 ```
 
-**Note**: Release mode (`--release`) is required for acceptable performance.
+Linux build deps: `sudo apt install libasound2-dev libdbus-1-dev`
 
-## Keyboard Controls
-
-| Key | Action |
-|-----|--------|
-| `Space` | Pause/Resume |
-| `Up` | Next track |
-| `Down` | Previous track |
-| `Right` | Seek forward 10s |
-| `Left` | Seek backward 10s |
-| `L` | Toggle playlist view |
-| `Y` | Toggle lyrics view |
-| `V` | Cycle visualization modes |
-| `B` | Toggle visualization style (bars/dots) |
-| `E` | Cycle EQ presets |
-| `X` | Cycle effects presets |
-| `Shift+R` | Cycle repeat mode (Off → All → One) |
-| `R` | Rescan folders for changes |
-| `S` | Save playlist as M3U |
-| `F` | Toggle pre/post-fader metering |
-| `C` | Cycle crossfeed presets (Off/Light/Medium/Strong) |
-| `I` | Toggle CPU/memory stats display |
-| `[` | Balance left (5% steps) |
-| `]` | Balance right (5% steps) |
-| `+` / `=` | Volume up (5%) |
-| `-` | Volume down (5%) |
-| `Q` / `Esc` | Quit |
-
-### Playlist View Controls
-
-Press `L` to open the playlist view, which replaces the visualization area with a scrollable track list.
-
-| Key | Action |
-|-----|--------|
-| `Up` / `Down` | Scroll track list |
-| `Enter` | Jump to selected track |
-| `A` | Enqueue selected track (move it to play next) |
-| `/` | Search/filter by filename |
-| `D` | Remove selected track |
-| `S` | Save playlist as M3U |
-| `Esc` / `L` | Close playlist view |
-
-Track durations are shown in a right-aligned column. The cursor follows the currently playing track on transitions.
-
-While searching (`/`), type to filter tracks by filename (case-insensitive). Press `Enter` to jump to the selected match, or `Esc` to cancel.
-
-### Lyrics View Controls
-
-Press `Y` to open the lyrics view. Synced lyrics auto-scroll to the current line; plain lyrics show as static text.
-
-| Key | Action |
-|-----|--------|
-| `W` / `S` | Scroll up/down (disables auto-scroll for synced lyrics) |
-| `A` / `D` | Adjust sync offset -/+0.5s (synced lyrics only) |
-| `Up` / `Down` | Next/previous track (global) |
-| `Left` / `Right` | Seek +/-10s (global) |
-| `Esc` / `Y` | Close lyrics view |
-
-Lyrics are loaded from embedded tags first (USLT/ID3v2, Vorbis comments, iTunes atoms), then fetched from [LRCLIB](https://lrclib.net) if not found. LRCLIB matches by artist, title, and duration for accurate results. Synced lyrics (LRC format) are preferred over plain text.
-
-## EQ Presets
-
-### Built-in Presets
-
-| Preset | Description |
-|--------|-------------|
-| Flat | No EQ (passthrough) |
-| Bass Boost | +6dB at 32Hz, tapering to +1dB at 250Hz |
-| Treble Boost | +2dB at 4kHz, rising to +5dB at 16kHz |
-| Vocal | Cuts bass, boosts 1-4kHz midrange |
-| Loudness | Boosts lows and highs (smiley curve) |
-
-### Custom Presets
-
-Drop JSON files into `~/.config/keet/eq/` (macOS/Linux) or `%APPDATA%\keet\eq\` (Windows):
-
-```json
-{
-  "name": "My Preset",
-  "bands": [
-    {"freq": 60, "gain": 4.0, "q": 0.8},
-    {"freq": 250, "gain": -2.0},
-    {"freq": 4000, "gain": 3.0, "q": 1.2}
-  ]
-}
-```
-
-- `freq`: Center frequency in Hz
-- `gain`: Boost/cut in dB (positive = boost, negative = cut)
-- `q`: Filter bandwidth (default: 1.0, lower = wider)
-
-Custom presets appear automatically when cycling with `E`.
-
-Example presets are included in `assets/` -- copy them to the presets folders as a starting point:
-
-```bash
-# macOS/Linux
-mkdir -p ~/.config/keet/eq ~/.config/keet/effects
-cp assets/eq-example.json ~/.config/keet/eq/
-cp assets/fx-example.json ~/.config/keet/effects/
-
-# Windows
-copy assets\eq-example.json %APPDATA%\keet\eq\
-copy assets\fx-example.json %APPDATA%\keet\effects\
-```
-
-## Effects Presets
-
-### Built-in Presets
-
-| Preset | Description |
-|--------|-------------|
-| None | No effects (passthrough) |
-| Small Room | Subtle room ambience |
-| Concert Hall | Large hall reverb |
-| Cathedral | Long, spacious reverb |
-| Studio | Tight reverb + light chorus |
-| Chorus | Stereo chorus effect |
-| Echo | Rhythmic delay with feedback |
-
-### Custom Presets
-
-Drop JSON files into `~/.config/keet/effects/` (macOS/Linux) or `%APPDATA%\keet\effects\` (Windows):
-
-```json
-{
-  "name": "My Environment",
-  "reverb": {
-    "wet": 0.5,
-    "room_size": 0.7,
-    "damping": 0.5
-  },
-  "chorus": {
-    "wet": 0.3,
-    "rate": 1.5,
-    "depth": 3.0
-  },
-  "delay": {
-    "wet": 0.2,
-    "delay_ms": 400.0,
-    "feedback": 0.3
-  }
-}
-```
-
-All effect sections are optional -- omit any to disable that effect. Custom presets appear when cycling with `X`.
-
-Processing order: chorus -> delay -> reverb.
-
-## Crossfade
-
-Use `--crossfade <seconds>` (or `-x`) to enable smooth crossfade between tracks:
-
-```bash
-cargo run --release -- ~/Music/ --crossfade 3
-```
-
-Uses an equal-power crossfade curve for natural-sounding transitions. The previous track's tail is captured and mixed into the next track's beginning.
-
-## Visualization Modes
-
-Press `V` to cycle through:
-
-1. **None** - Minimal UI, lower CPU
-2. **VU Meter** - Stereo level meters with peak hold dots
-3. **Spectrum Horizontal** - Stereo butterfly display (L channel up, R channel down)
-4. **Spectrum Vertical** - 31-band analyzer with peak dots and height-based color gradient (green -> yellow -> red)
-
-Press `B` to toggle between two visualization styles:
-- **Dots** (default) - Braille characters for progress/VU, braille spectrum bars
-- **Bars** - Block characters for VU, thin partials for progress
-
-Press `F` to toggle between post-fader (shows volume-adjusted levels) and pre-fader (shows raw signal levels) metering.
-
-The spectrum analyzer features:
-- 31-band ISO 1/3-octave analysis (20Hz - 20kHz)
-- Per-channel L/R FFT processing (4096-point)
-- Unweighted display (no A-weighting -- accurate for spectrum analysis)
-- Fractional bin edge weighting for accurate low-frequency bands
-- Hann window correction and dBFS-calibrated scale
-- Spectral tilt correction (+3dB/octave relative to 1kHz)
-- Peak hold dots with gravity
+Version is embedded from git tags via `build.rs` (`GIT_VERSION` env var). The release profile uses `strip = true` and `lto = true`.
 
 ## Architecture
 
-```
-+-----------+    +------------------+   Ring Buffer   +------------------+
-| Main      |    | Producer Thread  | --------------> | Audio Callback   |
-| Thread    |    | (decode/resample)|   (lock-free)   | (playback/gain)  |
-|           |    | (EQ/FX/RG/CF/BAL/xfade)|           +--------+---------+
-| UI/input  |    | (gapless loop)  |                          |
-| viz/stats |    +------------------+  Viz Ring Buffer         |
-|           | <------------------------------------------------+
-+-----------+
-              All shared state via atomics (Release/Acquire for transitions)
-```
+### Three-Thread Model
 
-DSP chain: `decode -> resample -> EQ -> effects -> RG gain -> crossfeed -> balance -> crossfade -> peak limiter -> clipping check -> ring buffer -> volume -> output`
+1. **Main/UI thread** (`main.rs`, `ui.rs`) — polls input at ~50fps, renders ANSI UI top-to-bottom, runs visualization analysis (FFT/VU), detects track transitions via atomic `track_transition_count` (Acquire ordering)
+2. **Producer/decode thread** (`decode.rs`) — decodes audio (symphonia), applies full DSP chain, writes to lock-free ring buffer (`rtrb`). Sleeps when buffer >75% full
+3. **Audio callback** (`audio.rs`) — cpal callback, reads ring buffer, applies volume gain, taps samples to viz buffer. **Zero locks in the callback**
 
-Playback position is tracked on the consumer side (audio callback) for accurate time display and lyrics sync.
+### Shared State
 
-### Source Layout
+`PlayerState` in `state.rs` uses 40+ atomics (no Mutex on hot paths). Key patterns:
+- **Relaxed ordering** for independent UI state (volume, viz mode, EQ index)
+- **Release/Acquire** for `track_transition_count` (producer signals → main thread reads)
+- **Swap-to-consume** pattern: `take_skip_next()`, `take_seek()`, `take_eq_changed()` — read-once signals
+- **f32-as-bits**: spectrum/peak values stored via `f32::to_bits()` / `f32::from_bits()` in AtomicU32
 
-```
-src/
-├── main.rs        Entry point, CLI args, playlist loop, lyrics loading
-├── state.rs       PlayerState, UiState, ViewMode, constants, ANSI colors
-├── audio.rs       Audio stream, sample rate switching, CoreAudio FFI
-├── decode.rs      Continuous decoder thread, gapless playback, ReplayGain, resampling
-├── eq.rs          Biquad EQ filters, preset loading, JSON parsing
-├── effects.rs     Reverb, chorus, delay effects with preset loading
-├── playlist.rs    Playlist builder, metadata reader, shuffle
-├── crossfeed.rs   Meier-style headphone crossfeed filter
-├── metadata.rs    Tag reading (artist, title, lyrics, ReplayGain), background scan
-├── lyrics.rs      LRC parser, LRCLIB API client, synced/plain lyrics state
-├── resume.rs      Resume state persistence (save/restore sessions)
-├── viz.rs         VizAnalyser, StatsMonitor, spectrum rendering
-├── media_keys.rs  OS media transport controls (souvlaki)
-└── ui.rs          Terminal UI, keyboard input, progress display, lyrics/playlist views
-```
+### Ring Buffers
 
-### Resampler Modes
+- **Audio ring buffer**: sized per output rate via `state::ring_capacity_for(rate)` = `rate * 2 * 4` (~4 sec stereo). 48 kHz → 1.5 MB, 96 kHz → 3 MB, 192 kHz exclusive → 6 MB. Capacity is stored on `state.ring_capacity` so decode.rs and ui.rs can compute fill levels without a constant. Re-sized in main.rs whenever the ring is rebuilt (initial setup, exclusive-mode rate switch, stream-error device swap). Lock-free `rtrb` crate
+- **Viz ring buffer**: 8,192 samples. Audio callback writes best-effort tap, UI thread reads for FFT/VU analysis
 
-| Mode | sinc_len | Interpolation | Use case |
-|------|----------|---------------|----------|
-| Default | 64 | Linear | Low CPU, transparent quality |
-| `--quality` | 256 | Cubic | Negligible difference, peace of mind |
+### DSP Chain (producer thread, in order)
 
-## Command Line
+`decode → resample → EQ (biquad) → effects (reverb/chorus/delay) → ReplayGain → crossfeed → balance → crossfade mix → peak limiter → ring buffer → [audio callback] → volume → output`
 
-```
-keet <file-or-folder>... [options]
+### Consumer-Side Sample Counting
 
-Options:
-  --shuffle, -s     Randomize playlist order (re-shuffles on each repeat)
-  --repeat, -r      Loop playlist (rescans sources for new files each cycle)
-  --quality, -q     HQ resampler (higher CPU, inaudible difference)
-  --eq, -e <name>   Start with EQ preset by name or JSON file path
-  --fx <name>       Start with effects preset by name or JSON file path
-  --crossfade, -x <secs>  Crossfade duration between tracks (0 = disabled)
-  --rg-mode <mode>  ReplayGain mode: track (default), album, or off
-  --device <name>   Select output device by name (substring match)
-  --list-devices    List available output devices and exit
-  --exclusive       Exclusive mode: per-track rate matching, device lock (macOS)
-```
+`samples_played` is incremented in the **audio callback** (consumer), not the decode thread (producer). This is critical — the producer runs ~4 seconds ahead of playback. Counting on the producer side causes lyrics sync, progress bar, and seek to be off by the ring buffer depth.
 
-Multiple files, folders, and M3U playlists can be passed as arguments. Duplicates are removed automatically. Running `keet` with no arguments resumes the last session.
+### Pre-Allocated Buffers
 
-## Dependencies
+The decode loop uses reusable `Vec<f32>` buffers (decoded_buf, eq_buf, fx_buf, etc.) that are `.clear()`ed each iteration to retain capacity. Do not replace with `std::mem::take()` — that drops capacity and forces per-chunk malloc.
 
-| Crate | Purpose |
-|-------|---------|
-| cpal 0.17 | Cross-platform audio I/O |
-| symphonia 0.5 | Audio decoding (MP3, FLAC, WAV, OGG, AAC, ALAC, AIFF) |
-| rubato 1.0 | Sample rate conversion |
-| crossterm 0.29 | Terminal UI |
-| rtrb 0.3 | Lock-free ring buffer |
-| realfft 3.4 | FFT for spectrum analysis |
-| serde 1.0 | JSON deserialization for EQ/effects presets |
-| souvlaki 0.8 | OS media transport controls (media keys, AirPods, Bluetooth) |
-| ureq 3 | HTTP client for LRCLIB lyrics fetching |
+### Crossfade Tail
 
-## Platform Notes
+Uses `VecDeque<f32>` to capture the last N samples of a track. `VecDeque::drain(..excess)` from the front is O(1), unlike `Vec::drain` which shifts the entire buffer.
 
-- **macOS**: Automatic sample rate switching via CoreAudio; exclusive (hog) mode for bit-perfect playback with per-track rate matching; Bluetooth devices (AirPods etc.) detected and locked to native 48kHz; seamless device switching when audio output changes mid-playback; media keys via MPRemoteCommandCenter
-- **Linux**: Works with PipeWire/PulseAudio/ALSA; falls back to device default rate if unsupported; media keys via MPRIS/D-Bus
-- **Windows**: WASAPI shared mode with larger buffer (2048 samples) for lower CPU overhead; media keys via SMTC
-- **WSL**: Auto-detected via `/proc/version`; uses larger buffer (2048 samples) to reduce crackling from PulseAudio virtualization
+## Platform-Specific Code
 
-## Building
+- **macOS** (`#[cfg(target_os = "macos")]`): CoreAudio FFI in `audio.rs` for sample rate switching, Bluetooth detection (forces 48kHz), hog mode (exclusive). Uses `coreaudio-sys` bindings
+- **Windows**: Larger WASAPI buffer (2048 samples), `winresource` for icon/version embedding in `build.rs`
+- **Linux/WSL**: WSL detected via `/proc/version` for buffer sizing. ALSA/PipeWire via cpal
 
-### Linux/WSL Dependencies
+## Stream Error Recovery
 
-```bash
-sudo apt install libasound2-dev libdbus-1-dev
-```
+When the audio device disconnects (USB DAC unplugged, AirPods removed), the cpal error callback sets `stream_error` atomic. The main loop detects this, joins the producer thread (which may be stuck in the buffer-full sleep loop since the callback stopped draining), drops the old stream, rebuilds on the new default device with fresh ring buffers, and resumes from the current track via `continue 'playlist`.
 
-- `libasound2-dev` -- ALSA headers (required by cpal)
-- `libdbus-1-dev` -- D-Bus headers (required by souvlaki for MPRIS media keys)
+## Lyrics Loading
 
-### Compile
+Lyrics are resolved in priority order: embedded tags (metadata cache) → standalone tag read → LRCLIB API fetch. The LRCLIB fetch is async — on track transitions, it spawns a thread that sends the result via `mpsc::channel` to `ui.lyrics_receiver`, so the UI doesn't block on HTTP. Duration is passed to LRCLIB for accurate version matching.
 
-```bash
-cargo build --release
-```
+## Gapless Transitions
 
-The binary is at `target/release/keet`. Copy to `/usr/local/bin/` for system-wide access.
+The producer thread runs a continuous loop across tracks — it signals `track_transition_count` (Release) and the main thread picks it up (Acquire) to update UI/metadata. The `samples_played.store(0)` reset happens on the producer side, which means the progress bar snaps to 0:00 slightly before the audio transition is audible (by the ring buffer depth). This is a known minor UI artifact.
 
-Version is embedded automatically from git tags via `build.rs`.
+## CLI Argument Parsing
 
-### macOS .app Bundle
+Arguments are parsed manually in `main.rs` (no clap dependency). Multiple source paths (files, folders, M3U playlists) are accepted and deduplicated. Running `keet` with no args resumes from `~/.config/keet/state.json`.
 
-```bash
-bash scripts/bundle-macos.sh
-```
+## Terminal Safety
 
-Creates `Keet.app` with the app icon, ready to drag to `/Applications`.
+A custom panic hook restores terminal from raw mode, shows the cursor, and appends to `~/.config/keet/crash.log`. On startup, the terminal is reset (`\x1Bc`) to clean up after any previous crash.
 
-Since Keet is a terminal app, launch it from Terminal after installing:
+## Key Design Constraints
 
-```bash
-/Applications/Keet.app/Contents/MacOS/keet ~/Music/ --shuffle --repeat
-```
+- **No locks in the audio callback** — all data exchange via atomics and lock-free ring buffers
+- **native-tls, not rustls** — ureq uses OS TLS stack (Schannel/Security.framework) to avoid ~1.5MB binary bloat from rustls/ring. The TLS provider must be set explicitly: `TlsProvider::NativeTls`
+- **Metadata scan is multi-threaded** — work-stealing via `AtomicUsize::fetch_add` index, capped at `min(available_parallelism, 4)` threads since it's I/O-bound
+- **UI renders sequentially** — top-to-bottom ANSI escape output, cursor-up to redraw. Not a cursor-addressed layout. Terminal width checked but no side-by-side panels
+- **Playlist scroll uses scroll margin** (scrolloff=4) — viewport moves before cursor reaches edge, like Vim
 
-### Windows
+## Module Responsibilities
 
-The `.exe` automatically includes the app icon and version metadata (from git tags) when built on Windows.
-
-## License
-
-GPL-3.0
+- `state.rs` — `PlayerState` (atomics), `UiState` (UI-local mutable state), constants, ANSI color codes
+- `decode.rs` — producer thread: decode loop, gapless transitions, DSP chain application, seek handling
+- `audio.rs` — cpal stream setup, audio callback, CoreAudio FFI (macOS), device enumeration
+- `ui.rs` — terminal rendering, keyboard input polling, playlist/lyrics view modes
+- `metadata.rs` — `MetadataCache` with parallel background scan, tag reading (artist/title/lyrics/ReplayGain)
+- `lyrics.rs` — LRC parser, LRCLIB HTTP client, synced/plain lyrics types
+- `eq.rs` — biquad parametric EQ, preset loading from JSON
+- `effects.rs` — reverb/chorus/delay chain, preset loading
+- `crossfeed.rs` — Meier-style headphone crossfeed filter
+- `playlist.rs` — recursive folder scan, M3U parse/save, rescan diffing
+- `resume.rs` — session state persistence to `~/.config/keet/state.json`
+- `viz.rs` — FFT spectrum analysis (31-band ISO 1/3-octave), VU metering, process stats (platform syscalls)

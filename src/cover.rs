@@ -261,21 +261,27 @@ fn urlencoded(s: &str) -> String {
 
 fn decode_and_resize(bytes: &[u8]) -> Option<CoverImage> {
     let img = image::load_from_memory(bytes).ok()?;
+    // `thumbnail_exact` uses nearest-neighbor and allocates only the output
+    // buffer. `resize_exact(_, _, Lanczos3)` allocates two intermediate f32
+    // RGBA planes sized `dst × src` and `src × dst` — together ~5–8 MB for a
+    // 1000×1000 source going to 320×320. At terminal cover sizes the visual
+    // difference is invisible, but the peak heap drops by an order of
+    // magnitude.
     match detect_protocol() {
         GraphicsProtocol::Kitty => {
-            let resized = img.resize_exact(KITTY_SIZE, KITTY_SIZE, image::imageops::FilterType::Lanczos3);
+            let resized = img.thumbnail_exact(KITTY_SIZE, KITTY_SIZE);
             let mut png: Vec<u8> = Vec::new();
             resized.write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png).ok()?;
             Some(CoverImage::Kitty { png })
         }
         GraphicsProtocol::Iterm2 => {
-            let resized = img.resize_exact(KITTY_SIZE, KITTY_SIZE, image::imageops::FilterType::Lanczos3);
+            let resized = img.thumbnail_exact(KITTY_SIZE, KITTY_SIZE);
             let mut png: Vec<u8> = Vec::new();
             resized.write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png).ok()?;
             Some(CoverImage::Iterm2 { png })
         }
         GraphicsProtocol::Sixel => {
-            let resized = img.resize_exact(SIXEL_SIZE, SIXEL_SIZE, image::imageops::FilterType::Lanczos3);
+            let resized = img.thumbnail_exact(SIXEL_SIZE, SIXEL_SIZE);
             let rgba = resized.to_rgba8();
             let opts = icy_sixel::EncodeOptions::default();
             let data = icy_sixel::sixel_encode(
@@ -287,7 +293,7 @@ fn decode_and_resize(bytes: &[u8]) -> Option<CoverImage> {
             Some(CoverImage::Sixel { data })
         }
         GraphicsProtocol::HalfBlock => {
-            let resized = img.resize_exact(HALF_BLOCK_W, HALF_BLOCK_H, image::imageops::FilterType::Lanczos3);
+            let resized = img.thumbnail_exact(HALF_BLOCK_W, HALF_BLOCK_H);
             let rgb = resized.to_rgb8();
             Some(CoverImage::HalfBlock {
                 width: HALF_BLOCK_W,

@@ -5,10 +5,14 @@ use std::time::Instant;
 use std::path::PathBuf;
 
 pub const SUPPORTED_EXTENSIONS: &[&str] = &["mp3", "flac", "wav", "ogg", "aac", "m4a", "mp4", "m4b", "aiff", "aif"];
-// Sized for the worst-case output rate (192 kHz stereo, ~4 sec). At 48 kHz this gives
-// ~16 sec of headroom, which is fine — the producer only fills to a fraction and sleeps.
-pub const RING_BUFFER_SIZE: usize = 192_000 * 2 * 4;
 pub const VIZ_BUFFER_SIZE: usize = 8192; // Small buffer for viz tap from audio callback
+
+/// Ring buffer capacity for a given output rate: ~4 seconds of stereo f32.
+/// Sized per-stream rather than worst-case — 48 kHz output => 1.5 MB, 192 kHz => 6 MB.
+#[inline]
+pub const fn ring_capacity_for(output_rate: u32) -> usize {
+    output_rate as usize * 2 * 4
+}
 
 // Visualization constants
 pub const FFT_SIZE: usize = 4096;
@@ -174,6 +178,10 @@ pub struct PlayerState {
     // Buffer level (updated by producer, read by UI)
     pub(crate) buffer_level: AtomicUsize,
 
+    // Ring buffer capacity in samples — sized per output rate, so decode.rs and UI
+    // can compute fill percentage / drain thresholds without a hard-coded constant.
+    pub(crate) ring_capacity: AtomicUsize,
+
     // Signal consumer to drain the ring buffer (for seek/skip).
     // Triggers an immediate full drain in the audio callback.
     pub(crate) reset_consumer_counter: AtomicBool,
@@ -267,6 +275,7 @@ impl PlayerState {
             producer_done: AtomicBool::new(false),
             track_info_ready: AtomicBool::new(false),
             buffer_level: AtomicUsize::new(0),
+            ring_capacity: AtomicUsize::new(ring_capacity_for(48_000)),
             reset_consumer_counter: AtomicBool::new(false),
             viz_mode: AtomicU8::new(VizMode::None as u8),
             peak_left: AtomicU32::new(0),

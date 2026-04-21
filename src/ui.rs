@@ -7,7 +7,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use crossterm::terminal;
 
 use crate::state::{
-    PlayerState, VizMode, VizStyle, RING_BUFFER_SIZE,
+    PlayerState, VizMode, VizStyle,
     C_RESET, C_BOLD, C_DIM, C_CYAN, C_GREEN, C_YELLOW, C_MAGENTA, C_RED,
     ViewMode, InputMode, UiState,
 };
@@ -130,7 +130,8 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
     };
 
     let buf = state.buffer_level.load(Ordering::Relaxed);
-    let raw_buf_pct = buf as f32 / RING_BUFFER_SIZE as f32 * 100.0;
+    let ring_cap = state.ring_capacity.load(Ordering::Relaxed).max(1);
+    let raw_buf_pct = buf as f32 / ring_cap as f32 * 100.0;
     stats.update_buf(raw_buf_pct);
     let buf_pct = stats.smoothed_buf_pct as u32;
 
