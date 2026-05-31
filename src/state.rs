@@ -17,9 +17,17 @@ pub const fn ring_capacity_for(output_rate: u32) -> usize {
 // Visualization constants
 pub const FFT_SIZE: usize = 4096;
 pub const SPECTRUM_BANDS: usize = 31;
-pub const VIZ_DECAY: f32 = 0.70; // Smoothing factor for spectrum (lower = more responsive)
+// Display smoothing for spectrum bars, applied asymmetrically (fast attack / slow
+// release): VIZ_ATTACK governs the rise so beats land on time, VIZ_DECAY the fall
+// so it stays smooth. A symmetric low-pass here delayed the onset ~150 ms.
+pub const VIZ_ATTACK: f32 = 0.3; // Rise smoothing (lower = snappier, more on-beat)
+pub const VIZ_DECAY: f32 = 0.70; // Fall smoothing (higher = smoother decay)
 
-pub const GRAVITY: f32 = 0.04;    // Constant fall speed for main bars
+// Spectrum bars fall proportionally so tall bars don't crawl down and look
+// sluggish during loud passages: BAR_DECAY is the fraction of height kept per
+// frame, GRAVITY a small linear floor so a band still settles fully to silence.
+pub const BAR_DECAY: f32 = 0.85;    // Proportional fall: lower = faster decay
+pub const GRAVITY: f32 = 0.012;     // Linear floor added to the proportional fall
 pub const DOT_GRAVITY: f32 = 0.025; // Slower fall for the peak dots
 pub const ATTACK: f32 = 0.7;       // Snappiness of the rise
 pub const HOLD_TIME: u8 = 10;      // Frames for the dot to "hang"

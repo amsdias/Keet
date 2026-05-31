@@ -197,6 +197,33 @@ fn build_resume_state(
     }
 }
 
+/// Build a fresh audio + viz ring-buffer pair and output stream sized for
+/// `stream_rate`, updating `state.ring_capacity` to match. Used at initial setup
+/// and for every stream rebuild (exclusive rate switch, stream-error device swap)
+/// so those paths can't drift apart. Returns the audio producer, viz consumer, and
+/// stream; the caller calls `stream.play()`.
+/// Audio producer, viz consumer, and output stream returned by `rebuild_stream`.
+type StreamParts = (rtrb::Producer<f32>, rtrb::Consumer<f32>, cpal::Stream);
+
+fn rebuild_stream(
+    device: &cpal::Device,
+    stream_rate: u32,
+    buffer_size: cpal::BufferSize,
+    state: &Arc<PlayerState>,
+) -> Result<StreamParts, Box<dyn std::error::Error>> {
+    let ring_cap = ring_capacity_for(stream_rate);
+    state.ring_capacity.store(ring_cap, Ordering::Relaxed);
+    let (prod, cons) = RingBuffer::<f32>::new(ring_cap);
+    let (viz_prod, viz_cons) = RingBuffer::<f32>::new(VIZ_BUFFER_SIZE);
+    let config = StreamConfig {
+        channels: 2,
+        sample_rate: stream_rate,
+        buffer_size,
+    };
+    let stream = build_stream(device, &config, cons, viz_prod, Arc::clone(state))?;
+    Ok((prod, viz_cons, stream))
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Ensure terminal is in normal mode (cleanup from previous crashed runs)
     let _ = terminal::disable_raw_mode();
@@ -683,18 +710,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let saved_buffer_size = buffer_size;
-    let stream_config = StreamConfig {
-        channels: 2,
-        sample_rate: stream_rate,
-        buffer_size,
-    };
 
-    let ring_cap = ring_capacity_for(stream_rate);
-    state.ring_capacity.store(ring_cap, Ordering::Relaxed);
-    let (mut prod, cons) = RingBuffer::<f32>::new(ring_cap);
-    let (viz_prod, mut viz_cons) = RingBuffer::<f32>::new(VIZ_BUFFER_SIZE);
-
-    let mut stream = build_stream(&device, &stream_config, cons, viz_prod, Arc::clone(&state))?;
+    let (mut prod, mut viz_cons, mut stream) =
+        rebuild_stream(&device, stream_rate, saved_buffer_size, &state)?;
     stream.play()?;
 
     // Set exclusive mode if requested (macOS only: hog mode + per-track rate switching)
@@ -719,6 +737,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut last_transition_count: usize = 0;
+
+    // Persist resume state off the main thread: serializing + writing JSON on a
+    // slow/network $HOME could otherwise stall the UI at every track transition.
+    // A single saver thread serializes the writes (so the temp-file rename can't
+    // race), and the channel is drained + joined at shutdown so the final save
+    // is never lost.
+    let (save_tx, save_rx) = std::sync::mpsc::channel::<ResumeState>();
+    let saver_handle = thread::spawn(move || {
+        while let Ok(rs) = save_rx.recv() {
+            save_state(&rs);
+        }
+    });
 
     'playlist: loop {
         if state.should_quit() { break; }
@@ -764,16 +794,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 // Reindex metadata cache
-                ui.metadata_cache.cancel.store(true, Ordering::Relaxed);
-                if let Some(h) = ui.scan_handle.take() {
-                    h.join().ok();
-                }
-                ui.metadata_cache.reindex(&playlist, &old_playlist);
-                ui.metadata_cache.cancel.store(false, Ordering::Relaxed);
-                ui.scan_handle = Some(metadata::spawn_metadata_scan(
-                    playlist.clone(),
-                    std::sync::Arc::clone(&ui.metadata_cache),
-                ));
+                crate::ui::reindex_and_restart_scan(&mut ui, &playlist, &old_playlist);
 
                 ui.current = 0;
             } else {
@@ -934,7 +955,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 print!("\x1B[J");
                 io::stdout().flush().ok();
-                save_state(&build_resume_state(&ui, &playlist, &state, &eq_presets, &fx_presets, &cf_presets, &device_arg));
+                let _ = save_tx.send(build_resume_state(&ui, &playlist, &state, &eq_presets, &fx_presets, &cf_presets, &device_arg));
                 if let Some(id) = hog_device_id {
                     audio::release_exclusive_mode(id);
                 }
@@ -1004,7 +1025,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         media_keys::update_playback(mc, state.is_paused(), 0.0);
                     }
 
-                    save_state(&build_resume_state(&ui, &playlist, &state, &eq_presets, &fx_presets, &cf_presets, &device_arg));
+                    let _ = save_tx.send(build_resume_state(&ui, &playlist, &state, &eq_presets, &fx_presets, &cf_presets, &device_arg));
                 }
             }
 
@@ -1029,8 +1050,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Exclusive mode: rate change needed (producer detected different sample rate)
             if state.rate_change_needed.swap(false, Ordering::Relaxed) {
-                // Wait for buffer to drain so current track finishes
-                while state.buffer_level.load(Ordering::Relaxed) > 0 && !state.should_quit() && !state.is_paused() {
+                // Wait for the buffer to drain so the current track finishes before we
+                // tear the stream down. A paused stream never drains, so wait out the
+                // pause instead of bailing — bailing here would truncate the buffered
+                // tail and click. The rate switch simply defers until playback resumes.
+                while !state.should_quit()
+                    && (state.is_paused() || state.buffer_level.load(Ordering::Relaxed) > 0)
+                {
                     thread::sleep(Duration::from_millis(10));
                 }
 
@@ -1046,23 +1072,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 stream_rate = actual_rate;
                 state.output_rate.store(stream_rate as u64, Ordering::Relaxed);
 
-                // Drop old stream before creating new ring buffer
+                // Drop old stream before creating the new ring buffer.
                 drop(stream);
 
-                // Rebuild ring buffer and stream
-                let ring_cap = ring_capacity_for(stream_rate);
-                state.ring_capacity.store(ring_cap, Ordering::Relaxed);
-                let (new_prod, new_cons) = RingBuffer::<f32>::new(ring_cap);
-                let (new_viz_prod, new_viz_cons) = RingBuffer::<f32>::new(VIZ_BUFFER_SIZE);
+                let (new_prod, new_viz_cons, new_stream) =
+                    rebuild_stream(&device, stream_rate, saved_buffer_size, &state)?;
                 prod = new_prod;
                 viz_cons = new_viz_cons;
-
-                let new_config = StreamConfig {
-                    channels: 2,
-                    sample_rate: stream_rate,
-                    buffer_size: saved_buffer_size,
-                };
-                stream = build_stream(&device, &new_config, new_cons, new_viz_prod, Arc::clone(&state))?;
+                stream = new_stream;
                 stream.play()?;
 
                 // Continue playlist from the track that needs the new rate
@@ -1086,6 +1103,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Ok(_) => {}
                         Err(_) => break 'playlist,
                     }
+                    // Consume the unstick signal: it was only set to break the old
+                    // producer out of its buffer-full sleep. Leaving it set would make
+                    // the producer we respawn below peek jump_to_track >= 0 and exit
+                    // immediately, wasting a spawn/join cycle before playback resumes.
+                    state.take_jump();
                     drop(stream);
 
                     device = new_device;
@@ -1109,21 +1131,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     stream_rate = new_rate;
                     state.output_rate.store(stream_rate as u64, Ordering::Relaxed);
 
-                    let ring_cap = ring_capacity_for(stream_rate);
-                    state.ring_capacity.store(ring_cap, Ordering::Relaxed);
-                    let (new_prod, new_cons) = RingBuffer::<f32>::new(ring_cap);
-                    let (new_viz_prod, new_viz_cons) = RingBuffer::<f32>::new(VIZ_BUFFER_SIZE);
-                    prod = new_prod;
-                    viz_cons = new_viz_cons;
-
-                    let new_config = StreamConfig {
-                        channels: 2,
-                        sample_rate: stream_rate,
-                        buffer_size: saved_buffer_size,
-                    };
-                    match build_stream(&device, &new_config, new_cons, new_viz_prod, Arc::clone(&state)) {
-                        Ok(s) => {
-                            stream = s;
+                    match rebuild_stream(&device, stream_rate, saved_buffer_size, &state) {
+                        Ok((new_prod, new_viz_cons, new_stream)) => {
+                            prod = new_prod;
+                            viz_cons = new_viz_cons;
+                            stream = new_stream;
                             if stream.play().is_err() {
                                 break 'playlist;
                             }
@@ -1145,7 +1157,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Err(_) => break 'playlist,
                 }
 
-                save_state(&build_resume_state(&ui, &playlist, &state, &eq_presets, &fx_presets, &cf_presets, &device_arg));
+                let _ = save_tx.send(build_resume_state(&ui, &playlist, &state, &eq_presets, &fx_presets, &cf_presets, &device_arg));
                 ui.current = playlist.len(); // Will trigger repeat-cycle or exit
                 continue 'playlist;
             }
@@ -1247,6 +1259,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             thread::sleep(Duration::from_millis(50));
         }
     }
+
+    // Flush any queued resume-state writes before exit.
+    drop(save_tx);
+    let _ = saver_handle.join();
 
     terminal::disable_raw_mode()?;
 

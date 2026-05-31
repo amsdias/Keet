@@ -6,7 +6,7 @@ use realfft::{RealFftPlanner, RealToComplex};
 
 use crate::state::{
     PlayerState, VizMode, VizStyle, SPECTRUM_BANDS, FFT_SIZE, VIZ_DECAY,
-    GRAVITY, DOT_GRAVITY, ATTACK, HOLD_TIME,
+    BAR_DECAY, GRAVITY, DOT_GRAVITY, ATTACK, VIZ_ATTACK, HOLD_TIME,
     C_RESET, C_DIM, C_CYAN, C_GREEN, C_YELLOW, C_MAGENTA, C_RED,
 };
 
@@ -213,6 +213,8 @@ pub struct VizAnalyser {
     fft: Arc<dyn RealToComplex<f32>>,
     fft_input: Vec<f32>,
     fft_output: Vec<realfft::num_complex::Complex<f32>>,
+    // Reused FFT scratch so the per-hop transform doesn't allocate on the UI thread.
+    fft_scratch: Vec<realfft::num_complex::Complex<f32>>,
     window: Vec<f32>,
     ch_l: ChannelBands,
     ch_r: ChannelBands,
@@ -238,6 +240,7 @@ impl VizAnalyser {
         let fft = planner.plan_fft_forward(FFT_SIZE);
         let fft_input = fft.make_input_vec();
         let fft_output = fft.make_output_vec();
+        let fft_scratch = fft.make_scratch_vec();
         let window: Vec<f32> = (0..FFT_SIZE)
             .map(|i| 0.5 *(1.0 - (2.0 * std::f32::consts::PI * i as f32 / FFT_SIZE as f32).cos()))
             .collect();
@@ -246,6 +249,7 @@ impl VizAnalyser {
             fft,
             fft_input,
             fft_output,
+            fft_scratch,
             window,
             ch_l: ChannelBands::new(),
             ch_r: ChannelBands::new(),
@@ -340,13 +344,13 @@ impl VizAnalyser {
             for (i, (&sample, &w)) in self.ch_l.sample_buffer.iter().take(FFT_SIZE).zip(&self.window).enumerate() {
                 self.fft_input[i] = sample * w;
             }
-            let l_bands = Self::run_fft_and_compute(&*self.fft, &mut self.fft_input, &mut self.fft_output, self.sample_rate);
+            let l_bands = Self::run_fft_and_compute(&*self.fft, &mut self.fft_input, &mut self.fft_output, &mut self.fft_scratch, self.sample_rate);
 
             // Process R channel
             for (i, (&sample, &w)) in self.ch_r.sample_buffer.iter().take(FFT_SIZE).zip(&self.window).enumerate() {
                 self.fft_input[i] = sample * w;
             }
-            let r_bands = Self::run_fft_and_compute(&*self.fft, &mut self.fft_input, &mut self.fft_output, self.sample_rate);
+            let r_bands = Self::run_fft_and_compute(&*self.fft, &mut self.fft_input, &mut self.fft_output, &mut self.fft_scratch, self.sample_rate);
 
             // Apply ballistics per channel
             Self::apply_ballistics(&l_bands, &mut self.ch_l.heights, &mut self.ch_l.smoothed);
@@ -390,9 +394,10 @@ impl VizAnalyser {
         fft: &dyn RealToComplex<f32>,
         fft_input: &mut [f32],
         fft_output: &mut [realfft::num_complex::Complex<f32>],
+        scratch: &mut [realfft::num_complex::Complex<f32>],
         sample_rate: u32,
     ) -> [f32; SPECTRUM_BANDS] {
-        if fft.process(fft_input, fft_output).is_err() {
+        if fft.process_with_scratch(fft_input, fft_output, scratch).is_err() {
             return [0.0; SPECTRUM_BANDS];
         }
 
@@ -468,9 +473,18 @@ impl VizAnalyser {
             if bands[i] > heights[i] {
                 heights[i] = heights[i] * (1.0 - ATTACK) + bands[i] * ATTACK;
             } else {
-                heights[i] = (heights[i] - GRAVITY).max(0.0);
+                // Proportional fall + small linear floor: high bars fall at the same
+                // rate as low ones, so loud passages stay responsive instead of the
+                // bars crawling down from a fixed per-frame step.
+                heights[i] = (heights[i] * BAR_DECAY - GRAVITY).max(0.0);
             }
-            smoothed[i] = smoothed[i] * VIZ_DECAY + heights[i] * (1.0 - VIZ_DECAY);
+            // Fast attack so beats land on time, slow release so the fall stays
+            // smooth. A symmetric low-pass here added ~150 ms of onset lag.
+            smoothed[i] = if heights[i] > smoothed[i] {
+                smoothed[i] * VIZ_ATTACK + heights[i] * (1.0 - VIZ_ATTACK)
+            } else {
+                smoothed[i] * VIZ_DECAY + heights[i] * (1.0 - VIZ_DECAY)
+            };
         }
     }
 }
@@ -544,9 +558,12 @@ pub fn render_vu_meter(state: &PlayerState, style: VizStyle) -> Vec<String> {
     lines
 }
 
-const SPECTRUM_H_BRAILLE: &[char] = &[' ', '⣀', '⣀', '⣤', '⣤', '⣶', '⣶', '⣿', '⣿'];
-// Braille chars filling from top down (for R channel going down)
-const SPECTRUM_H_BRAILLE_DN: &[char] = &[' ', '⠉', '⠉', '⠛', '⠛', '⠿', '⠿', '⣿', '⣿'];
+// The horizontal spectrum is stacked over SPECTRUM_H_ROWS braille rows per channel
+// (was a single row) for more height. Per-row partial fills index by quarters filled
+// (1..4): up fills from the bottom (L channel), down fills from the top (R channel).
+const SPECTRUM_H_ROWS: usize = 3;
+const H_UP_BRAILLE: [char; 5] = [' ', '⣀', '⣤', '⣶', '⣿'];
+const H_DN_BRAILLE: [char; 5] = [' ', '⠉', '⠛', '⠿', '⣿'];
 // Block chars inverted: index N → bar fills N/8 from the top
 const SPECTRUM_H_BLOCKS_DN: &[char] = &[' ', '▇', '▆', '▅', '▄', '▃', '▂', '▁', '█'];
 
@@ -566,46 +583,72 @@ const BAND_COLORS: [&str; 31] = [
 pub fn render_spectrum_horizontal(state: &PlayerState, style: VizStyle) -> Vec<String> {
     let spec_l = state.get_spectrum();
     let spec_r = state.get_spectrum_r();
+    let n = SPECTRUM_H_ROWS;
+    let mut lines: Vec<String> = Vec::with_capacity(n * 2);
 
-    let chars_up = match style {
-        VizStyle::Bars => SPECTRUM_H_CHARS,
-        VizStyle::Dots => SPECTRUM_H_BRAILLE,
-    };
-
-    // L channel (bars going up) — same as before
-    let mut line_l = String::from("  ");
-    for (i, &level) in spec_l.iter().enumerate() {
-        let char_idx = (level * 8.0).min(8.0) as usize;
-        let color = BAND_COLORS.get(i).unwrap_or(&C_YELLOW);
-        line_l.push_str(&format!("{}{} ", color, chars_up[char_idx]));
+    // L channel: bars grow upward. Rows print top→bottom, so row 0 covers the
+    // highest magnitude slice [(n-1)/n, 1.0] and the last row the base [0, 1/n].
+    for r in 0..n {
+        let lo = (n - 1 - r) as f32 / n as f32;
+        let hi = (n - r) as f32 / n as f32;
+        let mut line = String::from("  ");
+        for (i, &level) in spec_l.iter().enumerate() {
+            let color = BAND_COLORS.get(i).unwrap_or(&C_YELLOW);
+            line.push_str(&h_cell(level, lo, hi, style, color, true));
+        }
+        line.push_str(C_RESET);
+        lines.push(line);
     }
-    line_l.push_str(C_RESET);
 
-    // R channel (bars going down)
-    let mut line_r = String::from("  ");
-    for (i, &level) in spec_r.iter().enumerate() {
-        let char_idx = (level * 8.0).min(8.0) as usize;
-        let color = BAND_COLORS.get(i).unwrap_or(&C_YELLOW);
-        match style {
-            VizStyle::Dots => {
-                line_r.push_str(&format!("{}{} ", color, SPECTRUM_H_BRAILLE_DN[char_idx]));
-            }
-            VizStyle::Bars => {
-                if char_idx == 0 {
-                    line_r.push_str("  ");
-                } else if char_idx == 8 {
-                    line_r.push_str(&format!("{}█ ", color));
-                } else {
-                    // Reverse video: FG becomes BG and vice versa, so the block's
-                    // "empty" part uses the terminal's real background (invisible)
-                    line_r.push_str(&format!("{}\x1B[7m{}\x1B[27m{C_RESET} ", color, SPECTRUM_H_BLOCKS_DN[char_idx]));
-                }
+    // R channel: bars grow downward. Rows print top→bottom, so row 0 is the base
+    // [0, 1/n] just under the L bars and the last row the deepest [(n-1)/n, 1.0].
+    for r in 0..n {
+        let lo = r as f32 / n as f32;
+        let hi = (r + 1) as f32 / n as f32;
+        let mut line = String::from("  ");
+        for (i, &level) in spec_r.iter().enumerate() {
+            let color = BAND_COLORS.get(i).unwrap_or(&C_YELLOW);
+            line.push_str(&h_cell(level, lo, hi, style, color, false));
+        }
+        line.push_str(C_RESET);
+        lines.push(line);
+    }
+
+    lines
+}
+
+/// Render one 2-char-wide spectrum cell for a horizontal-spectrum row spanning the
+/// magnitude range `[lo, hi)`. `up` selects bottom-up fill (L channel) vs top-down
+/// fill (R channel).
+fn h_cell(level: f32, lo: f32, hi: f32, style: VizStyle, color: &str, up: bool) -> String {
+    if level >= hi {
+        let full = match style { VizStyle::Bars => '█', VizStyle::Dots => '⣿' };
+        return format!("{}{} ", color, full);
+    }
+    if level <= lo {
+        return String::from("  ");
+    }
+    let frac = (level - lo) / (hi - lo); // fraction of this row that's filled
+    match style {
+        VizStyle::Dots => {
+            let idx = ((frac * 4.0).ceil() as usize).clamp(1, 4);
+            let ch = if up { H_UP_BRAILLE[idx] } else { H_DN_BRAILLE[idx] };
+            format!("{}{} ", color, ch)
+        }
+        VizStyle::Bars => {
+            let idx = ((frac * 8.0).ceil() as usize).clamp(1, 8);
+            if up {
+                format!("{}{} ", color, SPECTRUM_H_CHARS[idx])
+            } else if idx >= 8 {
+                format!("{}█ ", color)
+            } else {
+                // Reverse video: FG becomes BG and vice versa, so the block's
+                // "empty" part uses the terminal's real background (invisible),
+                // making the block fill from the top of the cell.
+                format!("{}\x1B[7m{}\x1B[27m{C_RESET} ", color, SPECTRUM_H_BLOCKS_DN[idx])
             }
         }
     }
-    line_r.push_str(C_RESET);
-
-    vec![line_l, line_r]
 }
 
 pub fn render_spectrum_vertical(state: &PlayerState, style: VizStyle) -> Vec<String> {
@@ -674,7 +717,7 @@ pub fn get_viz_line_count(mode: VizMode, style: VizStyle) -> usize {
     match mode {
         VizMode::None => 0,
         VizMode::VuMeter => if matches!(style, VizStyle::Bars) { 4 } else { 3 },
-        VizMode::SpectrumHorizontal => 3,
+        VizMode::SpectrumHorizontal => SPECTRUM_H_ROWS * 2 + 1,
         VizMode::SpectrumVertical => 9,
         VizMode::Oscilloscope => OSCILLOSCOPE_ROWS + 1,
         VizMode::Lissajous => LISSAJOUS_ROWS + 1,

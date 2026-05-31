@@ -48,7 +48,16 @@ fn convert_samples_into(buf: &AudioBufferRef, out: &mut Vec<f32>) {
                 for ch in p { out.push(ch[f] as f32 / 2147483648.0); }
             }
         }
-        // Catchall for S24/U8/U16/U24/U32/F64: convert via symphonia's make_equivalent.
+        AudioBufferRef::S24(b) => {
+            let spec = b.planes();
+            let p = spec.planes();
+            out.reserve(b.frames() * p.len());
+            for f in 0..b.frames() {
+                // i24 carries its value in an i32; full scale is 2^23.
+                for ch in p { out.push(ch[f].inner() as f32 / 8_388_608.0); }
+            }
+        }
+        // Catchall for U8/U16/U24/U32/F64: convert via symphonia's make_equivalent.
         _ => interleave_f32_planes_into(&buf.make_equivalent::<f32>(), out),
     }
 }
@@ -342,7 +351,6 @@ pub fn decode_playlist(
         let mut deinterleaved: Vec<Vec<f32>> = vec![Vec::with_capacity(chunk_size); channels];
         let mut interleaved_out: Vec<f32> = Vec::with_capacity(chunk_size * channels * 2);
         let mut decoded_buf: Vec<f32> = Vec::with_capacity(chunk_size * channels * 2);
-        let mut chunk_buf: Vec<f32> = Vec::with_capacity(chunk_size * channels);
         // Scratch for per-packet symphonia → interleaved f32 conversion. Retained across
         // iterations so we don't malloc on every packet.
         let mut raw_buf: Vec<f32> = Vec::with_capacity(chunk_size * channels * 2);
@@ -456,15 +464,18 @@ pub fn decode_playlist(
             // Resample if needed
             decoded_buf.clear();
             if let Some(ref mut resampler) = resampler {
-                while pending.len() >= chunk_size * channels {
-                    chunk_buf.clear();
-                    chunk_buf.extend_from_slice(&pending[..chunk_size * channels]);
-                    pending.drain(..chunk_size * channels);
+                // Walk fixed-size chunks out of `pending` with a read cursor, then drop
+                // the consumed prefix in a single move. Draining each chunk off the
+                // front would memmove the trailing samples on every iteration.
+                let mut consumed = 0usize;
+                while pending.len() - consumed >= chunk_size * channels {
+                    let chunk = &pending[consumed..consumed + chunk_size * channels];
 
                     for ch_buf in deinterleaved.iter_mut() { ch_buf.clear(); }
-                    for (i, &s) in chunk_buf.iter().enumerate() {
+                    for (i, &s) in chunk.iter().enumerate() {
                         deinterleaved[i % channels].push(s);
                     }
+                    consumed += chunk_size * channels;
 
                     let frames_in = chunk_size;
                     if let Ok(adapter_in) = SequentialSliceOfVecs::new(&deinterleaved, channels, frames_in) {
@@ -472,6 +483,9 @@ pub fn decode_playlist(
                             interleaved_out.extend(resampled.take_data());
                         }
                     }
+                }
+                if consumed > 0 {
+                    pending.drain(..consumed);
                 }
 
                 if interleaved_out.is_empty() {

@@ -360,13 +360,16 @@ pub struct EffectsChain {
     reverb: Option<Freeverb>,
     chorus: Option<Chorus>,
     delay: Option<Delay>,
+    /// Smoothed safety-limiter gain (1.0 = no reduction). Persisted across buffers
+    /// so the gain doesn't jump discontinuously between `process_stereo` calls.
+    limiter_gain: f32,
 }
 
 impl EffectsChain {
     pub fn new(_sample_rate: f32) -> Self {
         // Lazy: skip the ~44KB reverb/chorus/delay allocations until a preset that
         // needs them is loaded. The "None" preset keeps this at zero overhead.
-        Self { reverb: None, chorus: None, delay: None }
+        Self { reverb: None, chorus: None, delay: None, limiter_gain: 1.0 }
     }
 
     pub fn load_preset(&mut self, preset: &EffectsPreset, sample_rate: f32) {
@@ -394,6 +397,7 @@ impl EffectsChain {
     }
 
     pub fn reset(&mut self) {
+        self.limiter_gain = 1.0;
         if let Some(r) = self.reverb.as_mut() { r.reset(); }
         if let Some(c) = self.chorus.as_mut() { c.reset(); }
         if let Some(d) = self.delay.as_mut() { d.reset(); }
@@ -409,12 +413,22 @@ impl EffectsChain {
         if let Some(d) = self.delay.as_mut() { d.process_stereo(samples); }
         if let Some(r) = self.reverb.as_mut() { r.process_stereo(samples); }
 
-        // Safety limiter: prevent effects from exceeding 0dBFS
-        let peak = samples.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
-        if peak > 1.0 {
-            let scale = 1.0 / peak;
-            for s in samples.iter_mut() {
-                *s *= scale;
+        // Safety limiter: keep effect output below 0 dBFS without the per-buffer
+        // gain jumps a brickwall causes (audible zipper/pumping when reverb/delay
+        // push past full scale). Instant attack guarantees no sample exceeds 0 dBFS;
+        // slow per-sample release lets the gain recover smoothly across buffers, so
+        // the reduction is continuous rather than recomputed independently per call.
+        const LIMITER_RELEASE: f32 = 0.0005;
+        for frame in samples.chunks_mut(2) {
+            let peak = frame.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+            let target = if peak > 1.0 { 1.0 / peak } else { 1.0 };
+            if target < self.limiter_gain {
+                self.limiter_gain = target; // instant attack — never clip
+            } else {
+                self.limiter_gain += (target - self.limiter_gain) * LIMITER_RELEASE;
+            }
+            for s in frame.iter_mut() {
+                *s *= self.limiter_gain;
             }
         }
     }

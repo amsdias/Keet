@@ -44,12 +44,18 @@ pub fn build_playlist(path: &Path, shuffle: bool) -> Result<Vec<PathBuf>, Box<dy
     if path.is_file() {
         list.push(path.to_path_buf());
     } else if path.is_dir() {
-        fn scan_dir(dir: &Path, list: &mut Vec<PathBuf>) {
+        // Track visited directories by canonical path so a symlink pointing back up
+        // the tree can't drive scan_dir into unbounded (stack-overflowing) recursion.
+        fn scan_dir(dir: &Path, list: &mut Vec<PathBuf>, visited: &mut std::collections::HashSet<PathBuf>) {
+            let canonical = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+            if !visited.insert(canonical) {
+                return;
+            }
             if let Ok(entries) = fs::read_dir(dir) {
                 for entry in entries.flatten() {
                     let p = entry.path();
                     if p.is_dir() {
-                        scan_dir(&p, list);
+                        scan_dir(&p, list, visited);
                     } else if p.is_file() {
                         if let Some(ext) = p.extension() {
                             if SUPPORTED_EXTENSIONS.contains(&ext.to_string_lossy().to_lowercase().as_str()) {
@@ -60,7 +66,8 @@ pub fn build_playlist(path: &Path, shuffle: bool) -> Result<Vec<PathBuf>, Box<dy
                 }
             }
         }
-        scan_dir(path, &mut list);
+        let mut visited = std::collections::HashSet::new();
+        scan_dir(path, &mut list, &mut visited);
         list.sort();
 
         if shuffle {

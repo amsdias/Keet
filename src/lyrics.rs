@@ -61,15 +61,16 @@ impl Lyrics {
 /// Detects LRC format by looking for `[MM:SS` patterns.
 pub fn parse_lyrics(raw: &str) -> Lyrics {
     // Check if this looks like LRC (at least one timestamp line)
-    let has_timestamps = raw.lines().any(|line| parse_lrc_timestamp(line).is_some());
+    let has_timestamps = raw.lines().any(|line| !parse_lrc_line(line).is_empty());
 
     if has_timestamps {
         let mut lines: Vec<LrcLine> = Vec::new();
         for line in raw.lines() {
-            if let Some((time, text)) = parse_lrc_timestamp(line) {
+            // A line may carry several timestamps sharing the same text.
+            // Non-timestamped lines (metadata like [ar:Artist]) yield nothing.
+            for (time, text) in parse_lrc_line(line) {
                 lines.push(LrcLine { time, text });
             }
-            // Skip non-timestamped lines (metadata like [ar:Artist], [ti:Title], etc.)
         }
         lines.sort_by(|a, b| a.time.partial_cmp(&b.time).unwrap_or(std::cmp::Ordering::Equal));
         Lyrics::Synced(lines)
@@ -81,23 +82,50 @@ pub fn parse_lyrics(raw: &str) -> Lyrics {
     }
 }
 
-/// Parse a single LRC line like `[01:23.45]Some text` or `[01:23]Text`.
-/// Returns (seconds, text) if valid.
-fn parse_lrc_timestamp(line: &str) -> Option<(f64, String)> {
-    let line = line.trim();
-    if !line.starts_with('[') { return None; }
-    let close = line.find(']')?;
-    let inside = &line[1..close];
-    let text = line[close + 1..].to_string();
+/// Parse an LRC line into `(seconds, text)` for each leading timestamp tag.
+/// Supports `[MM:SS]`, `[MM:SS.xx]` and `[HH:MM:SS.xx]`, and multiple timestamps
+/// sharing one line (e.g. `[00:12.00][00:48.00]Chorus`), which LRCLIB occasionally
+/// returns. Returns empty for metadata lines like `[ar:Artist]` and untimed text.
+fn parse_lrc_line(line: &str) -> Vec<(f64, String)> {
+    let mut rest = line.trim();
+    let mut times: Vec<f64> = Vec::new();
+    while let Some(stripped) = rest.strip_prefix('[') {
+        let close = match stripped.find(']') {
+            Some(c) => c,
+            None => break,
+        };
+        match parse_lrc_time(&stripped[..close]) {
+            Some(t) => {
+                times.push(t);
+                rest = &stripped[close + 1..];
+            }
+            None => break, // not a timestamp (e.g. [ar:...]) — stop scanning tags
+        }
+    }
+    if times.is_empty() {
+        return Vec::new();
+    }
+    let text = rest.to_string();
+    times.into_iter().map(|t| (t, text.clone())).collect()
+}
 
-    // Parse MM:SS.xx or MM:SS
+/// Parse the inside of an LRC time tag (`MM:SS`, `MM:SS.xx`, or `HH:MM:SS.xx`) to seconds.
+fn parse_lrc_time(inside: &str) -> Option<f64> {
     let parts: Vec<&str> = inside.split(':').collect();
-    if parts.len() != 2 { return None; }
-
-    let minutes: f64 = parts[0].parse().ok()?;
-    let seconds: f64 = parts[1].parse().ok()?;
-
-    Some((minutes * 60.0 + seconds, text))
+    match parts.as_slice() {
+        [m, s] => {
+            let minutes: f64 = m.parse().ok()?;
+            let seconds: f64 = s.parse().ok()?;
+            Some(minutes * 60.0 + seconds)
+        }
+        [h, m, s] => {
+            let hours: f64 = h.parse().ok()?;
+            let minutes: f64 = m.parse().ok()?;
+            let seconds: f64 = s.parse().ok()?;
+            Some(hours * 3600.0 + minutes * 60.0 + seconds)
+        }
+        _ => None,
+    }
 }
 
 /// Fetch lyrics from LRCLIB (free, no API key, ~3M entries).

@@ -923,6 +923,28 @@ fn remove_track(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<PathBu
     ui.set_status(format!("Removed: {}", removed_name));
 }
 
+/// Cancel the in-flight metadata scan, remap the cache to the reordered playlist,
+/// then spawn a fresh scan. Reordering the playlist (sort/shuffle/rescan/source-switch)
+/// must go through here: the scan workers write metadata by the index of the playlist
+/// snapshot they were spawned with, so reindexing without first joining them lets
+/// in-flight writes land in the wrong (remapped) cache slots.
+pub(crate) fn reindex_and_restart_scan(
+    ui: &mut UiState,
+    playlist: &[PathBuf],
+    old_playlist: &[PathBuf],
+) {
+    ui.metadata_cache.cancel.store(true, Ordering::Relaxed);
+    if let Some(h) = ui.scan_handle.take() {
+        h.join().ok();
+    }
+    ui.metadata_cache.reindex(playlist, old_playlist);
+    ui.metadata_cache.cancel.store(false, Ordering::Relaxed);
+    ui.scan_handle = Some(crate::metadata::spawn_metadata_scan(
+        playlist.to_vec(),
+        std::sync::Arc::clone(&ui.metadata_cache),
+    ));
+}
+
 /// Sort the playlist by tag metadata: artist → album → disc → track → title → filename.
 /// Tracks without any tags fall to the bottom (sorted among themselves by filename).
 /// Preserves the currently-playing track's logical position.
@@ -975,7 +997,7 @@ fn sort_playlist_by_tags(state: &PlayerState, ui: &mut UiState, playlist: &mut V
     // Sorting invalidates the enqueue queue (positions no longer reflect user intent).
     ui.enqueue_count = 0;
 
-    ui.metadata_cache.reindex(playlist, &old_playlist);
+    reindex_and_restart_scan(ui, playlist, &old_playlist);
     state.current_track.store(ui.current, Ordering::Relaxed);
     ui.cursor = ui.current;
     ensure_cursor_visible(ui, playlist);
@@ -1015,7 +1037,7 @@ fn toggle_shuffle(ui: &mut UiState, playlist: &mut Vec<PathBuf>) {
         ui.set_status("Shuffle OFF".to_string());
     }
     // Cached metadata is indexed by position — remap it to match the reordered paths.
-    ui.metadata_cache.reindex(playlist, &old_playlist);
+    reindex_and_restart_scan(ui, playlist, &old_playlist);
     ui.playlist_dirty = true;
     ui.banner_dirty = true;
 }
@@ -1114,17 +1136,7 @@ fn switch_source_paths(
     state.total_tracks.store(playlist.len(), Ordering::Relaxed);
     state.current_track.store(0, Ordering::Relaxed);
 
-    // Reindex metadata cache: cancel old scan, remap entries, spawn fresh scan
-    ui.metadata_cache.cancel.store(true, Ordering::Relaxed);
-    if let Some(h) = ui.scan_handle.take() {
-        h.join().ok();
-    }
-    ui.metadata_cache.reindex(playlist, &old_playlist);
-    ui.metadata_cache.cancel.store(false, Ordering::Relaxed);
-    ui.scan_handle = Some(crate::metadata::spawn_metadata_scan(
-        playlist.clone(),
-        std::sync::Arc::clone(&ui.metadata_cache),
-    ));
+    reindex_and_restart_scan(ui, playlist, &old_playlist);
 
     // Signal the producer to break out of the current track and jump to index 0
     // of the new playlist on its next iteration.
@@ -1178,17 +1190,7 @@ fn rescan(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<PathBuf>) {
     state.total_tracks.store(playlist.len(), Ordering::Relaxed);
     state.current_track.store(ui.current, Ordering::Relaxed);
 
-    // Reindex metadata cache: cancel old scan, remap entries, spawn new scan
-    ui.metadata_cache.cancel.store(true, Ordering::Relaxed);
-    if let Some(h) = ui.scan_handle.take() {
-        h.join().ok();
-    }
-    ui.metadata_cache.reindex(playlist, &old_playlist);
-    ui.metadata_cache.cancel.store(false, Ordering::Relaxed);
-    ui.scan_handle = Some(crate::metadata::spawn_metadata_scan(
-        playlist.clone(),
-        std::sync::Arc::clone(&ui.metadata_cache),
-    ));
+    reindex_and_restart_scan(ui, playlist, &old_playlist);
 
     if playlist.is_empty() || (playlist.len() == 1 && total_removed > 0 && current_track_path.is_some()) {
         ui.set_status("All files removed, finishing current track".to_string());

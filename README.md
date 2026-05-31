@@ -19,7 +19,7 @@ Version is embedded from git tags via `build.rs` (`GIT_VERSION` env var). The re
 
 ### Three-Thread Model
 
-1. **Main/UI thread** (`main.rs`, `ui.rs`) — polls input at ~50fps, renders ANSI UI top-to-bottom, runs visualization analysis (FFT/VU), detects track transitions via atomic `track_transition_count` (Acquire ordering)
+1. **Main/UI thread** (`main.rs`, `ui.rs`) — runs a ~20fps loop (50 ms sleep): polls input, renders ANSI UI top-to-bottom, runs visualization analysis (FFT/VU), detects track transitions via atomic `track_transition_count` (Acquire ordering). Key latency is therefore up to ~50 ms
 2. **Producer/decode thread** (`decode.rs`) — decodes audio (symphonia), applies full DSP chain, writes to lock-free ring buffer (`rtrb`). Sleeps when buffer >75% full
 3. **Audio callback** (`audio.rs`) — cpal callback, reads ring buffer, applies volume gain, taps samples to viz buffer. **Zero locks in the callback**
 

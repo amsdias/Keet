@@ -186,6 +186,72 @@ fn parse_rg_peak_value(s: &str) -> Option<f32> {
     s.trim().parse::<f32>().ok()
 }
 
+/// Tag values accumulated across one or more metadata sources. Each field is
+/// filled only once (first non-empty wins), so the primary container metadata
+/// takes precedence over probe-side tags.
+#[derive(Default)]
+struct TagFields {
+    title: Option<String>,
+    artist: Option<String>,
+    album: Option<String>,
+    lyrics: Option<String>,
+    track_number: Option<u32>,
+    disc_number: Option<u32>,
+    rg_track_gain: Option<f32>,
+    rg_track_peak: Option<f32>,
+    rg_album_gain: Option<f32>,
+    rg_album_peak: Option<f32>,
+}
+
+/// Merge a metadata revision's tags into `fields`, filling only gaps. Shared by
+/// the container-metadata and probe-side passes so the extraction logic lives once.
+fn merge_metadata_tags(fields: &mut TagFields, tags: &[symphonia::core::meta::Tag]) {
+    for tag in tags {
+        match tag.std_key {
+            Some(StandardTagKey::TrackTitle) if fields.title.is_none() => {
+                if let Value::String(ref s) = tag.value { fields.title = Some(s.clone()); }
+            }
+            Some(StandardTagKey::Artist) if fields.artist.is_none() => {
+                if let Value::String(ref s) = tag.value { fields.artist = Some(s.clone()); }
+            }
+            Some(StandardTagKey::Album) if fields.album.is_none() => {
+                if let Value::String(ref s) = tag.value { fields.album = Some(s.clone()); }
+            }
+            Some(StandardTagKey::Lyrics) if fields.lyrics.is_none() => {
+                if let Value::String(ref s) = tag.value { fields.lyrics = Some(s.clone()); }
+            }
+            Some(StandardTagKey::TrackNumber) if fields.track_number.is_none() => {
+                fields.track_number = parse_leading_u32(&tag.value);
+            }
+            Some(StandardTagKey::DiscNumber) if fields.disc_number.is_none() => {
+                fields.disc_number = parse_leading_u32(&tag.value);
+            }
+            _ => {}
+        }
+        let key_lower = tag.key.to_lowercase();
+        if let Value::String(ref s) = tag.value {
+            match key_lower.as_str() {
+                "replaygain_track_gain" if fields.rg_track_gain.is_none() => {
+                    fields.rg_track_gain = parse_rg_gain_value(s);
+                }
+                "replaygain_track_peak" if fields.rg_track_peak.is_none() => {
+                    fields.rg_track_peak = parse_rg_peak_value(s);
+                }
+                "replaygain_album_gain" if fields.rg_album_gain.is_none() => {
+                    fields.rg_album_gain = parse_rg_gain_value(s);
+                }
+                "replaygain_album_peak" if fields.rg_album_peak.is_none() => {
+                    fields.rg_album_peak = parse_rg_peak_value(s);
+                }
+                "lyrics" | "unsyncedlyrics" if fields.lyrics.is_none() => {
+                    fields.lyrics = Some(s.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 fn read_metadata_full(path: &Path) -> Option<CachedMeta> {
     let file = File::open(path).ok()?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
@@ -209,114 +275,27 @@ fn read_metadata_full(path: &Path) -> Option<CachedMeta> {
             None
         });
 
-    let mut title: Option<String> = None;
-    let mut artist: Option<String> = None;
-    let mut album: Option<String> = None;
-    let mut lyrics: Option<String> = None;
-    let mut track_number: Option<u32> = None;
-    let mut disc_number: Option<u32> = None;
-    let mut rg_track_gain: Option<f32> = None;
-    let mut rg_track_peak: Option<f32> = None;
-    let mut rg_album_gain: Option<f32> = None;
-    let mut rg_album_peak: Option<f32> = None;
+    let mut fields = TagFields::default();
 
+    // Primary: container-level metadata (e.g. FLAC/Vorbis comments, MP4 atoms).
     if let Some(rev) = probed.format.metadata().current() {
-        for tag in rev.tags() {
-            match tag.std_key {
-                Some(StandardTagKey::TrackTitle) => {
-                    if let Value::String(ref s) = tag.value { title = Some(s.clone()); }
-                }
-                Some(StandardTagKey::Artist) => {
-                    if let Value::String(ref s) = tag.value { artist = Some(s.clone()); }
-                }
-                Some(StandardTagKey::Album) => {
-                    if let Value::String(ref s) = tag.value { album = Some(s.clone()); }
-                }
-                Some(StandardTagKey::Lyrics) if lyrics.is_none() => {
-                    if let Value::String(ref s) = tag.value { lyrics = Some(s.clone()); }
-                }
-                Some(StandardTagKey::TrackNumber) if track_number.is_none() => {
-                    track_number = parse_leading_u32(&tag.value);
-                }
-                Some(StandardTagKey::DiscNumber) if disc_number.is_none() => {
-                    disc_number = parse_leading_u32(&tag.value);
-                }
-                _ => {}
-            }
-            let key_lower = tag.key.to_lowercase();
-            if let Value::String(ref s) = tag.value {
-                match key_lower.as_str() {
-                    "replaygain_track_gain" if rg_track_gain.is_none() => {
-                        rg_track_gain = parse_rg_gain_value(s);
-                    }
-                    "replaygain_track_peak" if rg_track_peak.is_none() => {
-                        rg_track_peak = parse_rg_peak_value(s);
-                    }
-                    "replaygain_album_gain" if rg_album_gain.is_none() => {
-                        rg_album_gain = parse_rg_gain_value(s);
-                    }
-                    "replaygain_album_peak" if rg_album_peak.is_none() => {
-                        rg_album_peak = parse_rg_peak_value(s);
-                    }
-                    "lyrics" | "unsyncedlyrics" if lyrics.is_none() => {
-                        lyrics = Some(s.clone());
-                    }
-                    _ => {}
-                }
-            }
-        }
+        merge_metadata_tags(&mut fields, rev.tags());
     }
 
-    if title.is_none() || artist.is_none() || album.is_none() || lyrics.is_none() {
+    // Fallback: probe-side metadata (e.g. an ID3v2 block ahead of the stream),
+    // used only to fill gaps the container metadata didn't cover.
+    if fields.title.is_none() || fields.artist.is_none() || fields.album.is_none() || fields.lyrics.is_none() {
         if let Some(meta) = probed.metadata.get() {
             if let Some(rev) = meta.current() {
-                for tag in rev.tags() {
-                    match tag.std_key {
-                        Some(StandardTagKey::TrackTitle) if title.is_none() => {
-                            if let Value::String(ref s) = tag.value { title = Some(s.clone()); }
-                        }
-                        Some(StandardTagKey::Artist) if artist.is_none() => {
-                            if let Value::String(ref s) = tag.value { artist = Some(s.clone()); }
-                        }
-                        Some(StandardTagKey::Album) if album.is_none() => {
-                            if let Value::String(ref s) = tag.value { album = Some(s.clone()); }
-                        }
-                        Some(StandardTagKey::Lyrics) if lyrics.is_none() => {
-                            if let Value::String(ref s) = tag.value { lyrics = Some(s.clone()); }
-                        }
-                        Some(StandardTagKey::TrackNumber) if track_number.is_none() => {
-                            track_number = parse_leading_u32(&tag.value);
-                        }
-                        Some(StandardTagKey::DiscNumber) if disc_number.is_none() => {
-                            disc_number = parse_leading_u32(&tag.value);
-                        }
-                        _ => {}
-                    }
-                    let key_lower = tag.key.to_lowercase();
-                    if let Value::String(ref s) = tag.value {
-                        match key_lower.as_str() {
-                            "replaygain_track_gain" if rg_track_gain.is_none() => {
-                                rg_track_gain = parse_rg_gain_value(s);
-                            }
-                            "replaygain_track_peak" if rg_track_peak.is_none() => {
-                                rg_track_peak = parse_rg_peak_value(s);
-                            }
-                            "replaygain_album_gain" if rg_album_gain.is_none() => {
-                                rg_album_gain = parse_rg_gain_value(s);
-                            }
-                            "replaygain_album_peak" if rg_album_peak.is_none() => {
-                                rg_album_peak = parse_rg_peak_value(s);
-                            }
-                            "lyrics" | "unsyncedlyrics" if lyrics.is_none() => {
-                                lyrics = Some(s.clone());
-                            }
-                            _ => {}
-                        }
-                    }
-                }
+                merge_metadata_tags(&mut fields, rev.tags());
             }
         }
     }
+
+    let TagFields {
+        title, artist, album, lyrics, track_number, disc_number,
+        rg_track_gain, rg_track_peak, rg_album_gain, rg_album_peak,
+    } = fields;
 
     let filename = path.file_name()
         .unwrap_or_default()
