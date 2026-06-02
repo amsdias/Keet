@@ -14,6 +14,8 @@ use std::fs::File;
 use std::fmt::Write as _;
 use std::io::Cursor;
 use std::sync::OnceLock;
+
+use image::ImageEncoder;
 use std::time::Duration;
 
 use symphonia::core::formats::FormatOptions;
@@ -33,6 +35,8 @@ const HALF_BLOCK_H: u32 = COVER_ROWS * 2;
 const KITTY_SIZE: u32 = 320;
 /// Kitty image ID we reserve. Re-transmitting with the same ID replaces.
 const KITTY_IMAGE_ID: u32 = 1;
+/// Separate Kitty image id for the viz (cover uses id 1; avoid clobbering it).
+const VIZ_IMAGE_ID: u32 = 2;
 /// Sixel target pixel size. Sixel renders 1:1 pixels, so this needs to fit
 /// the cover slot at typical cell dimensions (~10x20 px on Windows Terminal
 /// default font). 200×200 ≈ 20 cols × 10 rows in those units.
@@ -100,6 +104,12 @@ pub enum CoverImage {
 /// Safe to emit even when no image is currently on screen.
 pub fn kitty_clear_escape() -> String {
     format!("\x1B_Ga=d,d=i,i={},q=2\x1B\\", KITTY_IMAGE_ID)
+}
+
+/// Remove any placement of the viz image id (analysis spectrogram). Safe to emit
+/// unconditionally, even when no such image is on screen.
+pub fn viz_image_clear_escape() -> String {
+    format!("\x1B_Ga=d,d=i,i={},q=2\x1B\\", VIZ_IMAGE_ID)
 }
 
 /// Try local sources only: embedded tag, sidecar file, on-disk cache.
@@ -337,13 +347,12 @@ fn render_half_block(width: u32, height: u32, pixels: &[u8]) -> Vec<String> {
                     let _ = write!(line, "\x1B[48;2;{};{};{}m", b.0, b.1, b.2);
                     last_bot = Some(b);
                 }
-                None => {
+                None
                     // Clear any background from previous cell on an odd last row.
-                    if last_bot.is_some() {
+                    if last_bot.is_some() => {
                         line.push_str("\x1B[49m");
                         last_bot = None;
                     }
-                }
                 _ => {}
             }
             line.push('▀');
@@ -352,6 +361,116 @@ fn render_half_block(width: u32, height: u32, pixels: &[u8]) -> Vec<String> {
         lines.push(line);
         y += 2;
     }
+    lines
+}
+
+/// Public wrapper so other modules (viz) can render an arbitrary RGB buffer
+/// as half-block truecolor rows.
+pub fn render_half_block_public(width: u32, height: u32, pixels: &[u8]) -> Vec<String> {
+    render_half_block(width, height, pixels)
+}
+
+/// Render a raw RGB image (`w`×`h` px) into a block occupying `cols`×`rows`
+/// terminal cells, using the detected graphics protocol. Returns one String per
+/// row (caller adds horizontal padding). For HalfBlock, the caller should use
+/// `render_half_block_public` instead — this fn covers the pixel-image protocols.
+pub fn render_image_block(rgb: &[u8], w: u32, h: u32, cols: u32, rows: u32) -> Vec<String> {
+    let blank = || vec![String::new(); rows as usize];
+    match detect_protocol() {
+        GraphicsProtocol::Kitty => match encode_png_rgb(rgb, w, h) {
+            Some(png) => viz_kitty_lines(&png, cols, rows),
+            None => blank(),
+        },
+        GraphicsProtocol::Iterm2 => match encode_png_rgb(rgb, w, h) {
+            Some(png) => viz_iterm2_lines(&png, cols, rows),
+            None => blank(),
+        },
+        GraphicsProtocol::Sixel => {
+            // icy_sixel wants RGBA; expand the borrowed RGB without an RgbImage copy.
+            let mut rgba = Vec::with_capacity(rgb.len() / 3 * 4);
+            for px in rgb.chunks_exact(3) {
+                rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
+            }
+            let opts = icy_sixel::EncodeOptions::default();
+            match icy_sixel::sixel_encode(&rgba, w as usize, h as usize, &opts) {
+                Ok(data) => viz_sixel_lines(&data, cols, rows),
+                Err(_) => blank(),
+            }
+        }
+        GraphicsProtocol::HalfBlock => blank(),
+    }
+}
+
+/// PNG-encode a raw RGB8 buffer directly — no intermediate `RgbImage` allocation
+/// or per-frame copy of the borrowed pixels.
+fn encode_png_rgb(rgb: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
+    let mut png = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut png)
+        .write_image(rgb, w, h, image::ExtendedColorType::Rgb8)
+        .ok()?;
+    Some(png)
+}
+
+fn viz_kitty_lines(png: &[u8], cols: u32, rows: u32) -> Vec<String> {
+    let b64 = base64_encode(png);
+    let chunk_size = 4096;
+    let total = b64.len();
+    let mut transmit = String::with_capacity(total + 256);
+    let mut pos = 0;
+    let mut first = true;
+    while pos < total {
+        let end = (pos + chunk_size).min(total);
+        let is_last = end == total;
+        transmit.push_str("\x1B_G");
+        if first {
+            // p=1 pins a single placement: re-transmitting each frame with the same
+            // image id + placement id REPLACES it in place rather than spawning a new
+            // placement every frame (which otherwise piles up and slows the terminal).
+            let _ = write!(transmit, "a=T,f=100,i={},p=1,c={},r={},C=1,q=2,m={}",
+                VIZ_IMAGE_ID, cols, rows, if is_last { 0 } else { 1 });
+            first = false;
+        } else {
+            let _ = write!(transmit, "m={}", if is_last { 0 } else { 1 });
+        }
+        transmit.push(';');
+        transmit.push_str(&b64[pos..end]);
+        transmit.push_str("\x1B\\");
+        pos = end;
+    }
+    let blank = " ".repeat(cols as usize);
+    let mut lines = Vec::with_capacity(rows as usize);
+    lines.push(format!("{transmit}{blank}"));
+    for _ in 1..rows { lines.push(blank.clone()); }
+    lines
+}
+
+fn viz_iterm2_lines(png: &[u8], cols: u32, rows: u32) -> Vec<String> {
+    let b64 = base64_encode(png);
+    let mut first = String::with_capacity(b64.len() + 128);
+    first.push_str("\x1B[s\x1B]1337;File=size=");
+    let _ = write!(first, "{}", png.len());
+    let _ = write!(first, ";width={};height={};inline=1;preserveAspectRatio=1:", cols, rows);
+    first.push_str(&b64);
+    first.push('\x07');
+    first.push_str("\x1B[u");
+    let _ = write!(first, "\x1B[{}C", cols);
+    let skip = format!("\x1B[{}C", cols);
+    let mut lines = Vec::with_capacity(rows as usize);
+    lines.push(first);
+    for _ in 1..rows { lines.push(skip.clone()); }
+    lines
+}
+
+fn viz_sixel_lines(data: &str, cols: u32, rows: u32) -> Vec<String> {
+    let mut first = String::with_capacity(data.len() + 16);
+    first.push_str("\x1B[s");
+    first.push_str(data);
+    first.push_str("\x1B[u");
+    let _ = write!(first, "\x1B[{}C", cols);
+    let skip = format!("\x1B[{}C", cols);
+    let mut lines = Vec::with_capacity(rows as usize);
+    lines.push(first);
+    for _ in 1..rows { lines.push(skip.clone()); }
     lines
 }
 

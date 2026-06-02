@@ -575,7 +575,7 @@ pub fn set_exclusive_mode(device: &cpal::Device) -> Result<u32, String> {
             .map(|d| d.name().to_string())
             .unwrap_or_default();
         let device_id = macos_audio::find_device_id_by_name(&device_name)
-            .or_else(|| macos_audio::get_default_device_id())
+            .or_else(macos_audio::get_default_device_id)
             .ok_or_else(|| "Could not find CoreAudio device ID".to_string())?;
 
         macos_audio::set_hog_mode(device_id)?;
@@ -702,7 +702,7 @@ pub fn build_stream(
 
                 // Tap played stereo samples into viz buffer (best-effort, drop if full)
                 // Pre-fader mode: undo volume gain so viz shows raw signal levels
-                let frames_written = if channels > 0 { out_idx / channels } else { 0 };
+                let frames_written = out_idx.checked_div(channels).unwrap_or(0);
                 let viz_samples = frames_written * 2; // stereo
                 let pre_fader = state.is_pre_fader();
                 let viz_scale = if pre_fader && gain > 0.0 { 1.0 / gain } else { 1.0 };

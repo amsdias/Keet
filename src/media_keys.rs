@@ -19,12 +19,10 @@ pub fn setup(state: Arc<PlayerState>) -> Option<MediaControls> {
 
     controls.attach(move |event: MediaControlEvent| {
         match event {
-            MediaControlEvent::Play => {
-                if state.is_paused() { state.toggle_pause(); }
-            }
-            MediaControlEvent::Pause => {
-                if !state.is_paused() { state.toggle_pause(); }
-            }
+            MediaControlEvent::Play
+                if state.is_paused() => { state.toggle_pause(); }
+            MediaControlEvent::Pause
+                if !state.is_paused() => { state.toggle_pause(); }
             MediaControlEvent::Toggle => state.toggle_pause(),
             MediaControlEvent::Next => state.next(),
             MediaControlEvent::Previous => state.prev(),

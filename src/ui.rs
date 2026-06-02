@@ -14,7 +14,7 @@ use crate::state::{
 use crate::viz::{
     StatsMonitor, VizAnalyser, render_vu_meter, render_spectrum_horizontal,
     render_spectrum_vertical, render_oscilloscope, render_lissajous,
-    render_spectrogram, get_viz_line_count,
+    render_spectrogram, render_spectrogram_analysis, get_viz_line_count,
 };
 
 pub fn format_time(secs: f64) -> String {
@@ -77,6 +77,7 @@ fn visible_len(s: &str) -> usize {
     s.chars().count()
 }
 
+#[allow(clippy::too_many_arguments)] // cohesive render context; bundling into a struct adds no clarity
 pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_info: &str, ext: &str, eq_preset: &crate::eq::EqPreset, fx_name: &str, cf_name: &str, stats: &mut StatsMonitor, prev_viz_lines: usize, playlist: &[PathBuf], analyser: &VizAnalyser) -> usize {
     let viz_mode = state.viz_mode();
     let viz_style = state.viz_style();
@@ -175,10 +176,12 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
         VizMode::Oscilloscope => "Scope",
         VizMode::Lissajous => "Vector",
         VizMode::Spectrogram => "SpecGram",
+        VizMode::SpectrogramAnalysis => "SpecAna",
     };
-    let next_style = match viz_style {
-        VizStyle::Dots => "Bars",
-        VizStyle::Bars => "Dots",
+    let next_style = if viz_mode == VizMode::SpectrogramAnalysis {
+        if matches!(viz_style, VizStyle::Dots) { "Linear" } else { "Log" }
+    } else {
+        match viz_style { VizStyle::Dots => "Bars", VizStyle::Bars => "Dots" }
     };
     let stats_display = if state.show_stats() {
         format!(" cpu:{:.1}% mem:{:.0}M", stats.cpu_usage, stats.memory_mb)
@@ -401,7 +404,7 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
     match viz_mode {
         VizMode::None => {}
         VizMode::VuMeter => {
-            for line in render_vu_meter(state, viz_style) {
+            for line in render_vu_meter(state, viz_style, term_w) {
                 print!("\n\r\x1B[K{}", line);
             }
         }
@@ -416,7 +419,7 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
             }
         }
         VizMode::Oscilloscope => {
-            for line in render_oscilloscope(analyser, viz_style) {
+            for line in render_oscilloscope(analyser, viz_style, term_w) {
                 print!("\n\r\x1B[K{}", line);
             }
         }
@@ -426,7 +429,14 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
             }
         }
         VizMode::Spectrogram => {
-            for line in render_spectrogram(analyser, viz_style) {
+            for line in render_spectrogram(analyser, viz_style, term_w) {
+                print!("\n\r\x1B[K{}", line);
+            }
+        }
+        VizMode::SpectrogramAnalysis => {
+            // {B}/viz_style selects the frequency axis here: Dots = log, Bars = linear.
+            let log_axis = matches!(viz_style, VizStyle::Dots);
+            for line in render_spectrogram_analysis(analyser, term_w, log_axis, state.is_paused()) {
                 print!("\n\r\x1B[K{}", line);
             }
         }
@@ -1013,8 +1023,8 @@ fn sort_playlist_by_tags(state: &PlayerState, ui: &mut UiState, playlist: &mut V
 /// Toggle runtime shuffle. When turning ON, shuffles the tracks after the current
 /// one (so the now-playing song isn't interrupted). When turning OFF, re-sorts
 /// the playlist by PathBuf order and relocates the current track.
-fn toggle_shuffle(ui: &mut UiState, playlist: &mut Vec<PathBuf>) {
-    let old_playlist = playlist.clone();
+fn toggle_shuffle(ui: &mut UiState, playlist: &mut [PathBuf]) {
+    let old_playlist = playlist.to_vec();
     ui.shuffle = !ui.shuffle;
     let current_path = playlist.get(ui.current).cloned();
 
@@ -1256,12 +1266,11 @@ fn prompt_path_line() -> Option<PathBuf> {
                     let trimmed = buf.trim().to_string();
                     break if trimmed.is_empty() { None } else { Some(PathBuf::from(trimmed)) };
                 }
-                KeyCode::Backspace => {
-                    if buf.pop().is_some() {
+                KeyCode::Backspace
+                    if buf.pop().is_some() => {
                         print!("\x08 \x08");
                         io::stdout().flush().ok();
                     }
-                }
                 KeyCode::Char(c) => {
                     buf.push(c);
                     print!("{}", c);

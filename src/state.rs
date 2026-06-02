@@ -17,6 +17,31 @@ pub const fn ring_capacity_for(output_rate: u32) -> usize {
 // Visualization constants
 pub const FFT_SIZE: usize = 4096;
 pub const SPECTRUM_BANDS: usize = 31;
+
+// Analysis-spectrogram scroll cadence. Columns are produced at the FFT hop rate
+// (output_rate / FFT_SIZE/2), which is ~21/s at 44.1k but ~94/s at 192k — far
+// faster than a terminal can smoothly re-draw a full image. To keep scrolling
+// even, we aggregate several hops into one column so the column rate stays ~one
+// per target frame at any sample rate, and the render loop ticks at the same
+// period. Both the aggregation and the render cadence derive from this constant.
+pub const SPECTRO_TARGET_FRAME_MS: f32 = 45.0; // ~22 columns/frames per second
+
+/// Number of FFT hops aggregated into one analysis-spectrogram column at the
+/// given output rate, so the column-production rate is ~constant across rates.
+pub fn spectro_hops_per_col(output_rate: u64) -> usize {
+    if output_rate == 0 { return 1; }
+    let hop_ms = (FFT_SIZE as f32 / 2.0) * 1000.0 / output_rate as f32;
+    ((SPECTRO_TARGET_FRAME_MS / hop_ms).round() as usize).max(1)
+}
+
+/// Render/column period (ms) for the analysis spectrogram at the given output
+/// rate. Equals the time to produce one aggregated column, so exactly one column
+/// lands per frame and the scroll advances evenly.
+pub fn spectro_frame_ms(output_rate: u64) -> u64 {
+    if output_rate == 0 { return SPECTRO_TARGET_FRAME_MS as u64; }
+    let hop_ms = (FFT_SIZE as f32 / 2.0) * 1000.0 / output_rate as f32;
+    (spectro_hops_per_col(output_rate) as f32 * hop_ms).round().max(1.0) as u64
+}
 // Display smoothing for spectrum bars, applied asymmetrically (fast attack / slow
 // release): VIZ_ATTACK governs the rise so beats land on time, VIZ_DECAY the fall
 // so it stays smooth. A symmetric low-pass here delayed the onset ~150 ms.
@@ -131,6 +156,7 @@ pub enum VizMode {
     Oscilloscope = 4,
     Lissajous = 5,
     Spectrogram = 6,
+    SpectrogramAnalysis = 7,
 }
 
 impl VizMode {
@@ -142,7 +168,8 @@ impl VizMode {
             VizMode::SpectrumVertical => VizMode::Oscilloscope,
             VizMode::Oscilloscope => VizMode::Lissajous,
             VizMode::Lissajous => VizMode::Spectrogram,
-            VizMode::Spectrogram => VizMode::None,
+            VizMode::Spectrogram => VizMode::SpectrogramAnalysis,
+            VizMode::SpectrogramAnalysis => VizMode::None,
         }
     }
 
@@ -154,6 +181,7 @@ impl VizMode {
             4 => VizMode::Oscilloscope,
             5 => VizMode::Lissajous,
             6 => VizMode::Spectrogram,
+            7 => VizMode::SpectrogramAnalysis,
             _ => VizMode::None,
         }
     }

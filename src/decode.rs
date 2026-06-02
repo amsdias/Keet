@@ -134,6 +134,7 @@ fn compute_rg_gain(mode: RgMode, tags: &RgTags) -> f32 {
     linear
 }
 
+#[allow(clippy::too_many_arguments)] // producer thread entry point; args are the full decode context
 pub fn decode_playlist(
     playlist: &[PathBuf],
     start_index: usize,
@@ -507,7 +508,7 @@ pub fn decode_playlist(
                 eq.process_stereo(&mut eq_buf);
                 &eq_buf[..]
             } else {
-                &output[..]
+                output
             };
 
             // Effects processing

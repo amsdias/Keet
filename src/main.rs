@@ -663,6 +663,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut prev_viz_lines: usize = usize::MAX;
+    // Tracks whether the Kitty analysis-spectrogram image was placed last frame,
+    // so we can delete it (by id) when the user switches away from that mode.
+    let mut prev_viz_image_shown = false;
 
     // --- Persistent audio setup (created once, reused across all tracks) ---
     let mut device = if let Some(ref dev_name) = device_arg {
@@ -1162,9 +1165,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue 'playlist;
             }
 
-            // UI update
-            let ui_interval: u64 = 50;
-            if last_ui.elapsed() >= Duration::from_millis(ui_interval) {
+            // UI update. The analysis spectrogram is the one continuously-scrolling
+            // mode; match the render cadence to its (sample-rate-adaptive) column
+            // rate so it advances one column per frame, evenly. Other modes stay at
+            // 20fps. The loop sleep below uses the SAME value, which keeps the cadence
+            // even — an unequal sleep/interval is what made it judder before.
+            let analysis_viz = state.viz_mode() == VizMode::SpectrogramAnalysis;
+            let frame_ms: u64 = if analysis_viz {
+                crate::state::spectro_frame_ms(state.output_rate.load(Ordering::Relaxed))
+            } else {
+                50
+            };
+            if last_ui.elapsed() >= Duration::from_millis(frame_ms) {
                 if state.viz_mode() != VizMode::None {
                     let viz_available = viz_cons.slots();
                     if viz_available > 0 {
@@ -1225,12 +1237,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Remove any previously-placed kitty graphic before redrawing.
                     // No-op on terminals that don't speak the protocol.
                     let kitty_clear = if matches!(cover::detect_protocol(), cover::GraphicsProtocol::Kitty) {
-                        cover::kitty_clear_escape()
+                        format!("{}{}", cover::kitty_clear_escape(), cover::viz_image_clear_escape())
                     } else {
                         String::new()
                     };
                     print!("{}\x1B[0m\x1B[2J\x1B[H{}", kitty_clear, composed.replace('\n', "\r\n"));
                     prev_viz_lines = usize::MAX;
+                    prev_viz_image_shown = false; // resize already cleared any viz image
                 }
 
                 // Refresh filename from the metadata cache once the background
@@ -1246,6 +1259,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let current_eq = &eq_presets[state.eq_index()];
                 let current_fx = &fx_presets[state.effects_index()].name;
                 let current_cf = &cf_presets[state.crossfeed_index()].name;
+
+                // Delete the Kitty analysis-spectrogram image (by id) when it's no
+                // longer being drawn — leaving the mode OR switching away from the
+                // Player view (playlist/lyrics). The image is a graphics overlay, so
+                // unlike the text viz it isn't painted over by the new view.
+                let viz_image_shown = ui.view_mode == state::ViewMode::Player
+                    && state.viz_mode() == VizMode::SpectrogramAnalysis
+                    && matches!(cover::detect_protocol(), cover::GraphicsProtocol::Kitty);
+                if prev_viz_image_shown && !viz_image_shown {
+                    print!("{}", cover::viz_image_clear_escape());
+                }
+                prev_viz_image_shown = viz_image_shown;
+
                 prev_viz_lines = print_status(&state, &mut ui, &filename, &track_info, &track_ext, current_eq, current_fx, current_cf, &mut stats, prev_viz_lines, &playlist, &viz_analyser);
 
                 if let Some(ref mut mc) = media_controls {
@@ -1256,7 +1282,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             media_keys::poll();
-            thread::sleep(Duration::from_millis(50));
+            thread::sleep(Duration::from_millis(frame_ms));
         }
     }
 
@@ -1272,7 +1298,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Wipe the whole header (banner + status + viz + playlist/lyrics) and any
     // kitty graphic, leaving only the goodbye line.
     if matches!(cover::detect_protocol(), cover::GraphicsProtocol::Kitty) {
-        print!("{}", cover::kitty_clear_escape());
+        print!("{}{}", cover::kitty_clear_escape(), cover::viz_image_clear_escape());
     }
     print!("\x1B[H\x1B[2J");
     println!("✓ Done");

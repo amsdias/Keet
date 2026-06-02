@@ -1,6 +1,17 @@
+// This module is pixel/grid-heavy (FFT bins, braille dot grids, scope/spectrogram
+// canvases) where `for i in 0..n { buf[row*w + col] }` index math is clearer than
+// iterator gymnastics. Allow the range-loop lint module-wide rather than scatter it.
+#![allow(clippy::needless_range_loop)]
+
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+/// Process-global, monotonically increasing id for the newest analysis-spectrogram
+/// column. Used to key the paused-frame render cache so it can never reuse a stale
+/// image across a track change (each new column gets a fresh, never-repeated id).
+static SPECTRO_GEN: AtomicU64 = AtomicU64::new(0);
 
 use realfft::{RealFftPlanner, RealToComplex};
 
@@ -206,8 +217,22 @@ impl ChannelBands {
 // Size of the recent stereo sample ring used by oscilloscope/lissajous.
 // 1024 stereo pairs ≈ 21 ms at 48 kHz — enough trace for a clear pattern.
 pub const WAVEFORM_BUF_SIZE: usize = 1024;
-// Number of spectrogram columns kept in history (time axis).
-pub const SPECTROGRAM_COLS: usize = 60;
+// Max spectrogram columns kept in history (time axis). The render shows up to the
+// terminal width; this is the cap (and history depth) for very wide terminals.
+pub const SPECTROGRAM_COLS: usize = 240;
+// Each column averages this many FFT hops, dilating the time axis so the display
+// scrolls slower and smoother. At ~43 ms/hop: 1 = ~2.6 s window (was), 4 = ~10 s.
+pub const SPECTROGRAM_HOPS_PER_COL: usize = 4;
+
+// Analysis spectrogram: history depth (time window, columns ≈ FFT hops),
+// vertical rows, and dB contrast window.
+const SPECTRO_ANALYSIS_COLS: usize = 512;
+const SPECTRO_ANALYSIS_ROWS: usize = 16;
+// dB contrast window (tune by eye). With the 1/FFT_SIZE magnitude normalization a
+// full-scale tone peaks near -12 dB, so the ceiling sits a little below that and
+// the floor spans a ~60 dB range down to quiet detail. CEIL = brightest, FLOOR = dark.
+const SPECTRO_ANALYSIS_FLOOR_DB: f32 = -80.0;
+const SPECTRO_ANALYSIS_CEIL_DB: f32 = -20.0;
 
 pub struct VizAnalyser {
     fft: Arc<dyn RealToComplex<f32>>,
@@ -232,6 +257,21 @@ pub struct VizAnalyser {
     pub(crate) waveform_buf: VecDeque<(f32, f32)>,
     // History of mono spectrum frames, newest at back. Used by spectrogram.
     pub(crate) spectrogram_history: VecDeque<[f32; SPECTRUM_BANDS]>,
+    // Analysis spectrogram: per-hop dB magnitude columns (one Vec<f32> of length
+    // = FFT bins), newest at back. Captured only while the mode is active.
+    spectro_raw_history: VecDeque<Vec<f32>>,
+    // Reusable scratch holding the L-channel magnitudes between the L and R FFTs.
+    spectro_mag_l: Vec<f32>,
+    // Per-bin magnitude accumulator + hop count for the in-progress column. Several
+    // hops are averaged into one column so the column rate stays ~constant (and
+    // smoothly scroll-able) regardless of sample rate.
+    spectro_mag_accum: Vec<f32>,
+    spectro_mag_count: usize,
+    // Generation id of the newest pushed column (from SPECTRO_GEN). Keys the paused render cache.
+    spectro_last_gen: u64,
+    // Running sum of hops for the in-progress spectrogram column (time dilation).
+    spectrogram_accum: [f32; SPECTRUM_BANDS],
+    spectrogram_accum_count: usize,
 }
 
 impl VizAnalyser {
@@ -264,6 +304,13 @@ impl VizAnalyser {
             sample_rate,
             waveform_buf: VecDeque::with_capacity(WAVEFORM_BUF_SIZE),
             spectrogram_history: VecDeque::with_capacity(SPECTROGRAM_COLS),
+            spectro_raw_history: VecDeque::with_capacity(SPECTRO_ANALYSIS_COLS),
+            spectro_mag_l: Vec::new(),
+            spectro_mag_accum: Vec::new(),
+            spectro_mag_count: 0,
+            spectro_last_gen: 0,
+            spectrogram_accum: [0.0; SPECTRUM_BANDS],
+            spectrogram_accum_count: 0,
         }
     }
 
@@ -306,13 +353,13 @@ impl VizAnalyser {
         if peak_l > self.smoothed_peak_l {
             self.smoothed_peak_l = self.smoothed_peak_l * ATTACK_FACTOR + peak_l * (1.0 - ATTACK_FACTOR);
         } else {
-            self.smoothed_peak_l = self.smoothed_peak_l * DECAY_FACTOR;
+            self.smoothed_peak_l *= DECAY_FACTOR;
         }
 
         if peak_r > self.smoothed_peak_r {
             self.smoothed_peak_r = self.smoothed_peak_r * ATTACK_FACTOR + peak_r * (1.0 - ATTACK_FACTOR);
         } else {
-            self.smoothed_peak_r = self.smoothed_peak_r * DECAY_FACTOR;
+            self.smoothed_peak_r *= DECAY_FACTOR;
         }
 
         state.set_peaks(self.smoothed_peak_l, self.smoothed_peak_r);
@@ -346,11 +393,60 @@ impl VizAnalyser {
             }
             let l_bands = Self::run_fft_and_compute(&*self.fft, &mut self.fft_input, &mut self.fft_output, &mut self.fft_scratch, self.sample_rate);
 
+            // Analysis-spectrogram capture: stash L magnitudes (fft_output now holds L's spectrum).
+            let capture = state.viz_mode() == VizMode::SpectrogramAnalysis;
+            if capture {
+                let nbins = self.fft_output.len();
+                self.spectro_mag_l.resize(nbins, 0.0);
+                for (i, c) in self.fft_output.iter().enumerate() {
+                    self.spectro_mag_l[i] = c.norm();
+                }
+            }
+
             // Process R channel
             for (i, (&sample, &w)) in self.ch_r.sample_buffer.iter().take(FFT_SIZE).zip(&self.window).enumerate() {
                 self.fft_input[i] = sample * w;
             }
             let r_bands = Self::run_fft_and_compute(&*self.fft, &mut self.fft_input, &mut self.fft_output, &mut self.fft_scratch, self.sample_rate);
+
+            // Analysis-spectrogram capture: accumulate mono magnitude = avg(|L|,|R|)
+            // per bin, and push one averaged dB column every `hops_per_col` hops so
+            // the column rate stays ~constant (and smoothly scroll-able) across
+            // sample rates.
+            if capture {
+                let nbins = self.fft_output.len();
+                let norm = 1.0 / FFT_SIZE as f32;
+                if self.spectro_mag_accum.len() != nbins {
+                    self.spectro_mag_accum = vec![0.0; nbins];
+                    self.spectro_mag_count = 0;
+                }
+                for i in 0..nbins {
+                    self.spectro_mag_accum[i] += (self.spectro_mag_l[i] + self.fft_output[i].norm()) * 0.5 * norm;
+                }
+                self.spectro_mag_count += 1;
+
+                let hops_per_col = crate::state::spectro_hops_per_col(self.sample_rate as u64);
+                if self.spectro_mag_count >= hops_per_col {
+                    let inv = 1.0 / self.spectro_mag_count as f32;
+                    let mut col = if self.spectro_raw_history.len() >= SPECTRO_ANALYSIS_COLS {
+                        self.spectro_raw_history.pop_front().unwrap()
+                    } else {
+                        Vec::with_capacity(nbins)
+                    };
+                    col.clear();
+                    for &acc in self.spectro_mag_accum.iter() {
+                        col.push(20.0 * (acc * inv + 1e-9).log10());
+                    }
+                    self.spectro_raw_history.push_back(col);
+                    self.spectro_last_gen = SPECTRO_GEN.fetch_add(1, Ordering::Relaxed);
+                    for v in self.spectro_mag_accum.iter_mut() { *v = 0.0; }
+                    self.spectro_mag_count = 0;
+                }
+            } else if !self.spectro_raw_history.is_empty() {
+                self.spectro_raw_history.clear();
+                self.spectro_mag_accum.clear();
+                self.spectro_mag_count = 0;
+            }
 
             // Apply ballistics per channel
             Self::apply_ballistics(&l_bands, &mut self.ch_l.heights, &mut self.ch_l.smoothed);
@@ -377,11 +473,24 @@ impl VizAnalyser {
             state.set_spectrum_r(&self.ch_r.smoothed);
             state.set_dots(&self.peak_hold);
 
-            // Append to spectrogram history (mono = L+R average of the smoothed bands).
-            if self.spectrogram_history.len() == SPECTROGRAM_COLS {
-                self.spectrogram_history.pop_front();
+            // Accumulate hops into the current spectrogram column; push a column
+            // (the hop average) only every SPECTROGRAM_HOPS_PER_COL hops. This
+            // dilates the time axis so the spectrogram scrolls slower and smoother.
+            // mono = L+R average of the smoothed bands.
+            for (acc, &m) in self.spectrogram_accum.iter_mut().zip(mono.iter()) {
+                *acc += m;
             }
-            self.spectrogram_history.push_back(mono);
+            self.spectrogram_accum_count += 1;
+            if self.spectrogram_accum_count >= SPECTROGRAM_HOPS_PER_COL {
+                let inv = 1.0 / self.spectrogram_accum_count as f32;
+                let col: [f32; SPECTRUM_BANDS] = std::array::from_fn(|i| self.spectrogram_accum[i] * inv);
+                if self.spectrogram_history.len() == SPECTROGRAM_COLS {
+                    self.spectrogram_history.pop_front();
+                }
+                self.spectrogram_history.push_back(col);
+                self.spectrogram_accum = [0.0; SPECTRUM_BANDS];
+                self.spectrogram_accum_count = 0;
+            }
 
             // 50% overlap
             self.ch_l.sample_buffer.drain(..FFT_SIZE / 2);
@@ -491,10 +600,11 @@ impl VizAnalyser {
 
 const SPECTRUM_H_CHARS: &[char] = &[' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
-pub fn render_vu_meter(state: &PlayerState, style: VizStyle) -> Vec<String> {
+pub fn render_vu_meter(state: &PlayerState, style: VizStyle, width: usize) -> Vec<String> {
     let (left, right) = state.get_peaks();
     let (dot_l, dot_r) = state.get_vu_dots();
-    let bar_width = 30;
+    // Fill the width: 2-space pad + "L " label (2) + 2-col safety margin = 6 overhead.
+    let bar_width = width.saturating_sub(6).max(10);
 
     fn make_bar(level: f32, dot_val: f32, label: &str, width: usize, style: VizStyle) -> String {
         let full = (level.clamp(0.0, 1.0) * width as f32) as usize;
@@ -688,14 +798,14 @@ pub fn render_spectrum_vertical(state: &PlayerState, style: VizStyle) -> Vec<Str
                 lines[row].push_str(&format!("{C_RESET}{}{} ", color, ch));
             } else if bar_partial && dot_in_row {
                 let frac = (dot - row_bottom) / (row_top - row_bottom);
-                let idx = (frac * 7.0).max(1.0).min(7.0) as usize;
+                let idx = (frac * 7.0).clamp(1.0, 7.0) as usize;
                 lines[row].push_str(&format!("{C_RESET}{}{} ", color, partials[idx]));
             } else if dot_in_row {
                 let dot_ch = match style {
                     VizStyle::Dots => '⣀',
                     VizStyle::Bars => {
                         let frac = (dot - row_bottom) / (row_top - row_bottom);
-                        let idx = (frac * 7.0).max(1.0).min(7.0) as usize;
+                        let idx = (frac * 7.0).clamp(1.0, 7.0) as usize;
                         LOWER_BLOCKS[idx.min(2)]
                     }
                 };
@@ -722,14 +832,13 @@ pub fn get_viz_line_count(mode: VizMode, style: VizStyle) -> usize {
         VizMode::Oscilloscope => OSCILLOSCOPE_ROWS + 1,
         VizMode::Lissajous => LISSAJOUS_ROWS + 1,
         VizMode::Spectrogram => SPECTROGRAM_ROWS + 1,
+        VizMode::SpectrogramAnalysis => SPECTRO_ANALYSIS_ROWS + 1,
     }
 }
 
 // --- Oscilloscope -----------------------------------------------------------
 
-const OSCILLOSCOPE_COLS: usize = 60;   // terminal cells wide
-const OSCILLOSCOPE_ROWS: usize = 8;    // terminal cells tall
-const OSCILLOSCOPE_DOTS_W: usize = OSCILLOSCOPE_COLS * 2; // braille 2 dots/cell
+const OSCILLOSCOPE_ROWS: usize = 8;    // terminal cells tall (width is responsive)
 const OSCILLOSCOPE_DOTS_H: usize = OSCILLOSCOPE_ROWS * 4;
 
 // Bit offsets within a braille cell for dot (px, py) where px∈0..2, py∈0..4.
@@ -738,37 +847,39 @@ const BRAILLE_BITS: [[u32; 4]; 2] = [
     [0x08, 0x10, 0x20, 0x80],
 ];
 
-pub fn render_oscilloscope(analyser: &VizAnalyser, style: VizStyle) -> Vec<String> {
+pub fn render_oscilloscope(analyser: &VizAnalyser, style: VizStyle, width: usize) -> Vec<String> {
+    // Fill the terminal width (2-space pad + 2-col safety margin), with a sane cap.
+    let cols = width.saturating_sub(4).clamp(8, 240);
     match style {
-        VizStyle::Dots => render_oscilloscope_dots(analyser),
-        VizStyle::Bars => render_oscilloscope_bars(analyser),
+        VizStyle::Dots => render_oscilloscope_dots(analyser, cols),
+        VizStyle::Bars => render_oscilloscope_bars(analyser, cols),
     }
 }
 
-fn render_oscilloscope_bars(analyser: &VizAnalyser) -> Vec<String> {
+fn render_oscilloscope_bars(analyser: &VizAnalyser, cols: usize) -> Vec<String> {
     let buf = &analyser.waveform_buf;
     // 2× horizontal resolution via quadrant blocks: sample at 2× cell width.
-    const SUB_COLS: usize = OSCILLOSCOPE_COLS * 2;
+    let sub_cols = cols * 2;
     const SUB_ROWS: usize = OSCILLOSCOPE_ROWS * 2;
-    let mut col_values = vec![0.0f32; SUB_COLS];
+    let mut col_values = vec![0.0f32; sub_cols];
     if !buf.is_empty() {
         let n = buf.len();
-        for x in 0..SUB_COLS {
-            let idx = x * (n - 1) / SUB_COLS.max(1);
+        for x in 0..sub_cols {
+            let idx = x * (n - 1) / sub_cols.max(1);
             let (l, r) = buf[idx];
             col_values[x] = ((l + r) * 0.5).clamp(-1.0, 1.0);
         }
     }
     // Mark filled sub-cells (2 sub-cols × 2 sub-rows per terminal cell).
     let mid_sub = SUB_ROWS as f32 / 2.0;
-    let mut sub_grid = vec![false; SUB_ROWS * SUB_COLS];
+    let mut sub_grid = vec![false; SUB_ROWS * sub_cols];
     for (x, &v) in col_values.iter().enumerate() {
         let wave_sub = mid_sub - v * mid_sub;
         let (lo, hi) = if wave_sub < mid_sub { (wave_sub, mid_sub) } else { (mid_sub, wave_sub) };
         let lo_i = lo.floor() as usize;
         let hi_i = (hi.ceil() as usize).min(SUB_ROWS);
         for sy in lo_i..hi_i {
-            sub_grid[sy * SUB_COLS + x] = true;
+            sub_grid[sy * sub_cols + x] = true;
         }
     }
     // Quadrant block lookup indexed by (TL, TR, BL, BR) packed as a 4-bit nibble.
@@ -790,13 +901,13 @@ fn render_oscilloscope_bars(analyser: &VizAnalyser) -> Vec<String> {
         line.push_str(color);
         let top_row = cy * 2;
         let bot_row = cy * 2 + 1;
-        for cx in 0..OSCILLOSCOPE_COLS {
+        for cx in 0..cols {
             let lx = cx * 2;
             let rx = cx * 2 + 1;
-            let tl = sub_grid[top_row * SUB_COLS + lx] as u8;
-            let tr = sub_grid[top_row * SUB_COLS + rx] as u8;
-            let bl = sub_grid[bot_row * SUB_COLS + lx] as u8;
-            let br = sub_grid[bot_row * SUB_COLS + rx] as u8;
+            let tl = sub_grid[top_row * sub_cols + lx] as u8;
+            let tr = sub_grid[top_row * sub_cols + rx] as u8;
+            let bl = sub_grid[bot_row * sub_cols + lx] as u8;
+            let br = sub_grid[bot_row * sub_cols + rx] as u8;
             let idx = (tl) | (tr << 1) | (bl << 2) | (br << 3);
             line.push(QUAD[idx as usize]);
         }
@@ -806,12 +917,13 @@ fn render_oscilloscope_bars(analyser: &VizAnalyser) -> Vec<String> {
     lines
 }
 
-fn render_oscilloscope_dots(analyser: &VizAnalyser) -> Vec<String> {
+fn render_oscilloscope_dots(analyser: &VizAnalyser, cols: usize) -> Vec<String> {
     let buf = &analyser.waveform_buf;
-    let mut grid = vec![0u32; OSCILLOSCOPE_DOTS_W * OSCILLOSCOPE_DOTS_H];
+    let dots_w = cols * 2; // braille 2 dots/cell
+    let mut grid = vec![0u32; dots_w * OSCILLOSCOPE_DOTS_H];
     let set = |g: &mut [u32], x: usize, y: usize| {
-        if x < OSCILLOSCOPE_DOTS_W && y < OSCILLOSCOPE_DOTS_H {
-            g[y * OSCILLOSCOPE_DOTS_W + x] = 1;
+        if x < dots_w && y < OSCILLOSCOPE_DOTS_H {
+            g[y * dots_w + x] = 1;
         }
     };
 
@@ -819,9 +931,9 @@ fn render_oscilloscope_dots(analyser: &VizAnalyser) -> Vec<String> {
         let n = buf.len();
         let mut prev_y: Option<i32> = None;
         let mid = (OSCILLOSCOPE_DOTS_H / 2) as i32;
-        for x in 0..OSCILLOSCOPE_DOTS_W {
+        for x in 0..dots_w {
             // Map column to sample index (newest on right).
-            let idx = x * (n - 1) / OSCILLOSCOPE_DOTS_W.max(1);
+            let idx = x * (n - 1) / dots_w.max(1);
             let (l, r) = buf[idx];
             let mono = (l + r) * 0.5;
             let y = mid - (mono.clamp(-1.0, 1.0) * mid as f32) as i32;
@@ -841,13 +953,13 @@ fn render_oscilloscope_dots(analyser: &VizAnalyser) -> Vec<String> {
     for cy in 0..OSCILLOSCOPE_ROWS {
         let mut line = String::from("  ");
         let mut last_color = "";
-        for cx in 0..OSCILLOSCOPE_COLS {
+        for cx in 0..cols {
             let mut bits: u32 = 0;
             for py in 0..4 {
                 for px in 0..2 {
                     let gx = cx * 2 + px;
                     let gy = cy * 4 + py;
-                    if grid[gy * OSCILLOSCOPE_DOTS_W + gx] != 0 {
+                    if grid[gy * dots_w + gx] != 0 {
                         bits |= BRAILLE_BITS[px][py];
                     }
                 }
@@ -968,42 +1080,52 @@ fn render_lissajous_dots(analyser: &VizAnalyser) -> Vec<String> {
 
 // --- Spectrogram ------------------------------------------------------------
 
-const SPECTROGRAM_ROWS: usize = 8;
+// One octave per row: ISO ⅓-octave = 3 bands/octave, 31 bands ≈ 10 octaves.
+const SPECTROGRAM_ROWS: usize = 10;
 
-// 31 bands → 8 rows (top = highest freq). Colors mirror BAND_COLORS by region.
+// 31 bands → 10 octave rows (top = highest freq). Colors mirror BAND_COLORS by region.
 const SPECTROGRAM_ROW_COLORS: [&str; SPECTROGRAM_ROWS] = [
-    C_MAGENTA, C_RED, C_RED, C_YELLOW,
-    C_YELLOW, C_GREEN, C_GREEN, C_CYAN,
+    C_MAGENTA, C_RED, C_RED, C_YELLOW, C_YELLOW,
+    C_YELLOW, C_GREEN, C_GREEN, C_GREEN, C_CYAN,
 ];
 
 // 9-level braille fill, one extra dot per step so each magnitude maps to a
 // visibly distinct glyph (the shared SPECTRUM_H_BRAILLE table has duplicates).
 const SPECTROGRAM_DOTS: &[char] = &[' ', '⡀', '⣀', '⣄', '⣤', '⣦', '⣶', '⣷', '⣿'];
 
-pub fn render_spectrogram(analyser: &VizAnalyser, style: VizStyle) -> Vec<String> {
+// Spectrogram contrast window: the magnitude slice [FLOOR, CEIL] is mapped across
+// the full glyph height. Bands are dB-scaled into [0,1] over 90 dB and music only
+// occupies a narrow part of that, so mapping the whole [0,1] bunches everything
+// mid-scale (~3 dots) no matter the gain — a window spreads the relevant range so
+// the rows actually move. Below FLOOR = empty; at/above CEIL = full height.
+const SPECTROGRAM_FLOOR: f32 = 0.30; // raise to darken / drop weak bands
+const SPECTROGRAM_CEIL: f32 = 0.62;  // lower to make peaks reach full height sooner
+
+pub fn render_spectrogram(analyser: &VizAnalyser, style: VizStyle, width: usize) -> Vec<String> {
     let hist = &analyser.spectrogram_history;
-    let cols = SPECTROGRAM_COLS;
+    // Fill the terminal width (2-space pad + 2-col safety margin), capped at history.
+    let cols = width.saturating_sub(4).clamp(8, SPECTROGRAM_COLS);
     let chars: &[char] = match style {
         VizStyle::Bars => SPECTRUM_H_CHARS,
         VizStyle::Dots => SPECTROGRAM_DOTS,
     };
-    // Per-band magnitudes after FFT post-processing rarely exceed ~0.7; with
-    // a linear mapping the upper glyphs are essentially unreachable. Sqrt
-    // pulls mid-range values upward so the dynamic range actually spans
-    // the palette. Applied for dots only — bars already look fine linearly.
-    let boost = matches!(style, VizStyle::Dots);
+    // Width of the contrast window (guard against a zero/inverted span).
+    let span = (SPECTROGRAM_CEIL - SPECTROGRAM_FLOOR).max(1e-3);
 
-    // Group 31 bands into 8 rows, top-to-bottom = highest-to-lowest freq.
-    // Row i pulls the max over its band group for snappier high-freq response.
+    // Group 31 bands into 10 octave rows, top-to-bottom = highest-to-lowest freq.
+    // One octave (3 ⅓-octave bands) per row; the top row absorbs the spare 20 kHz
+    // band. Row i pulls the max over its group for snappier high-freq response.
     let band_groups: [(usize, usize); SPECTROGRAM_ROWS] = [
         (27, 31), // 10k-20k air
-        (23, 27), // 4k-8k brilliance
-        (19, 23), // 2k-3.15k presence
-        (15, 19), // 630-1.25k upper-mid
-        (11, 15), // 200-500 low-mid
-        (7, 11),  // 100-160 bass
-        (4, 7),   // 50-80 low bass
-        (0, 4),   // 20-40 sub
+        (24, 27), // 5k-8k brilliance
+        (21, 24), // 2.5k-4k presence
+        (18, 21), // 1.25k-2k upper-mid
+        (15, 18), // 630-1k mid
+        (12, 15), // 315-500 low-mid
+        (9, 12),  // 160-250 upper bass
+        (6, 9),   // 80-125 bass
+        (3, 6),   // 40-63 low bass
+        (0, 3),   // 20-31.5 sub
     ];
 
     let mut lines = Vec::with_capacity(SPECTROGRAM_ROWS);
@@ -1011,25 +1133,217 @@ pub fn render_spectrogram(analyser: &VizAnalyser, style: VizStyle) -> Vec<String
         let mut line = String::from("  ");
         let color = SPECTROGRAM_ROW_COLORS[row];
         line.push_str(color);
-        // Oldest column on the left, newest on the right. Pad with spaces when history
-        // hasn't filled up yet.
-        let n = hist.len();
-        let pad = cols.saturating_sub(n);
+        // Show the newest `cols` columns: oldest on the left, newest on the right.
+        // Pad with spaces when history hasn't filled the visible width yet.
+        let n = hist.len().min(cols);
+        let start = hist.len() - n;
+        let pad = cols - n;
         for _ in 0..pad {
             line.push(' ');
         }
-        for col in 0..n {
+        for col in start..hist.len() {
             let frame = &hist[col];
             let mut v: f32 = 0.0;
             for b in lo..hi {
                 v = v.max(frame[b]);
             }
-            let v_mapped = if boost { v.sqrt() } else { v };
-            let idx = (v_mapped * 8.0).clamp(0.0, 8.0) as usize;
+            // Linear within the [FLOOR, CEIL] window (i.e. linear in dB, the standard
+            // sonogram mapping): below FLOOR → empty, at/above CEIL → full height.
+            let v_norm = ((v - SPECTROGRAM_FLOOR) / span).clamp(0.0, 1.0);
+            let idx = ((v_norm * 8.0) as usize).min(8);
             line.push(chars[idx]);
         }
         line.push_str(C_RESET);
         lines.push(line);
     }
     lines
+}
+
+// --- SpectrogramAnalysis helpers --------------------------------------------
+
+/// Fill `rgb` (resized to width_px·height_px·3, reused across frames) with the
+/// analysis-spectrogram image: x = time (newest right), y = frequency (linear or
+/// log), pixel = colormap(dB in contrast window). `log_axis` selects the freq map.
+fn analysis_rgb_into(rgb: &mut Vec<u8>, analyser: &VizAnalyser, width_px: usize, height_px: usize, log_axis: bool) {
+    rgb.clear();
+    rgb.resize(width_px * height_px * 3, 0);
+    let hist = &analyser.spectro_raw_history;
+    let nbins = hist.back().map(|c| c.len()).unwrap_or(0);
+    if nbins == 0 {
+        return;
+    }
+    let n = hist.len();
+    let row_bin: Vec<usize> = (0..height_px)
+        .map(|y| if log_axis {
+            analysis_row_to_bin_log(y, height_px, nbins, analyser.sample_rate as f32)
+        } else {
+            analysis_row_to_bin_linear(y, height_px, nbins)
+        })
+        .collect();
+    for x in 0..width_px {
+        let cols_shown = n.min(width_px);
+        let pad = width_px - cols_shown;
+        if x < pad { continue; }
+        let col_idx = n - cols_shown + (x - pad);
+        let col = &hist[col_idx];
+        for (y, &bin) in row_bin.iter().enumerate() {
+            let db = col.get(bin).copied().unwrap_or(SPECTRO_ANALYSIS_FLOOR_DB);
+            let t = analysis_intensity(db, SPECTRO_ANALYSIS_FLOOR_DB, SPECTRO_ANALYSIS_CEIL_DB);
+            let (r, g, b) = analysis_colormap(t);
+            let p = (y * width_px + x) * 3;
+            rgb[p] = r; rgb[p + 1] = g; rgb[p + 2] = b;
+        }
+    }
+}
+
+pub fn render_spectrogram_analysis(analyser: &VizAnalyser, width: usize, log_axis: bool, paused: bool) -> Vec<String> {
+    use std::cell::RefCell;
+    thread_local! {
+        // Reused across frames so the per-frame image buffer isn't reallocated each tick.
+        static RGB_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+        // Paused-frame cache: while paused the image is frozen, so reuse the last
+        // rendered lines (keyed by column generation + geometry) to skip the encode.
+        static CACHE: RefCell<(u64, usize, bool, Vec<String>)> =
+            const { RefCell::new((u64::MAX, 0, false, Vec::new())) };
+    }
+    let cols = width.saturating_sub(4).clamp(8, 320);
+    let rows = SPECTRO_ANALYSIS_ROWS;
+    let gen = analyser.spectro_last_gen;
+
+    // When paused the content can't change, so reuse the cached render and skip the
+    // per-frame image build + PNG re-encode entirely.
+    if paused {
+        let hit = CACHE.with(|c| {
+            let c = c.borrow();
+            if c.0 == gen && c.1 == width && c.2 == log_axis && !c.3.is_empty() {
+                Some(c.3.clone())
+            } else {
+                None
+            }
+        });
+        if let Some(lines) = hit {
+            return lines;
+        }
+    }
+
+    let proto = crate::cover::detect_protocol();
+    // Image pixel size. Half-block packs 2 px-rows per char row; the graphics path
+    // uses one pixel column per stored hop (the history depth — so the data fills
+    // the frame instead of black-padding) and oversamples height for frequency
+    // detail, then the protocol scales it to the cols×rows cell box.
+    let (w, h) = match proto {
+        crate::cover::GraphicsProtocol::HalfBlock => (cols, rows * 2),
+        _ => (SPECTRO_ANALYSIS_COLS, rows * 16),
+    };
+    let lines = RGB_BUF.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        let rgb: &mut Vec<u8> = &mut guard;
+        analysis_rgb_into(rgb, analyser, w, h, log_axis);
+        let mut lines = match proto {
+            crate::cover::GraphicsProtocol::HalfBlock =>
+                crate::cover::render_half_block_public(w as u32, h as u32, rgb.as_slice()),
+            _ =>
+                crate::cover::render_image_block(rgb.as_slice(), w as u32, h as u32, cols as u32, rows as u32),
+        };
+        for line in lines.iter_mut() { line.insert_str(0, "  "); }
+        lines
+    });
+
+    if paused {
+        CACHE.with(|c| *c.borrow_mut() = (gen, width, log_axis, lines.clone()));
+    }
+    lines
+}
+
+/// Map a dB value to [0,1] across the contrast window [floor, ceil].
+fn analysis_intensity(db: f32, floor_db: f32, ceil_db: f32) -> f32 {
+    let span = (ceil_db - floor_db).max(1e-3);
+    ((db - floor_db) / span).clamp(0.0, 1.0)
+}
+
+/// Map a display row (0 = top = highest freq) to an FFT bin index, linear in Hz.
+fn analysis_row_to_bin_linear(row: usize, rows: usize, nbins: usize) -> usize {
+    if rows <= 1 || nbins == 0 { return 0; }
+    let frac = (rows - 1 - row) as f32 / (rows - 1) as f32; // 0 at bottom, 1 at top
+    ((frac * (nbins - 1) as f32).round() as usize).min(nbins - 1)
+}
+
+/// Map a display row to an FFT bin, logarithmic in Hz over [F_MIN, Nyquist].
+fn analysis_row_to_bin_log(row: usize, rows: usize, nbins: usize, sample_rate: f32) -> usize {
+    const F_MIN: f32 = 30.0;
+    if rows <= 1 || nbins == 0 { return 0; }
+    let nyquist = sample_rate * 0.5;
+    let bin_hz = nyquist / (nbins - 1).max(1) as f32;
+    let frac = (rows - 1 - row) as f32 / (rows - 1) as f32; // 0 bottom, 1 top
+    let f = F_MIN * (nyquist / F_MIN).powf(frac);
+    ((f / bin_hz).round() as usize).min(nbins - 1)
+}
+
+/// Perceptual "magma"-ish ramp: black -> purple -> red -> orange -> yellow -> white.
+fn analysis_colormap(t: f32) -> (u8, u8, u8) {
+    const STOPS: [(f32, f32, f32, f32); 6] = [
+        (0.0,   0.0,   0.0,   0.0),
+        (0.2,  40.0,  11.0,  84.0),
+        (0.4, 121.0,  28.0, 109.0),
+        (0.6, 190.0,  54.0,  66.0),
+        (0.8, 240.0, 134.0,  29.0),
+        (1.0, 252.0, 253.0, 191.0),
+    ];
+    let t = t.clamp(0.0, 1.0);
+    let mut i = 0;
+    while i + 1 < STOPS.len() && t > STOPS[i + 1].0 {
+        i += 1;
+    }
+    let (t0, r0, g0, b0) = STOPS[i];
+    let (t1, r1, g1, b1) = STOPS[(i + 1).min(STOPS.len() - 1)];
+    let f = if (t1 - t0).abs() < 1e-6 { 0.0 } else { (t - t0) / (t1 - t0) };
+    let lerp = |a: f32, b: f32| (a + (b - a) * f).round().clamp(0.0, 255.0) as u8;
+    (lerp(r0, r1), lerp(g0, g1), lerp(b0, b1))
+}
+
+#[cfg(test)]
+mod analysis_tests {
+    use super::*;
+
+    #[test]
+    fn intensity_maps_window_to_unit_range() {
+        assert!((analysis_intensity(-70.0, -70.0, -10.0) - 0.0).abs() < 1e-6);
+        assert!((analysis_intensity(-10.0, -70.0, -10.0) - 1.0).abs() < 1e-6);
+        assert!((analysis_intensity(-40.0, -70.0, -10.0) - 0.5).abs() < 1e-6);
+        assert_eq!(analysis_intensity(-90.0, -70.0, -10.0), 0.0);
+        assert_eq!(analysis_intensity(0.0, -70.0, -10.0), 1.0);
+    }
+
+    #[test]
+    fn linear_freq_map_spans_bins_endpoints() {
+        let nbins = 2049;
+        let h = 16;
+        assert_eq!(analysis_row_to_bin_linear(0, h, nbins), nbins - 1);
+        assert_eq!(analysis_row_to_bin_linear(h - 1, h, nbins), 0);
+    }
+
+    #[test]
+    fn log_freq_map_is_monotonic_and_bounded() {
+        let nbins = 2049;
+        let h = 32;
+        let sr = 44100.0;
+        let mut prev = usize::MAX;
+        for y in 0..h {
+            let b = analysis_row_to_bin_log(y, h, nbins, sr);
+            assert!(b < nbins);
+            if prev != usize::MAX { assert!(b <= prev); }
+            prev = b;
+        }
+    }
+
+    #[test]
+    fn colormap_dark_at_zero_bright_at_one() {
+        let lo = analysis_colormap(0.0);
+        let hi = analysis_colormap(1.0);
+        let sum = |c: (u8, u8, u8)| c.0 as u32 + c.1 as u32 + c.2 as u32;
+        assert!(sum(lo) < 60);
+        assert!(sum(hi) > 600);
+        let _ = analysis_colormap(-1.0);
+        let _ = analysis_colormap(2.0);
+    }
 }

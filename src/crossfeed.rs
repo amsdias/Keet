@@ -1,12 +1,13 @@
-/// Meier-style headphone crossfeed filter.
-///
-/// For each stereo frame:
-/// 1. Low-pass filter the opposite channel (~700Hz Butterworth, authentic Meier value)
-/// 2. Delay the filtered signal by ~300us (interaural time difference)
-/// 3. Blend the filtered+delayed opposite channel at the crossfeed level
-///
-/// High frequencies maintain stereo separation while low frequencies
-/// cross over, simulating speaker listening in a room.
+//! Meier-style headphone crossfeed filter.
+//!
+//! For each stereo frame:
+//!
+//! 1. Low-pass filter the opposite channel (~700Hz Butterworth, authentic Meier value)
+//! 2. Delay the filtered signal by ~300us (interaural time difference)
+//! 3. Blend the filtered+delayed opposite channel at the crossfeed level
+//!
+//! High frequencies maintain stereo separation while low frequencies
+//! cross over, simulating speaker listening in a room.
 
 use std::f32::consts::{FRAC_1_SQRT_2, PI};
 

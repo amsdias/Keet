@@ -1,8 +1,9 @@
-/// LRC lyrics parser and synced lyrics state.
-///
-/// Supports:
-/// - Plain (unsynced) lyrics — just text lines
-/// - LRC (synced) lyrics — `[MM:SS.xx]Line text` with auto-scroll by playback position
+//! LRC lyrics parser and synced lyrics state.
+//!
+//! Supports:
+//!
+//! - Plain (unsynced) lyrics — just text lines
+//! - LRC (synced) lyrics — `[MM:SS.xx]Line text` with auto-scroll by playback position
 
 /// A single synced lyrics line: timestamp in seconds + text.
 #[derive(Clone)]
