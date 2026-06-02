@@ -934,7 +934,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                   && !state.should_quit()
             {
                 poll_input(&state, &mut ui, &mut playlist);
+                // Begin/end synchronized update (DEC mode 2026): present each frame
+                // atomically so terminals (notably Windows Terminal) don't show the
+                // mid-redraw erase-then-repaint as flickering black lines. Ignored by
+                // terminals that don't support it.
+                print!("\x1B[?2026h");
                 prev_viz_lines = print_status(&state, &mut ui, &filename, &track_info, &track_ext, current_eq, current_fx, current_cf, &mut stats, prev_viz_lines, &playlist, &viz_analyser);
+                print!("\x1B[?2026l");
+                io::stdout().flush().ok();
                 thread::sleep(Duration::from_millis(20));
             }
         }
@@ -1272,7 +1279,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 prev_viz_image_shown = viz_image_shown;
 
+                // Begin/end synchronized update (DEC mode 2026): present each frame
+                // atomically so terminals (notably Windows Terminal) don't show the
+                // mid-redraw erase-then-repaint as flickering black lines. Ignored by
+                // terminals that don't support it.
+                print!("\x1B[?2026h");
                 prev_viz_lines = print_status(&state, &mut ui, &filename, &track_info, &track_ext, current_eq, current_fx, current_cf, &mut stats, prev_viz_lines, &playlist, &viz_analyser);
+                print!("\x1B[?2026l");
+                io::stdout().flush().ok();
 
                 if let Some(ref mut mc) = media_controls {
                     media_keys::update_playback(mc, state.is_paused(), state.time_secs());

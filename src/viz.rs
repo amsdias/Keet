@@ -1226,24 +1226,28 @@ pub fn render_spectrogram_analysis(analyser: &VizAnalyser, width: usize, log_axi
         }
     }
 
-    let proto = crate::cover::detect_protocol();
-    // Image pixel size. Half-block packs 2 px-rows per char row; the graphics path
-    // uses one pixel column per stored hop (the history depth — so the data fills
-    // the frame instead of black-padding) and oversamples height for frequency
-    // detail, then the protocol scales it to the cols×rows cell box.
-    let (w, h) = match proto {
-        crate::cover::GraphicsProtocol::HalfBlock => (cols, rows * 2),
-        _ => (SPECTRO_ANALYSIS_COLS, rows * 16),
+    // Only Kitty's id-addressed graphics survive our per-frame cursor-up redraw —
+    // its image is a separate layer. Sixel and iTerm2 images are cell content, so
+    // the redraw's erase-to-EOL wipes them (flicker), and Sixel renders 1:1 pixels
+    // instead of scaling to the cell box (half-width). For everything else, fall
+    // back to half-block truecolor: it's text, so it redraws cleanly and fills width.
+    let use_image = matches!(crate::cover::detect_protocol(), crate::cover::GraphicsProtocol::Kitty);
+    // Graphics path: one pixel column per stored hop (history depth, so data fills
+    // the frame) + oversampled height; Kitty scales it to the cell box. Half-block:
+    // 1 px/col, 2 px-rows/char row, sized directly to the cell area.
+    let (w, h) = if use_image {
+        (SPECTRO_ANALYSIS_COLS, rows * 16)
+    } else {
+        (cols, rows * 2)
     };
     let lines = RGB_BUF.with(|cell| {
         let mut guard = cell.borrow_mut();
         let rgb: &mut Vec<u8> = &mut guard;
         analysis_rgb_into(rgb, analyser, w, h, log_axis);
-        let mut lines = match proto {
-            crate::cover::GraphicsProtocol::HalfBlock =>
-                crate::cover::render_half_block_public(w as u32, h as u32, rgb.as_slice()),
-            _ =>
-                crate::cover::render_image_block(rgb.as_slice(), w as u32, h as u32, cols as u32, rows as u32),
+        let mut lines = if use_image {
+            crate::cover::render_image_block(rgb.as_slice(), w as u32, h as u32, cols as u32, rows as u32)
+        } else {
+            crate::cover::render_half_block_public(w as u32, h as u32, rgb.as_slice())
         };
         for line in lines.iter_mut() { line.insert_str(0, "  "); }
         lines
