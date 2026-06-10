@@ -18,7 +18,13 @@ use crate::viz::{
 };
 
 pub fn format_time(secs: f64) -> String {
-    format!("{:02}:{:02}", (secs / 60.0) as u32, (secs % 60.0) as u32)
+    let total = secs.max(0.0) as u64;
+    if total >= 3600 {
+        // Audiobooks and long mixes: h:mm:ss instead of rolling minutes past 60.
+        format!("{}:{:02}:{:02}", total / 3600, (total % 3600) / 60, total % 60)
+    } else {
+        format!("{:02}:{:02}", total / 60, total % 60)
+    }
 }
 
 fn icon_color_for_ext(ext: &str) -> &'static str {
@@ -424,7 +430,7 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
             }
         }
         VizMode::Lissajous => {
-            for line in render_lissajous(analyser, viz_style) {
+            for line in render_lissajous(analyser, viz_style, term_w) {
                 print!("\n\r\x1B[K{}", line);
             }
         }
@@ -714,12 +720,18 @@ fn handle_text_input(state: &PlayerState, ui: &mut UiState, _playlist: &mut Vec<
                     ui.scroll_offset = 0;
                 }
                 KeyCode::Enter => {
-                    let target = if ui.filtered_indices.is_empty() {
-                        ui.cursor
-                    } else {
-                        ui.filtered_indices.get(ui.cursor).copied().unwrap_or(0)
-                    };
-                    state.jump_to(target);
+                    // A non-empty query with zero hits leaves filtered_indices
+                    // empty — falling through to ui.cursor here would jump to
+                    // an unrelated track. Just close the search instead.
+                    let no_matches = !query.is_empty() && ui.filtered_indices.is_empty();
+                    if !no_matches {
+                        let target = if ui.filtered_indices.is_empty() {
+                            ui.cursor
+                        } else {
+                            ui.filtered_indices.get(ui.cursor).copied().unwrap_or(0)
+                        };
+                        state.jump_to(target);
+                    }
                     ui.input_mode = InputMode::Normal;
                     ui.filtered_indices.clear();
                     ui.cursor = 0;
@@ -873,6 +885,22 @@ fn ensure_cursor_visible(ui: &mut UiState, _playlist: &[PathBuf]) {
     }
 }
 
+/// Reorder `current` to follow `saved` (the pre-shuffle snapshot): tracks still
+/// present keep their saved order, tracks added since (rescan etc.) append at
+/// the end in their current relative order.
+fn restore_order(saved: &[PathBuf], current: &[PathBuf]) -> Vec<PathBuf> {
+    use std::collections::HashSet;
+    use std::path::Path;
+    let current_set: HashSet<&Path> = current.iter().map(|p| p.as_path()).collect();
+    let saved_set: HashSet<&Path> = saved.iter().map(|p| p.as_path()).collect();
+    let mut out: Vec<PathBuf> = saved.iter()
+        .filter(|p| current_set.contains(p.as_path()))
+        .cloned()
+        .collect();
+    out.extend(current.iter().filter(|p| !saved_set.contains(p.as_path())).cloned());
+    out
+}
+
 fn remove_track(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<PathBuf>) {
     if playlist.len() <= 1 {
         ui.set_status("Can't remove the last track".to_string());
@@ -1015,20 +1043,25 @@ fn sort_playlist_by_tags(state: &PlayerState, ui: &mut UiState, playlist: &mut V
     ui.banner_dirty = true;
     let was_shuffled = ui.shuffle;
     ui.shuffle = false;
+    // The user picked an explicit new order; the pre-shuffle snapshot is stale.
+    ui.pre_shuffle_order = None;
     ui.set_status(
         if was_shuffled { "Sorted by tags (shuffle off)" } else { "Sorted by tags" }.to_string()
     );
 }
 
-/// Toggle runtime shuffle. When turning ON, shuffles the tracks after the current
-/// one (so the now-playing song isn't interrupted). When turning OFF, re-sorts
-/// the playlist by PathBuf order and relocates the current track.
+/// Toggle runtime shuffle. When turning ON, snapshots the current order and
+/// shuffles the tracks after the current one (so the now-playing song isn't
+/// interrupted). When turning OFF, restores the snapshotted order — sorting
+/// would destroy an M3U's curated order — falling back to a path sort when no
+/// snapshot exists (e.g. the session started with --shuffle).
 fn toggle_shuffle(ui: &mut UiState, playlist: &mut [PathBuf]) {
     let old_playlist = playlist.to_vec();
     ui.shuffle = !ui.shuffle;
     let current_path = playlist.get(ui.current).cloned();
 
     if ui.shuffle {
+        ui.pre_shuffle_order = Some(old_playlist.clone());
         // Shuffle everything after the currently-playing track
         let start = ui.current + 1;
         if start < playlist.len() {
@@ -1037,8 +1070,15 @@ fn toggle_shuffle(ui: &mut UiState, playlist: &mut [PathBuf]) {
         }
         ui.set_status("Shuffle ON".to_string());
     } else {
-        // Sort and re-locate the current track
-        playlist.sort();
+        let restored = match ui.pre_shuffle_order.take() {
+            Some(saved) => restore_order(&saved, playlist),
+            None => {
+                let mut sorted = playlist.to_vec();
+                sorted.sort();
+                sorted
+            }
+        };
+        playlist.clone_from_slice(&restored);
         if let Some(ref cp) = current_path {
             if let Some(idx) = playlist.iter().position(|p| p == cp) {
                 ui.current = idx;
@@ -1139,6 +1179,7 @@ fn switch_source_paths(
 
     let old_playlist = std::mem::replace(playlist, new_list);
     ui.source_paths = vec![new_path.clone()];
+    ui.pre_shuffle_order = None; // snapshot belongs to the previous source
     ui.current = 0;
     ui.cursor = 0;
     ui.scroll_offset = 0;
@@ -1337,5 +1378,32 @@ pub fn run_first_launch_picker() -> Option<PathBuf> {
                 println!("  {}Cancelled{}", C_DIM, C_RESET);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod ui_tests {
+    use super::*;
+
+    #[test]
+    fn format_time_under_an_hour_keeps_mm_ss() {
+        assert_eq!(format_time(59.0), "00:59");
+        assert_eq!(format_time(125.4), "02:05");
+    }
+
+    #[test]
+    fn format_time_above_an_hour_shows_h_mm_ss() {
+        assert_eq!(format_time(3600.0), "1:00:00");
+        assert_eq!(format_time(3725.0), "1:02:05");
+        assert_eq!(format_time(2.0 * 3600.0 + 59.0 * 60.0 + 59.0), "2:59:59");
+    }
+
+    #[test]
+    fn restore_order_keeps_saved_order_and_appends_new() {
+        let p = |s: &str| PathBuf::from(s);
+        let saved = vec![p("a"), p("b"), p("c")];
+        // b removed, d added, rest shuffled
+        let current = vec![p("c"), p("d"), p("a")];
+        assert_eq!(restore_order(&saved, &current), vec![p("a"), p("c"), p("d")]);
     }
 }

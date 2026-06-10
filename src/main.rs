@@ -38,7 +38,7 @@ use rtrb::RingBuffer;
 use state::{PlayerState, UiState, RgMode, VizMode, ring_capacity_for, VIZ_BUFFER_SIZE};
 use viz::{StatsMonitor, VizAnalyser};
 use audio::{build_stream, set_output_sample_rate, probe_sample_rate, fix_bluetooth_sample_rate};
-use decode::decode_playlist;
+use decode::{decode_playlist, await_consumer_drain};
 use playlist::{build_playlist, shuffle_list};
 use ui::{print_status, poll_input, format_time};
 use resume::{ResumeState, save_state, load_state};
@@ -344,9 +344,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let flags = ["--shuffle", "-s", "--repeat", "-r", "--quality", "-q", "--eq", "-e", "--fx", "--crossfade", "-x", "--rg-mode", "--list-devices", "--device", "--exclusive", "--no-cover", "--help", "-h"];
+    // Loaded once and reused for the volume/EQ/device restore further down.
+    let resume_state_loaded = if args.len() < 2 { load_state() } else { None };
     let (source_paths, shuffle, repeat_mode) = if args.len() < 2 {
         // Try resume from saved state
-        match load_state() {
+        match resume_state_loaded.as_ref() {
             Some(rs) => {
                 let paths: Vec<PathBuf> = rs.source_paths.iter()
                     .filter_map(|s| {
@@ -499,7 +501,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cf_presets = Arc::new(cf_presets);
 
     // Restore resume state if resuming
-    let resume_state_loaded = if args.len() < 2 { load_state() } else { None };
     let mut resume_position: i64 = 0;
 
     if let Some(ref rs) = resume_state_loaded {
@@ -741,6 +742,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut last_transition_count: usize = 0;
 
+    // Media-key now-playing throttle state (see the update site in the UI loop).
+    let mut last_mk_push = Instant::now() - Duration::from_secs(2);
+    let mut last_mk_paused = false;
+
     // Persist resume state off the main thread: serializing + writing JSON on a
     // slow/network $HOME could otherwise stall the UI at every track transition.
     // A single saver thread serializes the writes (so the temp-file rename can't
@@ -794,6 +799,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         state.total_tracks.store(playlist.len(), Ordering::Relaxed);
                     }
                     if ui.shuffle { shuffle_list(&mut playlist); }
+                }
+
+                // Everything gone (in-app removals + files deleted on disk):
+                // nothing left to play. Without this guard the track fetch
+                // below would index into an empty playlist and panic.
+                if playlist.is_empty() {
+                    break;
                 }
 
                 // Reindex metadata cache
@@ -956,8 +968,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut last_ui = Instant::now();
 
         loop {
-            // Input
-            if poll_input(&state, &mut ui, &mut playlist) {
+            // Input. Also honor a quit that was raised while this loop wasn't
+            // watching (the stage-1/2 buffering waits poll input but discard
+            // the quit return) — otherwise Q during buffering keeps playing
+            // until the ring drains, or hangs entirely when paused.
+            if poll_input(&state, &mut ui, &mut playlist) || state.should_quit() {
                 print!("\x1B[?25h");
                 if prev_viz_lines != usize::MAX {
                     let up = 2 + prev_viz_lines;
@@ -979,6 +994,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if current_count != last_transition_count {
                 let new_index = state.producer_track_index.load(Ordering::Relaxed);
                 last_transition_count = current_count;
+
+                // Surface mid-playlist decode failures. The producer skips a
+                // bad file and signals the next track; without this the error
+                // text it stored was never shown anywhere.
+                let skip_err = state.decode_error.lock().ok().and_then(|mut e| e.take());
+                if let Some(msg) = skip_err {
+                    ui.set_status(format!("Skip: {}", msg));
+                }
 
                 // Playlist was modified — producer's new_index is from the stale snapshot.
                 // Schedule a jump to the right track; skip the rest of this transition so we
@@ -1045,9 +1068,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(p) => prod = p,
                     Err(_) => break 'playlist,
                 }
-                // Flush ring buffer
+                // Flush ring buffer, and wait for the callback to actually
+                // consume the drain request before the respawned producer can
+                // push — otherwise the drain may fire late and discard the new
+                // track's first samples.
                 if state.ring_capacity.load(Ordering::Relaxed) - prod.slots() > 0 {
                     state.reset_consumer_counter.store(true, Ordering::Relaxed);
+                    await_consumer_drain(&state);
                 }
                 if let Some(target) = state.take_jump() {
                     ui.current = target;
@@ -1288,8 +1315,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 print!("\x1B[?2026l");
                 io::stdout().flush().ok();
 
+                // OS now-playing refresh: pushing one every UI frame (~20 Hz)
+                // is needless objc/D-Bus traffic. Pause-state changes go out
+                // immediately; the position otherwise syncs at ~1 Hz.
                 if let Some(ref mut mc) = media_controls {
-                    media_keys::update_playback(mc, state.is_paused(), state.time_secs());
+                    let paused_now = state.is_paused();
+                    if paused_now != last_mk_paused
+                        || last_mk_push.elapsed() >= Duration::from_secs(1)
+                    {
+                        media_keys::update_playback(mc, paused_now, state.time_secs());
+                        last_mk_paused = paused_now;
+                        last_mk_push = Instant::now();
+                    }
                 }
 
                 last_ui = Instant::now();

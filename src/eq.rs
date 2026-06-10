@@ -1,5 +1,15 @@
 use serde::Deserialize;
 
+/// Flush near-zero values to exactly zero. IIR feedback paths (biquads, comb
+/// filters) decay into denormal range during silence, and denormal arithmetic
+/// is 10-100x slower on x86 — a CPU spike right when the player goes quiet.
+/// 1e-30 is ~-600 dB, far below audibility, while still comfortably above the
+/// f32 denormal threshold (~1.2e-38).
+#[inline]
+pub(crate) fn flush_denormal(x: f32) -> f32 {
+    if x.abs() < 1e-30 { 0.0 } else { x }
+}
+
 /// Single biquad filter state (2nd-order IIR) per channel
 #[derive(Clone)]
 struct BiquadState {
@@ -137,7 +147,9 @@ impl EqChain {
                 f.state_l.x2 = f.state_l.x1;
                 f.state_l.x1 = left;
                 f.state_l.y2 = f.state_l.y1;
-                f.state_l.y1 = out_l;
+                // Flush the feedback state: during silence y decays into
+                // denormal range, where x86 float ops are 10-100x slower.
+                f.state_l.y1 = flush_denormal(out_l);
                 left = out_l;
 
                 let out_r = f.coeffs.b0 * right
@@ -148,7 +160,7 @@ impl EqChain {
                 f.state_r.x2 = f.state_r.x1;
                 f.state_r.x1 = right;
                 f.state_r.y2 = f.state_r.y1;
-                f.state_r.y1 = out_r;
+                f.state_r.y1 = flush_denormal(out_r);
                 right = out_r;
             }
 
@@ -281,4 +293,18 @@ pub fn load_custom_presets() -> Vec<EqPreset> {
     }
     presets.sort_by(|a, b| a.name.cmp(&b.name));
     presets
+}
+
+#[cfg(test)]
+mod denormal_tests {
+    use super::*;
+
+    #[test]
+    fn flush_denormal_zeroes_tiny_values_keeps_audio() {
+        assert_eq!(flush_denormal(1e-32), 0.0);
+        assert_eq!(flush_denormal(-1e-35), 0.0);
+        assert_eq!(flush_denormal(0.5), 0.5);
+        assert_eq!(flush_denormal(-0.2), -0.2);
+        assert_eq!(flush_denormal(0.0), 0.0);
+    }
 }

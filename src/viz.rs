@@ -991,14 +991,18 @@ const LISSAJOUS_ROWS: usize = 8;
 const LISSAJOUS_DOTS_W: usize = LISSAJOUS_COLS * 2;
 const LISSAJOUS_DOTS_H: usize = LISSAJOUS_ROWS * 4;
 
-pub fn render_lissajous(analyser: &VizAnalyser, style: VizStyle) -> Vec<String> {
+pub fn render_lissajous(analyser: &VizAnalyser, style: VizStyle, width: usize) -> Vec<String> {
+    // The vectorscope box must stay ~square (16 cols × 8 rows ≈ square at the
+    // typical 1:2 cell aspect), so unlike the other modes it can't stretch to
+    // the terminal width — center it instead.
+    let pad = (width.saturating_sub(LISSAJOUS_COLS) / 2).max(2);
     match style {
-        VizStyle::Dots => render_lissajous_dots(analyser),
-        VizStyle::Bars => render_lissajous_bars(analyser),
+        VizStyle::Dots => render_lissajous_dots(analyser, pad),
+        VizStyle::Bars => render_lissajous_bars(analyser, pad),
     }
 }
 
-fn render_lissajous_bars(analyser: &VizAnalyser) -> Vec<String> {
+fn render_lissajous_bars(analyser: &VizAnalyser, pad: usize) -> Vec<String> {
     let buf = &analyser.waveform_buf;
     let mut counts = vec![0u32; LISSAJOUS_COLS * LISSAJOUS_ROWS];
     let inv_sqrt2 = std::f32::consts::FRAC_1_SQRT_2;
@@ -1017,7 +1021,7 @@ fn render_lissajous_bars(analyser: &VizAnalyser) -> Vec<String> {
 
     let mut lines = Vec::with_capacity(LISSAJOUS_ROWS);
     for cy in 0..LISSAJOUS_ROWS {
-        let mut line = String::from("  ");
+        let mut line = " ".repeat(pad);
         line.push_str(C_CYAN);
         for cx in 0..LISSAJOUS_COLS {
             let f = counts[cy * LISSAJOUS_COLS + cx] as f32 / max;
@@ -1034,7 +1038,7 @@ fn render_lissajous_bars(analyser: &VizAnalyser) -> Vec<String> {
     lines
 }
 
-fn render_lissajous_dots(analyser: &VizAnalyser) -> Vec<String> {
+fn render_lissajous_dots(analyser: &VizAnalyser, pad: usize) -> Vec<String> {
     let buf = &analyser.waveform_buf;
     let mut grid = vec![0u32; LISSAJOUS_DOTS_W * LISSAJOUS_DOTS_H];
 
@@ -1053,10 +1057,9 @@ fn render_lissajous_dots(analyser: &VizAnalyser) -> Vec<String> {
         }
     }
 
-    // Center the box horizontally-ish — align with the rest of the viz (2-space pad).
     let mut lines = Vec::with_capacity(LISSAJOUS_ROWS);
     for cy in 0..LISSAJOUS_ROWS {
-        let mut line = String::from("  ");
+        let mut line = " ".repeat(pad);
         line.push_str(C_CYAN);
         for cx in 0..LISSAJOUS_COLS {
             let mut bits: u32 = 0;

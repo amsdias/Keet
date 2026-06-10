@@ -14,12 +14,10 @@ use symphonia::core::probe::Hint;
 struct CachedMeta {
     display: String,
     search_text: String,
-    #[allow(dead_code)]
     artist: Option<String>,
-    #[allow(dead_code)]
     title: Option<String>,
-    #[allow(dead_code)]
     album: Option<String>,
+    // RG values are read per-track by the decoder, not from this cache (yet).
     #[allow(dead_code)]
     rg_track_gain: Option<f32>,
     #[allow(dead_code)]
@@ -30,9 +28,7 @@ struct CachedMeta {
     rg_album_peak: Option<f32>,
     lyrics: Option<String>,
     duration_secs: Option<f64>,
-    #[allow(dead_code)]
     track_number: Option<u32>,
-    #[allow(dead_code)]
     disc_number: Option<u32>,
 }
 

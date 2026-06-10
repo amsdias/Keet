@@ -225,9 +225,13 @@ fn fetch_itunes(artist: &str, album: &str) -> Option<Vec<u8>> {
     let tls = ureq::tls::TlsConfig::builder()
         .provider(ureq::tls::TlsProvider::NativeTls)
         .build();
+    // Split timeouts, NOT timeout_global: in ureq 3.3 the global timer trips
+    // during TCP/TLS setup, failing every HTTPS call before the handshake.
     let agent = ureq::Agent::config_builder()
         .tls_config(tls)
-        .timeout_global(Some(Duration::from_secs(8)))
+        .timeout_connect(Some(Duration::from_secs(5)))
+        .timeout_recv_response(Some(Duration::from_secs(15)))
+        .timeout_recv_body(Some(Duration::from_secs(15)))
         .user_agent("Keet Audio Player (https://github.com)")
         .build()
         .new_agent();

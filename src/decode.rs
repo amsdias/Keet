@@ -12,8 +12,9 @@ use symphonia::core::meta::{Limit, MetadataOptions};
 use symphonia::core::probe::Hint;
 use symphonia::core::units::Time;
 
-use rubato::{Async, FixedAsync, SincInterpolationType, SincInterpolationParameters, WindowFunction, Resampler};
+use rubato::{Async, FixedAsync, Indexing, SincInterpolationType, SincInterpolationParameters, WindowFunction, Resampler};
 use audioadapter_buffers::direct::SequentialSliceOfVecs;
+use audioadapter_buffers::owned::InterleavedOwned;
 
 use rtrb::Producer;
 
@@ -62,11 +63,86 @@ fn convert_samples_into(buf: &AudioBufferRef, out: &mut Vec<f32>) {
     }
 }
 
+/// Append `input` (interleaved, `channels`-channel) to `out` as interleaved
+/// stereo. The ring buffer, DSP chain, and audio callback all assume stereo;
+/// every decoded layout must pass through here. Mono is duplicated to L/R,
+/// quad and SMPTE-ordered surround layouts are downmixed (center and surrounds
+/// at -3 dB, LFE dropped).
+fn interleaved_to_stereo(input: &[f32], channels: usize, out: &mut Vec<f32>) {
+    const G: f32 = std::f32::consts::FRAC_1_SQRT_2; // -3 dB
+    match channels {
+        0 => {}
+        2 => out.extend_from_slice(input),
+        1 => {
+            out.reserve(input.len() * 2);
+            for &s in input {
+                out.push(s);
+                out.push(s);
+            }
+        }
+        4 => {
+            // Quad: FL FR BL BR — rears fold into their own sides.
+            out.reserve(input.len() / 2);
+            for frame in input.chunks_exact(4) {
+                out.push(frame[0] + G * frame[2]);
+                out.push(frame[1] + G * frame[3]);
+            }
+        }
+        n => {
+            // SMPTE order: FL FR FC [LFE] BL BR [SL SR]. Center feeds both
+            // sides; LFE (index 3, present from 6ch up) is dropped; remaining
+            // surrounds alternate left/right, which matches BL/BR (and SL/SR)
+            // pair ordering.
+            out.reserve(input.len() / n * 2);
+            for frame in input.chunks_exact(n) {
+                let mut l = frame[0] + G * frame[2];
+                let mut r = frame[1] + G * frame[2];
+                let rest = if n >= 6 { &frame[4..] } else { &frame[3..] };
+                for (i, &s) in rest.iter().enumerate() {
+                    if i % 2 == 0 { l += G * s; } else { r += G * s; }
+                }
+                out.push(l);
+                out.push(r);
+            }
+        }
+    }
+}
+
 fn deinterleave_into(samples: &[f32], ch: usize, out: &mut Vec<Vec<f32>>) {
     out.resize_with(ch, Vec::new);
     for plane in out.iter_mut() { plane.clear(); }
     for (i, &s) in samples.iter().enumerate() {
         out[i % ch].push(s);
+    }
+}
+
+/// Wait (bounded) until the audio callback has consumed a drain request set via
+/// `reset_consumer_counter`. The producer must not push new samples while the
+/// flag is pending: the callback drains *everything* in the ring when it sees
+/// the flag, so samples pushed in between would be silently discarded —
+/// clipping the start of post-seek/skip audio. Bounded so a dead stream
+/// (device error) can't hang the producer; 250 ms is many callback periods.
+pub(crate) fn await_consumer_drain(state: &PlayerState) {
+    for _ in 0..50 {
+        if !state.reset_consumer_counter.load(Ordering::Relaxed) || state.should_quit() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Push the whole slice into the ring, waiting briefly when full.
+/// `push_entire_slice` alone is all-or-nothing — on a full ring it pushes
+/// NOTHING and the chunk would be silently dropped (the EOF flush runs without
+/// the buffer-space throttle, so it can actually hit that).
+fn push_all(producer: &mut Producer<f32>, state: &PlayerState, mut data: &[f32]) {
+    while !data.is_empty() && !state.should_quit() {
+        let n = producer.slots().min(data.len());
+        if n > 0 && producer.push_entire_slice(&data[..n]).is_ok() {
+            data = &data[n..];
+            continue;
+        }
+        thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -113,7 +189,11 @@ fn compute_rg_gain(mode: RgMode, tags: &RgTags) -> f32 {
             (g, p)
         }
         _ => {
-            (tags.track_gain, tags.track_peak)
+            // ReplayGain spec: fall back to the album values when track tags
+            // are missing (mirrors the Album→Track fallback above).
+            let g = tags.track_gain.or(tags.album_gain);
+            let p = tags.track_peak.or(tags.album_peak);
+            (g, p)
         }
     };
 
@@ -153,6 +233,9 @@ pub fn decode_playlist(
     let crossfade_samples = crossfade_secs as usize * output_rate as usize * 2; // stereo
     let mut crossfade_tail: Option<std::collections::VecDeque<f32>> = None;
     let mut track_index = start_index;
+    // True until the first track this producer decodes is set up. Distinct from
+    // `track_index == start_index`, which wrongly matches again on repeat-one.
+    let mut first_iteration = true;
     // Ring capacity is sized per output rate in main.rs and stored on state before
     // the producer is spawned, so it's stable for the lifetime of this call.
     let ring_capacity = state.ring_capacity.load(Ordering::Relaxed);
@@ -228,7 +311,11 @@ pub fn decode_playlist(
 
         let track_id = track.id;
         let sample_rate = track.codec_params.sample_rate.unwrap_or(44100);
-        let channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(2);
+        // Source layout, kept for the UI. Everything downstream of decode —
+        // resampler, DSP chain, ring buffer, audio callback — runs on stereo;
+        // interleaved_to_stereo converts right after each packet is decoded.
+        let src_channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(2);
+        let channels = 2usize;
         let bits_per_sample = track.codec_params.bits_per_sample.unwrap_or(16);
         let total = track.codec_params.n_frames.unwrap_or(0);
 
@@ -262,59 +349,10 @@ pub fn decode_playlist(
         }
         let rg_linear = compute_rg_gain(state.rg_mode(), &rg_tags);
 
-        let mut broke_for_skip = false;
-        let mut skipped = false;
-
-        // Wait for buffer to drain so display update matches audio playback
-        if track_index != start_index {
-            let drain_threshold = output_rate as usize; // ~0.5s stereo
-            loop {
-                let buffered = ring_capacity - producer.slots();
-                if buffered <= drain_threshold { break; }
-                if state.should_quit() || state.skip_prev.load(Ordering::Relaxed)
-                    || state.jump_to_track.load(Ordering::Relaxed) >= 0 {
-                    broke_for_skip = true;
-                    break;
-                }
-                if state.take_skip_next() {
-                    state.reset_consumer_counter.store(true, Ordering::Relaxed);
-                    break;
-                }
-                if state.is_paused() {
-                    thread::sleep(Duration::from_millis(50));
-                } else {
-                    thread::sleep(Duration::from_millis(10));
-                }
-            }
-            if broke_for_skip { break; }
-        }
-
-        // --- Update track info ---
-        state.track_info_ready.store(false, Ordering::Relaxed);
-        state.sample_rate.store(sample_rate as u64, Ordering::Relaxed);
-        state.total_samples.store(total, Ordering::Relaxed);
-        state.samples_played.store(0, Ordering::Relaxed);
-        state.channels.store(channels, Ordering::Relaxed);
-        state.bits_per_sample.store(bits_per_sample as usize, Ordering::Relaxed);
-        state.track_info_ready.store(true, Ordering::Relaxed);
-
-        // Signal track transition (skip for first track — main thread already knows)
-        if track_index != start_index {
-            state.signal_next_track(track_index);
-        }
-
-        // Reset filter states for new track
-        eq.reset();
-        effects.reset();
-        crossfeed.reset();
-
-        // --- Crossfade setup for this track ---
-        let xfade_in = crossfade_tail.take();
-        let mut crossfade_pos: usize = 0;
-        let capture_tail = crossfade_samples > 0;
-        let mut tail_buf: std::collections::VecDeque<f32> = if capture_tail { std::collections::VecDeque::with_capacity(crossfade_samples) } else { std::collections::VecDeque::new() };
-
         // --- Create resampler if needed ---
+        // Created before the drain wait so a failure skips the track like the
+        // decoder-creation failures above. Falling back to "no resampler" here
+        // would silently play the track at the wrong pitch.
         let mut resampler: Option<Async<f32>> = if sample_rate != output_rate {
             let params = if hq_resampler {
                 SincInterpolationParameters {
@@ -333,23 +371,94 @@ pub fn decode_playlist(
                     window: WindowFunction::BlackmanHarris2,
                 }
             };
-            Async::new_sinc(
+            match Async::new_sinc(
                 output_rate as f64 / sample_rate as f64,
                 2.0,
                 &params,
                 1024,
                 channels,
                 FixedAsync::Input,
-            ).ok()
+            ) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    if let Ok(mut err) = state.decode_error.lock() {
+                        *err = Some(format!("{}: resampler: {}", path.display(), e));
+                    }
+                    state.signal_next_track(track_index + 1);
+                    track_index += 1;
+                    continue;
+                }
+            }
         } else {
             None
         };
+
+        let mut broke_for_skip = false;
+        let mut skipped = false;
+
+        // Wait for buffer to drain so display update matches audio playback.
+        // Gated on "not the first decoded track of this producer" rather than
+        // track_index != start_index: repeat-one re-enters with the same index,
+        // and skipping the wait there reset samples_played up to a full ring
+        // (~4 s) before the restart was audible.
+        if !first_iteration {
+            let drain_threshold = output_rate as usize; // ~0.5s stereo
+            loop {
+                let buffered = ring_capacity - producer.slots();
+                if buffered <= drain_threshold { break; }
+                if state.should_quit() || state.skip_prev.load(Ordering::Relaxed)
+                    || state.jump_to_track.load(Ordering::Relaxed) >= 0 {
+                    broke_for_skip = true;
+                    break;
+                }
+                if state.take_skip_next() {
+                    state.reset_consumer_counter.store(true, Ordering::Relaxed);
+                    await_consumer_drain(state);
+                    break;
+                }
+                if state.is_paused() {
+                    thread::sleep(Duration::from_millis(50));
+                } else {
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+            if broke_for_skip { break; }
+        }
+
+        // --- Update track info ---
+        state.track_info_ready.store(false, Ordering::Relaxed);
+        state.sample_rate.store(sample_rate as u64, Ordering::Relaxed);
+        state.total_samples.store(total, Ordering::Relaxed);
+        state.samples_played.store(0, Ordering::Relaxed);
+        state.channels.store(src_channels, Ordering::Relaxed);
+        state.bits_per_sample.store(bits_per_sample as usize, Ordering::Relaxed);
+        state.track_info_ready.store(true, Ordering::Relaxed);
+
+        // Signal track transition (skip for the producer's first track — main
+        // thread already knows). Repeat-one passes signal too, so the UI
+        // resets lyrics scroll and position for the restarted track.
+        if !first_iteration {
+            state.signal_next_track(track_index);
+        }
+        first_iteration = false;
+
+        // Reset filter states for new track
+        eq.reset();
+        effects.reset();
+        crossfeed.reset();
+
+        // --- Crossfade setup for this track ---
+        let xfade_in = crossfade_tail.take();
+        let mut crossfade_pos: usize = 0;
+        let capture_tail = crossfade_samples > 0;
+        let mut tail_buf: std::collections::VecDeque<f32> = if capture_tail { std::collections::VecDeque::with_capacity(crossfade_samples) } else { std::collections::VecDeque::new() };
 
         let chunk_size = resampler.as_ref().map(|r| r.input_frames_next()).unwrap_or(1024);
         let mut pending: Vec<f32> = Vec::with_capacity(chunk_size * channels * 2);
 
         // Reusable buffers
-        let mut deinterleaved: Vec<Vec<f32>> = vec![Vec::with_capacity(chunk_size); channels];
+        let mut deinterleaved: Vec<Vec<f32>> =
+            (0..channels).map(|_| Vec::with_capacity(chunk_size)).collect();
         let mut interleaved_out: Vec<f32> = Vec::with_capacity(chunk_size * channels * 2);
         let mut decoded_buf: Vec<f32> = Vec::with_capacity(chunk_size * channels * 2);
         // Scratch for per-packet symphonia → interleaved f32 conversion. Retained across
@@ -381,6 +490,7 @@ pub fn decode_playlist(
             if state.take_skip_next() {
                 if ring_capacity - producer.slots() > 0 {
                     state.reset_consumer_counter.store(true, Ordering::Relaxed);
+                    await_consumer_drain(state);
                 }
                 skipped = true;
                 break;
@@ -397,6 +507,7 @@ pub fn decode_playlist(
                 crossfeed.reset();
 
                 state.reset_consumer_counter.store(true, Ordering::Relaxed);
+                await_consumer_drain(state);
 
                 if probed.format.seek(SeekMode::Coarse, SeekTo::Time {
                     time: Time::from(new_time),
@@ -460,7 +571,8 @@ pub fn decode_playlist(
             convert_samples_into(&decoded, &mut raw_buf);
             if raw_buf.is_empty() { continue; }
 
-            pending.extend_from_slice(&raw_buf);
+            // Convert the source layout to interleaved stereo (appends to pending).
+            interleaved_to_stereo(&raw_buf, src_channels, &mut pending);
 
             // Resample if needed
             decoded_buf.clear();
@@ -600,7 +712,7 @@ pub fn decode_playlist(
             // Push to ring buffer
             let out: &[f32] = if using_final_buf { &final_buf } else { bal_output };
             if !out.is_empty() {
-                let _ = producer.push_entire_slice(out);
+                push_all(producer, state, out);
 
                 // Capture tail for crossfade into next track
                 if capture_tail {
@@ -613,16 +725,50 @@ pub fn decode_playlist(
             }
         }
 
-        // Flush resampler
+        // Flush the resampler tail. Zero-padding `pending` to a full chunk and
+        // pushing everything the resampler produced appended up to ~23 ms of
+        // resampled silence to every track — an audible gap in gapless albums.
+        // Instead: feed the real frames with `partial_len` (rubato pads
+        // internally), pump zeros to drain the sinc delay line, and emit
+        // exactly ceil(ratio·pending) + delay frames.
         if let Some(ref mut resampler) = resampler {
-            if !pending.is_empty() {
-                pending.resize(chunk_size * channels, 0.0);
+            if !pending.is_empty() && !skipped && !broke_for_skip {
+                let pending_frames = pending.len() / channels;
+                let ratio = output_rate as f64 / sample_rate as f64;
+                let mut frames_wanted =
+                    (pending_frames as f64 * ratio).ceil() as usize + resampler.output_delay();
                 deinterleave_into(&pending, channels, &mut flush_planes);
-                let frames_in = chunk_size;
-                if let Ok(adapter_in) = SequentialSliceOfVecs::new(&flush_planes, channels, frames_in) {
-                    if let Ok(resampled) = resampler.process(&adapter_in, 0, None) {
-                        let output = resampled.take_data();
-                        let _ = producer.push_entire_slice(&output);
+                // The adapter needs full chunk geometry; rubato only reads the
+                // first `partial_len` frames of it.
+                for plane in flush_planes.iter_mut() {
+                    plane.resize(chunk_size, 0.0);
+                }
+                let mut partial = Some(pending_frames);
+                while frames_wanted > 0 {
+                    let adapter_in =
+                        match SequentialSliceOfVecs::new(&flush_planes, channels, chunk_size) {
+                            Ok(a) => a,
+                            Err(_) => break,
+                        };
+                    let indexing = Indexing {
+                        input_offset: 0,
+                        output_offset: 0,
+                        partial_len: Some(partial.take().unwrap_or(0)),
+                        active_channels_mask: None,
+                    };
+                    let out_frames = resampler.output_frames_next();
+                    let mut out_buf = InterleavedOwned::<f32>::new(0.0f32, channels, out_frames);
+                    match resampler.process_into_buffer(&adapter_in, &mut out_buf, Some(&indexing)) {
+                        Ok((_, nbr_out)) => {
+                            if nbr_out == 0 {
+                                break;
+                            }
+                            let data = out_buf.take_data();
+                            let take = frames_wanted.min(nbr_out);
+                            push_all(producer, state, &data[..take * channels]);
+                            frames_wanted -= take;
+                        }
+                        Err(_) => break,
                     }
                 }
             }
@@ -661,5 +807,73 @@ pub fn decode_playlist(
 
     if !state.rate_change_needed.load(Ordering::Relaxed) {
         state.producer_done.store(true, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stereo_passes_through_appending() {
+        let mut out = vec![9.0, 9.0]; // pre-existing content must be kept
+        interleaved_to_stereo(&[0.1, 0.2, 0.3, 0.4], 2, &mut out);
+        assert_eq!(out, vec![9.0, 9.0, 0.1, 0.2, 0.3, 0.4]);
+    }
+
+    #[test]
+    fn mono_duplicates_to_both_channels() {
+        let mut out = Vec::new();
+        interleaved_to_stereo(&[0.5, -0.25], 1, &mut out);
+        assert_eq!(out, vec![0.5, 0.5, -0.25, -0.25]);
+    }
+
+    #[test]
+    fn five_one_downmix_center_and_surrounds_minus_3db_lfe_dropped() {
+        // SMPTE order: FL FR FC LFE BL BR
+        let mut out = Vec::new();
+        interleaved_to_stereo(&[0.2, 0.4, 0.6, 1.0, 0.1, 0.3], 6, &mut out);
+        let g = std::f32::consts::FRAC_1_SQRT_2;
+        let want_l = 0.2 + g * 0.6 + g * 0.1;
+        let want_r = 0.4 + g * 0.6 + g * 0.3;
+        assert_eq!(out.len(), 2);
+        assert!((out[0] - want_l).abs() < 1e-6, "L: got {} want {}", out[0], want_l);
+        assert!((out[1] - want_r).abs() < 1e-6, "R: got {} want {}", out[1], want_r);
+    }
+
+    #[test]
+    fn quad_downmix_routes_rears_to_their_sides() {
+        // Quad order: FL FR BL BR
+        let mut out = Vec::new();
+        interleaved_to_stereo(&[0.2, 0.4, 0.1, 0.3], 4, &mut out);
+        let g = std::f32::consts::FRAC_1_SQRT_2;
+        assert!((out[0] - (0.2 + g * 0.1)).abs() < 1e-6);
+        assert!((out[1] - (0.4 + g * 0.3)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rg_track_mode_falls_back_to_album_tags() {
+        let tags = RgTags {
+            track_gain: None,
+            track_peak: None,
+            album_gain: Some(-6.0),
+            album_peak: Some(0.9),
+        };
+        let gain = compute_rg_gain(RgMode::Track, &tags);
+        let want = 10.0f32.powf(-6.0 / 20.0);
+        assert!((gain - want).abs() < 1e-6, "got {} want {}", gain, want);
+    }
+
+    #[test]
+    fn rg_track_mode_prefers_track_tags_when_present() {
+        let tags = RgTags {
+            track_gain: Some(-3.0),
+            track_peak: None,
+            album_gain: Some(-6.0),
+            album_peak: None,
+        };
+        let gain = compute_rg_gain(RgMode::Track, &tags);
+        let want = 10.0f32.powf(-3.0 / 20.0);
+        assert!((gain - want).abs() < 1e-6);
     }
 }

@@ -5,6 +5,7 @@ A high-performance, low-CPU terminal audio player with real-time spectrum visual
 ## Features
 
 - **Multi-format support**: MP3, FLAC, WAV, OGG, AAC/M4A, ALAC, AIFF
+- **Any channel layout**: Mono, stereo, quad, 5.1, and 7.1 sources all play correctly — surround is downmixed to stereo (ITU-style: center at -3dB into both sides, LFE dropped)
 - **Low CPU usage**: <0.5% total system CPU (release mode)
 - **Synced lyrics**: Embedded LRC lyrics + automatic fetching from LRCLIB (~3M songs), with adjustable sync offset
 - **Parametric EQ**: Built-in presets (Flat, Bass Boost, Treble Boost, Vocal, Loudness) + custom JSON presets
@@ -13,7 +14,7 @@ A high-performance, low-CPU terminal audio player with real-time spectrum visual
 - **ReplayGain**: Loudness normalization with peak-based clipping prevention (`--rg-mode track|album|off`)
 - **Crossfade**: Smooth equal-power crossfade between tracks (`--crossfade`)
 - **Pre/post-fader metering**: Toggle between raw signal and volume-adjusted visualization
-- **Media controls**: AirPods stalk controls, Bluetooth headphone buttons, keyboard media keys (macOS/Windows/Linux)
+- **Media controls**: AirPods stalk controls, Bluetooth headphone buttons, keyboard media keys, OS seek bar / skip-by seeking (macOS/Windows/Linux)
 - **Real-time visualizations**: VU meter, horizontal/vertical spectrum, oscilloscope, lissajous (vector scope), spectrogram — toggleable bars/dots styles
 - **Album cover art**: Auto-decoded from embedded tags or sidecar files; rendered via Kitty / iTerm2 / Sixel graphics protocols, with truecolor half-block fallback
 - **Metadata display**: Reads artist/title/album/track number from ID3, Vorbis, and MP4 tags
@@ -25,10 +26,10 @@ A high-performance, low-CPU terminal audio player with real-time spectrum visual
 - **Clipping indicator**: Persistent dot that turns red when signal exceeds 0dBFS, with peak safety limiter
 - **Smart audio processing**: Automatic sample rate switching (macOS), Bluetooth detection, conditional resampling, seamless device switching
 - **Volume control**: Adjustable 0-150% with per-sample gain
-- **Playlist features**: Shuffle, repeat (all/one), recursive folder scanning, playlist view with search/sort/track durations/album column, page navigation (Home/End/PgUp/PgDn + vim `g`/`G`/Ctrl+U/D), tag-based sort (artist → album → disc → track), play queue (enqueue tracks after current), M3U import/export, folder rescan, multiple source paths with deduplication
+- **Playlist features**: Shuffle (toggling off restores the previous order — M3U order survives), repeat (all/one), recursive folder scanning, playlist view with search/sort/track durations/album column, page navigation (Home/End/PgUp/PgDn + vim `g`/`G`/Ctrl+U/D), tag-based sort (artist → album → disc → track), play queue (enqueue tracks after current), M3U import/export, folder rescan, multiple source paths with deduplication
 - **Resume playback**: Save and restore last session (track, position, volume, EQ, effects, crossfeed, balance, device, exclusive) automatically
 - **HQ resampler mode**: Optional `--quality` flag for audiophile-grade resampling
-- **Resilient playback**: Silently skips missing/corrupt files, recovers from device disconnection (including USB DAC unplug)
+- **Resilient playback**: Skips missing/corrupt files with a status message, recovers from device disconnection (including USB DAC unplug)
 - **Terminal-safe UI**: Output adapts to terminal width, handles terminal resize gracefully
 - **Process stats**: Lightweight CPU/memory monitoring via direct platform syscalls (toggle with `I`)
 
@@ -249,7 +250,7 @@ Press `V` to cycle through:
 5. **Oscilloscope** - Mono waveform; `Bars` style uses quadrant blocks for 2x sub-cell resolution
 6. **Lissajous** - Stereo vector scope (L vs R); detects mono/stereo/anti-phase imbalance
 7. **Spectrogram** - Scrolling time-frequency heatmap, dense colormap palette
-8. **Analysis Spectrogram** - High-resolution time × frequency spectrogram with a magma colormap. On graphics-capable terminals (Kitty/iTerm2/Sixel) it renders a true pixel image — fine enough to reveal detail like images encoded into audio — and falls back to half-block truecolor elsewhere. Linear frequency axis by default (`B` toggles linear/log); scroll cadence is matched to the sample rate for smooth motion.
+8. **Analysis Spectrogram** - High-resolution time × frequency spectrogram with a magma colormap. On Kitty-protocol terminals (Kitty, Ghostty, WezTerm) it renders a true pixel image — fine enough to reveal detail like images encoded into audio — and falls back to half-block truecolor everywhere else (iTerm2, Sixel/Windows Terminal, plain terminals). Linear frequency axis by default (`B` toggles linear/log); scroll cadence is matched to the sample rate for smooth motion.
 
 Press `B` to toggle between two visualization styles:
 - **Dots** - Braille characters for sub-cell precision (used by VU/oscilloscope/lissajous/spectrogram)
@@ -282,7 +283,7 @@ The spectrum analyzer features:
               All shared state via atomics (Release/Acquire for transitions)
 ```
 
-DSP chain: `decode -> resample -> EQ -> effects -> RG gain -> crossfeed -> balance -> crossfade -> peak limiter -> clipping check -> ring buffer -> volume -> output`
+DSP chain: `decode -> to-stereo -> resample -> EQ -> effects -> RG gain -> crossfeed -> balance -> crossfade -> peak limiter -> clipping check -> ring buffer -> volume -> output`
 
 Playback position is tracked on the consumer side (audio callback) for accurate time display and lyrics sync.
 

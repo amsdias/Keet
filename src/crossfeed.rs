@@ -84,6 +84,9 @@ impl BiquadState {
             + coeffs.b2 * self.x2
             - coeffs.a1 * self.y1
             - coeffs.a2 * self.y2;
+        // Flush the feedback state: during silence y decays into denormal
+        // range, where x86 float ops are 10-100x slower.
+        let output = crate::eq::flush_denormal(output);
         self.x2 = self.x1;
         self.x1 = input;
         self.y2 = self.y1;

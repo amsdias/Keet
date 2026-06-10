@@ -93,6 +93,9 @@ pub fn keet_config_dir() -> Option<PathBuf> {
 /// Parse an M3U/M3U8 playlist file into a list of audio file paths.
 pub fn parse_m3u(path: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     let content = fs::read_to_string(path)?;
+    // Windows editors commonly prepend a UTF-8 BOM, which would otherwise glue
+    // itself to the first entry's path and make it unresolvable.
+    let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
     let parent = path.parent().unwrap_or(Path::new("."));
     let mut list = Vec::new();
 
@@ -202,4 +205,25 @@ pub fn rescan_playlist(
     playlist.append(&mut added);
 
     Ok((added_count, removed_count))
+}
+
+#[cfg(test)]
+mod m3u_tests {
+    use super::*;
+
+    #[test]
+    fn parse_m3u_strips_utf8_bom_from_first_entry() {
+        let dir = std::env::temp_dir().join(format!("keet_m3u_test_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let track = dir.join("song.mp3");
+        fs::write(&track, b"").unwrap();
+        let m3u = dir.join("list.m3u");
+        // Windows editors commonly prepend a UTF-8 BOM.
+        fs::write(&m3u, format!("\u{feff}{}\n", track.display())).unwrap();
+
+        let parsed = parse_m3u(&m3u).expect("BOM-prefixed first entry should parse");
+        assert_eq!(parsed, vec![track.clone()]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

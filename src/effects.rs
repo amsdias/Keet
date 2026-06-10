@@ -32,8 +32,13 @@ impl CombFilter {
 
     fn process(&mut self, input: f32) -> f32 {
         let output = self.buffer[self.index];
-        self.filter_store = output * self.damp2 + self.filter_store * self.damp1;
-        self.buffer[self.index] = input + self.filter_store * self.feedback;
+        // Flush the feedback paths: during silence these decay into denormal
+        // range, where x86 float ops are 10-100x slower (classic freeverb
+        // "undenormalise" fix).
+        self.filter_store =
+            crate::eq::flush_denormal(output * self.damp2 + self.filter_store * self.damp1);
+        self.buffer[self.index] =
+            crate::eq::flush_denormal(input + self.filter_store * self.feedback);
         self.index = (self.index + 1) % self.buffer.len();
         output
     }
@@ -60,7 +65,7 @@ impl AllpassFilter {
     fn process(&mut self, input: f32) -> f32 {
         let buffered = self.buffer[self.index];
         let output = -input + buffered;
-        self.buffer[self.index] = input + buffered * 0.5;
+        self.buffer[self.index] = crate::eq::flush_denormal(input + buffered * 0.5);
         self.index = (self.index + 1) % self.buffer.len();
         output
     }
@@ -287,8 +292,10 @@ impl Delay {
             let delayed_l = self.buffer_l[read_idx];
             let delayed_r = self.buffer_r[read_idx];
 
-            self.buffer_l[self.write_idx] = samples[li] + delayed_l * self.feedback;
-            self.buffer_r[self.write_idx] = samples[ri] + delayed_r * self.feedback;
+            self.buffer_l[self.write_idx] =
+                crate::eq::flush_denormal(samples[li] + delayed_l * self.feedback);
+            self.buffer_r[self.write_idx] =
+                crate::eq::flush_denormal(samples[ri] + delayed_r * self.feedback);
 
             samples[li] = samples[li] * (1.0 - self.wet) + delayed_l * self.wet;
             samples[ri] = samples[ri] * (1.0 - self.wet) + delayed_r * self.wet;

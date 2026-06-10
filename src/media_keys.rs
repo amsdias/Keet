@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use souvlaki::{
     MediaControlEvent, MediaControls, MediaMetadata,
-    MediaPlayback, MediaPosition, PlatformConfig,
+    MediaPlayback, MediaPosition, PlatformConfig, SeekDirection,
 };
 
 use crate::state::PlayerState;
@@ -27,6 +27,24 @@ pub fn setup(state: Arc<PlayerState>) -> Option<MediaControls> {
             MediaControlEvent::Next => state.next(),
             MediaControlEvent::Previous => state.prev(),
             MediaControlEvent::Stop => state.quit(),
+            MediaControlEvent::Seek(dir) => {
+                state.seek(match dir {
+                    SeekDirection::Forward => 10,
+                    SeekDirection::Backward => -10,
+                });
+            }
+            MediaControlEvent::SeekBy(dir, dur) => {
+                let secs = dur.as_secs() as i64;
+                state.seek(match dir {
+                    SeekDirection::Forward => secs,
+                    SeekDirection::Backward => -secs,
+                });
+            }
+            // Player seeks are relative; translate the absolute target.
+            MediaControlEvent::SetPosition(pos) => {
+                let delta = pos.0.as_secs_f64() - state.time_secs();
+                state.seek(delta.round() as i64);
+            }
             _ => {}
         }
     }).ok()?;

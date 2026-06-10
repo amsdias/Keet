@@ -145,9 +145,15 @@ pub fn fetch_lrclib(artist: &str, title: &str, duration_secs: Option<u32>) -> Op
     let tls = ureq::tls::TlsConfig::builder()
         .provider(ureq::tls::TlsProvider::NativeTls)
         .build();
+    // Split timeouts, NOT timeout_global: in ureq 3.3 the global timer trips
+    // during TCP/TLS setup, failing every HTTPS call before the handshake.
     let agent = ureq::Agent::config_builder()
         .tls_config(tls)
-        .timeout_global(Some(std::time::Duration::from_secs(8)))
+        .timeout_connect(Some(std::time::Duration::from_secs(5)))
+        // LRCLIB can take >7s to first byte on a slow day; the fetch runs on a
+        // worker thread (generation-counter aborted on skip), so be generous.
+        .timeout_recv_response(Some(std::time::Duration::from_secs(15)))
+        .timeout_recv_body(Some(std::time::Duration::from_secs(15)))
         .user_agent("Keet Audio Player (https://github.com)")
         .build()
         .new_agent();

@@ -581,6 +581,10 @@ pub struct UiState {
     pub current: usize,
     pub source_paths: Vec<PathBuf>,
     pub shuffle: bool,
+    /// Playlist order snapshot taken when shuffle is toggled ON, so toggling it
+    /// OFF can restore the real prior order (an M3U's curated order isn't
+    /// reconstructible by sorting).
+    pub pre_shuffle_order: Option<Vec<PathBuf>>,
     pub repeat_mode: RepeatMode,
     pub enqueue_count: usize,
     pub status_message: Option<(String, Instant)>,
@@ -623,6 +627,7 @@ impl UiState {
             current: 0,
             source_paths,
             shuffle: false,
+            pre_shuffle_order: None,
             repeat_mode: RepeatMode::Off,
             enqueue_count: 0,
             status_message: None,
