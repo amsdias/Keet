@@ -500,6 +500,12 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
 
         if let Event::Resize(_, _) = ev {
             ui.terminal_resized = true;
+            // Probed cell metrics may be stale after a font-size change
+            // (Ctrl+zoom also fires Resize). Too-small assumed cells make the
+            // sixel image overflow its block — auto-scroll storm — so drop
+            // back to the conservative floor; pixel-exact fill returns on the
+            // next launch.
+            crate::cover::set_cell_metrics(None);
             continue;
         }
 

@@ -1365,12 +1365,24 @@ pub fn analysis_needs_raw_lines() -> bool {
 }
 
 /// Decide the analysis-spectrogram render geometry for a graphics protocol:
-/// `Some((w, h))` = render the RGB image that big and emit it via
-/// `render_image_block`; `None` = use the half-block text fallback.
+/// `Some((w, h))` = render the image that big; `None` = half-block fallback.
+/// Sixel sizing uses the probed terminal cell metrics when available
+/// (pixel-exact block fill), else the conservative 8×16 px floor.
 fn analysis_image_geometry(
     protocol: crate::cover::GraphicsProtocol,
     cols: usize,
     rows: usize,
+) -> Option<(usize, usize)> {
+    let (cw, ch) = crate::cover::cell_metrics().unwrap_or((8, 16));
+    analysis_image_geometry_with(protocol, cols, rows, (cw as usize, ch as usize))
+}
+
+/// Pure core of `analysis_image_geometry`, parameterized on the cell size.
+fn analysis_image_geometry_with(
+    protocol: crate::cover::GraphicsProtocol,
+    cols: usize,
+    rows: usize,
+    cell: (usize, usize),
 ) -> Option<(usize, usize)> {
     use crate::cover::GraphicsProtocol as GP;
     match protocol {
@@ -1378,15 +1390,14 @@ fn analysis_image_geometry(
         // survive the per-frame cursor-up redraw as a separate layer: render
         // one pixel column per stored hop (history depth) + oversampled height.
         GP::Kitty => Some((SPECTRO_ANALYSIS_COLS, rows * 16)),
-        // Sixel renders 1:1 pixels with no scaling, and we can't know the
-        // terminal's cell metrics without a CSI 16 t round-trip. Overflowing
-        // the reserved block is catastrophic — an image whose bottom edge
-        // passes the screen bottom triggers sixel auto-scroll EVERY frame
-        // (status line marches up forever) — while underfilling just leaves
-        // blank cells at the block's bottom/right. So size at a conservative
-        // 8×16 px per cell: real WT-default cells are ~9-10×19-20, putting the
-        // image at ~80% of the block. The per-frame erase/repaint cycle is
-        // hidden by the DEC 2026 synchronized-update wrap (main.rs).
+        // Sixel renders 1:1 pixels with no scaling. `cell` is the probed cell
+        // size (pixel-exact fill) or the conservative 8×16 floor when the
+        // CSI 16 t probe got no answer. Overflowing the reserved block is
+        // catastrophic — an image whose bottom edge passes the screen bottom
+        // triggers sixel auto-scroll EVERY frame (status line marches up
+        // forever) — while underfilling just leaves blank cells at the
+        // block's bottom/right. The per-frame erase/repaint cycle is hidden
+        // by the DEC 2026 synchronized-update wrap (main.rs).
         //
         // Width is then trimmed to a multiple of the pixels-per-hop k so every
         // displayed hop is exactly k px wide. With a fractional ratio some
@@ -1394,9 +1405,9 @@ fn analysis_image_geometry(
         // scrolling features alternate fat/thin — visible shimmer. Uniform
         // hops make motion a rigid k-px translation of identical bytes.
         GP::Sixel => {
-            let raw_w = cols * 8;
+            let raw_w = cols * cell.0;
             let k = raw_w.div_ceil(SPECTRO_ANALYSIS_COLS).max(1);
-            Some((((raw_w / k) * k).max(k), rows * 16))
+            Some((((raw_w / k) * k).max(k), rows * cell.1))
         }
         // iTerm2 images are cell content the redraw's erase wipes (flicker),
         // and OSC 1337 has no in-place replacement. Half-block fallback.
@@ -1559,6 +1570,24 @@ mod analysis_tests {
             analysis_image_geometry(GP::Sixel, 120, 16),
             Some((960, 256))
         );
+    }
+
+    #[test]
+    fn analysis_geometry_sixel_uses_probed_cell_metrics() {
+        // With probed 9×19 px cells, the image fills the block exactly
+        // (modulo the px-per-hop width trim) instead of the 8×16 floor.
+        use crate::cover::GraphicsProtocol as GP;
+        // raw_w = 120*9 = 1080, k = ceil(1080/512) = 3, trimmed = 1080.
+        assert_eq!(
+            analysis_image_geometry_with(GP::Sixel, 120, 14, (9, 19)),
+            Some((1080, 14 * 19))
+        );
+        // Probed metrics must keep the uniform px-per-hop invariant.
+        for cols in 8..=320 {
+            let (w, _) = analysis_image_geometry_with(GP::Sixel, cols, 16, (9, 19)).unwrap();
+            let k = w.div_ceil(SPECTRO_ANALYSIS_COLS).max(1);
+            assert_eq!(w % k, 0, "cols={}: w={} not a multiple of k={}", cols, w, k);
+        }
     }
 
     #[test]

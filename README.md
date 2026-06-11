@@ -15,7 +15,7 @@ A high-performance, low-CPU terminal audio player with real-time spectrum visual
 - **Crossfade**: Smooth equal-power crossfade between tracks (`--crossfade`)
 - **Pre/post-fader metering**: Toggle between raw signal and volume-adjusted visualization
 - **Media controls**: AirPods stalk controls, Bluetooth headphone buttons, keyboard media keys, OS seek bar / skip-by seeking (macOS/Windows/Linux)
-- **Real-time visualizations**: VU meter, horizontal/vertical spectrum, oscilloscope, lissajous (vector scope), spectrogram — toggleable bars/dots styles
+- **Real-time visualizations**: VU meter, horizontal/vertical spectrum, oscilloscope, lissajous (vector scope), spectrogram, and a high-resolution pixel-image analysis spectrogram (Kitty graphics / Sixel) — toggleable bars/dots styles
 - **Album cover art**: Auto-decoded from embedded tags or sidecar files; rendered via Kitty / iTerm2 / Sixel graphics protocols, with truecolor half-block fallback (used automatically for WezTerm on Windows, where ConPTY drops Kitty graphics)
 - **Metadata display**: Reads artist/title/album/track number from ID3, Vorbis, and MP4 tags
 - **Format-colored icons**: File type indicated by icon color (green=MP3, cyan=FLAC, yellow=WAV, etc.)
@@ -350,7 +350,7 @@ Multiple files, folders, and M3U playlists can be passed as arguments. Duplicate
 | souvlaki 0.8 | OS media transport controls (media keys, AirPods, Bluetooth) |
 | ureq 3 | HTTP client for LRCLIB lyrics fetching (native-tls, no rustls bloat) |
 | image 0.25 | Album cover decoding/resizing (jpeg/png/webp) |
-| icy_sixel 0.5 | Sixel encoder for terminals without Kitty/iTerm2 graphics |
+| icy_sixel 0.5 | Sixel encoder for album covers on terminals without Kitty/iTerm2 graphics (the analysis spectrogram uses a built-in fixed-palette sixel encoder instead) |
 
 ## Platform Notes
 
@@ -368,7 +368,17 @@ sudo apt install libasound2-dev libdbus-1-dev
 ```
 
 - `libasound2-dev` -- ALSA headers (required by cpal)
+- `libasound2-plugins` -- ALSA-to-PulseAudio plugin (automatic ALSA apps routing)
 - `libdbus-1-dev` -- D-Bus headers (required by souvlaki for MPRIS media keys)
+
+Create/edit ~/.asoundrc:
+
+```bash
+cat > ~/.asoundrc << 'EOF'
+pcm.default pulse
+ctl.default pulse
+EOF
+```
 
 ### Compile
 
