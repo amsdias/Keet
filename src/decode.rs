@@ -135,8 +135,18 @@ pub(crate) fn await_consumer_drain(state: &PlayerState) {
 /// `push_entire_slice` alone is all-or-nothing — on a full ring it pushes
 /// NOTHING and the chunk would be silently dropped (the EOF flush runs without
 /// the buffer-space throttle, so it can actually hit that).
+///
+/// Must also bail on the skip-prev/jump unstick signals: main sets one of them
+/// and then joins the producer (skip-prev, jump, stream-error recovery). If the
+/// audio callback is dead the ring never drains, and waiting only on quit would
+/// deadlock that join — freezing the UI with no way to quit. Dropping the rest
+/// of the chunk is fine; the track is being abandoned anyway.
 fn push_all(producer: &mut Producer<f32>, state: &PlayerState, mut data: &[f32]) {
-    while !data.is_empty() && !state.should_quit() {
+    while !data.is_empty()
+        && !state.should_quit()
+        && !state.skip_prev.load(Ordering::Relaxed)
+        && state.jump_to_track.load(Ordering::Relaxed) < 0
+    {
         let n = producer.slots().min(data.len());
         if n > 0 && producer.push_entire_slice(&data[..n]).is_ok() {
             data = &data[n..];
@@ -875,5 +885,50 @@ mod tests {
         let gain = compute_rg_gain(RgMode::Track, &tags);
         let want = 10.0f32.powf(-3.0 / 20.0);
         assert!((gain - want).abs() < 1e-6);
+    }
+
+    /// Spawn `push_all` against a full ring nobody drains (dead-callback
+    /// scenario) and report whether it returned within ~500 ms.
+    fn push_all_returns(state: std::sync::Arc<PlayerState>) -> bool {
+        let (mut producer, _consumer) = rtrb::RingBuffer::<f32>::new(8);
+        producer.push_entire_slice(&[0.0; 8]).unwrap();
+        let handle = thread::spawn(move || push_all(&mut producer, &state, &[0.0; 4]));
+        for _ in 0..100 {
+            if handle.is_finished() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        false
+    }
+
+    #[test]
+    fn push_all_unsticks_on_jump_signal() {
+        let state = std::sync::Arc::new(PlayerState::new());
+        state.jump_to(0);
+        assert!(
+            push_all_returns(state),
+            "push_all must exit when jump_to_track is set — main joins the \
+             producer after setting it, and a dead stream never drains the ring"
+        );
+    }
+
+    #[test]
+    fn push_all_unsticks_on_skip_prev_signal() {
+        let state = std::sync::Arc::new(PlayerState::new());
+        state.prev();
+        assert!(
+            push_all_returns(state),
+            "push_all must exit when skip_prev is set — main joins the \
+             producer after setting it, and a dead stream never drains the ring"
+        );
+    }
+
+    #[test]
+    fn push_all_delivers_full_chunk_when_ring_has_space() {
+        let state = PlayerState::new();
+        let (mut producer, consumer) = rtrb::RingBuffer::<f32>::new(64);
+        push_all(&mut producer, &state, &[1.0; 48]);
+        assert_eq!(consumer.slots(), 48);
     }
 }

@@ -1181,6 +1181,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     // Resume from current track
                     continue 'playlist;
+                } else {
+                    // No default device right now — Windows can report none
+                    // for a while after a USB DAC is yanked. The swap above
+                    // already consumed the flag; put it back so we retry on
+                    // the next frame instead of abandoning recovery forever.
+                    // The loop keeps polling input, so quit stays responsive.
+                    state.stream_error.store(true, Ordering::Relaxed);
+                    ui.set_status("audio device lost — waiting for an output device".to_string());
                 }
             }
 

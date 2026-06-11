@@ -42,7 +42,7 @@ const VIZ_IMAGE_ID: u32 = 2;
 /// default font). 200×200 ≈ 20 cols × 10 rows in those units.
 const SIXEL_SIZE: u32 = 200;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GraphicsProtocol {
     Kitty,
     Iterm2,
@@ -54,38 +54,67 @@ pub enum GraphicsProtocol {
 pub fn detect_protocol() -> GraphicsProtocol {
     static CACHED: OnceLock<GraphicsProtocol> = OnceLock::new();
     *CACHED.get_or_init(|| {
-        if let Ok(tp) = std::env::var("TERM_PROGRAM") {
-            let lower = tp.to_ascii_lowercase();
-            // WezTerm speaks Kitty too, prefer it for image-id-based replacement.
-            if lower == "ghostty" || lower == "wezterm" {
-                return GraphicsProtocol::Kitty;
-            }
-            if lower == "iterm.app" {
-                return GraphicsProtocol::Iterm2;
-            }
+        let term_program = std::env::var("TERM_PROGRAM").ok();
+        let term = std::env::var("TERM").ok();
+        let lc_terminal = std::env::var("LC_TERMINAL").ok();
+        protocol_from_env(
+            term_program.as_deref(),
+            term.as_deref(),
+            std::env::var("KITTY_WINDOW_ID").is_ok(),
+            lc_terminal.as_deref(),
+            std::env::var("WT_SESSION").is_ok(),
+            cfg!(windows),
+        )
+    })
+}
+
+/// Pure decision core of `detect_protocol`, parameterized for testability.
+fn protocol_from_env(
+    term_program: Option<&str>,
+    term: Option<&str>,
+    has_kitty_window_id: bool,
+    lc_terminal: Option<&str>,
+    has_wt_session: bool,
+    is_windows: bool,
+) -> GraphicsProtocol {
+    if let Some(tp) = term_program {
+        let lower = tp.to_ascii_lowercase();
+        // On Windows, locally spawned processes talk to the terminal through
+        // ConPTY, which drops the APC sequences the Kitty protocol rides on —
+        // WezTerm itself supports Kitty graphics but never sees the bytes.
+        // Half-block is plain SGR and survives any ConPTY version.
+        if lower == "wezterm" && is_windows {
+            return GraphicsProtocol::HalfBlock;
         }
-        if let Ok(term) = std::env::var("TERM") {
-            if term.contains("kitty") {
-                return GraphicsProtocol::Kitty;
-            }
-            if term == "foot" || term == "foot-extra" || term == "mlterm" {
-                return GraphicsProtocol::Sixel;
-            }
-        }
-        if std::env::var("KITTY_WINDOW_ID").is_ok() {
+        // WezTerm speaks Kitty too, prefer it for image-id-based replacement.
+        if lower == "ghostty" || lower == "wezterm" {
             return GraphicsProtocol::Kitty;
         }
-        if let Ok(lc) = std::env::var("LC_TERMINAL") {
-            if lc.eq_ignore_ascii_case("iterm2") {
-                return GraphicsProtocol::Iterm2;
-            }
+        if lower == "iterm.app" {
+            return GraphicsProtocol::Iterm2;
         }
-        // Windows Terminal sets WT_SESSION; v1.22+ supports sixel natively.
-        if std::env::var("WT_SESSION").is_ok() {
+    }
+    if let Some(term) = term {
+        if term.contains("kitty") {
+            return GraphicsProtocol::Kitty;
+        }
+        if term == "foot" || term == "foot-extra" || term == "mlterm" {
             return GraphicsProtocol::Sixel;
         }
-        GraphicsProtocol::HalfBlock
-    })
+    }
+    if has_kitty_window_id {
+        return GraphicsProtocol::Kitty;
+    }
+    if let Some(lc) = lc_terminal {
+        if lc.eq_ignore_ascii_case("iterm2") {
+            return GraphicsProtocol::Iterm2;
+        }
+    }
+    // Windows Terminal sets WT_SESSION; v1.22+ supports sixel natively.
+    if has_wt_session {
+        return GraphicsProtocol::Sixel;
+    }
+    GraphicsProtocol::HalfBlock
 }
 
 /// Decoded cover, shape depending on the detected rendering protocol.
@@ -628,4 +657,43 @@ fn base64_encode(bytes: &[u8]) -> String {
         out.push('=');
     }
     out
+}
+
+#[cfg(test)]
+mod protocol_tests {
+    use super::*;
+
+    #[test]
+    fn wezterm_on_unix_uses_kitty() {
+        let p = protocol_from_env(Some("WezTerm"), None, false, None, false, false);
+        assert_eq!(p, GraphicsProtocol::Kitty);
+    }
+
+    #[test]
+    fn wezterm_on_windows_falls_back_to_half_block() {
+        // ConPTY drops the APC sequences the Kitty protocol rides on, so a
+        // locally spawned process must not pick Kitty under Windows-WezTerm.
+        let p = protocol_from_env(Some("WezTerm"), None, false, None, false, true);
+        assert_eq!(p, GraphicsProtocol::HalfBlock);
+    }
+
+    #[test]
+    fn windows_terminal_uses_sixel() {
+        let p = protocol_from_env(None, Some("xterm-256color"), false, None, true, true);
+        assert_eq!(p, GraphicsProtocol::Sixel);
+    }
+
+    #[test]
+    fn plain_terminal_uses_half_block() {
+        let p = protocol_from_env(None, Some("xterm-256color"), false, None, false, false);
+        assert_eq!(p, GraphicsProtocol::HalfBlock);
+    }
+
+    #[test]
+    fn ghostty_uses_kitty_and_iterm_uses_osc1337() {
+        let g = protocol_from_env(Some("ghostty"), None, false, None, false, false);
+        assert_eq!(g, GraphicsProtocol::Kitty);
+        let i = protocol_from_env(Some("iTerm.app"), None, false, None, false, false);
+        assert_eq!(i, GraphicsProtocol::Iterm2);
+    }
 }
