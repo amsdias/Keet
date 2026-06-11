@@ -15,6 +15,7 @@ use crate::viz::{
     StatsMonitor, VizAnalyser, render_vu_meter, render_spectrum_horizontal,
     render_spectrum_vertical, render_oscilloscope, render_lissajous,
     render_spectrogram, render_spectrogram_analysis, get_viz_line_count,
+    analysis_needs_raw_lines, analysis_rows_for_window,
 };
 
 pub fn format_time(secs: f64) -> String {
@@ -90,8 +91,25 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
     let eq_name = &eq_preset.name;
     let eq_curve = crate::eq::render_eq_curve(eq_preset);
     let eq_line = !eq_curve.is_empty();
-    let viz_lines = get_viz_line_count(viz_mode, viz_style) + if eq_line { 1 } else { 0 };
-    let term_w = terminal::size().map(|(w, _)| w as usize).unwrap_or(120);
+    let (term_w, term_h) = terminal::size()
+        .map(|(w, h)| (w as usize, h as usize))
+        .unwrap_or((120, 40));
+    // Clamp the analysis spectrogram (the tallest viz) so the full frame fits
+    // the window: an overflowing frame makes every full repaint (viz switch,
+    // track skip) scroll the banner top into scrollback.
+    let rows_above_viz = ui.banner_lines + 2 + if eq_line { 1 } else { 0 };
+    let ana_rows = analysis_rows_for_window(term_h, rows_above_viz);
+    let viz_lines = if viz_mode == VizMode::SpectrogramAnalysis {
+        ana_rows + 1
+    } else {
+        get_viz_line_count(viz_mode, viz_style)
+    } + if eq_line { 1 } else { 0 };
+    // Sixel emit-on-change bookkeeping: cleared every frame, re-asserted only
+    // by the analysis branch below. Any frame that doesn't reach that branch
+    // (playlist/lyrics view, another viz) may paint over the block, so the
+    // next analysis render must re-emit instead of skipping.
+    let block_was_intact = ui.spectro_block_intact;
+    ui.spectro_block_intact = false;
 
     let track = state.current_track.load(Ordering::Relaxed) + 1;
     let total = state.total_tracks.load(Ordering::Relaxed);
@@ -442,8 +460,22 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
         VizMode::SpectrogramAnalysis => {
             // {B}/viz_style selects the frequency axis here: Dots = log, Bars = linear.
             let log_axis = matches!(viz_style, VizStyle::Dots);
-            for line in render_spectrogram_analysis(analyser, term_w, log_axis, state.is_paused()) {
-                print!("\n\r\x1B[K{}", line);
+            // Sixel: NO erase-to-EOL — the row-1 transmit paints the whole
+            // block, and erasing the following rows would wipe the image down
+            // to a 1-row strip. The sixel block erases itself before painting.
+            let el = if analysis_needs_raw_lines() { "" } else { "\x1B[K" };
+            // Force a full re-emit when the screen was repainted from scratch
+            // this frame (resize/viz-switch/skip path), when the block wasn't
+            // ours last frame, or when the layout height changed (EQ curve
+            // line toggling, transient status row) — the block moves rows
+            // then, and a skipped emit would leave the image stranded at the
+            // old position.
+            let force = prev_viz_lines == usize::MAX
+                || !block_was_intact
+                || viz_lines != prev_viz_lines;
+            ui.spectro_block_intact = true;
+            for line in render_spectrogram_analysis(analyser, term_w, log_axis, state.is_paused(), ana_rows, force) {
+                print!("\n\r{}{}", el, line);
             }
         }
     }
@@ -629,14 +661,25 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
                 KeyEvent { code: KeyCode::Down, .. } => state.prev(),
                 KeyEvent { code: KeyCode::Right, .. } => state.seek(10),
                 KeyEvent { code: KeyCode::Left, .. } => state.seek(-10),
-                KeyEvent { code: KeyCode::Char('v'), .. } => state.cycle_viz_mode(),
+                KeyEvent { code: KeyCode::Char('v'), .. } => {
+                    state.cycle_viz_mode();
+                    // Re-anchor the UI at the top of the screen (resize-repaint
+                    // path): a taller viz then grows into the reclaimed rows
+                    // instead of scrolling the whole screen up.
+                    ui.terminal_resized = true;
+                }
                 KeyEvent { code: KeyCode::Char('+'), .. } |
                 KeyEvent { code: KeyCode::Char('='), .. } => state.volume_up(),
                 KeyEvent { code: KeyCode::Char('-'), .. } => state.volume_down(),
                 KeyEvent { code: KeyCode::Char('e'), .. } => state.cycle_eq(),
                 KeyEvent { code: KeyCode::Char('x'), .. } => state.cycle_effects(),
                 KeyEvent { code: KeyCode::Char('f'), .. } => state.toggle_pre_fader(),
-                KeyEvent { code: KeyCode::Char('b'), .. } => state.toggle_viz_style(),
+                KeyEvent { code: KeyCode::Char('b'), .. } => {
+                    state.toggle_viz_style();
+                    // Style can change the viz height (VU: 4 vs 3 lines) — same
+                    // re-anchor as 'v' so growth never scrolls the screen.
+                    ui.terminal_resized = true;
+                }
                 KeyEvent { code: KeyCode::Char('l'), .. } => {
                     ui.view_mode = match ui.view_mode {
                         ViewMode::Player | ViewMode::Lyrics => {

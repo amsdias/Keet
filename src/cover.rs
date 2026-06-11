@@ -424,7 +424,16 @@ pub fn render_image_block(rgb: &[u8], w: u32, h: u32, cols: u32, rows: u32) -> V
             for px in rgb.chunks_exact(3) {
                 rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
             }
-            let opts = icy_sixel::EncodeOptions::default();
+            // The spectrogram colormap is a smooth gradient: Floyd-Steinberg
+            // dithering (the default) sprays palette noise across the dark
+            // background, which defeats sixel RLE (bigger blob) and burns
+            // UI-thread CPU. 128 colors show no visible banding here. Covers
+            // are photos and keep the dithered defaults (the other call site).
+            let opts = icy_sixel::EncodeOptions {
+                max_colors: 128,
+                diffusion: 0.0,
+                ..icy_sixel::EncodeOptions::default()
+            };
             match icy_sixel::sixel_encode(&rgba, w as usize, h as usize, &opts) {
                 Ok(data) => viz_sixel_lines(&data, cols, rows),
                 Err(_) => blank(),
@@ -494,9 +503,95 @@ fn viz_iterm2_lines(png: &[u8], cols: u32, rows: u32) -> Vec<String> {
     lines
 }
 
+/// Encode an indexed-color image as a sixel blob with a caller-supplied FIXED
+/// palette (same DCS framing icy_sixel emits, which Windows Terminal renders:
+/// `\x1bP9;1;0q`, `#i;2;r;g;b` in percent, per-color RLE bands). Bypassing the
+/// quantizer matters for animated content: re-quantizing a scrolling image
+/// lands a slightly different palette every emission, so even unchanged
+/// pixels get re-colored — visible shimmer. With a fixed palette, unchanged
+/// content encodes to byte-identical output.
+pub(crate) fn sixel_encode_indexed(indices: &[u8], palette: &[(u8, u8, u8)], w: usize, h: usize) -> String {
+    let mut out = String::with_capacity(indices.len() / 4 + palette.len() * 16 + 32);
+    out.push_str("\x1BP9;1;0q");
+    for (i, &(r, g, b)) in palette.iter().enumerate() {
+        let _ = write!(out, "#{};2;{};{};{}",
+            i, r as u32 * 100 / 255, g as u32 * 100 / 255, b as u32 * 100 / 255);
+    }
+    let mut col_bits: Vec<u8> = vec![0; w];
+    for y0 in (0..h).step_by(6) {
+        let y_max = (y0 + 6).min(h);
+        // Colors present in this band (rows y0..y_max are contiguous memory).
+        let mut used = [false; 256];
+        for &px in &indices[y0 * w..y_max * w] {
+            used[px as usize] = true;
+        }
+        for (c, used_c) in used.iter().enumerate().take(palette.len()) {
+            if !used_c { continue; }
+            // Build this color's per-column sixel bits, then run-length encode.
+            col_bits.iter_mut().for_each(|b| *b = 0);
+            for (bit, y) in (y0..y_max).enumerate() {
+                let row = &indices[y * w..(y + 1) * w];
+                for (b, &px) in col_bits.iter_mut().zip(row) {
+                    if px as usize == c {
+                        *b |= 1 << bit;
+                    }
+                }
+            }
+            let _ = write!(out, "#{}", c);
+            let mut x = 0;
+            while x < w {
+                let bits = col_bits[x];
+                let mut run = 1;
+                while x + run < w && col_bits[x + run] == bits {
+                    run += 1;
+                }
+                let ch = (63 + bits) as char;
+                if run > 3 {
+                    let _ = write!(out, "!{}{}", run, ch);
+                } else {
+                    for _ in 0..run {
+                        out.push(ch);
+                    }
+                }
+                x += run;
+            }
+            out.push('$'); // back to band start for the next color overlay
+        }
+        out.push('-'); // next band
+    }
+    out.push_str("\x1B\\");
+    out
+}
+
+/// Sixel viz block from pre-indexed pixels and a fixed palette — the
+/// shimmer-free path for the analysis spectrogram (see sixel_encode_indexed).
+pub(crate) fn render_viz_sixel_indexed(
+    indices: &[u8],
+    palette: &[(u8, u8, u8)],
+    w: usize,
+    h: usize,
+    cols: u32,
+    rows: u32,
+) -> Vec<String> {
+    let data = sixel_encode_indexed(indices, palette, w, h);
+    viz_sixel_lines(&data, cols, rows)
+}
+
 fn viz_sixel_lines(data: &str, cols: u32, rows: u32) -> Vec<String> {
-    let mut first = String::with_capacity(data.len() + 16);
+    // Sixel pixels are ordinary cell content — no Kitty-style image layer or
+    // id-replacement. Two consequences: (1) the block must clear ITSELF (one
+    // erase pass over all rows here, before painting) because stale cells are
+    // never cleared elsewhere; (2) the caller must print the remaining rows
+    // without erase-to-EOL — an EL after this line has painted them wipes that
+    // row's slice of the image (seen on Windows Terminal: 16-row image reduced
+    // to a 1-row strip). See viz::analysis_needs_raw_lines.
+    // SCORC (ESC[u) restores without consuming the save, so it's used twice.
+    let mut first = String::with_capacity(data.len() + 8 * rows as usize + 16);
     first.push_str("\x1B[s");
+    for _ in 0..rows {
+        first.push_str("\x1B[2K\x1B[B");
+    }
+    first.push_str("\x1B[u");
     first.push_str(data);
     first.push_str("\x1B[u");
     let _ = write!(first, "\x1B[{}C", cols);
@@ -695,5 +790,64 @@ mod protocol_tests {
         assert_eq!(g, GraphicsProtocol::Kitty);
         let i = protocol_from_env(Some("iTerm.app"), None, false, None, false, false);
         assert_eq!(i, GraphicsProtocol::Iterm2);
+    }
+}
+
+#[cfg(test)]
+mod viz_sixel_tests {
+    use super::*;
+
+    #[test]
+    fn viz_sixel_first_line_erases_whole_block_before_painting() {
+        // Sixel pixels are ordinary cell content. The block must erase all of
+        // its rows up front, inside the same line as the transmit — if the
+        // caller erased rows 2..N after this line painted them, the image
+        // would be wiped down to a 1-row strip (observed on Windows Terminal).
+        let lines = viz_sixel_lines("SIXELDATA", 120, 16);
+        assert_eq!(lines.len(), 16);
+        let erase_pass = "\x1B[2K\x1B[B".repeat(16);
+        let want_prefix = format!("\x1B[s{}\x1B[u", erase_pass);
+        assert!(
+            lines[0].starts_with(&want_prefix),
+            "first line must erase all rows before painting, got start: {:?}",
+            &lines[0][..lines[0].len().min(40)]
+        );
+        assert!(lines[0].contains("SIXELDATA"));
+        assert!(lines[0].ends_with("\x1B[u\x1B[120C"));
+    }
+
+    #[test]
+    fn sixel_indexed_emits_fixed_palette_and_rle() {
+        // 8×6 image, all palette index 0 → one band, every column has all six
+        // bits set (char 63+63='~'), run of 8 (>3) uses RLE: "!8~".
+        let idx = vec![0u8; 48];
+        let s = sixel_encode_indexed(&idx, &[(0, 0, 0), (255, 255, 255)], 8, 6);
+        assert!(s.starts_with("\x1BP9;1;0q"), "proven-on-WT DCS header");
+        assert!(s.contains("#0;2;0;0;0"), "palette entry 0 in percent scale");
+        assert!(s.contains("#1;2;100;100;100"), "palette entry 1 in percent scale");
+        assert!(s.contains("#0!8~"), "RLE band for color 0");
+        assert!(s.ends_with("\x1B\\"), "string terminator");
+    }
+
+    #[test]
+    fn sixel_indexed_partial_band_overlays_colors() {
+        // 2×3 image: column 0 = color 0, column 1 = color 1. Three rows fill
+        // only the low 3 sixel bits (char 63+7='F'); empty columns are '?'.
+        let idx = vec![0, 1, 0, 1, 0, 1];
+        let s = sixel_encode_indexed(&idx, &[(0, 0, 0), (255, 0, 0)], 2, 3);
+        assert!(s.contains("#0F?"), "color 0 paints column 0 only");
+        assert!(s.contains("#1?F"), "color 1 paints column 1 only");
+        assert!(s.contains('$'), "carriage return between color overlays");
+        assert!(s.contains('-'), "band terminator");
+    }
+
+    #[test]
+    fn viz_sixel_skip_lines_write_nothing_destructive() {
+        // Rows 2..N must be pure cursor-right skips: no erase, no spaces —
+        // anything that touches the cells wipes that row's slice of the image.
+        let lines = viz_sixel_lines("SIXELDATA", 80, 4);
+        for line in &lines[1..] {
+            assert_eq!(line, "\x1B[80C");
+        }
     }
 }

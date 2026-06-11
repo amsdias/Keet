@@ -1268,6 +1268,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ui.terminal_resized = true;
                 }
 
+                // Begin synchronized update (DEC mode 2026) before any frame
+                // output — including the full repaint below, which now also runs
+                // on every viz mode/style key — so the erase-then-repaint is
+                // presented atomically. Closed after print_status. Ignored by
+                // terminals that don't support it.
+                print!("\x1B[?2026h");
+
                 if ui.terminal_resized {
                     ui.terminal_resized = false;
                     // Clear entire screen and reprint banner (old lines may
@@ -1283,7 +1290,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         String::new()
                     };
-                    print!("{}\x1B[0m\x1B[2J\x1B[H{}", kitty_clear, composed.replace('\n', "\r\n"));
+                    // Home + erase-down (NOT \x1B[2J): ConPTY implements ED2 by
+                    // scrolling the viewport into scrollback, so on Windows
+                    // Terminal a 2J repaint shoves the whole UI out of sight
+                    // instead of refreshing in place. ED0 from home erases the
+                    // same cells without the scroll.
+                    print!("{}\x1B[0m\x1B[H\x1B[J{}", kitty_clear, composed.replace('\n', "\r\n"));
                     prev_viz_lines = usize::MAX;
                     prev_viz_image_shown = false; // resize already cleared any viz image
                 }
@@ -1314,11 +1326,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 prev_viz_image_shown = viz_image_shown;
 
-                // Begin/end synchronized update (DEC mode 2026): present each frame
-                // atomically so terminals (notably Windows Terminal) don't show the
-                // mid-redraw erase-then-repaint as flickering black lines. Ignored by
-                // terminals that don't support it.
-                print!("\x1B[?2026h");
                 prev_viz_lines = print_status(&state, &mut ui, &filename, &track_info, &track_ext, current_eq, current_fx, current_cf, &mut stats, prev_viz_lines, &playlist, &viz_analyser);
                 print!("\x1B[?2026l");
                 io::stdout().flush().ok();
@@ -1359,7 +1366,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if matches!(cover::detect_protocol(), cover::GraphicsProtocol::Kitty) {
         print!("{}{}", cover::kitty_clear_escape(), cover::viz_image_clear_escape());
     }
-    print!("\x1B[H\x1B[2J");
+    // Home + erase-down, not ED2 — see the resize repaint above (ConPTY turns
+    // 2J into a scrollback push on Windows Terminal).
+    print!("\x1B[H\x1B[J");
     println!("✓ Done");
     io::stdout().flush().ok();
 

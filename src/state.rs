@@ -598,6 +598,12 @@ pub struct UiState {
     pub playlist_dirty: bool,
     pub current_track_removed: bool,
     pub terminal_resized: bool,
+    /// Whether the previous frame left the analysis-spectrogram sixel block on
+    /// screen untouched. Cleared at the top of every print_status frame and
+    /// re-asserted by the analysis branch — any other frame (playlist/lyrics
+    /// view, another viz mode) leaves it false, forcing a full re-emit when
+    /// the spectrogram next renders over whatever that frame painted.
+    pub spectro_block_intact: bool,
     pub lyrics: Option<crate::lyrics::Lyrics>,
     pub lyrics_receiver: Option<std::sync::mpsc::Receiver<Option<crate::lyrics::Lyrics>>>,
     pub lyrics_scroll: usize,
@@ -641,6 +647,7 @@ impl UiState {
             playlist_dirty: false,
             current_track_removed: false,
             terminal_resized: false,
+            spectro_block_intact: false,
             lyrics: None,
             lyrics_receiver: None,
             lyrics_scroll: 0,

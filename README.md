@@ -16,7 +16,7 @@ A high-performance, low-CPU terminal audio player with real-time spectrum visual
 - **Pre/post-fader metering**: Toggle between raw signal and volume-adjusted visualization
 - **Media controls**: AirPods stalk controls, Bluetooth headphone buttons, keyboard media keys, OS seek bar / skip-by seeking (macOS/Windows/Linux)
 - **Real-time visualizations**: VU meter, horizontal/vertical spectrum, oscilloscope, lissajous (vector scope), spectrogram — toggleable bars/dots styles
-- **Album cover art**: Auto-decoded from embedded tags or sidecar files; rendered via Kitty / iTerm2 / Sixel graphics protocols, with truecolor half-block fallback
+- **Album cover art**: Auto-decoded from embedded tags or sidecar files; rendered via Kitty / iTerm2 / Sixel graphics protocols, with truecolor half-block fallback (used automatically for WezTerm on Windows, where ConPTY drops Kitty graphics)
 - **Metadata display**: Reads artist/title/album/track number from ID3, Vorbis, and MP4 tags
 - **Format-colored icons**: File type indicated by icon color (green=MP3, cyan=FLAC, yellow=WAV, etc.)
 - **Output device selection**: `--device` selects by name, `--list-devices` enumerates
@@ -250,7 +250,7 @@ Press `V` to cycle through:
 5. **Oscilloscope** - Mono waveform; `Bars` style uses quadrant blocks for 2x sub-cell resolution
 6. **Lissajous** - Stereo vector scope (L vs R); detects mono/stereo/anti-phase imbalance
 7. **Spectrogram** - Scrolling time-frequency heatmap, dense colormap palette
-8. **Analysis Spectrogram** - High-resolution time × frequency spectrogram with a magma colormap. On Kitty-protocol terminals (Kitty, Ghostty, WezTerm) it renders a true pixel image — fine enough to reveal detail like images encoded into audio — and falls back to half-block truecolor everywhere else (iTerm2, Sixel/Windows Terminal, plain terminals). Linear frequency axis by default (`B` toggles linear/log); scroll cadence is matched to the sample rate for smooth motion.
+8. **Analysis Spectrogram** - High-resolution time × frequency spectrogram with a magma colormap, rendered as a true pixel image — fine enough to reveal detail like images encoded into audio. On Kitty-protocol terminals (Kitty, Ghostty, WezTerm) it uses Kitty graphics with in-place image replacement; on Windows Terminal it uses a custom fixed-palette Sixel encoder that only re-transmits when the image changes, so scrolling stays smooth and shimmer-free even through ConPTY. Falls back to half-block truecolor elsewhere (iTerm2, WezTerm on Windows, plain terminals). The block auto-sizes to fit the window height. Linear frequency axis by default (`B` toggles linear/log); scroll cadence is matched to the sample rate for smooth motion.
 
 Press `B` to toggle between two visualization styles:
 - **Dots** - Braille characters for sub-cell precision (used by VU/oscilloscope/lissajous/spectrogram)

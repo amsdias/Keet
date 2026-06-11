@@ -4,7 +4,7 @@
 #![allow(clippy::needless_range_loop)]
 
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -1167,9 +1167,9 @@ pub fn render_spectrogram(analyser: &VizAnalyser, style: VizStyle, width: usize)
 /// Fill `rgb` (resized to width_px·height_px·3, reused across frames) with the
 /// analysis-spectrogram image: x = time (newest right), y = frequency (linear or
 /// log), pixel = colormap(dB in contrast window). `log_axis` selects the freq map.
-fn analysis_rgb_into(rgb: &mut Vec<u8>, analyser: &VizAnalyser, width_px: usize, height_px: usize, log_axis: bool) {
-    rgb.clear();
-    rgb.resize(width_px * height_px * 3, 0);
+fn analysis_levels_into(out: &mut Vec<u8>, analyser: &VizAnalyser, width_px: usize, height_px: usize, log_axis: bool, logical_cols: usize) {
+    out.clear();
+    out.resize(width_px * height_px, 0);
     let hist = &analyser.spectro_raw_history;
     let nbins = hist.back().map(|c| c.len()).unwrap_or(0);
     if nbins == 0 {
@@ -1183,83 +1183,225 @@ fn analysis_rgb_into(rgb: &mut Vec<u8>, analyser: &VizAnalyser, width_px: usize,
             analysis_row_to_bin_linear(y, height_px, nbins)
         })
         .collect();
+    // Pixel columns map through a fixed timeline of `logical_cols` slots
+    // (newest at the right) so the pixel width is decoupled from the history
+    // depth. Kitty renders 1 px per slot; Sixel images are wider than the
+    // history is deep and stretch each slot across several pixels (mapping
+    // 1:1 instead leaves everything left of the last 512 px permanently
+    // black); half-block passes logical_cols == width_px, keeping its 1:1
+    // most-recent-hops window. Unfilled slots stay black (fill-from-right).
+    let filled = n.min(logical_cols);
+    let blank_slots = logical_cols - filled;
+    let oldest_shown = n - filled;
     for x in 0..width_px {
-        let cols_shown = n.min(width_px);
-        let pad = width_px - cols_shown;
-        if x < pad { continue; }
-        let col_idx = n - cols_shown + (x - pad);
-        let col = &hist[col_idx];
+        let slot = x * logical_cols / width_px.max(1);
+        if slot < blank_slots { continue; }
+        let col = &hist[oldest_shown + (slot - blank_slots)];
         for (y, &bin) in row_bin.iter().enumerate() {
             let db = col.get(bin).copied().unwrap_or(SPECTRO_ANALYSIS_FLOOR_DB);
             let t = analysis_intensity(db, SPECTRO_ANALYSIS_FLOOR_DB, SPECTRO_ANALYSIS_CEIL_DB);
-            let (r, g, b) = analysis_colormap(t);
-            let p = (y * width_px + x) * 3;
-            rgb[p] = r; rgb[p + 1] = g; rgb[p + 2] = b;
+            out[y * width_px + x] = (t * 255.0).round() as u8;
         }
     }
 }
 
-pub fn render_spectrogram_analysis(analyser: &VizAnalyser, width: usize, log_axis: bool, paused: bool) -> Vec<String> {
+/// Expand quantized intensity levels to truecolor via the colormap (Kitty PNG
+/// and half-block paths; the sixel path maps levels into a fixed palette).
+fn colorize_levels(levels: &[u8], rgb: &mut Vec<u8>) {
+    rgb.clear();
+    rgb.reserve(levels.len() * 3);
+    for &lv in levels {
+        let (r, g, b) = analysis_colormap(lv as f32 / 255.0);
+        rgb.extend_from_slice(&[r, g, b]);
+    }
+}
+
+/// 128-entry fixed palette for the indexed sixel path: the colormap sampled
+/// uniformly, so intensity `level >> 1` is exactly the palette index. A fixed
+/// palette keeps unchanged pixels byte-identical between emissions — the
+/// per-frame re-quantization it replaces made the scrolling image shimmer.
+fn analysis_sixel_palette() -> &'static [(u8, u8, u8)] {
+    static PALETTE: OnceLock<Vec<(u8, u8, u8)>> = OnceLock::new();
+    PALETTE.get_or_init(|| (0..128).map(|i| analysis_colormap(i as f32 / 127.0)).collect())
+}
+
+pub fn render_spectrogram_analysis(analyser: &VizAnalyser, width: usize, log_axis: bool, paused: bool, rows: usize, force: bool) -> Vec<String> {
     use std::cell::RefCell;
     thread_local! {
-        // Reused across frames so the per-frame image buffer isn't reallocated each tick.
+        // Reused across frames so the per-frame image buffers aren't reallocated each tick.
         static RGB_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+        static LEVELS_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
         // Paused-frame cache: while paused the image is frozen, so reuse the last
         // rendered lines (keyed by column generation + geometry) to skip the encode.
-        static CACHE: RefCell<(u64, usize, bool, Vec<String>)> =
-            const { RefCell::new((u64::MAX, 0, false, Vec::new())) };
+        static CACHE: RefCell<(u64, usize, bool, usize, Vec<String>)> =
+            const { RefCell::new((u64::MAX, 0, false, 0, Vec::new())) };
+        // Key of the sixel block last emitted to the terminal. Sixel pixels
+        // persist as cell content, so an unchanged frame can be skipped
+        // entirely — no re-encode, no re-transmission through ConPTY.
+        static LAST_EMIT: RefCell<(u64, usize, bool, usize)> =
+            const { RefCell::new((u64::MAX, 0, false, 0)) };
     }
     let cols = width.saturating_sub(4).clamp(8, 320);
-    let rows = SPECTRO_ANALYSIS_ROWS;
     let gen = analyser.spectro_last_gen;
+    let key = (gen, width, log_axis, rows);
+    let sixel = analysis_needs_raw_lines();
+
+    // Sixel emit-on-change: the image only changes when a new hop lands
+    // (gen bump) or the geometry/axis changes. Re-encoding + re-sending the
+    // blob 20×/s through ConPTY saturates Windows Terminal's CPU-side sixel
+    // pipeline and makes the scroll cadence jerky. Passive empty lines move
+    // the cursor over the block without touching its cells.
+    if analysis_can_skip_emit(sixel, force, key, LAST_EMIT.with(|c| *c.borrow())) {
+        return vec![String::new(); rows];
+    }
 
     // When paused the content can't change, so reuse the cached render and skip the
     // per-frame image build + PNG re-encode entirely.
     if paused {
         let hit = CACHE.with(|c| {
             let c = c.borrow();
-            if c.0 == gen && c.1 == width && c.2 == log_axis && !c.3.is_empty() {
-                Some(c.3.clone())
+            if c.0 == gen && c.1 == width && c.2 == log_axis && c.3 == rows && !c.4.is_empty() {
+                Some(c.4.clone())
             } else {
                 None
             }
         });
         if let Some(lines) = hit {
+            if sixel {
+                LAST_EMIT.with(|c| *c.borrow_mut() = key);
+            }
             return lines;
         }
     }
 
-    // Only Kitty's id-addressed graphics survive our per-frame cursor-up redraw —
-    // its image is a separate layer. Sixel and iTerm2 images are cell content, so
-    // the redraw's erase-to-EOL wipes them (flicker), and Sixel renders 1:1 pixels
-    // instead of scaling to the cell box (half-width). For everything else, fall
-    // back to half-block truecolor: it's text, so it redraws cleanly and fills width.
-    let use_image = matches!(crate::cover::detect_protocol(), crate::cover::GraphicsProtocol::Kitty);
-    // Graphics path: one pixel column per stored hop (history depth, so data fills
-    // the frame) + oversampled height; Kitty scales it to the cell box. Half-block:
-    // 1 px/col, 2 px-rows/char row, sized directly to the cell area.
-    let (w, h) = if use_image {
-        (SPECTRO_ANALYSIS_COLS, rows * 16)
-    } else {
-        (cols, rows * 2)
-    };
-    let lines = RGB_BUF.with(|cell| {
-        let mut guard = cell.borrow_mut();
-        let rgb: &mut Vec<u8> = &mut guard;
-        analysis_rgb_into(rgb, analyser, w, h, log_axis);
-        let mut lines = if use_image {
-            crate::cover::render_image_block(rgb.as_slice(), w as u32, h as u32, cols as u32, rows as u32)
+    // Protocol-dependent geometry: Some((w, h)) renders a pixel image that big,
+    // None falls back to half-block truecolor (text, so it redraws cleanly and
+    // fills the width). Per-protocol rationale lives in analysis_image_geometry.
+    let image_geom = analysis_image_geometry(crate::cover::detect_protocol(), cols, rows);
+    // Half-block: 1 px/col, 2 px-rows/char row, sized directly to the cell area.
+    let (w, h) = image_geom.unwrap_or((cols, rows * 2));
+    let lines = LEVELS_BUF.with(|lcell| {
+        let mut lguard = lcell.borrow_mut();
+        let levels: &mut Vec<u8> = &mut lguard;
+        // Image paths map pixels through a logical timeline of history slots;
+        // half-block keeps its 1:1 most-recent-hops window. Kitty stretches
+        // the full 512-hop history (terminal scales smoothly). Sixel shows
+        // the most recent w/k hops at exactly k px each (w is a multiple of
+        // k, see analysis_image_geometry) — uniform hop widths, no shimmer.
+        let logical_cols = if image_geom.is_some() {
+            if sixel {
+                let k = w.div_ceil(SPECTRO_ANALYSIS_COLS).max(1);
+                w / k
+            } else {
+                SPECTRO_ANALYSIS_COLS
+            }
         } else {
-            crate::cover::render_half_block_public(w as u32, h as u32, rgb.as_slice())
+            w
+        };
+        analysis_levels_into(levels, analyser, w, h, log_axis, logical_cols);
+        let mut lines = if image_geom.is_some() && sixel {
+            // Fixed-palette indexed sixel — no quantizer, no shimmer.
+            for lv in levels.iter_mut() { *lv >>= 1; }
+            crate::cover::render_viz_sixel_indexed(levels, analysis_sixel_palette(), w, h, cols as u32, rows as u32)
+        } else {
+            RGB_BUF.with(|cell| {
+                let mut guard = cell.borrow_mut();
+                let rgb: &mut Vec<u8> = &mut guard;
+                colorize_levels(levels, rgb);
+                if image_geom.is_some() {
+                    crate::cover::render_image_block(rgb.as_slice(), w as u32, h as u32, cols as u32, rows as u32)
+                } else {
+                    crate::cover::render_half_block_public(w as u32, h as u32, rgb.as_slice())
+                }
+            })
         };
         for line in lines.iter_mut() { line.insert_str(0, "  "); }
         lines
     });
 
     if paused {
-        CACHE.with(|c| *c.borrow_mut() = (gen, width, log_axis, lines.clone()));
+        CACHE.with(|c| *c.borrow_mut() = (gen, width, log_axis, rows, lines.clone()));
+    }
+    if sixel {
+        LAST_EMIT.with(|c| *c.borrow_mut() = key);
     }
     lines
+}
+
+/// Whether this frame's sixel analysis block can be left untouched on screen
+/// (no re-encode, no re-transmission). Only valid when the protocol is Sixel
+/// (cell content persists untouched), nothing repainted over the block
+/// (`force`), and the content/geometry key is unchanged since the last
+/// emission. Kitty/half-block always re-emit (cheap; id-replaced or text).
+fn analysis_can_skip_emit(
+    sixel: bool,
+    force: bool,
+    key: (u64, usize, bool, usize),
+    last: (u64, usize, bool, usize),
+) -> bool {
+    sixel && !force && key == last
+}
+
+/// Clamp the analysis-spectrogram row count so the whole frame fits the
+/// window. If the frame is even 1-2 rows taller than the terminal, every full
+/// repaint (viz switch, track skip) scrolls the banner's top rows into
+/// scrollback — on ConPTY that litters one UI fragment per song. `rows_above`
+/// = banner + status lines above the viz block; 3 more rows are reserved for
+/// the viz separator line, the transient status line, and one row of slack.
+pub fn analysis_rows_for_window(term_h: usize, rows_above: usize) -> usize {
+    SPECTRO_ANALYSIS_ROWS.min(4.max(term_h.saturating_sub(rows_above + 3)))
+}
+
+/// Whether the analysis-spectrogram lines must be printed WITHOUT the usual
+/// per-line erase-to-EOL. Sixel pixels are ordinary cell content: the row-1
+/// transmit paints the whole block downward, so erasing rows 2..N afterwards
+/// wipes the image to a 1-row strip. The sixel first line erases the block
+/// itself before painting (see cover::viz_sixel_lines).
+pub fn analysis_needs_raw_lines() -> bool {
+    matches!(
+        crate::cover::detect_protocol(),
+        crate::cover::GraphicsProtocol::Sixel
+    )
+}
+
+/// Decide the analysis-spectrogram render geometry for a graphics protocol:
+/// `Some((w, h))` = render the RGB image that big and emit it via
+/// `render_image_block`; `None` = use the half-block text fallback.
+fn analysis_image_geometry(
+    protocol: crate::cover::GraphicsProtocol,
+    cols: usize,
+    rows: usize,
+) -> Option<(usize, usize)> {
+    use crate::cover::GraphicsProtocol as GP;
+    match protocol {
+        // Kitty scales the image to the cell box and its id-addressed images
+        // survive the per-frame cursor-up redraw as a separate layer: render
+        // one pixel column per stored hop (history depth) + oversampled height.
+        GP::Kitty => Some((SPECTRO_ANALYSIS_COLS, rows * 16)),
+        // Sixel renders 1:1 pixels with no scaling, and we can't know the
+        // terminal's cell metrics without a CSI 16 t round-trip. Overflowing
+        // the reserved block is catastrophic — an image whose bottom edge
+        // passes the screen bottom triggers sixel auto-scroll EVERY frame
+        // (status line marches up forever) — while underfilling just leaves
+        // blank cells at the block's bottom/right. So size at a conservative
+        // 8×16 px per cell: real WT-default cells are ~9-10×19-20, putting the
+        // image at ~80% of the block. The per-frame erase/repaint cycle is
+        // hidden by the DEC 2026 synchronized-update wrap (main.rs).
+        //
+        // Width is then trimmed to a multiple of the pixels-per-hop k so every
+        // displayed hop is exactly k px wide. With a fractional ratio some
+        // hops render 1px and some 2px in a fixed screen pattern, and
+        // scrolling features alternate fat/thin — visible shimmer. Uniform
+        // hops make motion a rigid k-px translation of identical bytes.
+        GP::Sixel => {
+            let raw_w = cols * 8;
+            let k = raw_w.div_ceil(SPECTRO_ANALYSIS_COLS).max(1);
+            Some((((raw_w / k) * k).max(k), rows * 16))
+        }
+        // iTerm2 images are cell content the redraw's erase wipes (flicker),
+        // and OSC 1337 has no in-place replacement. Half-block fallback.
+        GP::Iterm2 | GP::HalfBlock => None,
+    }
 }
 
 /// Map a dB value to [0,1] across the contrast window [floor, ceil].
@@ -1327,6 +1469,117 @@ mod analysis_tests {
         let h = 16;
         assert_eq!(analysis_row_to_bin_linear(0, h, nbins), nbins - 1);
         assert_eq!(analysis_row_to_bin_linear(h - 1, h, nbins), 0);
+    }
+
+    #[test]
+    fn analysis_skip_allows_unchanged_sixel_frames() {
+        let key = (7u64, 120usize, false, 14usize);
+        assert!(analysis_can_skip_emit(true, false, key, key));
+    }
+
+    #[test]
+    fn analysis_skip_never_when_forced_or_changed_or_not_sixel() {
+        let key = (7u64, 120usize, false, 14usize);
+        // Forced (full repaint / block painted over): must re-emit.
+        assert!(!analysis_can_skip_emit(true, true, key, key));
+        // New hop landed (gen bump): must re-emit.
+        assert!(!analysis_can_skip_emit(true, false, (8, 120, false, 14), key));
+        // Geometry changed: must re-emit.
+        assert!(!analysis_can_skip_emit(true, false, (7, 120, false, 12), key));
+        // Non-sixel protocols always re-emit.
+        assert!(!analysis_can_skip_emit(false, false, key, key));
+    }
+
+    #[test]
+    fn analysis_rows_keep_full_height_in_tall_windows() {
+        assert_eq!(analysis_rows_for_window(50, 15), SPECTRO_ANALYSIS_ROWS);
+    }
+
+    #[test]
+    fn analysis_rows_shed_to_fit_short_windows() {
+        // 32-row window, 15 rows above the viz block, 3 reserved (separator +
+        // transient status + slack) → only 14 spectrogram rows fit.
+        assert_eq!(analysis_rows_for_window(32, 15), 14);
+    }
+
+    #[test]
+    fn analysis_rows_floor_at_four_for_tiny_windows() {
+        assert_eq!(analysis_rows_for_window(12, 15), 4);
+    }
+
+    #[test]
+    fn analysis_levels_stretch_history_across_wider_images() {
+        // Sixel images are wider in pixels than the history is deep (512
+        // hops); each logical slot must stretch across the width instead of
+        // mapping 1:1 right-anchored, which left the image's left half
+        // permanently black on Windows Terminal.
+        let mut a = VizAnalyser::new(48000);
+        a.spectro_raw_history.push_back(vec![-10.0]); // hot column (older)
+        a.spectro_raw_history.push_back(vec![-70.0]); // floor column (newer)
+        let mut lv = Vec::new();
+        // 4 px wide, full history (n == logical == 2): each slot covers 2 px.
+        analysis_levels_into(&mut lv, &a, 4, 1, false, 2);
+        assert_eq!(lv[0], lv[1], "first history column must cover px 0..2");
+        assert_eq!(lv[2], lv[3], "second history column must cover px 2..4");
+        assert_ne!(lv[0], lv[2]);
+        assert_ne!(lv[0], 0, "no blank padding when history is full");
+    }
+
+    #[test]
+    fn analysis_levels_keep_one_to_one_most_recent_window_for_half_block() {
+        let mut a = VizAnalyser::new(48000);
+        for i in 0..4 {
+            let db = if i == 3 { -10.0 } else { -70.0 };
+            a.spectro_raw_history.push_back(vec![db]);
+        }
+        let mut lv = Vec::new();
+        // logical == width: a 2-px window shows the most recent 2 hops 1:1.
+        analysis_levels_into(&mut lv, &a, 2, 1, false, 2);
+        assert_ne!(lv[0], lv[1]);
+        assert_ne!(lv[1], 0, "newest (hot) hop lands at the right edge");
+    }
+
+    #[test]
+    fn analysis_geometry_kitty_renders_history_depth() {
+        use crate::cover::GraphicsProtocol as GP;
+        assert_eq!(
+            analysis_image_geometry(GP::Kitty, 120, 16),
+            Some((SPECTRO_ANALYSIS_COLS, 16 * 16))
+        );
+    }
+
+    #[test]
+    fn analysis_geometry_sixel_undershoots_cell_box() {
+        // Sixel renders 1:1 pixels with no scaling, and an image whose bottom
+        // edge passes the screen bottom makes the terminal scroll — every
+        // frame. Cell metrics are unknowable without querying, so size at a
+        // conservative 8×16 px per cell: must underfill, never overflow.
+        use crate::cover::GraphicsProtocol as GP;
+        assert_eq!(
+            analysis_image_geometry(GP::Sixel, 120, 16),
+            Some((960, 256))
+        );
+    }
+
+    #[test]
+    fn analysis_geometry_sixel_width_is_multiple_of_px_per_hop() {
+        // Every displayed hop must be exactly k px wide: with a fractional
+        // ratio (e.g. 1120px / 512 slots), some hops render 1px and some 2px
+        // in a fixed screen pattern, so scrolling features alternate fat/thin
+        // — visible shimmer. Width must be trimmed to a multiple of k.
+        use crate::cover::GraphicsProtocol as GP;
+        for cols in 8..=320 {
+            let (w, _) = analysis_image_geometry(GP::Sixel, cols, 16).unwrap();
+            let k = w.div_ceil(SPECTRO_ANALYSIS_COLS).max(1);
+            assert_eq!(w % k, 0, "cols={}: w={} not a multiple of k={}", cols, w, k);
+        }
+    }
+
+    #[test]
+    fn analysis_geometry_iterm2_and_plain_use_half_block() {
+        use crate::cover::GraphicsProtocol as GP;
+        assert_eq!(analysis_image_geometry(GP::Iterm2, 120, 16), None);
+        assert_eq!(analysis_image_geometry(GP::HalfBlock, 120, 16), None);
     }
 
     #[test]
