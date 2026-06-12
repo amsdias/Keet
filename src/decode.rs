@@ -116,6 +116,18 @@ fn deinterleave_into(samples: &[f32], ch: usize, out: &mut Vec<Vec<f32>>) {
     }
 }
 
+/// True when the producer must stop waiting and unwind: main sets one of these
+/// signals and then JOINS the producer thread (quit/shutdown, skip-prev or
+/// jump respawn, stream-error recovery). Every producer wait loop must check
+/// this — a loop that waits only on ring space deadlocks the join when the
+/// audio callback is dead and the ring never drains (frozen UI, raw mode eats
+/// Ctrl+C). Add new join-preceding signals HERE, not at individual wait sites.
+pub(crate) fn producer_should_unstick(state: &PlayerState) -> bool {
+    state.should_quit()
+        || state.skip_prev.load(Ordering::Relaxed)
+        || state.jump_to_track.load(Ordering::Relaxed) >= 0
+}
+
 /// Wait (bounded) until the audio callback has consumed a drain request set via
 /// `reset_consumer_counter`. The producer must not push new samples while the
 /// flag is pending: the callback drains *everything* in the ring when it sees
@@ -124,7 +136,7 @@ fn deinterleave_into(samples: &[f32], ch: usize, out: &mut Vec<Vec<f32>>) {
 /// (device error) can't hang the producer; 250 ms is many callback periods.
 pub(crate) fn await_consumer_drain(state: &PlayerState) {
     for _ in 0..50 {
-        if !state.reset_consumer_counter.load(Ordering::Relaxed) || state.should_quit() {
+        if !state.reset_consumer_counter.load(Ordering::Relaxed) || producer_should_unstick(state) {
             return;
         }
         thread::sleep(Duration::from_millis(5));
@@ -136,17 +148,10 @@ pub(crate) fn await_consumer_drain(state: &PlayerState) {
 /// NOTHING and the chunk would be silently dropped (the EOF flush runs without
 /// the buffer-space throttle, so it can actually hit that).
 ///
-/// Must also bail on the skip-prev/jump unstick signals: main sets one of them
-/// and then joins the producer (skip-prev, jump, stream-error recovery). If the
-/// audio callback is dead the ring never drains, and waiting only on quit would
-/// deadlock that join — freezing the UI with no way to quit. Dropping the rest
-/// of the chunk is fine; the track is being abandoned anyway.
+/// Must also bail on the unstick signals (see `producer_should_unstick`) —
+/// dropping the rest of the chunk is fine; the track is being abandoned anyway.
 fn push_all(producer: &mut Producer<f32>, state: &PlayerState, mut data: &[f32]) {
-    while !data.is_empty()
-        && !state.should_quit()
-        && !state.skip_prev.load(Ordering::Relaxed)
-        && state.jump_to_track.load(Ordering::Relaxed) < 0
-    {
+    while !data.is_empty() && !producer_should_unstick(state) {
         let n = producer.slots().min(data.len());
         if n > 0 && producer.push_entire_slice(&data[..n]).is_ok() {
             data = &data[n..];
@@ -416,8 +421,7 @@ pub fn decode_playlist(
             loop {
                 let buffered = ring_capacity - producer.slots();
                 if buffered <= drain_threshold { break; }
-                if state.should_quit() || state.skip_prev.load(Ordering::Relaxed)
-                    || state.jump_to_track.load(Ordering::Relaxed) >= 0 {
+                if producer_should_unstick(state) {
                     broke_for_skip = true;
                     break;
                 }
@@ -487,12 +491,9 @@ pub fn decode_playlist(
 
         // --- Packet decode loop ---
         loop {
-            if state.should_quit() {
-                broke_for_skip = true;
-                break;
-            }
-            // Check skip-prev and jump — these require producer to exit entirely
-            if state.skip_prev.load(Ordering::Relaxed) || state.jump_to_track.load(Ordering::Relaxed) >= 0 {
+            // Quit, skip-prev, jump — all require the producer to exit entirely
+            // (main is about to join us).
+            if producer_should_unstick(state) {
                 broke_for_skip = true;
                 break;
             }
@@ -921,6 +922,51 @@ mod tests {
             push_all_returns(state),
             "push_all must exit when skip_prev is set — main joins the \
              producer after setting it, and a dead stream never drains the ring"
+        );
+    }
+
+    #[test]
+    fn unstick_predicate_fires_on_each_join_signal() {
+        let s = PlayerState::new();
+        assert!(!producer_should_unstick(&s), "fresh state must not unstick");
+        s.quit();
+        assert!(producer_should_unstick(&s), "quit must unstick");
+
+        let s = PlayerState::new();
+        s.prev();
+        assert!(producer_should_unstick(&s), "skip-prev must unstick");
+
+        let s = PlayerState::new();
+        s.jump_to(0);
+        assert!(producer_should_unstick(&s), "jump must unstick");
+    }
+
+    #[test]
+    fn push_all_unsticks_on_quit_signal() {
+        let state = std::sync::Arc::new(PlayerState::new());
+        state.quit();
+        assert!(push_all_returns(state), "push_all must exit on quit");
+    }
+
+    #[test]
+    fn await_consumer_drain_unsticks_promptly_on_jump() {
+        // With the drain flag pending and a dead callback, the wait is bounded
+        // at 250 ms — but a pending join (jump set) must end it promptly, not
+        // ride out the full bound.
+        let state = std::sync::Arc::new(PlayerState::new());
+        state.reset_consumer_counter.store(true, Ordering::Relaxed);
+        state.jump_to(0);
+        let handle = thread::spawn(move || await_consumer_drain(&state));
+        for _ in 0..24 {
+            if handle.is_finished() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            handle.is_finished(),
+            "await_consumer_drain must return well before its 250 ms bound \
+             when a join-preceding signal is set"
         );
     }
 

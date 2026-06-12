@@ -669,7 +669,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let mut prev_viz_lines: usize = usize::MAX;
+    let mut prev_frame_lines: usize = usize::MAX;
     // Tracks whether the Kitty analysis-spectrogram image was placed last frame,
     // so we can delete it (by id) when the user switches away from that mode.
     let mut prev_viz_image_shown = false;
@@ -897,7 +897,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Force a full redraw so the next track's status line starts clean
             // instead of leaving orphan lines from the previous render.
             ui.terminal_resized = true;
-            prev_viz_lines = usize::MAX;
+            prev_frame_lines = usize::MAX;
             continue 'playlist;
         }
 
@@ -957,7 +957,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // mid-redraw erase-then-repaint as flickering black lines. Ignored by
                 // terminals that don't support it.
                 print!("\x1B[?2026h");
-                prev_viz_lines = print_status(&state, &mut ui, &filename, &track_info, &track_ext, current_eq, current_fx, current_cf, &mut stats, prev_viz_lines, &playlist, &viz_analyser);
+                prev_frame_lines = print_status(&state, &mut ui, &filename, &track_info, &track_ext, current_eq, current_fx, current_cf, &mut stats, prev_frame_lines, &playlist, &viz_analyser);
                 print!("\x1B[?2026l");
                 io::stdout().flush().ok();
                 thread::sleep(Duration::from_millis(20));
@@ -980,8 +980,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // until the ring drains, or hangs entirely when paused.
             if poll_input(&state, &mut ui, &mut playlist) || state.should_quit() {
                 print!("\x1B[?25h");
-                if prev_viz_lines != usize::MAX {
-                    let up = 2 + prev_viz_lines;
+                if prev_frame_lines != usize::MAX {
+                    // One row above the frame's anchor line (the gap row under
+                    // the banner), then erase down to wipe the whole frame.
+                    let up = 1 + prev_frame_lines;
                     print!("\x1B[{}F", up);
                 }
                 print!("\x1B[J");
@@ -1302,7 +1304,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // instead of refreshing in place. ED0 from home erases the
                     // same cells without the scroll.
                     print!("{}\x1B[0m\x1B[H\x1B[J{}", kitty_clear, composed.replace('\n', "\r\n"));
-                    prev_viz_lines = usize::MAX;
+                    prev_frame_lines = usize::MAX;
                     prev_viz_image_shown = false; // resize already cleared any viz image
                 }
 
@@ -1332,7 +1334,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 prev_viz_image_shown = viz_image_shown;
 
-                prev_viz_lines = print_status(&state, &mut ui, &filename, &track_info, &track_ext, current_eq, current_fx, current_cf, &mut stats, prev_viz_lines, &playlist, &viz_analyser);
+                prev_frame_lines = print_status(&state, &mut ui, &filename, &track_info, &track_ext, current_eq, current_fx, current_cf, &mut stats, prev_frame_lines, &playlist, &viz_analyser);
                 print!("\x1B[?2026l");
                 io::stdout().flush().ok();
 
@@ -1366,7 +1368,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     print!("\x1B[?25h");
 
-    let _ = prev_viz_lines; // no longer needed: full screen clear below covers everything
+    let _ = prev_frame_lines; // no longer needed: full screen clear below covers everything
     // Wipe the whole header (banner + status + viz + playlist/lyrics) and any
     // kitty graphic, leaving only the goodbye line.
     if matches!(cover::detect_protocol(), cover::GraphicsProtocol::Kitty) {

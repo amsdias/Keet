@@ -84,8 +84,47 @@ fn visible_len(s: &str) -> usize {
     s.chars().count()
 }
 
+/// Counts the frame lines actually emitted below the first (anchor) row, so
+/// the caller's cursor-up math is derived from what was printed instead of
+/// predicted by hand — predicted counts drifting from printed reality was a
+/// recurring off-by-one source (the next frame's cursor-up then lands
+/// mid-frame and the layout smears).
+struct FrameWriter {
+    below_first: usize,
+}
+
+impl FrameWriter {
+    fn new() -> Self {
+        Self { below_first: 0 }
+    }
+
+    /// Print the frame's first line in place (carriage return + erase): the
+    /// anchor row the next frame's cursor-up returns to. Not counted.
+    fn first_line(&mut self, s: &str) {
+        print!("\r\x1B[K{}", s);
+    }
+
+    /// Advance one line and print with erase-to-EOL.
+    fn line(&mut self, s: &str) {
+        print!("\n\r\x1B[K{}", s);
+        self.below_first += 1;
+    }
+
+    /// Advance one line and print WITHOUT erase — sixel blocks erase
+    /// themselves, and an EL here would wipe that row's slice of the image.
+    fn line_raw(&mut self, s: &str) {
+        print!("\n\r{}", s);
+        self.below_first += 1;
+    }
+
+    /// Lines emitted below the anchor row this frame.
+    fn count(&self) -> usize {
+        self.below_first
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // cohesive render context; bundling into a struct adds no clarity
-pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_info: &str, ext: &str, eq_preset: &crate::eq::EqPreset, fx_name: &str, cf_name: &str, stats: &mut StatsMonitor, prev_viz_lines: usize, playlist: &[PathBuf], analyser: &VizAnalyser) -> usize {
+pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_info: &str, ext: &str, eq_preset: &crate::eq::EqPreset, fx_name: &str, cf_name: &str, stats: &mut StatsMonitor, prev_frame_lines: usize, playlist: &[PathBuf], analyser: &VizAnalyser) -> usize {
     let viz_mode = state.viz_mode();
     let viz_style = state.viz_style();
     let eq_name = &eq_preset.name;
@@ -166,16 +205,18 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
     let max_name = term_w.saturating_sub(overhead).min(35);
     let display_name = truncate_plain(name, max_name);
 
-    // Move cursor back to start of our output area (single atomic escape)
-    if prev_viz_lines != usize::MAX {
-        let up = 1 + prev_viz_lines;
-        print!("\x1B[{}F", up); // CPL: move up N lines, go to column 1
+    // Move cursor back to the frame's anchor row (single atomic escape).
+    // prev_frame_lines = lines the previous frame emitted below its first
+    // row, as counted by FrameWriter — derived, not predicted.
+    if prev_frame_lines != usize::MAX && prev_frame_lines > 0 {
+        print!("\x1B[{}F", prev_frame_lines); // CPL: up N lines, column 1
     }
+    let mut w = FrameWriter::new();
 
     // Line 1: Track info (truncated to terminal width)
     let ic = icon_color_for_ext(ext);
     let line1 = format!("{C_DIM}[{track}/{total}]{C_RESET} {ic}♪{C_RESET} {C_BOLD}{C_CYAN}{display_name}{C_RESET} {C_DIM}{track_info}{C_RESET}");
-    print!("\r\x1B[K{}\n", truncate_ansi(&line1, term_w));
+    w.first_line(&truncate_ansi(&line1, term_w));
 
     // Line 2: Progress (truncated to terminal width)
     let vol = state.volume.load(Ordering::Relaxed);
@@ -213,11 +254,11 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
         String::new()
     };
     let line2 = format!("  {icon_color}{icon}{C_RESET} {C_BOLD}[{cur}/{tot}]{C_RESET} {C_GREEN}{bar_filled}{C_RESET} {C_DIM}vol:{vol}%{eq_display}{fx_display}{cf_display}{clip_display}{bal_display} {fader} buf:{buf_pct}%{stats_display} {{V}}:{next_viz} {{B}}:{next_style}{C_RESET}");
-    print!("\r\x1B[K{}", truncate_ansi(&line2, term_w));
+    w.line(&truncate_ansi(&line2, term_w));
 
     // EQ curve visualization (when non-Flat preset is active)
     if eq_line {
-        print!("\n\r\x1B[K{}", eq_curve);
+        w.line(&eq_curve);
     }
 
     // Separation line and content area
@@ -229,7 +270,7 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
         ui.last_visible_rows = visible_rows;
 
         // Separator
-        print!("\n\r\x1B[K  {C_DIM}{}{C_RESET}", "─".repeat(term_w.saturating_sub(2)));
+        w.line(&format!("  {C_DIM}{}{C_RESET}", "─".repeat(term_w.saturating_sub(2))));
 
         let search_active = matches!(&ui.input_mode, InputMode::Search(q) if !q.is_empty());
         // Compute the item count without materializing the full index vector.
@@ -258,9 +299,9 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
         ui.scroll_offset = ui.scroll_offset.min(max_offset);
 
         if items_len == 0 && search_active {
-            print!("\n\r\x1B[K  {C_DIM}(no matches){C_RESET}");
+            w.line(&format!("  {C_DIM}(no matches){C_RESET}"));
             for _ in 1..visible_rows {
-                print!("\n\r\x1B[K");
+                w.line("");
             }
         } else {
             let visible_count = visible_rows.min(items_len.saturating_sub(ui.scroll_offset));
@@ -320,12 +361,12 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
                     format!(" {marker} {C_DIM}{num}{C_RESET}  {truncated_name}{album_part}{dur_part}")
                 };
 
-                print!("\n\r\x1B[K{}", line);
+                w.line(&line);
             }
 
             // Pad remaining rows
             for _ in visible_count..visible_rows {
-                print!("\n\r\x1B[K");
+                w.line("");
             }
         }
 
@@ -345,12 +386,11 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
                 }
             }
         };
-        print!("\n\r\x1B[K{}", truncate_ansi(&footer, term_w));
+        w.line(&truncate_ansi(&footer, term_w));
 
-        let total_lines = 1 + visible_rows + 1; // separator + rows + footer
         print!("\x1B[J");
         io::stdout().flush().ok();
-        return total_lines;
+        return w.count();
     }
 
     // Lyrics view
@@ -361,7 +401,7 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
         let visible_rows = term_h.saturating_sub(header_lines + footer_lines + ui.banner_lines).max(1);
 
         // Separator
-        print!("\n\r\x1B[K  {C_DIM}{}{C_RESET}", "─".repeat(term_w.saturating_sub(2)));
+        w.line(&format!("  {C_DIM}{}{C_RESET}", "─".repeat(term_w.saturating_sub(2))));
 
         if let Some(ref lyrics) = ui.lyrics {
             let total_lines = lyrics.line_count();
@@ -393,15 +433,15 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
                     } else {
                         format!("  {C_DIM}{text}{C_RESET}")
                     };
-                    print!("\n\r\x1B[K{}", truncate_ansi(&line, term_w));
+                    w.line(&truncate_ansi(&line, term_w));
                 } else {
-                    print!("\n\r\x1B[K");
+                    w.line("");
                 }
             }
         } else {
-            print!("\n\r\x1B[K  {C_DIM}(no lyrics available){C_RESET}");
+            w.line(&format!("  {C_DIM}(no lyrics available){C_RESET}"));
             for _ in 1..visible_rows {
-                print!("\n\r\x1B[K");
+                w.line("");
             }
         }
 
@@ -412,49 +452,48 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
         } else { String::new() };
         let sync_hint = if is_synced { "  [A/D] sync" } else { "" };
         let footer = format!("  {C_DIM}[Y] close  [W/S] scroll{sync_hint}{offset_display}{C_RESET}");
-        print!("\n\r\x1B[K{}", truncate_ansi(&footer, term_w));
+        w.line(&truncate_ansi(&footer, term_w));
 
-        let total_lines = 1 + visible_rows + 1;
         print!("\x1B[J");
         io::stdout().flush().ok();
-        return total_lines;
+        return w.count();
     }
 
     // Original Player mode rendering below
     if viz_mode != VizMode::None {
-        print!("\n\r\x1B[K  {C_DIM}{}{C_RESET}", "─".repeat(term_w.saturating_sub(2)));
+        w.line(&format!("  {C_DIM}{}{C_RESET}", "─".repeat(term_w.saturating_sub(2))));
     }
 
     match viz_mode {
         VizMode::None => {}
         VizMode::VuMeter => {
             for line in render_vu_meter(state, viz_style, term_w) {
-                print!("\n\r\x1B[K{}", line);
+                w.line(&line);
             }
         }
         VizMode::SpectrumHorizontal => {
             for line in render_spectrum_horizontal(state, viz_style) {
-                print!("\n\r\x1B[K{}", line);
+                w.line(&line);
             }
         }
         VizMode::SpectrumVertical => {
             for line in render_spectrum_vertical(state, viz_style) {
-                print!("\n\r\x1B[K{}", line);
+                w.line(&line);
             }
         }
         VizMode::Oscilloscope => {
             for line in render_oscilloscope(analyser, viz_style, term_w) {
-                print!("\n\r\x1B[K{}", line);
+                w.line(&line);
             }
         }
         VizMode::Lissajous => {
             for line in render_lissajous(analyser, viz_style, term_w) {
-                print!("\n\r\x1B[K{}", line);
+                w.line(&line);
             }
         }
         VizMode::Spectrogram => {
             for line in render_spectrogram(analyser, viz_style, term_w) {
-                print!("\n\r\x1B[K{}", line);
+                w.line(&line);
             }
         }
         VizMode::SpectrogramAnalysis => {
@@ -463,34 +502,35 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
             // Sixel: NO erase-to-EOL — the row-1 transmit paints the whole
             // block, and erasing the following rows would wipe the image down
             // to a 1-row strip. The sixel block erases itself before painting.
-            let el = if analysis_needs_raw_lines() { "" } else { "\x1B[K" };
+            let raw = analysis_needs_raw_lines();
             // Force a full re-emit when the screen was repainted from scratch
             // this frame (resize/viz-switch/skip path), when the block wasn't
             // ours last frame, or when the layout height changed (EQ curve
             // line toggling, transient status row) — the block moves rows
             // then, and a skipped emit would leave the image stranded at the
-            // old position.
-            let force = prev_viz_lines == usize::MAX
+            // old position. Predicted height below the anchor = line2 (1) +
+            // viz_lines; compared against the previous frame's derived count.
+            let force = prev_frame_lines == usize::MAX
                 || !block_was_intact
-                || viz_lines != prev_viz_lines;
+                || 1 + viz_lines != prev_frame_lines;
             ui.spectro_block_intact = true;
             for line in render_spectrogram_analysis(analyser, term_w, log_axis, state.is_paused(), ana_rows, force) {
-                print!("\n\r{}{}", el, line);
+                if raw { w.line_raw(&line); } else { w.line(&line); }
             }
         }
     }
 
     // Show status message in Player mode
     if let Some(msg) = ui.take_status() {
-        print!("\n\r\x1B[K  {C_GREEN}{msg}{C_RESET}");
+        w.line(&format!("  {C_GREEN}{msg}{C_RESET}"));
         print!("\x1B[J");
         io::stdout().flush().ok();
-        return viz_lines + 1;
+        return w.count();
     }
 
     print!("\x1B[J");
     io::stdout().flush().ok();
-    viz_lines
+    w.count()
 }
 
 pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<PathBuf>) -> bool {
@@ -1433,6 +1473,17 @@ pub fn run_first_launch_picker() -> Option<PathBuf> {
 #[cfg(test)]
 mod ui_tests {
     use super::*;
+
+    #[test]
+    fn frame_writer_derives_count_from_emission() {
+        let mut w = FrameWriter::new();
+        w.first_line("anchor");
+        assert_eq!(w.count(), 0, "the first line is the anchor row, not counted");
+        w.line("progress");
+        w.line_raw("sixel transmit");
+        w.line("");
+        assert_eq!(w.count(), 3, "count must equal the lines actually emitted");
+    }
 
     #[test]
     fn format_time_under_an_hour_keeps_mm_ss() {
