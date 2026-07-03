@@ -978,3 +978,326 @@ mod tests {
         assert_eq!(consumer.slots(), 48);
     }
 }
+
+/// DSP-chain integration tests: decode real files through the full producer
+/// chain (decode → to-stereo → resample → EQ → effects → ReplayGain →
+/// crossfeed → balance → limiter) with the test draining the ring in place of
+/// the audio callback. No audio device involved. WAV fixtures are synthesized
+/// into a temp dir; compressed fixtures live in tests/fixtures (see
+/// generate.sh there).
+#[cfg(test)]
+mod chain_tests {
+    use super::*;
+    use crate::state::RgMode;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    // ---- WAV synthesis -----------------------------------------------------
+
+    #[derive(Clone, Copy)]
+    enum WavFmt {
+        Pcm16,
+        Pcm24,
+        F32,
+    }
+
+    fn write_wav(path: &PathBuf, rate: u32, channels: u16, fmt: WavFmt, interleaved: &[f32]) {
+        let (tag, bits): (u16, u16) = match fmt {
+            WavFmt::Pcm16 => (1, 16),
+            WavFmt::Pcm24 => (1, 24),
+            WavFmt::F32 => (3, 32),
+        };
+        let bytes_per = (bits / 8) as u32;
+        let mut data: Vec<u8> = Vec::with_capacity(interleaved.len() * bytes_per as usize);
+        for &s in interleaved {
+            let s = s.clamp(-1.0, 1.0);
+            match fmt {
+                WavFmt::Pcm16 => {
+                    data.extend_from_slice(&((s * 32767.0).round() as i16).to_le_bytes());
+                }
+                WavFmt::Pcm24 => {
+                    let v = (s * 8_388_607.0).round() as i32;
+                    data.extend_from_slice(&v.to_le_bytes()[..3]);
+                }
+                WavFmt::F32 => data.extend_from_slice(&s.to_le_bytes()),
+            }
+        }
+        let block_align = channels as u32 * bytes_per;
+        // IEEE-float WAVs carry a `fact` chunk (sample count) per spec.
+        let fact_len: u32 = if matches!(fmt, WavFmt::F32) { 12 } else { 0 };
+        let mut out: Vec<u8> = Vec::with_capacity(data.len() + 64);
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&(4 + 24 + fact_len + 8 + data.len() as u32).to_le_bytes());
+        out.extend_from_slice(b"WAVE");
+        out.extend_from_slice(b"fmt ");
+        out.extend_from_slice(&16u32.to_le_bytes());
+        out.extend_from_slice(&tag.to_le_bytes());
+        out.extend_from_slice(&channels.to_le_bytes());
+        out.extend_from_slice(&rate.to_le_bytes());
+        out.extend_from_slice(&(rate * block_align).to_le_bytes());
+        out.extend_from_slice(&(block_align as u16).to_le_bytes());
+        out.extend_from_slice(&bits.to_le_bytes());
+        if fact_len > 0 {
+            out.extend_from_slice(b"fact");
+            out.extend_from_slice(&4u32.to_le_bytes());
+            out.extend_from_slice(&((interleaved.len() / channels as usize) as u32).to_le_bytes());
+        }
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&data);
+        std::fs::write(path, out).expect("write wav fixture");
+    }
+
+    fn sine(rate: u32, secs: f32, freq: f32, amp: f32) -> Vec<f32> {
+        let n = (rate as f32 * secs) as usize;
+        (0..n)
+            .map(|i| amp * (2.0 * std::f32::consts::PI * freq * i as f32 / rate as f32).sin())
+            .collect()
+    }
+
+    fn interleave(chs: &[Vec<f32>]) -> Vec<f32> {
+        let n = chs[0].len();
+        let mut out = Vec::with_capacity(n * chs.len());
+        for i in 0..n {
+            for ch in chs {
+                out.push(ch[i]);
+            }
+        }
+        out
+    }
+
+    fn tmp_wav(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join("keet_chain_tests");
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join(format!("{}_{}.wav", name, std::process::id()))
+    }
+
+    fn fixture(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name)
+    }
+
+    // ---- harness -----------------------------------------------------------
+
+    /// Run files through the real producer chain with the test acting as the
+    /// audio callback: drain the ring, collect every output sample.
+    fn run_chain(paths: &[PathBuf], output_rate: u32, rg: RgMode) -> Vec<f32> {
+        let state = Arc::new(PlayerState::new());
+        let cap = 1 << 16;
+        state.ring_capacity.store(cap, Ordering::Relaxed);
+        state.rg_mode.store(rg as u8, Ordering::Relaxed);
+        let (mut producer, mut consumer) = rtrb::RingBuffer::<f32>::new(cap);
+        let st = Arc::clone(&state);
+        let list = paths.to_vec();
+        let handle = thread::spawn(move || {
+            let mut eq_chain = crate::eq::EqChain::new();
+            let eq_presets = crate::eq::builtin_presets();
+            let mut fx_chain = crate::effects::EffectsChain::new(output_rate as f32);
+            let fx_presets = crate::effects::builtin_presets();
+            let mut cf_filter = crate::crossfeed::CrossfeedFilter::new();
+            let cf_presets = crate::crossfeed::builtin_presets();
+            decode_playlist(
+                &list, 0, &mut producer, &st, output_rate, false,
+                &mut eq_chain, &eq_presets, &mut fx_chain, &fx_presets,
+                0, &mut cf_filter, &cf_presets,
+            );
+        });
+        let mut out = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            while let Ok(s) = consumer.pop() {
+                out.push(s);
+            }
+            if state.producer_done.load(Ordering::Relaxed) && consumer.slots() == 0 {
+                break;
+            }
+            if Instant::now() > deadline {
+                state.quit();
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        let _ = handle.join();
+        if let Ok(mut e) = state.decode_error.lock() {
+            if let Some(msg) = e.take() {
+                panic!("decode error: {}", msg);
+            }
+        }
+        out
+    }
+
+    // ---- analysis ----------------------------------------------------------
+
+    fn channels(out: &[f32]) -> (Vec<f32>, Vec<f32>) {
+        let l = out.iter().step_by(2).copied().collect();
+        let r = out.iter().skip(1).step_by(2).copied().collect();
+        (l, r)
+    }
+
+    /// Goertzel amplitude of a tone, measured over the middle of the signal
+    /// (away from edge transients). The window is trimmed to a whole number
+    /// of cycles of the target frequency — an off-bin tone suffers up to
+    /// ~3.9 dB of rectangular-window scalloping loss, which read as a fake
+    /// 17% level drop in the resampler test before this trim.
+    fn tone_amplitude(samples: &[f32], rate: f32, freq: f32) -> f32 {
+        let total = samples.len();
+        assert!(total > 8192, "not enough samples to analyze: {}", total);
+        let win = &samples[2048..total - 2048];
+        let cycles = (freq as f64 * win.len() as f64 / rate as f64).floor();
+        let n = ((cycles * rate as f64 / freq as f64).round() as usize).min(win.len());
+        let win = &win[..n];
+        let n = n as f64;
+        let k = cycles;
+        let w = 2.0 * std::f64::consts::PI * k / n;
+        let coeff = 2.0 * w.cos();
+        let (mut s1, mut s2) = (0.0f64, 0.0f64);
+        for &x in win {
+            let s0 = x as f64 + coeff * s1 - s2;
+            s2 = s1;
+            s1 = s0;
+        }
+        let power = s1 * s1 + s2 * s2 - coeff * s1 * s2;
+        (2.0 * power.max(0.0).sqrt() / n) as f32
+    }
+
+    // ---- tests ---------------------------------------------------------
+
+    #[test]
+    fn chain_preserves_stereo_identity_pitch_amplitude_and_duration() {
+        let path = tmp_wav("stereo");
+        let l = sine(44100, 1.0, 440.0, 0.5);
+        let r = sine(44100, 1.0, 1000.0, 0.5);
+        write_wav(&path, 44100, 2, WavFmt::Pcm16, &interleave(&[l, r]));
+        let out = run_chain(&[path], 44100, RgMode::Off);
+        let frames = out.len() / 2;
+        assert!((frames as i64 - 44100).unsigned_abs() < 1024, "duration: {} frames", frames);
+        let (l, r) = channels(&out);
+        assert!((tone_amplitude(&l, 44100.0, 440.0) - 0.5).abs() < 0.05, "L tone level");
+        assert!(tone_amplitude(&l, 44100.0, 1000.0) < 0.05, "R leaked into L");
+        assert!((tone_amplitude(&r, 44100.0, 1000.0) - 0.5).abs() < 0.05, "R tone level");
+        assert!(tone_amplitude(&r, 44100.0, 440.0) < 0.05, "L leaked into R");
+    }
+
+    #[test]
+    fn chain_plays_mono_at_correct_speed_into_both_channels() {
+        // The historical bug: mono played at 2x speed (interleave assumed
+        // stereo). Duration alone catches it — 1 s of mono must come out as
+        // ~44100 stereo frames, not ~22050.
+        let path = tmp_wav("mono");
+        write_wav(&path, 44100, 1, WavFmt::Pcm16, &sine(44100, 1.0, 440.0, 0.5));
+        let out = run_chain(&[path], 44100, RgMode::Off);
+        let frames = out.len() / 2;
+        assert!((frames as i64 - 44100).unsigned_abs() < 1024, "duration: {} frames", frames);
+        let (l, r) = channels(&out);
+        assert!((tone_amplitude(&l, 44100.0, 440.0) - 0.5).abs() < 0.05);
+        let max_diff = l.iter().zip(&r).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(max_diff < 1e-3, "mono must duplicate identically: max L-R diff {}", max_diff);
+    }
+
+    #[test]
+    fn chain_resamples_preserving_duration_and_pitch() {
+        // 44.1 kHz file on a 48 kHz output: engages the resampler including
+        // its EOF flush (the class that appended ~23 ms of silence).
+        let path = tmp_wav("resample");
+        let l = sine(44100, 1.0, 440.0, 0.5);
+        let r = sine(44100, 1.0, 1000.0, 0.5);
+        write_wav(&path, 44100, 2, WavFmt::Pcm16, &interleave(&[l, r]));
+        let out = run_chain(&[path], 48000, RgMode::Off);
+        let frames = out.len() / 2;
+        assert!(
+            (frames as i64 - 48000).unsigned_abs() < 1500,
+            "resampled duration: {} frames (want ~48000)",
+            frames
+        );
+        let (l, r) = channels(&out);
+        let al = tone_amplitude(&l, 48000.0, 440.0);
+        let ar = tone_amplitude(&r, 48000.0, 1000.0);
+        assert!((al - 0.5).abs() < 0.06, "440 Hz level through resampler: {}", al);
+        assert!((ar - 0.5).abs() < 0.06, "1000 Hz level through resampler: {}", ar);
+    }
+
+    #[test]
+    fn chain_decodes_24bit_and_float_wavs() {
+        // The convert_samples fallthrough class: non-16-bit sources used to
+        // produce silence or clicks.
+        for (name, fmt) in [("s24", WavFmt::Pcm24), ("f32", WavFmt::F32)] {
+            let path = tmp_wav(name);
+            write_wav(&path, 44100, 1, fmt, &sine(44100, 1.0, 440.0, 0.5));
+            let out = run_chain(&[path], 44100, RgMode::Off);
+            let frames = out.len() / 2;
+            assert!((frames as i64 - 44100).unsigned_abs() < 1024, "{}: {} frames", name, frames);
+            let (l, _) = channels(&out);
+            let amp = tone_amplitude(&l, 44100.0, 440.0);
+            assert!((amp - 0.5).abs() < 0.05, "{}: tone level {}", name, amp);
+        }
+    }
+
+    #[test]
+    fn chain_downmixes_5_1_itu_style() {
+        // SMPTE order FL FR FC LFE BL BR. FL carries 440, FC carries 1000,
+        // LFE carries 330 (must be DROPPED). Expect: L = 440 at full level +
+        // 1000 at -3 dB; R = 1000 at -3 dB only; 330 nowhere.
+        let rate = 44100;
+        let silent = vec![0.0f32; rate as usize];
+        let chs = [
+            sine(rate, 1.0, 440.0, 0.4),  // FL
+            silent.clone(),                // FR
+            sine(rate, 1.0, 1000.0, 0.4), // FC
+            sine(rate, 1.0, 330.0, 0.8),  // LFE
+            silent.clone(),                // BL
+            silent,                        // BR
+        ];
+        let path = tmp_wav("five_one");
+        write_wav(&path, rate, 6, WavFmt::Pcm16, &interleave(&chs));
+        let out = run_chain(&[path], rate, RgMode::Off);
+        let (l, r) = channels(&out);
+        let g = std::f32::consts::FRAC_1_SQRT_2;
+        assert!((tone_amplitude(&l, 44100.0, 440.0) - 0.4).abs() < 0.05, "FL into L");
+        assert!(tone_amplitude(&r, 44100.0, 440.0) < 0.05, "FL must not reach R");
+        assert!((tone_amplitude(&l, 44100.0, 1000.0) - 0.4 * g).abs() < 0.05, "center at -3 dB into L");
+        assert!((tone_amplitude(&r, 44100.0, 1000.0) - 0.4 * g).abs() < 0.05, "center at -3 dB into R");
+        assert!(tone_amplitude(&l, 44100.0, 330.0) < 0.05, "LFE must be dropped (L)");
+        assert!(tone_amplitude(&r, 44100.0, 330.0) < 0.05, "LFE must be dropped (R)");
+    }
+
+    #[test]
+    fn chain_decodes_flac_fixture_losslessly() {
+        let out = run_chain(&[fixture("sine_lr.flac")], 44100, RgMode::Off);
+        let frames = out.len() / 2;
+        assert!((frames as i64 - 44100).unsigned_abs() < 1024, "duration: {} frames", frames);
+        let (l, r) = channels(&out);
+        assert!((tone_amplitude(&l, 44100.0, 440.0) - 0.5).abs() < 0.05);
+        assert!(tone_amplitude(&l, 44100.0, 1000.0) < 0.05);
+        assert!((tone_amplitude(&r, 44100.0, 1000.0) - 0.5).abs() < 0.05);
+        assert!(tone_amplitude(&r, 44100.0, 440.0) < 0.05);
+    }
+
+    #[test]
+    fn chain_decodes_mp3_fixture_within_lossy_tolerances() {
+        // MP3 has encoder delay/padding, so duration is loose; joint stereo
+        // and psychoacoustics smear levels a little.
+        let out = run_chain(&[fixture("sine_lr.mp3")], 44100, RgMode::Off);
+        let frames = out.len() / 2;
+        assert!(
+            (frames as i64 - 44100).unsigned_abs() < 4410,
+            "mp3 duration: {} frames (want 44100 +/- 10%)",
+            frames
+        );
+        let (l, r) = channels(&out);
+        assert!(tone_amplitude(&l, 44100.0, 440.0) > 0.35, "L tone survived encoding");
+        assert!(tone_amplitude(&l, 44100.0, 1000.0) < 0.1, "stereo separation");
+        assert!(tone_amplitude(&r, 44100.0, 1000.0) > 0.35, "R tone survived encoding");
+    }
+
+    #[test]
+    fn chain_applies_replaygain_track_gain() {
+        // Fixture is tagged REPLAYGAIN_TRACK_GAIN=-6.02 dB: 0.5 amplitude in,
+        // ~0.25 out when rg-mode is Track.
+        let out = run_chain(&[fixture("sine_lr_rg.flac")], 44100, RgMode::Track);
+        let (l, _) = channels(&out);
+        let amp = tone_amplitude(&l, 44100.0, 440.0);
+        assert!((amp - 0.25).abs() < 0.04, "rg-adjusted level: {} (want ~0.25)", amp);
+    }
+}
