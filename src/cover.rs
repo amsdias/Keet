@@ -252,6 +252,8 @@ fn fetch_itunes(artist: &str, album: &str) -> Option<Vec<u8>> {
         urlencoded(&query),
     );
 
+    // ureq 3.3 `timeout_global` trips before TLS finishes — split the budget
+    // across connect + receive instead. See lyrics.rs for the same workaround.
     let tls = ureq::tls::TlsConfig::builder()
         .provider(ureq::tls::TlsProvider::NativeTls)
         .build();

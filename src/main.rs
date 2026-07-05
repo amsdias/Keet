@@ -8,11 +8,17 @@
 // Controls: Space=Pause, ↑↓=Tracks, ←→=Seek ±10s, V=Viz, +/-=Vol, Q=Quit
 
 mod state;
+mod theme;
+mod config;
+mod library;
+mod eq_ui;
 mod viz;
 mod audio;
 mod decode;
 mod playlist;
 mod ui;
+mod ui_hifi;
+mod ui_minimal;
 mod eq;
 mod effects;
 mod media_keys;
@@ -40,7 +46,7 @@ use viz::{StatsMonitor, VizAnalyser};
 use audio::{build_stream, set_output_sample_rate, probe_sample_rate, fix_bluetooth_sample_rate};
 use decode::{decode_playlist, await_consumer_drain};
 use playlist::{build_playlist, shuffle_list};
-use ui::{print_status, poll_input, format_time};
+use ui::{print_status, poll_input, poll_auto_sort, poll_library_tree, arm_auto_sort, format_time};
 use resume::{ResumeState, save_state, load_state};
 
 /// Kick off the lyrics loader on a background thread and install its receiver on `ui`.
@@ -194,6 +200,9 @@ fn build_resume_state(
         exclusive: Some(player_state.exclusive.load(std::sync::atomic::Ordering::Relaxed)),
         crossfeed_preset: Some(cf_presets[player_state.crossfeed_index()].name.clone()),
         balance: Some(player_state.balance_value()),
+        theme: Some(player_state.theme_kind().name().to_string()),
+        eq_gains: Some(player_state.eq_gains_array().to_vec()),
+        eq_custom: Some(player_state.is_eq_custom()),
     }
 }
 
@@ -286,6 +295,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("      --device <name>    Output device (substring match)");
         println!("      --exclusive        Exclusive mode: per-track sample rate, device lock (macOS)");
         println!("      --no-cover         Disable album cover display");
+        println!("      --theme <name>     UI theme: classic (default), minimal, hifi");
         println!("      --list-devices     List available output devices and exit");
         println!("  -h, --help             Show this help");
         println!();
@@ -309,6 +319,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  R            Rescan folders for new files");
         println!("  Z            Toggle shuffle");
         println!("  Shift+R      Toggle repeat (Off → All → One)");
+        println!("  T            Cycle UI theme (Classic → Minimal → HiFi)");
         println!("  O            Open a new source (type a path)");
         println!("  P            Pick a new source (native folder dialog)");
         println!("  I            Toggle CPU/memory stats");
@@ -333,6 +344,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("\x1B[1mCUSTOM PRESETS\x1B[0m");
         println!("  EQ:      ~/.config/keet/eq/*.json");
         println!("  Effects: ~/.config/keet/effects/*.json");
+        println!();
+        println!("\x1B[1mCONFIG\x1B[0m");
+        println!("  ~/.config/keet/config.json — persistent defaults, e.g. {{\"theme\": \"minimal\"}}");
         return Ok(());
     }
 
@@ -343,7 +357,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let flags = ["--shuffle", "-s", "--repeat", "-r", "--quality", "-q", "--eq", "-e", "--fx", "--crossfade", "-x", "--rg-mode", "--list-devices", "--device", "--exclusive", "--no-cover", "--help", "-h"];
+    let flags = ["--shuffle", "-s", "--repeat", "-r", "--quality", "-q", "--eq", "-e", "--fx", "--crossfade", "-x", "--rg-mode", "--list-devices", "--device", "--exclusive", "--no-cover", "--theme", "--help", "-h"];
     // Loaded once and reused for the volume/EQ/device restore further down.
     let resume_state_loaded = if args.len() < 2 { load_state() } else { None };
     let (source_paths, shuffle, repeat_mode) = if args.len() < 2 {
@@ -387,7 +401,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let r = args.iter().any(|a| a == "--repeat" || a == "-r");
         // Collect positional args (not flags, not values after flag options)
         let mut positional = Vec::new();
-        let value_flags = ["--eq", "-e", "--fx", "--crossfade", "-x", "--rg-mode", "--device"];
+        let value_flags = ["--eq", "-e", "--fx", "--crossfade", "-x", "--rg-mode", "--device", "--theme"];
         let mut skip_next = false;
         for arg in &args[1..] {
             if skip_next { skip_next = false; continue; }
@@ -427,6 +441,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|i| args.get(i + 1).cloned());
     let exclusive = args.iter().any(|a| a == "--exclusive");
     let cover_enabled = !args.iter().any(|a| a == "--no-cover");
+    let theme_arg: Option<theme::ThemeKind> = args.iter().position(|a| a == "--theme")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| {
+            theme::ThemeKind::from_str(s).or_else(|| {
+                eprintln!("Unknown theme '{}' (expected: classic, minimal, hifi)", s);
+                None
+            })
+        });
+    // Persistent user preferences (config.json) — applies on every launch.
+    let app_config = config::load();
 
     let mut playlist = {
         let mut combined = Vec::new();
@@ -511,6 +535,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(idx) = eq_presets.iter().position(|p| p.name == rs.eq_preset) {
             state.eq_preset_index.store(idx, Ordering::Relaxed);
         }
+        // Restore a Custom (edited) graphic EQ, if that's what was saved.
+        if rs.eq_custom == Some(true) {
+            if let Some(ref g) = rs.eq_gains {
+                let arr: [f32; eq::EQ_BANDS] = std::array::from_fn(|i| {
+                    g.get(i).copied().unwrap_or(0.0).clamp(-eq::EQ_GAIN_LIMIT, eq::EQ_GAIN_LIMIT)
+                });
+                state.set_eq_gains(&arr);
+                state.eq_custom.store(true, Ordering::Relaxed);
+            }
+        }
         // Restore FX preset by name
         if let Some(idx) = fx_presets.iter().position(|p| p.name == rs.effects_preset) {
             state.effects_preset_index.store(idx, Ordering::Relaxed);
@@ -535,6 +569,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             state.balance.store(bal.clamp(-100, 100), Ordering::Relaxed);
         }
     }
+    // Resolve the launch theme: --theme flag → config.json default → resumed
+    // last-session theme → Classic. The config default applies on every launch
+    // (including with explicit source paths), unlike the resume theme.
+    let config_theme = app_config.theme.as_deref().and_then(theme::ThemeKind::from_str);
+    let resume_theme = resume_state_loaded
+        .as_ref()
+        .and_then(|rs| rs.theme.as_deref())
+        .and_then(theme::ThemeKind::from_str);
+    state.set_theme(theme::resolve_theme(theme_arg, config_theme, resume_theme));
 
     // Override device/exclusive from resume state when resuming with no args
     let mut device_arg = device_arg;
@@ -558,32 +601,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::fmt::Write as FmtWrite;
 
     let build_banner_box = |shuffle: bool, repeat_mode: state::RepeatMode, state: &PlayerState| -> String {
-        let pad_left = (inner_w - title.len()) / 2;
-        let pad_right = inner_w - title.len() - pad_left;
         let eq_name = &eq_presets[state.eq_index()].name;
         let fx_name = &fx_presets[state.effects_index()].name;
-        let eq_info = if eq_name != "Flat" { format!(" | EQ: {}", eq_name) } else { String::new() };
-        let fx_info = if fx_name != "None" { format!(" | FX: {}", fx_name) } else { String::new() };
-        let xfade_info = if crossfade_secs > 0 { format!(" | xfade: {}s", crossfade_secs) } else { String::new() };
         let cf_name = &cf_presets[state.crossfeed_index()].name;
-        let cf_info = if cf_name != "Off" { format!(" | crossfeed: {}", cf_name) } else { String::new() };
         let bal_val = state.balance_value();
-        let bal_info = if bal_val != 0 {
-            if bal_val < 0 { format!(" | bal: L{}%", -bal_val) } else { format!(" | bal: R{}%", bal_val) }
-        } else { String::new() };
-        let info = format!("{}{}{}{}{}{}{}{}",
-            if shuffle { "shuffle" } else { "sequential" },
-            repeat_mode.label(),
-            if hq_resampler { " | HQ" } else { "" },
-            eq_info, fx_info, xfade_info, cf_info, bal_info);
-        let info_pad = inner_w.saturating_sub(info.chars().count() + 2);
-        let mut s = String::new();
-        writeln!(s, "╔{}╗", "═".repeat(inner_w)).ok();
-        writeln!(s, "║{}{}{}║", " ".repeat(pad_left), title, " ".repeat(pad_right)).ok();
-        writeln!(s, "╠{}╣", "═".repeat(inner_w)).ok();
-        writeln!(s, "║  {}{}║", info, " ".repeat(info_pad)).ok();
-        writeln!(s, "╚{}╝", "═".repeat(inner_w)).ok();
-        s
+        let theme_kind = state.theme_kind();
+
+        match theme_kind {
+            theme::ThemeKind::HiFi | theme::ThemeKind::Minimal => {
+                // HiFi and Minimal render their own anchor row inside the
+                // rewind region (header strip / wordmark), so the static
+                // banner area is zero-height.
+                let _ = (shuffle, repeat_mode, eq_name, fx_name, cf_name, bal_val);
+                String::new()
+            }
+            _ => {
+                // Classic boxed banner.
+                let pad_left = (inner_w - title.len()) / 2;
+                let pad_right = inner_w - title.len() - pad_left;
+                let eq_info = if eq_name != "Flat" { format!(" | EQ: {}", eq_name) } else { String::new() };
+                let fx_info = if fx_name != "None" { format!(" | FX: {}", fx_name) } else { String::new() };
+                let xfade_info = if crossfade_secs > 0 { format!(" | xfade: {}s", crossfade_secs) } else { String::new() };
+                let cf_info = if cf_name != "Off" { format!(" | crossfeed: {}", cf_name) } else { String::new() };
+                let bal_info = if bal_val != 0 {
+                    if bal_val < 0 { format!(" | bal: L{}%", -bal_val) } else { format!(" | bal: R{}%", bal_val) }
+                } else { String::new() };
+                let info = format!("{}{}{}{}{}{}{}{}",
+                    if shuffle { "shuffle" } else { "sequential" },
+                    repeat_mode.label(),
+                    if hq_resampler { " | HQ" } else { "" },
+                    eq_info, fx_info, xfade_info, cf_info, bal_info);
+                let info_pad = inner_w.saturating_sub(info.chars().count() + 2);
+                let mut s = String::new();
+                writeln!(s, "╔{}╗", "═".repeat(inner_w)).ok();
+                writeln!(s, "║{}{}{}║", " ".repeat(pad_left), title, " ".repeat(pad_right)).ok();
+                writeln!(s, "╠{}╣", "═".repeat(inner_w)).ok();
+                writeln!(s, "║  {}{}║", info, " ".repeat(info_pad)).ok();
+                writeln!(s, "╚{}╝", "═".repeat(inner_w)).ok();
+                s
+            }
+        }
     };
 
     let banner_box = build_banner_box(shuffle, repeat_mode, &state);
@@ -603,18 +660,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let device_name = device.description()
             .map(|d| d.name().to_string())
             .unwrap_or_else(|_| "Unknown device".to_string());
-        writeln!(banner_tail, "\nDevice: {}", device_name).ok();
+        // Device info banner is Classic-only — Minimal/HiFi surface device
+        // and rate inline (SIGNAL block / header strip), and the extra rows
+        // would push content past the terminal bottom.
+        let classic = state.theme_kind() == theme::ThemeKind::Classic;
+        if classic {
+            writeln!(banner_tail, "\nDevice: {}", device_name).ok();
+        }
 
         // Fix stale sample rate on Bluetooth devices (CoreAudio can get stuck at wrong rate)
         let bt_rate = fix_bluetooth_sample_rate();
         if let Some(rate) = bt_rate {
-            writeln!(banner_tail, "Bluetooth device detected, using native {}Hz", rate).ok();
+            if classic {
+                writeln!(banner_tail, "Bluetooth device detected, using native {}Hz", rate).ok();
+            }
         }
 
         let default_config = device.default_output_config()?;
         let rate = bt_rate.unwrap_or_else(|| default_config.sample_rate());
         let default_channels = default_config.channels();
-        writeln!(banner_tail, "Initial output: {}Hz (device default: {}ch)", rate, default_channels).ok();
+        if classic {
+            writeln!(banner_tail, "Initial output: {}Hz (device default: {}ch)", rate, default_channels).ok();
+        }
         rate
     };
 
@@ -624,12 +691,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // OS media transport controls (media keys, AirPods, Bluetooth headphones)
     let mut media_controls = media_keys::setup(Arc::clone(&state));
 
-    writeln!(banner_tail, "\n{0}{{Space}}{1} Pause  {0}{{↑/↓}}{1} Track  {0}{{←/→}}{1} Seek  {0}{{+/-}}{1} Vol  {0}{{[/]}}{1} Bal  {0}{{Q}}{1} Quit",
-        "\x1B[2m", "\x1B[0m").ok();
-    writeln!(banner_tail, "{0}{{E}}{1} EQ  {0}{{X}}{1} FX  {0}{{C}}{1} Crossfeed  {0}{{F}}{1} Fader  {0}{{V/B}}{1} Viz  {0}{{I}}{1} Info  {0}{{Y}}{1} Lyrics",
-        "\x1B[2m", "\x1B[0m").ok();
-    writeln!(banner_tail, "{0}{{L}}{1} List  {0}{{R}}{1} Rescan  {0}{{Shift+R}}{1} Repeat  {0}{{Z}}{1} Shuffle  {0}{{O}}{1} Open  {0}{{P}}{1} Pick\n",
-        "\x1B[2m", "\x1B[0m").ok();
+    // Verbose banner help is Classic-only. Minimal and HiFi have their own
+    // footer key bars per the design handoff, and the extra rows would push
+    // content past the terminal bottom and cause the kitty cover to scroll
+    // out of its banner slot.
+    if state.theme_kind() == theme::ThemeKind::Classic {
+        writeln!(banner_tail, "\n{0}{{Space}}{1} Pause  {0}{{↑/↓}}{1} Track  {0}{{←/→}}{1} Seek  {0}{{+/-}}{1} Vol  {0}{{[/]}}{1} Bal  {0}{{Q}}{1} Quit",
+            "\x1B[2m", "\x1B[0m").ok();
+        writeln!(banner_tail, "{0}{{E}}{1} EQ  {0}{{X}}{1} FX  {0}{{C}}{1} Crossfeed  {0}{{F}}{1} Fader  {0}{{V/B}}{1} Viz  {0}{{I}}{1} Info  {0}{{Y}}{1} Lyrics",
+            "\x1B[2m", "\x1B[0m").ok();
+        writeln!(banner_tail, "{0}{{L}}{1} List  {0}{{R}}{1} Rescan  {0}{{Shift+R}}{1} Repeat  {0}{{Z}}{1} Shuffle  {0}{{O}}{1} Open  {0}{{P}}{1} Pick\n",
+            "\x1B[2m", "\x1B[0m").ok();
+    }
 
     // Print banner and count its lines
     let banner = format!("{}{}", banner_box, banner_tail);
@@ -661,6 +734,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         playlist.clone(),
         std::sync::Arc::clone(&metadata_cache),
     ));
+    // Arm the one-shot artist→album auto-sort for folder sources; it fires once
+    // the scan above loads tags (see poll_auto_sort in the main loop).
+    arm_auto_sort(&mut ui);
 
     // Set starting track for resume
     if let Some(ref rs) = resume_state_loaded {
@@ -852,7 +928,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let producer_handle = thread::spawn(move || {
             let mut eq_chain = eq::EqChain::new();
-            eq_chain.load_preset(&eq_presets_clone[state_clone.eq_index()], sr as f32);
+            if state_clone.is_eq_custom() {
+                eq_chain.load_gains(&state_clone.eq_gains_array(), sr as f32);
+            } else {
+                eq_chain.load_preset(&eq_presets_clone[state_clone.eq_index()], sr as f32);
+            }
             let mut fx_chain = effects::EffectsChain::new(sr as f32);
             fx_chain.load_preset(&fx_presets_clone[state_clone.effects_index()], sr as f32);
             let mut cf_filter = crossfeed::CrossfeedFilter::new();
@@ -996,6 +1076,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let _ = producer_handle.join();
                 break 'playlist;
             }
+
+            // Fire the one-shot artist→album auto-sort once the metadata scan
+            // has loaded tags (no-op until armed + scan finished + not shuffling).
+            poll_auto_sort(&state, &mut ui, &mut playlist);
+            // Keep the library tree fresh while it's showing (no-op otherwise).
+            poll_library_tree(&mut ui, &playlist);
 
             // Check for track transitions from the producer
             let current_count = state.track_transition_count.load(Ordering::Acquire);
@@ -1265,14 +1351,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Ok(cover) = rx.try_recv() {
                         ui.cover = cover;
                         ui.cover_receiver = None;
-                        ui.banner_dirty = true; // redraw to show new cover or clear stale one
+                        // Only Classic shows the cover, so only Classic needs
+                        // a banner repaint when it arrives. For Minimal/HiFi
+                        // we skip the dirty flag — the full-screen redraw
+                        // would briefly flash the banner before the per-frame
+                        // UI overwrites it.
+                        if state.theme_kind() == theme::ThemeKind::Classic {
+                            ui.banner_dirty = true;
+                        }
                     }
                 }
 
                 if ui.banner_dirty {
                     ui.banner_dirty = false;
                     let new_box = build_banner_box(ui.shuffle, ui.repeat_mode, &state);
-                    ui.banner_text = format!("{}{}", new_box, ui.banner_tail);
+                    // banner_tail (device info + verbose key help) is Classic-only.
+                    // It was built once at startup, so if the user starts in
+                    // Classic and presses T to switch themes, the cached tail
+                    // would otherwise bleed into the new theme's banner.
+                    ui.banner_text = if state.theme_kind() == theme::ThemeKind::Classic {
+                        format!("{}{}", new_box, ui.banner_tail)
+                    } else {
+                        new_box
+                    };
                     ui.terminal_resized = true;
                 }
 
@@ -1289,7 +1390,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // have wrapped at the previous terminal width).
                     // In raw mode \n doesn't imply \r, so use \r\n.
                     let term_w = terminal::size().map(|(w, _)| w as usize).unwrap_or(120);
-                    let (composed, lines) = compose_banner(&ui.banner_text, ui.cover.as_ref(), term_w);
+                    // Cover overlay is Classic-only — variant-b/c mocks are
+                    // text-first and the kitty image scrolls out of its slot
+                    // once content exceeds terminal height. For non-Classic
+                    // themes, skip compose_banner entirely so no placeholder
+                    // black box is reserved in the cover slot.
+                    let (composed, lines) = if state.theme_kind() == theme::ThemeKind::Classic {
+                        compose_banner(&ui.banner_text, ui.cover.as_ref(), term_w)
+                    } else {
+                        let count = ui.banner_text.lines().count();
+                        (ui.banner_text.clone(), count)
+                    };
                     ui.banner_lines = lines;
                     // Remove any previously-placed kitty graphic before redrawing.
                     // No-op on terminals that don't speak the protocol.

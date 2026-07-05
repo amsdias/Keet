@@ -240,6 +240,10 @@ pub struct PlayerState {
     pub(crate) eq_preset_index: AtomicUsize,
     pub(crate) eq_preset_count: AtomicUsize,
     pub(crate) eq_changed: AtomicBool,
+    // Live 10-band graphic-EQ gains (dB, f32-as-bits) — the producer's source of
+    // truth. `eq_custom` = the gains were edited away from the named preset.
+    pub(crate) eq_gains: [AtomicU32; crate::eq::EQ_BANDS],
+    pub(crate) eq_custom: AtomicBool,
 
     // Effects preset index and count
     pub(crate) effects_preset_index: AtomicUsize,
@@ -289,6 +293,10 @@ pub struct PlayerState {
 
     // Repeat mode (Off/All/One) — readable by producer for repeat-one
     pub(crate) repeat_mode: AtomicU8,
+
+    // Active UI theme (ThemeKind as u8). UI-thread only; cheap to read each
+    // frame. Cycled at runtime via the T key.
+    pub(crate) theme: AtomicU8,
 }
 
 impl PlayerState {
@@ -325,6 +333,8 @@ impl PlayerState {
             eq_preset_index: AtomicUsize::new(0),
             eq_preset_count: AtomicUsize::new(0),
             eq_changed: AtomicBool::new(false),
+            eq_gains: std::array::from_fn(|_| AtomicU32::new(0)),
+            eq_custom: AtomicBool::new(false),
             effects_preset_index: AtomicUsize::new(0),
             effects_preset_count: AtomicUsize::new(0),
             effects_changed: AtomicBool::new(false),
@@ -346,7 +356,29 @@ impl PlayerState {
             next_track_rate: AtomicU32::new(0),
             stream_error: AtomicBool::new(false),
             repeat_mode: AtomicU8::new(RepeatMode::Off as u8),
+            theme: AtomicU8::new(crate::theme::ThemeKind::Classic as u8),
         }
+    }
+
+    pub fn theme_kind(&self) -> crate::theme::ThemeKind {
+        crate::theme::ThemeKind::from_u8(self.theme.load(Ordering::Relaxed))
+    }
+
+    pub fn set_theme(&self, kind: crate::theme::ThemeKind) {
+        self.theme.store(kind as u8, Ordering::Relaxed);
+        // HiFi's static VU panel needs live peak data to be useful — without
+        // a viz mode driving the analyser, the bars sit flat at -∞. Default
+        // viz on when entering HiFi, but only if the user hasn't already
+        // picked a mode.
+        if kind == crate::theme::ThemeKind::HiFi && self.viz_mode() == VizMode::None {
+            self.viz_mode.store(VizMode::VuMeter as u8, Ordering::Relaxed);
+        }
+    }
+
+    pub fn cycle_theme(&self) -> crate::theme::ThemeKind {
+        let next = self.theme_kind().next();
+        self.set_theme(next);
+        next
     }
 
     pub fn repeat_mode(&self) -> RepeatMode {
@@ -405,11 +437,15 @@ impl PlayerState {
         self.viz_mode.store(current.next() as u8, Ordering::Relaxed);
     }
 
-    pub fn cycle_eq(&self) {
+    /// Move the selected preset by `dir` (+1/-1), wrapping. Selecting a preset
+    /// drops out of Custom (its gains become the live EQ again).
+    pub fn step_eq_preset(&self, dir: i32) {
         let count = self.eq_preset_count.load(Ordering::Relaxed);
         if count == 0 { return; }
-        let cur = self.eq_preset_index.load(Ordering::Relaxed);
-        self.eq_preset_index.store((cur + 1) % count, Ordering::Relaxed);
+        let cur = self.eq_preset_index.load(Ordering::Relaxed) as i32;
+        let next = (cur + dir).rem_euclid(count as i32) as usize;
+        self.eq_preset_index.store(next, Ordering::Relaxed);
+        self.eq_custom.store(false, Ordering::Relaxed);
         self.eq_changed.store(true, Ordering::Relaxed);
     }
 
@@ -419,6 +455,36 @@ impl PlayerState {
 
     pub fn take_eq_changed(&self) -> bool {
         self.eq_changed.swap(false, Ordering::Relaxed)
+    }
+
+    // --- Live graphic-EQ gains ---
+
+    pub fn eq_gains_array(&self) -> [f32; crate::eq::EQ_BANDS] {
+        std::array::from_fn(|i| f32::from_bits(self.eq_gains[i].load(Ordering::Relaxed)))
+    }
+
+    pub fn set_eq_gains(&self, gains: &[f32; crate::eq::EQ_BANDS]) {
+        for (i, &g) in gains.iter().enumerate() {
+            self.eq_gains[i].store(g.to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    pub fn is_eq_custom(&self) -> bool {
+        self.eq_custom.load(Ordering::Relaxed)
+    }
+
+    /// Nudge one band's gain by `delta` dB (clamped ±limit), mark the EQ Custom,
+    /// and signal the producer. Returns the new gain.
+    pub fn nudge_eq_gain(&self, band: usize, delta: f32) -> f32 {
+        if band >= crate::eq::EQ_BANDS {
+            return 0.0;
+        }
+        let cur = f32::from_bits(self.eq_gains[band].load(Ordering::Relaxed));
+        let next = (cur + delta).clamp(-crate::eq::EQ_GAIN_LIMIT, crate::eq::EQ_GAIN_LIMIT);
+        self.eq_gains[band].store(next.to_bits(), Ordering::Relaxed);
+        self.eq_custom.store(true, Ordering::Relaxed);
+        self.eq_changed.store(true, Ordering::Relaxed);
+        next
     }
 
     pub fn cycle_effects(&self) {
@@ -563,6 +629,7 @@ pub enum ViewMode {
     Player,
     Playlist,
     Lyrics,
+    Eq,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -590,6 +657,30 @@ pub struct UiState {
     pub status_message: Option<(String, Instant)>,
     pub metadata_cache: std::sync::Arc<crate::metadata::MetadataCache>,
     pub scan_handle: Option<JoinHandle<()>>,
+    /// One-shot flag: when the background scan finishes and we're not shuffling,
+    /// auto-sort a folder-sourced playlist into artist→album order. Armed at
+    /// each folder rebuild (startup / rescan / source-switch); the sort can't
+    /// run at build time because tags load asynchronously.
+    pub auto_sort_pending: bool,
+    /// Library view presentation: false = flat list, true = artist→album tree.
+    pub library_tree_mode: bool,
+    /// The artist→album→track tree (a projection of the playlist by tags) and its
+    /// own navigation state, independent of the flat list's cursor/scroll so the
+    /// two presentations don't fight (esp. when the play queue is shuffled).
+    pub library_tree: crate::library::LibraryTree,
+    pub tree_fold: crate::library::FoldState,
+    pub tree_cursor: usize,
+    pub tree_scroll: usize,
+    /// Last rendered tree body height, so PageUp/Down can step by a viewport.
+    pub tree_view_height: usize,
+    /// The tree needs rebuilding (playlist changed, or tags still loading).
+    pub tree_dirty: bool,
+    /// Selected band (0..EQ_BANDS) in the EQ editor view.
+    pub eq_band: usize,
+    /// Active tree filter (from `/`). Empty = show the full fold-based tree.
+    pub tree_filter: String,
+    /// A pending bulk remove awaiting `[y/n]` confirmation: (label, playlist indices).
+    pub tree_pending_remove: Option<(String, Vec<usize>)>,
     pub removed_paths: std::collections::HashSet<PathBuf>,
     pub banner_lines: usize,
     pub banner_text: String,
@@ -639,6 +730,17 @@ impl UiState {
             status_message: None,
             metadata_cache,
             scan_handle: None,
+            auto_sort_pending: false,
+            library_tree_mode: false,
+            library_tree: crate::library::LibraryTree::default(),
+            tree_fold: crate::library::FoldState::default(),
+            tree_cursor: 0,
+            tree_scroll: 0,
+            tree_view_height: 0,
+            tree_dirty: true,
+            eq_band: 0,
+            tree_filter: String::new(),
+            tree_pending_remove: None,
             removed_paths: std::collections::HashSet::new(),
             banner_lines: 0,
             banner_text: String::new(),

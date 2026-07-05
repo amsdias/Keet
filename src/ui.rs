@@ -123,12 +123,140 @@ impl FrameWriter {
     }
 }
 
+/// Top-level renderer dispatcher. Routes by the active theme: Minimal and HiFi
+/// each own a full set of view renderers in `ui_minimal` / `ui_hifi`; Classic
+/// (the default) falls through to `print_status_classic` below. Every renderer
+/// honours the same contract — return the number of lines drawn below the
+/// anchor row (line 1) so the caller's cursor-up math stays exact.
 #[allow(clippy::too_many_arguments)] // cohesive render context; bundling into a struct adds no clarity
 pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_info: &str, ext: &str, eq_preset: &crate::eq::EqPreset, fx_name: &str, cf_name: &str, stats: &mut StatsMonitor, prev_frame_lines: usize, playlist: &[PathBuf], analyser: &VizAnalyser) -> usize {
+    use crate::theme::ThemeKind;
+    // Keep the live EQ gains mirroring the selected preset while not editing, so
+    // the curve/editor show the active shape and edits start from it.
+    if !state.is_eq_custom() {
+        state.set_eq_gains(&eq_preset.gains_10());
+    }
+    // The EQ+FX editor is one shared, palette-driven screen across all themes.
+    if ui.view_mode == ViewMode::Eq {
+        return print_status_eq_view(state, ui, eq_preset, fx_name, cf_name, prev_frame_lines);
+    }
+    if state.theme_kind() == ThemeKind::Minimal {
+        match ui.view_mode {
+            ViewMode::Player => {
+                return crate::ui_minimal::print_status_minimal(state, ui, name, track_info, eq_preset, fx_name, cf_name, stats, prev_frame_lines, analyser);
+            }
+            ViewMode::Playlist => {
+                return crate::ui_minimal::print_status_minimal_library(state, ui, name, prev_frame_lines, playlist);
+            }
+            ViewMode::Lyrics => {
+                return crate::ui_minimal::print_status_minimal_lyrics(state, ui, name, prev_frame_lines);
+            }
+            ViewMode::Eq => unreachable!("EQ view handled above"),
+        }
+    }
+    if state.theme_kind() == ThemeKind::HiFi {
+        match ui.view_mode {
+            ViewMode::Player => {
+                return crate::ui_hifi::print_status_hifi(state, ui, name, eq_preset, fx_name, cf_name, stats, prev_frame_lines);
+            }
+            ViewMode::Playlist => {
+                return crate::ui_hifi::print_status_hifi_library(state, ui, name, prev_frame_lines, playlist);
+            }
+            ViewMode::Lyrics => {
+                return crate::ui_hifi::print_status_hifi_lyrics(state, ui, name, prev_frame_lines);
+            }
+            ViewMode::Eq => unreachable!("EQ view handled above"),
+        }
+    }
+    print_status_classic(state, ui, name, track_info, ext, eq_preset, fx_name, cf_name, stats, prev_frame_lines, playlist, analyser)
+}
+
+/// The EQ+FX editor screen — one shared renderer for all themes (palette-driven).
+fn print_status_eq_view(
+    state: &PlayerState,
+    ui: &mut UiState,
+    eq_preset: &crate::eq::EqPreset,
+    fx_name: &str,
+    cf_name: &str,
+    prev_frame_lines: usize,
+) -> usize {
+    let kind = state.theme_kind();
+    let p = crate::theme::palette(kind);
+    let knob = match kind {
+        crate::theme::ThemeKind::Minimal => '●',
+        crate::theme::ThemeKind::HiFi => '◆',
+        crate::theme::ThemeKind::Classic => '█',
+    };
+    let (term_w, term_h) = terminal::size()
+        .map(|(w, h)| (w as usize, h as usize))
+        .unwrap_or((120, 40));
+
+    if prev_frame_lines != usize::MAX && prev_frame_lines > 0 {
+        print!("\x1B[{}F", prev_frame_lines);
+    }
+
+    let title = if state.is_eq_custom() {
+        "Custom".to_string()
+    } else {
+        eq_preset.name.clone()
+    };
+    let bal = state.balance_value();
+    let bal_str = if bal == 0 {
+        "centred".to_string()
+    } else if bal < 0 {
+        format!("L{}%", -bal)
+    } else {
+        format!("R{}%", bal)
+    };
+    let rg_str = match state.rg_mode() {
+        crate::state::RgMode::Album => "album",
+        crate::state::RgMode::Off => "off",
+        crate::state::RgMode::Track => "track",
+    };
+    let readouts = [
+        ("FX", fx_name),
+        ("XFEED", cf_name),
+        ("BAL", bal_str.as_str()),
+        ("RG", rg_str),
+    ];
+    let gains = state.eq_gains_array();
+    let body = crate::eq_ui::render_eq_screen(
+        &gains,
+        ui.eq_band,
+        &title,
+        &readouts,
+        knob,
+        p,
+        term_w,
+        term_h.saturating_sub(2),
+    );
+
+    // First body line is the anchor; the rest and the footer sit below it.
+    if let Some(first) = body.first() {
+        print!("\r\x1B[K{}", first);
+    }
+    let mut below = 0usize;
+    for line in body.iter().skip(1) {
+        print!("\n\r\x1B[K{}", line);
+        below += 1;
+    }
+    print!(
+        "\n\r\x1B[K  {dim}[←→] band   [↑↓] ±1 dB   [ [ / ] ] preset   [0] flatten band   [E/L/Esc] close{rst}",
+        dim = p.dim, rst = p.reset,
+    );
+    below += 1;
+
+    print!("\x1B[J");
+    io::stdout().flush().ok();
+    below
+}
+
+#[allow(clippy::too_many_arguments)] // cohesive render context; bundling into a struct adds no clarity
+fn print_status_classic(state: &PlayerState, ui: &mut UiState, name: &str, track_info: &str, ext: &str, eq_preset: &crate::eq::EqPreset, fx_name: &str, cf_name: &str, stats: &mut StatsMonitor, prev_frame_lines: usize, playlist: &[PathBuf], analyser: &VizAnalyser) -> usize {
     let viz_mode = state.viz_mode();
     let viz_style = state.viz_style();
     let eq_name = &eq_preset.name;
-    let eq_curve = crate::eq::render_eq_curve(eq_preset);
+    let eq_curve = crate::eq::render_eq_curve(&state.eq_gains_array());
     let eq_line = !eq_curve.is_empty();
     let (term_w, term_h) = terminal::size()
         .map(|(w, h)| (w as usize, h as usize))
@@ -272,6 +400,21 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
         // Separator
         w.line(&format!("  {C_DIM}{}{C_RESET}", "─".repeat(term_w.saturating_sub(2))));
 
+        if ui.library_tree_mode {
+            let lines = render_tree_body(
+                ui,
+                visible_rows,
+                term_w,
+                crate::theme::palette(crate::theme::ThemeKind::Classic),
+            );
+            let n = lines.len();
+            for line in &lines {
+                w.line(line);
+            }
+            for _ in n..visible_rows {
+                w.line("");
+            }
+        } else {
         let search_active = matches!(&ui.input_mode, InputMode::Search(q) if !q.is_empty());
         // Compute the item count without materializing the full index vector.
         // When the search filter is empty (and search inactive), iterate `0..playlist.len()`
@@ -369,6 +512,7 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
                 w.line("");
             }
         }
+        }
 
         // Search prompt or hint line
         let footer = match &ui.input_mode {
@@ -381,8 +525,10 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
             InputMode::Normal => {
                 if let Some(msg) = ui.take_status() {
                     format!("  {C_GREEN}{msg}{C_RESET}")
+                } else if ui.library_tree_mode {
+                    format!("  {C_DIM}[Tab] list  [←→] fold  [Enter] play  [/] filter  [D] remove  [L] close{C_RESET}")
                 } else {
-                    format!("  {C_DIM}[L] close  [↑↓] scroll  [Enter] play  [A] enqueue  [/] search  [D] remove  [S] save{C_RESET}")
+                    format!("  {C_DIM}[Tab] tree  [↑↓] scroll  [Enter] play  [A] enqueue  [/] search  [D] remove  [S] save{C_RESET}")
                 }
             }
         };
@@ -614,8 +760,122 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
                 }
             }
 
+            // EQ editor keys: arrows select/adjust bands; brackets cycle presets.
+            if ui.view_mode == ViewMode::Eq {
+                match k {
+                    KeyEvent { code: KeyCode::Left, .. } => {
+                        ui.eq_band = ui.eq_band.saturating_sub(1);
+                        continue;
+                    }
+                    KeyEvent { code: KeyCode::Right, .. } => {
+                        if ui.eq_band + 1 < crate::eq::EQ_BANDS {
+                            ui.eq_band += 1;
+                        }
+                        continue;
+                    }
+                    KeyEvent { code: KeyCode::Up, .. } => {
+                        state.nudge_eq_gain(ui.eq_band, 1.0);
+                        continue;
+                    }
+                    KeyEvent { code: KeyCode::Down, .. } => {
+                        state.nudge_eq_gain(ui.eq_band, -1.0);
+                        continue;
+                    }
+                    KeyEvent { code: KeyCode::Char('['), .. } => {
+                        state.step_eq_preset(-1);
+                        continue;
+                    }
+                    KeyEvent { code: KeyCode::Char(']'), .. } => {
+                        state.step_eq_preset(1);
+                        continue;
+                    }
+                    KeyEvent { code: KeyCode::Char('0'), .. } => {
+                        // Flatten the selected band to 0 dB.
+                        let cur = state.eq_gains_array()[ui.eq_band];
+                        state.nudge_eq_gain(ui.eq_band, -cur);
+                        continue;
+                    }
+                    KeyEvent { code: KeyCode::Esc, .. } => {
+                        ui.view_mode = ViewMode::Player;
+                        continue;
+                    }
+                    _ => {} // Fall through to global keys (E/L close, q, space, …)
+                }
+            }
+
             // Playlist view keys (when in Normal input mode)
             if ui.view_mode == ViewMode::Playlist {
+                // Tab flips the library between the flat list and the artist→album tree.
+                if matches!(k, KeyEvent { code: KeyCode::Tab, .. }) {
+                    ui.library_tree_mode = !ui.library_tree_mode;
+                    if ui.library_tree_mode {
+                        ui.tree_dirty = true;
+                    }
+                    return false;
+                }
+                if ui.library_tree_mode {
+                    // A staged bulk remove is awaiting confirmation: `y` removes,
+                    // any other key cancels.
+                    if let Some((label, indices)) = ui.tree_pending_remove.take() {
+                        if matches!(k, KeyEvent { code: KeyCode::Char('y'), .. }) {
+                            tree_remove_indices(state, ui, playlist, &indices);
+                        } else {
+                            ui.set_status(format!("cancelled removing {label}"));
+                        }
+                        return false;
+                    }
+                    match k {
+                        KeyEvent { code: KeyCode::Up, .. } => { tree_move(ui, -1); continue; }
+                        KeyEvent { code: KeyCode::Down, .. } => { tree_move(ui, 1); continue; }
+                        KeyEvent { code: KeyCode::Left, .. } => { tree_collapse_under_cursor(ui); continue; }
+                        KeyEvent { code: KeyCode::Right, .. } => { tree_expand_under_cursor(ui); continue; }
+                        KeyEvent { code: KeyCode::Enter, .. } => {
+                            if let Some(idx) = tree_cursor_play_index(ui) {
+                                state.jump_to(idx);
+                            }
+                            return false;
+                        }
+                        KeyEvent { code: KeyCode::Char('/'), .. } => {
+                            // Seed with the current filter so `/` edits, not resets it.
+                            ui.input_mode = InputMode::Search(ui.tree_filter.clone());
+                            return false;
+                        }
+                        KeyEvent { code: KeyCode::PageUp, .. } => { tree_page(ui, -1); continue; }
+                        KeyEvent { code: KeyCode::PageDown, .. } => { tree_page(ui, 1); continue; }
+                        KeyEvent { code: KeyCode::Char('u'), modifiers, .. }
+                            if modifiers.contains(KeyModifiers::CONTROL) => { tree_page(ui, -1); continue; }
+                        KeyEvent { code: KeyCode::Char('d'), modifiers, .. }
+                            if modifiers.contains(KeyModifiers::CONTROL) => { tree_page(ui, 1); continue; }
+                        KeyEvent { code: KeyCode::Char('d'), .. }
+                        | KeyEvent { code: KeyCode::Delete, .. } => {
+                            tree_remove_under_cursor(state, ui, playlist);
+                            return false;
+                        }
+                        KeyEvent { code: KeyCode::Home, .. } => { ui.tree_cursor = 0; continue; }
+                        KeyEvent { code: KeyCode::End, .. } => {
+                            ui.tree_cursor = tree_visible_len(ui).saturating_sub(1);
+                            continue;
+                        }
+                        KeyEvent { code: KeyCode::Char('g'), modifiers, .. }
+                            if !modifiers.contains(KeyModifiers::SHIFT) => { ui.tree_cursor = 0; continue; }
+                        KeyEvent { code: KeyCode::Char('G'), .. } => {
+                            ui.tree_cursor = tree_visible_len(ui).saturating_sub(1);
+                            continue;
+                        }
+                        KeyEvent { code: KeyCode::Esc, .. } => {
+                            // Esc clears an active filter first, then exits the library.
+                            if ui.tree_filter.is_empty() {
+                                ui.view_mode = ViewMode::Player;
+                            } else {
+                                ui.tree_filter.clear();
+                                ui.tree_cursor = 0;
+                                ui.tree_scroll = 0;
+                            }
+                            return false;
+                        }
+                        _ => {} // fall through to global keys (L, Y, space, q, v, b, …)
+                    }
+                } else {
                 match k {
                     KeyEvent { code: KeyCode::Up, .. } => {
                         playlist_cursor_up(ui);
@@ -698,6 +958,7 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
                     }
                     _ => {} // Fall through to global keys
                 }
+                }
             }
 
             // Global keys (work in all view modes)
@@ -717,7 +978,13 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
                 KeyEvent { code: KeyCode::Char('+'), .. } |
                 KeyEvent { code: KeyCode::Char('='), .. } => state.volume_up(),
                 KeyEvent { code: KeyCode::Char('-'), .. } => state.volume_down(),
-                KeyEvent { code: KeyCode::Char('e'), .. } => state.cycle_eq(),
+                KeyEvent { code: KeyCode::Char('e'), .. } => {
+                    // E opens (and closes) the EQ+FX editor screen.
+                    ui.view_mode = match ui.view_mode {
+                        ViewMode::Eq => ViewMode::Player,
+                        _ => ViewMode::Eq,
+                    };
+                }
                 KeyEvent { code: KeyCode::Char('x'), .. } => state.cycle_effects(),
                 KeyEvent { code: KeyCode::Char('f'), .. } => state.toggle_pre_fader(),
                 KeyEvent { code: KeyCode::Char('b'), .. } => {
@@ -728,7 +995,7 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
                 }
                 KeyEvent { code: KeyCode::Char('l'), .. } => {
                     ui.view_mode = match ui.view_mode {
-                        ViewMode::Player | ViewMode::Lyrics => {
+                        ViewMode::Player | ViewMode::Lyrics | ViewMode::Eq => {
                             ui.cursor = ui.current;
                             ensure_cursor_visible(ui, playlist);
                             ViewMode::Playlist
@@ -738,7 +1005,7 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
                 }
                 KeyEvent { code: KeyCode::Char('y'), .. } => {
                     ui.view_mode = match ui.view_mode {
-                        ViewMode::Player | ViewMode::Playlist => {
+                        ViewMode::Player | ViewMode::Playlist | ViewMode::Eq => {
                             ui.lyrics_scroll = 0;
                             ui.lyrics_auto_scroll = true;
                             ViewMode::Lyrics
@@ -792,13 +1059,61 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
                 KeyEvent { code: KeyCode::Char('i'), .. } => state.toggle_stats(),
                 KeyEvent { code: KeyCode::Char('['), .. } => state.balance_left(),
                 KeyEvent { code: KeyCode::Char(']'), .. } => state.balance_right(),
+                KeyEvent { code: KeyCode::Char('t'), .. } => {
+                    let kind = state.cycle_theme();
+                    ui.set_status(format!("theme: {}", kind.name()));
+                    // Theme switch changes paint top-to-bottom; force a full redraw so
+                    // residual lines from the previous theme don't bleed through.
+                    // Banner also changes shape per theme, so trigger a banner rebuild.
+                    ui.banner_dirty = true;
+                    ui.terminal_resized = true;
+                }
                 _ => {}
             }
     }
     false
 }
 
+/// `/` search while the tree view is showing: keystrokes drive `ui.tree_filter`
+/// live. Enter keeps the filter and returns to navigating the results; Esc
+/// clears it. Up/Down/PageUp/PageDown move the cursor through the filtered rows.
+fn tree_search_input(ui: &mut UiState, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Esc => {
+            ui.input_mode = InputMode::Normal;
+            ui.tree_filter.clear();
+            ui.tree_cursor = 0;
+            ui.tree_scroll = 0;
+        }
+        KeyCode::Enter => {
+            ui.input_mode = InputMode::Normal; // keep the filter, navigate results
+        }
+        KeyCode::Backspace => {
+            if let InputMode::Search(ref mut q) = ui.input_mode {
+                q.pop();
+            }
+            rebuild_tree_filter(ui);
+        }
+        KeyCode::Char(c) => {
+            if let InputMode::Search(ref mut q) = ui.input_mode {
+                q.push(c);
+            }
+            rebuild_tree_filter(ui);
+        }
+        KeyCode::Up => tree_move(ui, -1),
+        KeyCode::Down => tree_move(ui, 1),
+        KeyCode::PageUp => tree_page(ui, -1),
+        KeyCode::PageDown => tree_page(ui, 1),
+        _ => {}
+    }
+    false
+}
+
 fn handle_text_input(state: &PlayerState, ui: &mut UiState, _playlist: &mut Vec<PathBuf>, key: KeyEvent) -> bool {
+    // The tree view filters itself; its `/` search has its own handling.
+    if ui.library_tree_mode && matches!(ui.input_mode, InputMode::Search(_)) {
+        return tree_search_input(ui, key);
+    }
     match &mut ui.input_mode {
         InputMode::Search(ref mut query) => {
             match key.code {
@@ -1070,6 +1385,265 @@ pub(crate) fn reindex_and_restart_scan(
         playlist.to_vec(),
         std::sync::Arc::clone(&ui.metadata_cache),
     ));
+    ui.tree_dirty = true; // playlist reordered/rescanned — the tree needs rebuilding
+}
+
+/// True when the source paths are a folder/file collection we should auto-sort
+/// into artist→album order: non-empty and containing no curated `.m3u`/`.m3u8`
+/// playlist (an M3U's order is the user's curation and must be preserved).
+fn source_is_sortable(paths: &[PathBuf]) -> bool {
+    !paths.is_empty()
+        && paths.iter().all(|p| {
+            let ext = p.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
+            !matches!(ext.as_deref(), Some("m3u") | Some("m3u8"))
+        })
+}
+
+/// One-shot auto-sort gate: the sort should run only when it's armed, the
+/// background metadata scan has finished (so tags are actually loaded), and
+/// we're not shuffling (shuffle order is intentional).
+fn auto_sort_should_run(pending: bool, scan_finished: bool, shuffle: bool) -> bool {
+    pending && scan_finished && !shuffle
+}
+
+/// Fire the one-shot artist→album auto-sort once the background metadata scan
+/// has loaded tags. Called every UI frame: a no-op until armed and the scan is
+/// finished. The flag is spent the moment the scan completes — even if we're
+/// shuffling and skip the sort — so it never fires twice or retroactively after
+/// a later shuffle toggle.
+pub fn poll_auto_sort(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<PathBuf>) {
+    if !ui.auto_sort_pending {
+        return;
+    }
+    let scan_finished = ui.scan_handle.as_ref().is_some_and(|h| h.is_finished());
+    if !scan_finished {
+        return; // tags not loaded yet — keep waiting
+    }
+    let do_sort = auto_sort_should_run(ui.auto_sort_pending, scan_finished, ui.shuffle);
+    ui.auto_sort_pending = false;
+    if do_sort {
+        sort_playlist_by_tags(state, ui, playlist);
+    }
+}
+
+/// Arm the one-shot auto-sort after a folder-sourced playlist is (re)built
+/// (startup / rescan / source-switch). No-op for curated M3U sources or while
+/// shuffling; `poll_auto_sort` then fires it once the scan finishes.
+pub fn arm_auto_sort(ui: &mut UiState) {
+    ui.auto_sort_pending = source_is_sortable(&ui.source_paths) && !ui.shuffle;
+}
+
+// ===== Library tree view (artist → album → track browser) =====
+
+/// Rebuild the artist→album tree from the current playlist + metadata cache.
+/// Fold state (kept by name on `ui.tree_fold`) survives; the cursor is clamped.
+pub fn rebuild_library_tree(ui: &mut UiState, playlist: &[PathBuf]) {
+    let tags: Vec<crate::library::TrackTags> = playlist
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let (artist, album) = ui.metadata_cache.artist_album(i);
+            let title = ui.metadata_cache.title(i).unwrap_or_else(|| {
+                p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+            });
+            crate::library::TrackTags {
+                artist,
+                album,
+                disc: ui.metadata_cache.disc_number(i),
+                track: ui.metadata_cache.track_number(i),
+                title,
+            }
+        })
+        .collect();
+    ui.library_tree = crate::library::build(&tags);
+    let n = crate::library::visible_rows(&ui.library_tree, &ui.tree_fold).len();
+    if ui.tree_cursor >= n {
+        ui.tree_cursor = n.saturating_sub(1);
+    }
+    ui.tree_dirty = false;
+}
+
+/// Called each UI frame: while the tree view is showing, keep it fresh — rebuild
+/// when the playlist changed (`tree_dirty`) or while the scan is still loading
+/// tags (so `Unknown` rows settle into their real artists as tags arrive).
+pub fn poll_library_tree(ui: &mut UiState, playlist: &[PathBuf]) {
+    if !ui.library_tree_mode {
+        return;
+    }
+    let scan_running = ui.scan_handle.as_ref().is_some_and(|h| !h.is_finished());
+    if ui.tree_dirty || scan_running {
+        rebuild_library_tree(ui, playlist);
+    }
+}
+
+/// Render the tree body for a themed library renderer: adjust scroll to keep the
+/// cursor visible (small margin), record the viewport height for paging, and
+/// return the palette-coloured lines.
+pub fn render_tree_body(
+    ui: &mut UiState,
+    height: usize,
+    width: usize,
+    p: &crate::theme::Palette,
+) -> Vec<String> {
+    let visible = tree_visible(ui);
+    if ui.tree_cursor >= visible.len() {
+        ui.tree_cursor = visible.len().saturating_sub(1);
+    }
+    ui.tree_view_height = height;
+    let margin = 4.min(height / 2);
+    if ui.tree_cursor < ui.tree_scroll + margin {
+        ui.tree_scroll = ui.tree_cursor.saturating_sub(margin);
+    } else if ui.tree_cursor + margin + 1 > ui.tree_scroll + height {
+        ui.tree_scroll = (ui.tree_cursor + margin + 1).saturating_sub(height);
+    }
+    let max_scroll = visible.len().saturating_sub(height);
+    if ui.tree_scroll > max_scroll {
+        ui.tree_scroll = max_scroll;
+    }
+    crate::library::render_library_tree(
+        &ui.library_tree,
+        &ui.tree_fold,
+        &visible,
+        ui.tree_cursor,
+        ui.tree_scroll,
+        height,
+        width,
+        p,
+        Some(ui.current),
+    )
+}
+
+/// The tree's on-screen rows: filtered projection when a `/` filter is active,
+/// else the normal fold-based rows.
+fn tree_visible(ui: &UiState) -> Vec<crate::library::VisibleRow> {
+    if ui.tree_filter.is_empty() {
+        crate::library::visible_rows(&ui.library_tree, &ui.tree_fold)
+    } else {
+        crate::library::visible_rows_filtered(&ui.library_tree, &ui.tree_filter)
+    }
+}
+
+fn tree_visible_len(ui: &UiState) -> usize {
+    tree_visible(ui).len()
+}
+
+fn tree_row_at_cursor(ui: &UiState) -> Option<crate::library::VisibleRow> {
+    tree_visible(ui).get(ui.tree_cursor).copied()
+}
+
+/// Re-read the `/` query into `ui.tree_filter` and clamp the cursor to the new
+/// filtered row count. Called on each keystroke while searching in the tree.
+fn rebuild_tree_filter(ui: &mut UiState) {
+    ui.tree_filter = match &ui.input_mode {
+        InputMode::Search(q) => q.clone(),
+        _ => String::new(),
+    };
+    let n = tree_visible_len(ui);
+    if ui.tree_cursor >= n {
+        ui.tree_cursor = n.saturating_sub(1);
+    }
+    ui.tree_scroll = 0;
+}
+
+fn tree_move(ui: &mut UiState, delta: isize) {
+    let n = tree_visible_len(ui) as isize;
+    if n == 0 {
+        ui.tree_cursor = 0;
+        return;
+    }
+    ui.tree_cursor = (ui.tree_cursor as isize + delta).clamp(0, n - 1) as usize;
+}
+
+fn tree_page(ui: &mut UiState, dir: isize) {
+    let page = ui.tree_view_height.max(1) as isize;
+    tree_move(ui, dir * page);
+}
+
+fn tree_expand_under_cursor(ui: &mut UiState) {
+    if let Some(row) = tree_row_at_cursor(ui) {
+        crate::library::expand(&ui.library_tree, &mut ui.tree_fold, row);
+    }
+}
+
+fn tree_collapse_under_cursor(ui: &mut UiState) {
+    use crate::library::VisibleRow;
+    if let Some(row) = tree_row_at_cursor(ui) {
+        if let VisibleRow::Track { artist, album, .. } = row {
+            // Collapse the parent album and land the cursor on it.
+            let album_row = VisibleRow::Album { artist, album };
+            crate::library::collapse(&ui.library_tree, &mut ui.tree_fold, album_row);
+            if let Some(pos) = tree_visible(ui).iter().position(|r| *r == album_row) {
+                ui.tree_cursor = pos;
+            }
+        } else {
+            crate::library::collapse(&ui.library_tree, &mut ui.tree_fold, row);
+        }
+    }
+    let n = tree_visible_len(ui);
+    if ui.tree_cursor >= n {
+        ui.tree_cursor = n.saturating_sub(1);
+    }
+}
+
+/// The playlist index `Enter` plays: the first track under the cursor (a track →
+/// itself, an album → its first track, an artist → their first track).
+fn tree_cursor_play_index(ui: &UiState) -> Option<usize> {
+    tree_row_at_cursor(ui).and_then(|row| crate::library::first_track_index(&ui.library_tree, row))
+}
+
+/// Remove the tracks under the cursor. A track removes just itself; an album or
+/// artist stages a confirmation (`tree_pending_remove`) that `y` completes.
+fn tree_remove_under_cursor(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<PathBuf>) {
+    let Some(row) = tree_row_at_cursor(ui) else { return };
+    let indices = crate::library::subtree_track_indices(&ui.library_tree, row);
+    if indices.is_empty() {
+        return;
+    }
+    match row {
+        crate::library::VisibleRow::Track { .. } => {
+            tree_remove_indices(state, ui, playlist, &indices);
+        }
+        crate::library::VisibleRow::Album { artist, album } => {
+            let label = format!("album {}", ui.library_tree.artists[artist].albums[album].name);
+            ui.set_status(format!("remove {label} — {} tracks?  [y/n]", indices.len()));
+            ui.tree_pending_remove = Some((label, indices));
+        }
+        crate::library::VisibleRow::Artist { artist } => {
+            let label = format!("artist {}", ui.library_tree.artists[artist].name);
+            ui.set_status(format!("remove {label} — {} tracks?  [y/n]", indices.len()));
+            ui.tree_pending_remove = Some((label, indices));
+        }
+    }
+}
+
+/// Actually remove a set of playlist indices: drop them (descending, so earlier
+/// indices don't shift), record them in `removed_paths` so a rescan won't re-add
+/// them, fix the playing/cursor position, reindex the cache, and rebuild the tree.
+fn tree_remove_indices(
+    state: &PlayerState,
+    ui: &mut UiState,
+    playlist: &mut Vec<PathBuf>,
+    indices: &[usize],
+) {
+    let mut idx: Vec<usize> = indices.to_vec();
+    idx.sort_unstable();
+    idx.dedup();
+    let old_playlist = playlist.clone();
+    for &i in idx.iter().rev() {
+        if i < playlist.len() {
+            let key = std::fs::canonicalize(&playlist[i]).unwrap_or_else(|_| playlist[i].clone());
+            ui.removed_paths.insert(key);
+            playlist.remove(i);
+        }
+    }
+    // Shift the playing index down by however many removed tracks preceded it.
+    let removed_before_current = idx.iter().filter(|&&i| i < ui.current).count();
+    ui.current = ui.current.saturating_sub(removed_before_current).min(playlist.len().saturating_sub(1));
+    ui.tree_cursor = 0;
+    ui.tree_scroll = 0;
+    state.total_tracks.store(playlist.len(), Ordering::Relaxed);
+    reindex_and_restart_scan(ui, playlist, &old_playlist);
+    ui.set_status(format!("removed {} track(s)", idx.len()));
 }
 
 /// Sort the playlist by tag metadata: artist → album → disc → track → title → filename.
@@ -1277,6 +1851,7 @@ fn switch_source_paths(
     state.current_track.store(0, Ordering::Relaxed);
 
     reindex_and_restart_scan(ui, playlist, &old_playlist);
+    arm_auto_sort(ui); // new folder source → auto-sort once its tags load
 
     // Signal the producer to break out of the current track and jump to index 0
     // of the new playlist on its next iteration.
@@ -1331,6 +1906,7 @@ fn rescan(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<PathBuf>) {
     state.current_track.store(ui.current, Ordering::Relaxed);
 
     reindex_and_restart_scan(ui, playlist, &old_playlist);
+    arm_auto_sort(ui); // re-settle newly-added tracks into artist→album order
 
     if playlist.is_empty() || (playlist.len() == 1 && total_removed > 0 && current_track_path.is_some()) {
         ui.set_status("All files removed, finishing current track".to_string());
@@ -1505,5 +2081,25 @@ mod ui_tests {
         // b removed, d added, rest shuffled
         let current = vec![p("c"), p("d"), p("a")];
         assert_eq!(restore_order(&saved, &current), vec![p("a"), p("c"), p("d")]);
+    }
+
+    #[test]
+    fn source_is_sortable_false_when_any_m3u_present_or_empty() {
+        let p = |s: &str| PathBuf::from(s);
+        // Folder / file sources are sortable.
+        assert!(source_is_sortable(&[p("/music/rock"), p("/music/song.flac")]));
+        // Any .m3u / .m3u8 source is a curated order — not sortable (case-insensitive).
+        assert!(!source_is_sortable(&[p("/music/mix.m3u")]));
+        assert!(!source_is_sortable(&[p("/music/rock"), p("/lists/set.M3U8")]));
+        // No sources → nothing to auto-sort.
+        assert!(!source_is_sortable(&[]));
+    }
+
+    #[test]
+    fn auto_sort_should_run_only_when_pending_scanned_and_not_shuffling() {
+        assert!(auto_sort_should_run(true, true, false)); // armed, scan done, not shuffling
+        assert!(!auto_sort_should_run(false, true, false)); // not armed
+        assert!(!auto_sort_should_run(true, false, false)); // scan not finished — tags not loaded
+        assert!(!auto_sort_should_run(true, true, true)); // shuffling — leave the order alone
     }
 }

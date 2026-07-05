@@ -142,6 +142,9 @@ pub fn fetch_lrclib(artist: &str, title: &str, duration_secs: Option<u32>) -> Op
         url.push_str(&format!("&duration={}", dur));
     }
 
+    // Note: avoid `timeout_global` — in ureq 3.3 it trips before the TLS
+    // handshake even completes, making every fetch return None. Split the
+    // budget across connect + receive instead, which behaves as expected.
     let tls = ureq::tls::TlsConfig::builder()
         .provider(ureq::tls::TlsProvider::NativeTls)
         .build();

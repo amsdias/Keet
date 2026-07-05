@@ -20,6 +20,73 @@ use crate::state::{
     BAR_DECAY, GRAVITY, DOT_GRAVITY, ATTACK, VIZ_ATTACK, HOLD_TIME,
     C_RESET, C_DIM, C_CYAN, C_GREEN, C_YELLOW, C_MAGENTA, C_RED,
 };
+use crate::theme::{palette as theme_palette, ThemeKind};
+
+/// Per-theme color set used by the viz renderers. `low/mid/hot` map onto the
+/// classic green→yellow→red gradient; non-Classic themes collapse them onto
+/// the active palette so the spectrum/VU adopt the theme's identity.
+struct VizPalette {
+    low: &'static str,
+    mid: &'static str,
+    hot: &'static str,
+    #[allow(dead_code)]
+    accent: &'static str,
+    dim: &'static str,
+    reset: &'static str,
+}
+
+fn viz_palette(kind: ThemeKind) -> VizPalette {
+    match kind {
+        ThemeKind::Classic => VizPalette {
+            low: C_GREEN,
+            mid: C_YELLOW,
+            hot: C_RED,
+            accent: C_CYAN,
+            dim: C_DIM,
+            reset: C_RESET,
+        },
+        ThemeKind::Minimal => {
+            // Monochrome: the warm-cyan accent for content, danger only for clip/hot.
+            let p = theme_palette(ThemeKind::Minimal);
+            VizPalette {
+                low: p.accent,
+                mid: p.accent,
+                hot: p.danger,
+                accent: p.accent,
+                dim: p.dim,
+                reset: p.reset,
+            }
+        }
+        ThemeKind::HiFi => {
+            // Amber gradient: dim→fg→accent→danger.
+            let p = theme_palette(ThemeKind::HiFi);
+            VizPalette {
+                low: p.fg,
+                mid: p.accent,
+                hot: p.danger,
+                accent: p.accent,
+                dim: p.dim,
+                reset: p.reset,
+            }
+        }
+    }
+}
+
+/// Per-band color for the spectrum ribbon. Classic uses the rainbow gradient
+/// already baked into `BAND_COLORS`; Minimal/HiFi project onto a 3-stop ramp
+/// (low→mid→hot) sized to the band index so the visual identity stays
+/// consistent with the rest of the theme.
+fn band_color(idx: usize, vp: &VizPalette, kind: ThemeKind) -> &'static str {
+    if matches!(kind, ThemeKind::Classic) {
+        BAND_COLORS.get(idx).copied().unwrap_or(C_YELLOW)
+    } else {
+        // Map idx in 0..SPECTRUM_BANDS onto the 3 ramp stops.
+        let third = SPECTRUM_BANDS / 3;
+        if idx < third { vp.low }
+        else if idx < third * 2 { vp.mid }
+        else { vp.hot }
+    }
+}
 
 // --- Lightweight process stats (replaces sysinfo dependency) ---
 
@@ -605,20 +672,21 @@ pub fn render_vu_meter(state: &PlayerState, style: VizStyle, width: usize) -> Ve
     let (dot_l, dot_r) = state.get_vu_dots();
     // Fill the width: 2-space pad + "L " label (2) + 2-col safety margin = 6 overhead.
     let bar_width = width.saturating_sub(6).max(10);
+    let vp = viz_palette(state.theme_kind());
 
-    fn make_bar(level: f32, dot_val: f32, label: &str, width: usize, style: VizStyle) -> String {
+    fn make_bar(level: f32, dot_val: f32, label: &str, width: usize, style: VizStyle, vp: &VizPalette) -> String {
         let full = (level.clamp(0.0, 1.0) * width as f32) as usize;
         let dot_idx = (dot_val.clamp(0.0, 1.0) * width as f32) as usize;
 
         let yellow_start = width * 6 / 10 + 1;
         let red_start = width * 8 / 10 + 1;
 
-        let mut bar = format!("  {C_DIM}{label}{C_RESET} ");
+        let mut bar = format!("  {dim}{label}{rst} ", dim = vp.dim, rst = vp.reset, label = label);
         let mut last_color = "";
         for i in 0..width {
-            let color = if i >= red_start { C_RED }
-                        else if i >= yellow_start { C_YELLOW }
-                        else { C_GREEN };
+            let color = if i >= red_start { vp.hot }
+                        else if i >= yellow_start { vp.mid }
+                        else { vp.low };
             if color != last_color {
                 bar.push_str(color);
                 last_color = color;
@@ -629,12 +697,12 @@ pub fn render_vu_meter(state: &PlayerState, style: VizStyle, width: usize) -> Ve
                     if i < full {
                         bar.push('⣿');
                     } else if i == dot_idx && dot_idx > 0 {
-                        bar.push_str(C_RESET);
+                        bar.push_str(vp.reset);
                         bar.push_str(color);
                         last_color = color;
                         bar.push('⠅');
                     } else {
-                        if last_color != C_DIM { bar.push_str(C_DIM); last_color = C_DIM; }
+                        if last_color != vp.dim { bar.push_str(vp.dim); last_color = vp.dim; }
                         bar.push('⣀');
                     }
                 }
@@ -643,28 +711,28 @@ pub fn render_vu_meter(state: &PlayerState, style: VizStyle, width: usize) -> Ve
                         bar.push('█');
                     } else if i == dot_idx && dot_idx > 0 {
                         // Bright thin bar as peak dot
-                        bar.push_str(C_RESET);
+                        bar.push_str(vp.reset);
                         bar.push_str(color);
                         last_color = color;
                         bar.push('▏');
                     } else {
-                        if last_color != C_DIM { bar.push_str(C_DIM); last_color = C_DIM; }
+                        if last_color != vp.dim { bar.push_str(vp.dim); last_color = vp.dim; }
                         bar.push('▏');
                     }
                 }
             }
         }
-        bar.push_str(C_RESET);
+        bar.push_str(vp.reset);
         bar
     }
 
     let mut lines = vec![
-        make_bar(left, dot_l, "L", bar_width, style),
+        make_bar(left, dot_l, "L", bar_width, style, &vp),
     ];
     if matches!(style, VizStyle::Bars) {
         lines.push(String::new()); // minimal empty line gap
     }
-    lines.push(make_bar(right, dot_r, "R", bar_width, style));
+    lines.push(make_bar(right, dot_r, "R", bar_width, style, &vp));
     lines
 }
 
@@ -693,6 +761,8 @@ const BAND_COLORS: [&str; 31] = [
 pub fn render_spectrum_horizontal(state: &PlayerState, style: VizStyle) -> Vec<String> {
     let spec_l = state.get_spectrum();
     let spec_r = state.get_spectrum_r();
+    let kind = state.theme_kind();
+    let vp = viz_palette(kind);
     let n = SPECTRUM_H_ROWS;
     let mut lines: Vec<String> = Vec::with_capacity(n * 2);
 
@@ -703,10 +773,10 @@ pub fn render_spectrum_horizontal(state: &PlayerState, style: VizStyle) -> Vec<S
         let hi = (n - r) as f32 / n as f32;
         let mut line = String::from("  ");
         for (i, &level) in spec_l.iter().enumerate() {
-            let color = BAND_COLORS.get(i).unwrap_or(&C_YELLOW);
+            let color = band_color(i, &vp, kind);
             line.push_str(&h_cell(level, lo, hi, style, color, true));
         }
-        line.push_str(C_RESET);
+        line.push_str(vp.reset);
         lines.push(line);
     }
 
@@ -717,10 +787,10 @@ pub fn render_spectrum_horizontal(state: &PlayerState, style: VizStyle) -> Vec<S
         let hi = (r + 1) as f32 / n as f32;
         let mut line = String::from("  ");
         for (i, &level) in spec_r.iter().enumerate() {
-            let color = BAND_COLORS.get(i).unwrap_or(&C_YELLOW);
+            let color = band_color(i, &vp, kind);
             line.push_str(&h_cell(level, lo, hi, style, color, false));
         }
-        line.push_str(C_RESET);
+        line.push_str(vp.reset);
         lines.push(line);
     }
 
@@ -771,9 +841,11 @@ pub fn render_spectrum_vertical(state: &PlayerState, style: VizStyle) -> Vec<Str
     let height = 8;
     let mut lines = vec![String::new(); height];
 
+    let vp = viz_palette(state.theme_kind());
+    // Top rows are "hot" (loud), bottom rows are quiet — map onto hot→mid→low.
     let row_colors = [
-        C_RED, C_RED, C_YELLOW, C_YELLOW,
-        C_GREEN, C_GREEN, C_GREEN, C_GREEN,
+        vp.hot, vp.hot, vp.mid, vp.mid,
+        vp.low, vp.low, vp.low, vp.low,
     ];
 
     let partials = match style {
@@ -815,10 +887,10 @@ pub fn render_spectrum_vertical(state: &PlayerState, style: VizStyle) -> Vec<Str
                 let idx = (frac * 7.0).max(1.0) as usize;
                 lines[row].push_str(&format!("{C_RESET}{}{} ", color, partials[idx]));
             } else {
-                lines[row].push_str(&format!("{C_RESET}  "));
+                lines[row].push_str(&format!("{}  ", vp.reset));
             }
         }
-        lines[row].push_str(C_RESET);
+        lines[row].push_str(vp.reset);
     }
     lines
 }

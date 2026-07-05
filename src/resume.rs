@@ -29,6 +29,13 @@ pub struct ResumeState {
     pub crossfeed_preset: Option<String>,
     #[serde(default)]
     pub balance: Option<i32>,
+    #[serde(default)]
+    pub theme: Option<String>,
+    /// Live 10-band graphic-EQ gains, saved when the EQ was edited to Custom.
+    #[serde(default)]
+    pub eq_gains: Option<Vec<f32>>,
+    #[serde(default)]
+    pub eq_custom: Option<bool>,
 }
 
 fn state_file_path() -> Option<PathBuf> {

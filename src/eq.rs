@@ -62,22 +62,44 @@ impl BiquadCoeffs {
     }
 }
 
-/// A single EQ band definition from JSON
-#[derive(Deserialize, Clone)]
-pub struct EqBand {
-    pub freq: f32,
-    pub gain: f32,
-    #[serde(default = "default_q")]
-    pub q: f32,
-}
+/// Fixed 10-band graphic-EQ centres (ISO octave, Hz). Each band is a peaking
+/// filter at its centre with a fixed ~1-octave Q; only the gain is adjustable.
+pub const EQ_FREQS: [f32; 10] =
+    [31.0, 62.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0];
+/// Band count.
+pub const EQ_BANDS: usize = 10;
+/// Fixed Q per band (~1 octave bandwidth).
+pub const EQ_Q: f32 = 1.41;
+/// Gain limit (±dB) — the graphic-EQ hardware standard.
+pub const EQ_GAIN_LIMIT: f32 = 12.0;
 
-fn default_q() -> f32 { 1.0 }
+/// Short freq labels for the editor / curve (aligned with `EQ_FREQS`).
+pub const EQ_FREQ_LABELS: [&str; 10] =
+    ["31", "62", "125", "250", "500", "1k", "2k", "4k", "8k", "16k"];
 
-/// An EQ preset loaded from JSON or built-in
+/// An EQ preset: a name + one gain (dB) per band. Loaded from JSON or built-in.
 #[derive(Deserialize, Clone)]
 pub struct EqPreset {
     pub name: String,
-    pub bands: Vec<EqBand>,
+    #[serde(default)]
+    pub gains: Vec<f32>,
+}
+
+impl EqPreset {
+    /// Gains normalised to exactly `EQ_BANDS` values — short lists zero-padded,
+    /// long lists truncated — and clamped to the ±limit.
+    pub fn gains_10(&self) -> [f32; EQ_BANDS] {
+        let mut g = [0.0f32; EQ_BANDS];
+        for (i, slot) in g.iter_mut().enumerate() {
+            *slot = self
+                .gains
+                .get(i)
+                .copied()
+                .unwrap_or(0.0)
+                .clamp(-EQ_GAIN_LIMIT, EQ_GAIN_LIMIT);
+        }
+        g
+    }
 }
 
 /// One filter per band per channel (stereo)
@@ -99,14 +121,21 @@ impl EqChain {
     }
 
     pub fn load_preset(&mut self, preset: &EqPreset, sample_rate: f32) {
+        self.load_gains(&preset.gains_10(), sample_rate);
+    }
+
+    /// Build the fixed-band peaking filters from a gain-per-band array — the
+    /// graphic EQ's single source of truth (presets and the live editor both
+    /// feed this).
+    pub fn load_gains(&mut self, gains: &[f32; EQ_BANDS], sample_rate: f32) {
         self.filters.clear();
         let mut has_nonzero = false;
-        for band in &preset.bands {
-            if band.gain.abs() >= 0.01 {
+        for (i, &gain) in gains.iter().enumerate() {
+            if gain.abs() >= 0.01 {
                 has_nonzero = true;
             }
             self.filters.push(FilterBand {
-                coeffs: BiquadCoeffs::peaking_eq(band.freq, band.gain, band.q, sample_rate),
+                coeffs: BiquadCoeffs::peaking_eq(EQ_FREQS[i], gain, EQ_Q, sample_rate),
                 state_l: BiquadState::new(),
                 state_r: BiquadState::new(),
             });
@@ -170,16 +199,18 @@ impl EqChain {
     }
 }
 
-/// Render a compact EQ curve visualization for the status line
-/// Shows gain per band using block characters: ▁▂▃▄▅▆▇█ for boost, underline for cut
-pub fn render_eq_curve(preset: &EqPreset) -> String {
+/// Render a compact EQ curve visualization for the status line (Classic banner).
+/// Shows gain per band using block characters: ▁▂▃▄▅▆▇█ for boost, `·` for flat.
+/// Draws from the live 10-band gains, so it reflects preset changes AND edits.
+pub fn render_eq_curve(gains: &[f32; EQ_BANDS]) -> String {
     use crate::state::{C_RESET, C_DIM, C_CYAN, C_GREEN, C_YELLOW, C_RED};
 
-    if preset.bands.is_empty() {
+    if gains.iter().all(|g| g.abs() < 0.01) {
         return String::new();
     }
 
-    // Display 20 log-spaced points across 20Hz-20kHz, interpolating gain from all bands
+    // Display 20 log-spaced points across 20Hz-20kHz, interpolating gain from the
+    // 10 fixed bands with a ~1-octave bell (matches the graphic EQ's Q).
     let n_points = 20;
     let bars: &[char] = &[' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
@@ -190,15 +221,12 @@ pub fn render_eq_curve(preset: &EqPreset) -> String {
         let t = i as f32 / (n_points - 1) as f32;
         let freq = 20.0 * (1000.0f32).powf(t); // 20 * 10^(t*3) = 20..20000
 
-        // Sum contributions from all bands using bell curve (peaking EQ response)
+        // Sum contributions from all bands using a bell curve (peaking response).
         let mut gain = 0.0f32;
-        for band in &preset.bands {
-            let q = band.q;
-            // Distance in octaves between display freq and band center
-            let octaves = (freq / band.freq).log2();
-            // Bell curve shaped by Q (higher Q = narrower)
-            let weight = (-octaves * octaves * q * q * 2.0).exp();
-            gain += band.gain * weight;
+        for (b, &band_gain) in gains.iter().enumerate() {
+            let octaves = (freq / EQ_FREQS[b]).log2();
+            let weight = (-octaves * octaves * EQ_Q * EQ_Q * 2.0).exp();
+            gain += band_gain * weight;
         }
 
         let (ch, color) = if gain > 0.1 {
@@ -218,50 +246,19 @@ pub fn render_eq_curve(preset: &EqPreset) -> String {
     result
 }
 
-/// Built-in presets
+/// Built-in presets as 10-band gain shapes (dB). Bands: 31 62 125 250 500 1k 2k
+/// 4k 8k 16k — see `EQ_FREQS`. These approximate the old curated peaking curves.
 pub fn builtin_presets() -> Vec<EqPreset> {
+    let p = |name: &str, gains: [f32; EQ_BANDS]| EqPreset {
+        name: name.to_string(),
+        gains: gains.to_vec(),
+    };
     vec![
-        EqPreset {
-            name: "Flat".to_string(),
-            bands: vec![],
-        },
-        EqPreset {
-            name: "Bass Boost".to_string(),
-            bands: vec![
-                EqBand { freq: 32.0, gain: 6.0, q: 0.8 },
-                EqBand { freq: 64.0, gain: 5.0, q: 0.8 },
-                EqBand { freq: 125.0, gain: 3.0, q: 1.0 },
-                EqBand { freq: 250.0, gain: 1.0, q: 1.0 },
-            ],
-        },
-        EqPreset {
-            name: "Treble Boost".to_string(),
-            bands: vec![
-                EqBand { freq: 4000.0, gain: 2.0, q: 1.0 },
-                EqBand { freq: 8000.0, gain: 4.0, q: 1.0 },
-                EqBand { freq: 16000.0, gain: 5.0, q: 0.8 },
-            ],
-        },
-        EqPreset {
-            name: "Vocal".to_string(),
-            bands: vec![
-                EqBand { freq: 125.0, gain: -2.0, q: 1.0 },
-                EqBand { freq: 1000.0, gain: 3.0, q: 0.8 },
-                EqBand { freq: 2000.0, gain: 4.0, q: 0.8 },
-                EqBand { freq: 4000.0, gain: 3.0, q: 1.0 },
-                EqBand { freq: 8000.0, gain: 1.0, q: 1.0 },
-            ],
-        },
-        EqPreset {
-            name: "Loudness".to_string(),
-            bands: vec![
-                EqBand { freq: 32.0, gain: 4.0, q: 0.8 },
-                EqBand { freq: 64.0, gain: 3.0, q: 0.8 },
-                EqBand { freq: 125.0, gain: 1.0, q: 1.0 },
-                EqBand { freq: 8000.0, gain: 2.0, q: 1.0 },
-                EqBand { freq: 16000.0, gain: 3.0, q: 0.8 },
-            ],
-        },
+        p("Flat", [0.0; EQ_BANDS]),
+        p("Bass Boost", [6.0, 5.0, 3.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        p("Treble Boost", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0, 4.0, 5.0]),
+        p("Vocal", [0.0, 0.0, -2.0, 0.0, 0.0, 3.0, 4.0, 3.0, 1.0, 0.0]),
+        p("Loudness", [4.0, 3.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0, 3.0]),
     ]
 }
 
@@ -306,5 +303,46 @@ mod denormal_tests {
         assert_eq!(flush_denormal(0.5), 0.5);
         assert_eq!(flush_denormal(-0.2), -0.2);
         assert_eq!(flush_denormal(0.0), 0.0);
+    }
+
+    #[test]
+    fn gains_10_pads_truncates_and_clamps() {
+        // Short list zero-pads to 10.
+        let p = EqPreset { name: "x".into(), gains: vec![3.0, -2.0] };
+        assert_eq!(p.gains_10(), [3.0, -2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        // Long list truncates to 10.
+        let p = EqPreset { name: "x".into(), gains: vec![1.0; 12] };
+        assert_eq!(p.gains_10().len(), 10);
+        // Out-of-range clamps to ±limit.
+        let p = EqPreset { name: "x".into(), gains: vec![99.0, -99.0] };
+        assert_eq!(p.gains_10()[0], EQ_GAIN_LIMIT);
+        assert_eq!(p.gains_10()[1], -EQ_GAIN_LIMIT);
+    }
+
+    #[test]
+    fn builtin_presets_are_ten_band_shapes() {
+        let presets = builtin_presets();
+        let by = |n: &str| presets.iter().find(|p| p.name == n).unwrap().gains_10();
+        // Flat is silent.
+        assert_eq!(by("Flat"), [0.0; 10]);
+        // Bass Boost lifts the low bands, leaves the top flat.
+        let bass = by("Bass Boost");
+        assert!(bass[0] > 0.0 && bass[1] > 0.0);
+        assert_eq!(bass[9], 0.0);
+        // Treble Boost lifts the top, leaves the bottom flat.
+        let treble = by("Treble Boost");
+        assert!(treble[8] > 0.0 && treble[9] > 0.0);
+        assert_eq!(treble[0], 0.0);
+    }
+
+    #[test]
+    fn load_gains_active_only_when_a_band_is_nonzero() {
+        let mut eq = EqChain::new();
+        eq.load_gains(&[0.0; 10], 48000.0);
+        assert!(!eq.is_active());
+        let mut g = [0.0f32; 10];
+        g[3] = 6.0;
+        eq.load_gains(&g, 48000.0);
+        assert!(eq.is_active());
     }
 }
