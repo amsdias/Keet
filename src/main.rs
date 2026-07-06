@@ -668,7 +668,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let banner_box = build_banner_box(shuffle, repeat_mode, &state);
+    // Create UI state before the banner so shuffle/repeat have a single home
+    // (ui.*). The parsed `shuffle`/`repeat_mode` locals feed it once here and
+    // are not read again — every later reader (banner rebuild, main loop) uses
+    // ui.shuffle / ui.repeat_mode.
+    let metadata_cache = metadata::MetadataCache::new(playlist.len());
+    let mut ui = UiState::new(source_paths, std::sync::Arc::clone(&metadata_cache));
+    ui.shuffle = shuffle;
+    ui.repeat_mode = repeat_mode;
+    state.repeat_mode.store(repeat_mode as u8, Ordering::Relaxed);
+
+    let banner_box = build_banner_box(ui.shuffle, ui.repeat_mode, &state);
     let mut banner_tail = String::new();
 
     // Audio setup
@@ -745,11 +755,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the first poll_input — a late reply's Esc would read as the quit key.
     let resize_during_probe = cover::probe_cell_metrics();
 
-    let metadata_cache = metadata::MetadataCache::new(playlist.len());
-    let mut ui = UiState::new(source_paths, std::sync::Arc::clone(&metadata_cache));
-    ui.shuffle = shuffle;
-    ui.repeat_mode = repeat_mode;
-    state.repeat_mode.store(repeat_mode as u8, Ordering::Relaxed);
     ui.banner_lines = banner_lines;
     ui.banner_text = banner;
     ui.cover_enabled = cover_enabled;

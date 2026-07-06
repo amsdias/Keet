@@ -9,9 +9,53 @@ on:
       - main
 
 jobs:
+  # Fast gate: unit + DSP-chain integration tests (no audio device needed —
+  # the chain tests drain the rtrb ring in place of the callback). Platform-
+  # agnostic, so one Linux runner is enough.
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libdbus-1-dev pkg-config
+
+      - name: Test
+        run: cargo test --workspace
+
+  # Lint gate. `-D warnings` promotes clippy warnings to errors so the tree
+  # stays at zero. Drop the `-- -D warnings` to match CLAUDE.md's "warnings are
+  # informational" stance (then only hard clippy errors fail CI).
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install Linux deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libdbus-1-dev pkg-config
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
   build:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    # Don't spend matrix-build minutes if the code is red.
+    needs: [test, clippy]
 
     strategy:
       matrix:
