@@ -54,10 +54,9 @@ pub fn print_status_hifi(
     let inner_w = term_w.saturating_sub(4).clamp(60, 110);
 
     // === Anchor (line 1): top edge of header strip (double border) ===
+    let mut w = crate::ui::FrameWriter::new();
     let top = format!("╔{}╗", "═".repeat(inner_w));
-    print!("\r\x1B[K  {fg}{bar}{rst}", fg = p.fg, rst = p.reset, bar = top);
-
-    let mut lines_below: usize = 0;
+    w.first_line(&format!("  {fg}{bar}{rst}", fg = p.fg, rst = p.reset, bar = top));
 
     // === Header strip content row: K E E T │ ▶ PLAY · SHUFFLE · RPT-ALL  ...  TRACK 05 / 34 ===
     let track_n = state.current_track.load(Ordering::Relaxed) + 1;
@@ -86,6 +85,11 @@ pub fn print_status_hifi(
         "{c}{rep}{rst}",
         c = if repeat_label != "RPT-OFF" { p.fg } else { p.dim }, rst = p.reset, rep = repeat_label,
     ));
+    header_left.push_str(&format!("  {dim}·{rst}  ", dim = p.dim, rst = p.reset));
+    header_left.push_str(&format!(
+        "{dim}VOL{rst} {fg}{vol}%{rst}",
+        dim = p.dim, fg = p.fg, rst = p.reset, vol = state.volume.load(Ordering::Relaxed),
+    ));
     let header_right = format!(
         "{dim}TRACK{rst} {fg}{n:02}{rst} {dim}/ {tot}{rst}",
         dim = p.dim, fg = p.fg, rst = p.reset, n = track_n, tot = track_total,
@@ -95,21 +99,18 @@ pub fn print_status_hifi(
     let rvis = visible_len_ansi(&header_right);
     let row_inner_w = inner_w.saturating_sub(2);
     let hpad = row_inner_w.saturating_sub(lvis + rvis).max(2);
-    print!(
-        "\n\r\x1B[K  {fg}║{rst} {left}{gap}{right} {fg}║{rst}",
+    w.line(&format!(
+        "  {fg}║{rst} {left}{gap}{right} {fg}║{rst}",
         fg = p.fg, rst = p.reset,
         left = header_left, gap = " ".repeat(hpad), right = header_right,
-    );
-    lines_below += 1;
+    ));
 
     // === Bottom edge of header strip ===
     let header_bot = format!("╚{}╝", "═".repeat(inner_w));
-    print!("\n\r\x1B[K  {fg}{bar}{rst}", fg = p.fg, rst = p.reset, bar = header_bot);
-    lines_below += 1;
+    w.line(&format!("  {fg}{bar}{rst}", fg = p.fg, rst = p.reset, bar = header_bot));
 
     // Spacer
-    print!("\n\r\x1B[K");
-    lines_below += 1;
+    w.line("");
 
     // === Transport row: segmented time box (3 lines) + title/meta/progress on right ===
     let progress = if state.total_secs() > 0.0 {
@@ -153,60 +154,54 @@ pub fn print_status_hifi(
 
     // Row 1: seg_top  +  title (right column)
     let title_truncated = pad_or_truncate(&title_up, right_w);
-    print!(
-        "\n\r\x1B[K  {fg}{seg}{rst}{gap}{accent}{bold}{title}{rst}",
+    w.line(&format!(
+        "  {fg}{seg}{rst}{gap}{accent}{bold}{title}{rst}",
         fg = p.fg, accent = p.accent, bold = p.bold, rst = p.reset,
         seg = seg_top,
         gap = " ".repeat(gap_left),
         title = title_truncated,
-    );
-    lines_below += 1;
+    ));
 
     // Row 2: seg_mid  +  meta
     let meta_truncated = pad_or_truncate(&meta, right_w);
-    print!(
-        "\n\r\x1B[K  {fg}│{rst}{accent}{bold}{val}{rst}{fg}│{rst}{gap}{dim}{meta}{rst}",
+    w.line(&format!(
+        "  {fg}│{rst}{accent}{bold}{val}{rst}{fg}│{rst}{gap}{dim}{meta}{rst}",
         fg = p.fg, accent = p.accent, bold = p.bold, dim = p.dim, rst = p.reset,
         val = seg_mid_inner,
         gap = " ".repeat(gap_left),
         meta = meta_truncated,
-    );
-    lines_below += 1;
+    ));
 
     // Row 3: seg_bot  +  progress + " / TOTAL"
     let bar_w = right_w.saturating_sub(tot.chars().count() + 4).max(20);
     let bar = render_solid_bar(progress, bar_w);
-    print!(
-        "\n\r\x1B[K  {fg}{seg}{rst}{gap}{accent}{bar}{rst}  {dim}/ {tot}{rst}",
+    w.line(&format!(
+        "  {fg}{seg}{rst}{gap}{accent}{bar}{rst}  {dim}/ {tot}{rst}",
         fg = p.fg, accent = p.accent, dim = p.dim, rst = p.reset,
         seg = seg_bot,
         gap = " ".repeat(gap_left),
         bar = bar, tot = tot,
-    );
-    lines_below += 1;
+    ));
 
     // Spacer
-    print!("\n\r\x1B[K");
-    lines_below += 1;
+    w.line("");
 
     // === VU panel (single border) ===
     let (lp, rp) = state.get_peaks();
     let (lp_dot, rp_dot) = state.get_vu_dots();
-    print!(
-        "\n\r\x1B[K  {fg}┌{bar}┐{rst}",
+    w.line(&format!(
+        "  {fg}┌{bar}┐{rst}",
         fg = p.fg, rst = p.reset, bar = "─".repeat(inner_w),
-    );
-    lines_below += 1;
+    ));
 
     // Label row inside box. Inner content between the two `│` chars must span
     // `inner_w` columns to match the box top `┌─*inner_w┐`. The format adds a
     // leading and trailing space inside, so the label itself is `inner_w - 2`.
     let label_inner = pad_or_truncate("VU METER", inner_w.saturating_sub(2));
-    print!(
-        "\n\r\x1B[K  {fg}│{rst} {dim}{label}{rst} {fg}│{rst}",
+    w.line(&format!(
+        "  {fg}│{rst} {dim}{label}{rst} {fg}│{rst}",
         fg = p.fg, dim = p.dim, rst = p.reset, label = label_inner,
-    );
-    lines_below += 1;
+    ));
 
     // L/R bars: row inner content (between │ │) is " L {bar}{tail} " — that's
     // 4 fixed chars (lead space, L, space, trailing space) + meter_w + l_pad.
@@ -215,37 +210,32 @@ pub fn print_status_hifi(
     let l_bar = vu_bar(lp, lp_dot, meter_w, p);
     let r_bar = vu_bar(rp, rp_dot, meter_w, p);
     let l_pad = inner_w.saturating_sub(meter_w + 4);
-    print!(
-        "\n\r\x1B[K  {fg}│{rst} {dim}L{rst} {bar}{tail} {fg}│{rst}",
+    w.line(&format!(
+        "  {fg}│{rst} {dim}L{rst} {bar}{tail} {fg}│{rst}",
         fg = p.fg, dim = p.dim, rst = p.reset, bar = l_bar, tail = " ".repeat(l_pad),
-    );
-    lines_below += 1;
-    print!(
-        "\n\r\x1B[K  {fg}│{rst} {dim}R{rst} {bar}{tail} {fg}│{rst}",
+    ));
+    w.line(&format!(
+        "  {fg}│{rst} {dim}R{rst} {bar}{tail} {fg}│{rst}",
         fg = p.fg, dim = p.dim, rst = p.reset, bar = r_bar, tail = " ".repeat(l_pad),
-    );
-    lines_below += 1;
+    ));
 
     // dB scale row: `   {scale}{tail} ` must total `inner_w`.
     let scale = render_db_scale(meter_w, p);
     let scale_visible = visible_len_ansi(&scale);
     let scale_pad = inner_w.saturating_sub(scale_visible + 4);
-    print!(
-        "\n\r\x1B[K  {fg}│{rst}   {scale}{tail} {fg}│{rst}",
+    w.line(&format!(
+        "  {fg}│{rst}   {scale}{tail} {fg}│{rst}",
         fg = p.fg, rst = p.reset, scale = scale, tail = " ".repeat(scale_pad),
-    );
-    lines_below += 1;
+    ));
 
     // Bottom
-    print!(
-        "\n\r\x1B[K  {fg}└{bar}┘{rst}",
+    w.line(&format!(
+        "  {fg}└{bar}┘{rst}",
         fg = p.fg, rst = p.reset, bar = "─".repeat(inner_w),
-    );
-    lines_below += 1;
+    ));
 
     // Spacer
-    print!("\n\r\x1B[K");
-    lines_below += 1;
+    w.line("");
 
     // === Knob rack: 6 cells, single border each ===
     let vol = state.volume.load(Ordering::Relaxed);
@@ -331,18 +321,13 @@ pub fn print_status_hifi(
             fg = p.fg, rst = p.reset, bar = "─".repeat(cell_w.saturating_sub(2)),
         ));
     }
-    print!("\n\r\x1B[K{}", top_row);
-    lines_below += 1;
-    print!("\n\r\x1B[K{}", label_row);
-    lines_below += 1;
-    print!("\n\r\x1B[K{}", value_row);
-    lines_below += 1;
-    print!("\n\r\x1B[K{}", bot_row);
-    lines_below += 1;
+    w.line(&top_row);
+    w.line(&label_row);
+    w.line(&value_row);
+    w.line(&bot_row);
 
     // Spacer
-    print!("\n\r\x1B[K");
-    lines_below += 1;
+    w.line("");
 
     // === Marquee key bar ===
     let footer = if let Some(msg) = ui.take_status() {
@@ -350,14 +335,13 @@ pub fn print_status_hifi(
     } else {
         hifi_marquee_keys(p, term_w)
     };
-    print!("\n\r\x1B[K{}", truncate_ansi(&footer, term_w));
-    lines_below += 1;
+    w.line(&truncate_ansi(&footer, term_w));
 
     print!("\x1B[J");
     io::stdout().flush().ok();
 
     let _ = VizMode::None;
-    lines_below
+    w.count()
 }
 
 fn repeat_short(mode: crate::state::RepeatMode) -> &'static str {
@@ -570,10 +554,9 @@ pub fn print_status_hifi_library(
     let row_inner_w = inner_w.saturating_sub(2);
 
     // === Anchor (line 1): top edge of header strip (double border) ===
+    let mut w = crate::ui::FrameWriter::new();
     let top = format!("╔{}╗", "═".repeat(inner_w));
-    print!("\r\x1B[K  {fg}{bar}{rst}", fg = p.fg, rst = p.reset, bar = top);
-
-    let mut lines_below: usize = 0;
+    w.first_line(&format!("  {fg}{bar}{rst}", fg = p.fg, rst = p.reset, bar = top));
 
     // === Header content row: "L I B R A R Y" + right "N TRK · Hh Mm" ===
     let total_secs: f64 = (0..playlist.len())
@@ -591,22 +574,19 @@ pub fn print_status_hifi_library(
     let lvis = visible_len_ansi(&header_left);
     let rvis = visible_len_ansi(&header_right);
     let hpad = row_inner_w.saturating_sub(lvis + rvis).max(2);
-    print!(
-        "\n\r\x1B[K  {fg}║{rst} {left}{gap}{right} {fg}║{rst}",
+    w.line(&format!(
+        "  {fg}║{rst} {left}{gap}{right} {fg}║{rst}",
         fg = p.fg, rst = p.reset,
         left = header_left, gap = " ".repeat(hpad), right = header_right,
-    );
-    lines_below += 1;
+    ));
 
     // Bottom edge of header strip
     let header_bot = format!("╚{}╝", "═".repeat(inner_w));
-    print!("\n\r\x1B[K  {fg}{bar}{rst}", fg = p.fg, rst = p.reset, bar = header_bot);
-    lines_below += 1;
+    w.line(&format!("  {fg}{bar}{rst}", fg = p.fg, rst = p.reset, bar = header_bot));
 
     // === List area: single border ===
     let list_top = format!("┌{}┐", "─".repeat(inner_w));
-    print!("\n\r\x1B[K  {fg}{bar}{rst}", fg = p.fg, rst = p.reset, bar = list_top);
-    lines_below += 1;
+    w.line(&format!("  {fg}{bar}{rst}", fg = p.fg, rst = p.reset, bar = list_top));
 
     // Compute visible rows. Above: anchor + header_bot + list_top = 2 below the anchor.
     // Below: list_bot + spacer + key bar = 3.
@@ -627,16 +607,16 @@ pub fn print_status_hifi_library(
             match lines.get(i) {
                 Some(line) => {
                     let pad = inner_w.saturating_sub(visible_len_ansi(line));
-                    print!(
-                        "\n\r\x1B[K  {fg}│{rst}{line}{sp}{fg}│{rst}",
+                    w.line(&format!(
+                        "  {fg}│{rst}{line}{sp}{fg}│{rst}",
                         fg = p.fg, rst = p.reset, line = line, sp = " ".repeat(pad),
-                    );
+                    ));
                 }
                 None => {
-                    print!(
-                        "\n\r\x1B[K  {fg}│{rst}{blank}{fg}│{rst}",
+                    w.line(&format!(
+                        "  {fg}│{rst}{blank}{fg}│{rst}",
                         fg = p.fg, rst = p.reset, blank = " ".repeat(inner_w),
-                    );
+                    ));
                 }
             }
         }
@@ -676,16 +656,16 @@ pub fn print_status_hifi_library(
 
     if items_len == 0 && search_active {
         let inner_text = pad_or_truncate("  (no matches)", inner_w);
-        print!(
-            "\n\r\x1B[K  {fg}│{rst}{dim}{txt}{rst}{fg}│{rst}",
+        w.line(&format!(
+            "  {fg}│{rst}{dim}{txt}{rst}{fg}│{rst}",
             fg = p.fg, rst = p.reset, dim = p.dim, txt = inner_text,
-        );
+        ));
         for _ in 1..visible_rows {
             let blank = " ".repeat(inner_w);
-            print!(
-                "\n\r\x1B[K  {fg}│{rst}{txt}{fg}│{rst}",
+            w.line(&format!(
+                "  {fg}│{rst}{txt}{fg}│{rst}",
                 fg = p.fg, rst = p.reset, txt = blank,
-            );
+            ));
         }
     } else {
         let visible_count = visible_rows.min(items_len.saturating_sub(ui.scroll_offset));
@@ -738,27 +718,24 @@ pub fn print_status_hifi_library(
                     fg = p.fg, rst = p.reset, body = body,
                 )
             };
-            print!("\n\r\x1B[K{}", line);
+            w.line(&line);
         }
         for _ in visible_count..visible_rows {
             let blank = " ".repeat(inner_w);
-            print!(
-                "\n\r\x1B[K  {fg}│{rst}{txt}{fg}│{rst}",
+            w.line(&format!(
+                "  {fg}│{rst}{txt}{fg}│{rst}",
                 fg = p.fg, rst = p.reset, txt = blank,
-            );
+            ));
         }
     }
     }
-    lines_below += visible_rows;
 
     // List bottom border
     let list_bot = format!("└{}┘", "─".repeat(inner_w));
-    print!("\n\r\x1B[K  {fg}{bar}{rst}", fg = p.fg, rst = p.reset, bar = list_bot);
-    lines_below += 1;
+    w.line(&format!("  {fg}{bar}{rst}", fg = p.fg, rst = p.reset, bar = list_bot));
 
     // Spacer
-    print!("\n\r\x1B[K");
-    lines_below += 1;
+    w.line("");
 
     // === Marquee key bar / search prompt / status ===
     let footer = match &ui.input_mode {
@@ -783,12 +760,11 @@ pub fn print_status_hifi_library(
             }
         }
     };
-    print!("\n\r\x1B[K{}", truncate_ansi(&footer, term_w));
-    lines_below += 1;
+    w.line(&truncate_ansi(&footer, term_w));
 
     print!("\x1B[J");
     io::stdout().flush().ok();
-    lines_below
+    w.count()
 }
 
 fn format_dur_short(secs: f64) -> String {
@@ -845,10 +821,9 @@ pub fn print_status_hifi_lyrics(
     let row_inner_w = inner_w.saturating_sub(2);
 
     // === Anchor (line 1): top edge of header strip (double border) ===
+    let mut w = crate::ui::FrameWriter::new();
     let top = format!("╔{}╗", "═".repeat(inner_w));
-    print!("\r\x1B[K  {fg}{bar}{rst}", fg = p.fg, rst = p.reset, bar = top);
-
-    let mut lines_below: usize = 0;
+    w.first_line(&format!("  {fg}{bar}{rst}", fg = p.fg, rst = p.reset, bar = top));
 
     // === Header content row: TITLE accent bold + right "SYNC · {SOURCE} · 02:28 / 04:32" ===
     let idx = state.current_track.load(Ordering::Relaxed);
@@ -885,21 +860,18 @@ pub fn print_status_hifi_lyrics(
     } else { header_left };
     let lvis = visible_len_ansi(&header_left);
     let hpad = row_inner_w.saturating_sub(lvis + rvis).max(2);
-    print!(
-        "\n\r\x1B[K  {fg}║{rst} {left}{gap}{right} {fg}║{rst}",
+    w.line(&format!(
+        "  {fg}║{rst} {left}{gap}{right} {fg}║{rst}",
         fg = p.fg, rst = p.reset,
         left = header_left, gap = " ".repeat(hpad), right = header_right,
-    );
-    lines_below += 1;
+    ));
 
     let header_bot = format!("╚{}╝", "═".repeat(inner_w));
-    print!("\n\r\x1B[K  {fg}{bar}{rst}", fg = p.fg, rst = p.reset, bar = header_bot);
-    lines_below += 1;
+    w.line(&format!("  {fg}{bar}{rst}", fg = p.fg, rst = p.reset, bar = header_bot));
 
     // === Body box: single border, generous padding ===
     let body_top = format!("┌{}┐", "─".repeat(inner_w));
-    print!("\n\r\x1B[K  {fg}{bar}{rst}", fg = p.fg, rst = p.reset, bar = body_top);
-    lines_below += 1;
+    w.line(&format!("  {fg}{bar}{rst}", fg = p.fg, rst = p.reset, bar = body_top));
 
     // Reserved: header_strip 1 + header_bot 1 + body_top 1 = 3 below anchor
     // Footer: body_bot 1 + spacer 1 + key bar 1 = 3
@@ -954,43 +926,40 @@ pub fn print_status_hifi_lyrics(
                         dim = p.dim, rst = p.reset, txt = line_truncated,
                     )
                 };
-                print!(
-                    "\n\r\x1B[K  {fg}│{rst}{inner}{fg}│{rst}",
+                w.line(&format!(
+                    "  {fg}│{rst}{inner}{fg}│{rst}",
                     fg = p.fg, rst = p.reset, inner = inner_str,
-                );
+                ));
             } else {
                 let blank = " ".repeat(inner_w);
-                print!(
-                    "\n\r\x1B[K  {fg}│{rst}{txt}{fg}│{rst}",
+                w.line(&format!(
+                    "  {fg}│{rst}{txt}{fg}│{rst}",
                     fg = p.fg, rst = p.reset, txt = blank,
-                );
+                ));
             }
         }
     } else {
         let msg = "  (NO LYRICS AVAILABLE)";
         let inner_text = pad_or_truncate(msg, inner_w);
-        print!(
-            "\n\r\x1B[K  {fg}│{rst}{dim}{txt}{rst}{fg}│{rst}",
+        w.line(&format!(
+            "  {fg}│{rst}{dim}{txt}{rst}{fg}│{rst}",
             fg = p.fg, dim = p.dim, rst = p.reset, txt = inner_text,
-        );
+        ));
         for _ in 1..body_rows {
             let blank = " ".repeat(inner_w);
-            print!(
-                "\n\r\x1B[K  {fg}│{rst}{txt}{fg}│{rst}",
+            w.line(&format!(
+                "  {fg}│{rst}{txt}{fg}│{rst}",
                 fg = p.fg, rst = p.reset, txt = blank,
-            );
+            ));
         }
     }
-    lines_below += body_rows;
 
     // Body bottom border
     let body_bot = format!("└{}┘", "─".repeat(inner_w));
-    print!("\n\r\x1B[K  {fg}{bar}{rst}", fg = p.fg, rst = p.reset, bar = body_bot);
-    lines_below += 1;
+    w.line(&format!("  {fg}{bar}{rst}", fg = p.fg, rst = p.reset, bar = body_bot));
 
     // Spacer
-    print!("\n\r\x1B[K");
-    lines_below += 1;
+    w.line("");
 
     // === Marquee key bar ===
     let mut bar = String::new();
@@ -1017,12 +986,11 @@ pub fn print_status_hifi_lyrics(
             dim = p.dim, rst = p.reset, ofs = ui.lyrics_offset,
         ));
     }
-    print!("\n\r\x1B[K{}", truncate_ansi(&bar, term_w));
-    lines_below += 1;
+    w.line(&truncate_ansi(&bar, term_w));
 
     print!("\x1B[J");
     io::stdout().flush().ok();
-    lines_below
+    w.count()
 }
 
 fn truncate_ansi(s: &str, max_width: usize) -> String {

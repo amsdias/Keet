@@ -10,11 +10,26 @@ use serde::Deserialize;
 /// valid; absent keys fall back to Keet's built-in defaults / resume state.
 #[derive(Deserialize, Default, Debug)]
 pub struct Config {
-    /// Default UI theme: `"classic" | "minimal" | "hifi"`. Applied on every
-    /// launch, overriding the resumed last-session theme; `--theme` still wins.
+    /// Default UI theme: `"classic" | "minimal" | "hifi"`.
     #[serde(default)]
     pub theme: Option<String>,
+    /// Default visualization: `none | vu | spectrum | spectrum-vertical |
+    /// oscilloscope | lissajous | spectrogram | analysis`.
+    #[serde(default)]
+    pub viz: Option<String>,
+    /// Default ReplayGain mode: `track | album | off`.
+    #[serde(default)]
+    pub rg_mode: Option<String>,
+    /// Default EQ preset name (built-in or custom).
+    #[serde(default)]
+    pub eq: Option<String>,
+    /// Default crossfeed preset name: `off | light | medium | strong`.
+    #[serde(default)]
+    pub crossfeed: Option<String>,
 }
+
+// Each field applies on every launch, overriding the resumed last-session value;
+// an explicit CLI flag for that setting still wins. See main.rs.
 
 /// Parse config JSON, falling back to defaults on any error (malformed JSON, a
 /// broken config never blocks startup). Unknown keys are ignored.
@@ -47,5 +62,26 @@ mod tests {
         assert_eq!(parse(r#"{"theme": "hifi", "future": 1}"#).theme.as_deref(), Some("hifi"));
         // Malformed JSON → defaults, never a panic.
         assert_eq!(parse("not json").theme, None);
+    }
+
+    #[test]
+    fn parse_reads_all_defaults_and_they_resolve() {
+        let c = parse(
+            r#"{"theme":"hifi","viz":"analysis","rg_mode":"album","eq":"Vocal","crossfeed":"medium"}"#,
+        );
+        assert_eq!(c.viz.as_deref(), Some("analysis"));
+        assert_eq!(c.rg_mode.as_deref(), Some("album"));
+        assert_eq!(c.eq.as_deref(), Some("Vocal"));
+        assert_eq!(c.crossfeed.as_deref(), Some("medium"));
+        // The enum-backed ones resolve.
+        assert!(matches!(
+            crate::state::VizMode::from_str("analysis"),
+            Some(crate::state::VizMode::SpectrogramAnalysis)
+        ));
+        assert!(matches!(
+            crate::state::RgMode::from_str("album"),
+            Some(crate::state::RgMode::Album)
+        ));
+        assert!(crate::state::VizMode::from_str("nope").is_none());
     }
 }

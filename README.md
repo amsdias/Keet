@@ -178,11 +178,25 @@ Set a launch default in priority order — `--theme` flag → config file → la
 keet ~/Music --theme hifi          # this launch only
 ```
 
-For a *persistent* default that applies on every launch (including with explicit paths), create `~/.config/keet/config.json` (`%APPDATA%\keet\config.json` on Windows):
+For a *persistent* default that applies on every launch (including with explicit paths), create `~/.config/keet/config.json` (`%APPDATA%\keet\config.json` on Windows). Every key is optional and applies on top of the resumed session (an explicit CLI flag still wins):
 
 ```json
-{ "theme": "minimal" }
+{
+  "theme": "minimal",
+  "viz": "analysis",
+  "rg_mode": "track",
+  "eq": "Bass Boost",
+  "crossfeed": "off"
+}
 ```
+
+| Key | Values |
+|-----|--------|
+| `theme` | `classic` \| `minimal` \| `hifi` |
+| `viz` | `none` \| `vu` \| `spectrum` \| `spectrum-vertical` \| `oscilloscope` \| `lissajous` \| `spectrogram` \| `analysis` |
+| `rg_mode` | `track` \| `album` \| `off` |
+| `eq` | any preset name (built-in or custom) |
+| `crossfeed` | `off` \| `light` \| `medium` \| `strong` |
 
 ## EQ + FX Editor
 
@@ -230,10 +244,12 @@ Example presets are included in `assets/` -- copy them to the presets folders as
 mkdir -p ~/.config/keet/eq ~/.config/keet/effects
 cp assets/eq-example.json ~/.config/keet/eq/
 cp assets/fx-example.json ~/.config/keet/effects/
+cp assets/config-example.json ~/.config/keet/config.json   # default theme etc.
 
 # Windows
 copy assets\eq-example.json %APPDATA%\keet\eq\
 copy assets\fx-example.json %APPDATA%\keet\effects\
+copy assets\config-example.json %APPDATA%\keet\config.json
 ```
 
 ## Effects Presets

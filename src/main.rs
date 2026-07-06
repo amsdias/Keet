@@ -579,6 +579,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(theme::ThemeKind::from_str);
     state.set_theme(theme::resolve_theme(theme_arg, config_theme, resume_theme));
 
+    // Apply remaining config.json defaults. Each overrides the resumed value but
+    // yields to an explicit CLI flag for the same setting. (CLI flags only occur
+    // with explicit paths, and resume only on a bare launch, so checking flag
+    // presence gives the right priority in both modes.)
+    if let Some(v) = app_config.viz.as_deref().and_then(state::VizMode::from_str) {
+        state.viz_mode.store(v as u8, Ordering::Relaxed);
+    }
+    if !args.iter().any(|a| a == "--rg-mode") {
+        if let Some(m) = app_config.rg_mode.as_deref().and_then(RgMode::from_str) {
+            state.rg_mode.store(m as u8, Ordering::Relaxed);
+        }
+    }
+    if eq_arg.is_none() {
+        if let Some(name) = app_config.eq.as_deref() {
+            if let Some(idx) = eq_presets.iter().position(|p| p.name.eq_ignore_ascii_case(name)) {
+                state.eq_preset_index.store(idx, Ordering::Relaxed);
+            }
+        }
+    }
+    if let Some(name) = app_config.crossfeed.as_deref() {
+        if let Some(idx) = cf_presets.iter().position(|p| p.name.eq_ignore_ascii_case(name)) {
+            state.crossfeed_preset_index.store(idx, Ordering::Relaxed);
+        }
+    }
+
     // Override device/exclusive from resume state when resuming with no args
     let mut device_arg = device_arg;
     let mut exclusive = exclusive;
@@ -892,6 +917,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // Reindex metadata cache
                 crate::ui::reindex_and_restart_scan(&mut ui, &playlist, &old_playlist);
+                // Re-arm the artist→album auto-sort: the rebuild above is
+                // path-ordered, so without this a folder played on repeat-all
+                // reverts to filename order instead of staying tag-sorted.
+                arm_auto_sort(&mut ui);
 
                 ui.current = 0;
             } else {

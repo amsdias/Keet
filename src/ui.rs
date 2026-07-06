@@ -89,36 +89,36 @@ fn visible_len(s: &str) -> usize {
 /// predicted by hand — predicted counts drifting from printed reality was a
 /// recurring off-by-one source (the next frame's cursor-up then lands
 /// mid-frame and the layout smears).
-struct FrameWriter {
+pub(crate) struct FrameWriter {
     below_first: usize,
 }
 
 impl FrameWriter {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self { below_first: 0 }
     }
 
     /// Print the frame's first line in place (carriage return + erase): the
     /// anchor row the next frame's cursor-up returns to. Not counted.
-    fn first_line(&mut self, s: &str) {
+    pub(crate) fn first_line(&mut self, s: &str) {
         print!("\r\x1B[K{}", s);
     }
 
     /// Advance one line and print with erase-to-EOL.
-    fn line(&mut self, s: &str) {
+    pub(crate) fn line(&mut self, s: &str) {
         print!("\n\r\x1B[K{}", s);
         self.below_first += 1;
     }
 
     /// Advance one line and print WITHOUT erase — sixel blocks erase
     /// themselves, and an EL here would wipe that row's slice of the image.
-    fn line_raw(&mut self, s: &str) {
+    pub(crate) fn line_raw(&mut self, s: &str) {
         print!("\n\r{}", s);
         self.below_first += 1;
     }
 
     /// Lines emitted below the anchor row this frame.
-    fn count(&self) -> usize {
+    pub(crate) fn count(&self) -> usize {
         self.below_first
     }
 }

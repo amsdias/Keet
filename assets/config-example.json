@@ -1,3 +1,7 @@
 {
-  "theme": "minimal"
+  "theme": "minimal",
+  "viz": "analysis",
+  "rg_mode": "track",
+  "eq": "Flat",
+  "crossfeed": "off"
 }

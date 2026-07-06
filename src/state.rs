@@ -143,6 +143,15 @@ impl RgMode {
             RgMode::Off => "Off",
         }
     }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "track" => Some(RgMode::Track),
+            "album" => Some(RgMode::Album),
+            "off" => Some(RgMode::Off),
+            _ => None,
+        }
+    }
 }
 
 // Visualization modes
@@ -183,6 +192,21 @@ impl VizMode {
             6 => VizMode::Spectrogram,
             7 => VizMode::SpectrogramAnalysis,
             _ => VizMode::None,
+        }
+    }
+
+    /// Parse a config/default viz name. Accepts a few friendly aliases.
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "none" | "off" => Some(VizMode::None),
+            "vu" | "vumeter" | "vu-meter" => Some(VizMode::VuMeter),
+            "spectrum" | "spectrum-horizontal" => Some(VizMode::SpectrumHorizontal),
+            "spectrum-vertical" | "vertical" => Some(VizMode::SpectrumVertical),
+            "oscilloscope" | "scope" => Some(VizMode::Oscilloscope),
+            "lissajous" | "vector" => Some(VizMode::Lissajous),
+            "spectrogram" => Some(VizMode::Spectrogram),
+            "analysis" | "analysis-spectrogram" => Some(VizMode::SpectrogramAnalysis),
+            _ => None,
         }
     }
 

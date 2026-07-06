@@ -80,25 +80,22 @@ pub fn print_status_minimal(
     let buf_pct = stats.smoothed_buf_pct as u32;
 
     // === Anchor (line 1): wordmark ===
-    print_wordmark_anchor(p);
-
-    let mut lines_below: usize = 0;
+    let mut w = crate::ui::FrameWriter::new();
+    w.first_line(&wordmark_anchor(p));
 
     // === Line 2: dim rule separating the wordmark from the song info ===
     let rule_w = term_w.saturating_sub(4);
-    print!(
-        "\n\r\x1B[K  {rule}{rl}{rst}",
+    w.line(&format!(
+        "  {rule}{rl}{rst}",
         rule = p.rule, rst = p.reset, rl = "─".repeat(rule_w),
-    );
-    lines_below += 1;
+    ));
 
     // === Line 3: bold title (pushed down so the wordmark survives scroll) ===
     let title_truncated = truncate_plain(&title, term_w.saturating_sub(2));
-    print!(
-        "\n\r\x1B[K  {bold}{fg}{title}{rst}",
+    w.line(&format!(
+        "  {bold}{fg}{title}{rst}",
         bold = p.bold, fg = p.fg, rst = p.reset, title = title_truncated,
-    );
-    lines_below += 1;
+    ));
 
     // === Line 4: dim Artist · Album ===
     let mut sub = String::new();
@@ -107,15 +104,14 @@ pub fn print_status_minimal(
         if !sub.is_empty() { sub.push_str("  ·  "); }
         sub.push_str(al);
     }
-    print!(
-        "\n\r\x1B[K  {dim}{sub}{rst}",
+    w.line(&format!(
+        "  {dim}{sub}{rst}",
         dim = p.dim, rst = p.reset,
         sub = truncate_plain(&sub, term_w.saturating_sub(2)),
-    );
-    lines_below += 1;
+    ));
 
     // === Whitespace gap before NOW PLAYING / SIGNAL block ===
-    blank(&mut lines_below);
+    w.line("");
 
     // === Two-column block: NOW PLAYING (left) │ SIGNAL (right) ===
     // Layout: 2 (margin) + left_w + 1 (space) + 1 (│) + 1 (space) + signal_w
@@ -146,11 +142,10 @@ pub fn print_status_minimal(
     if two_col {
         let left = format!("{dim}{l}{rst}", dim = p.dim, rst = p.reset, l = np_label);
         let right = format!("{dim}SIGNAL{rst}", dim = p.dim, rst = p.reset);
-        print_two_col(&left, np_label.len(), &right, left_w);
+        w.line(&fmt_two_col(&left, np_label.len(), &right, left_w));
     } else {
-        print!("\n\r\x1B[K  {dim}{l}{rst}", dim = p.dim, rst = p.reset, l = np_label);
+        w.line(&format!("  {dim}{l}{rst}", dim = p.dim, rst = p.reset, l = np_label));
     }
-    lines_below += 1;
 
     // === Time/bar/total row paired with first SIGNAL row (output) ===
     let progress = if state.total_secs() > 0.0 {
@@ -171,11 +166,10 @@ pub fn print_status_minimal(
         let (k, v, good) = &signal_rows[0];
         let row = render_signal_row(p, k, v, *good, signal_w);
         let row_plain_len = signal_row_plain_len(k, v, signal_w);
-        print_two_col_padded(&time_line, time_line_plain_len, &row, row_plain_len, left_w);
+        w.line(&fmt_two_col_padded(&time_line, time_line_plain_len, &row, row_plain_len, left_w));
     } else {
-        print!("\n\r\x1B[K  {}", time_line);
+        w.line(&format!("  {}", time_line));
     }
-    lines_below += 1;
 
     // === Track meta line paired with second SIGNAL row (volume) ===
     let track_n = state.current_track.load(Ordering::Relaxed) + 1;
@@ -215,30 +209,27 @@ pub fn print_status_minimal(
         let (k, v, good) = &signal_rows[1];
         let row = render_signal_row(p, k, v, *good, signal_w);
         let row_plain_len = signal_row_plain_len(k, v, signal_w);
-        print_two_col_padded(&meta_styled, meta_visible_len, &row, row_plain_len, left_w);
+        w.line(&fmt_two_col_padded(&meta_styled, meta_visible_len, &row, row_plain_len, left_w));
     } else {
-        print!("\n\r\x1B[K  {}", meta_styled);
+        w.line(&format!("  {}", meta_styled));
     }
-    lines_below += 1;
 
     // === Remaining SIGNAL rows on the right (left side blank) ===
     if two_col {
         for (k, v, good) in signal_rows.iter().skip(2) {
             let row = render_signal_row(p, k, v, *good, signal_w);
             let row_plain_len = signal_row_plain_len(k, v, signal_w);
-            print_two_col_padded("", 0, &row, row_plain_len, left_w);
-            lines_below += 1;
+            w.line(&fmt_two_col_padded("", 0, &row, row_plain_len, left_w));
         }
     }
 
     // === SPECTRUM section ===
     if viz_mode != VizMode::None {
-        blank(&mut lines_below);
-        print!(
-            "\n\r\x1B[K  {dim}{label}{rst}",
+        w.line("");
+        w.line(&format!(
+            "  {dim}{label}{rst}",
             dim = p.dim, rst = p.reset, label = viz_section_label(viz_mode),
-        );
-        lines_below += 1;
+        ));
 
         if viz_mode == VizMode::SpectrogramAnalysis {
             // Real analysis spectrogram: a pixel image (Kitty on Ghostty/Kitty,
@@ -252,7 +243,7 @@ pub fn print_status_minimal(
             // Minimal's footer below the viz is a blank line + the 3-line
             // command-bar box (4 rows); analysis_rows_for_window reserves 3, so
             // pass +1 to reserve the tallest footer and never overflow.
-            let ana_rows = analysis_rows_for_window(term_h, 1 + lines_below + 1);
+            let ana_rows = analysis_rows_for_window(term_h, 1 + w.count() + 1);
             let raw = analysis_needs_raw_lines();
             let force = prev_viz_lines == usize::MAX || !block_was_intact;
             ui.spectro_block_intact = true;
@@ -260,15 +251,13 @@ pub fn print_status_minimal(
                 analyser, term_w, log_axis, state.is_paused(), ana_rows, force,
             ) {
                 if raw {
-                    print!("\n\r{}", line);
+                    w.line_raw(&line);
                 } else {
-                    print!("\n\r\x1B[K{}", line);
+                    w.line(&line);
                 }
-                lines_below += 1;
             }
         } else {
-            // Character-cell viz modes: erase-to-EOL is fine. Count the lines we
-            // actually print so the caller's cursor-up math can't drift.
+            // Character-cell viz modes: erase-to-EOL is fine.
             let viz_lines: Vec<String> = match viz_mode {
                 VizMode::None => Vec::new(),
                 VizMode::VuMeter => render_vu_meter(state, viz_style, term_w),
@@ -279,96 +268,89 @@ pub fn print_status_minimal(
                 VizMode::Spectrogram => render_spectrogram(analyser, viz_style, term_w),
                 VizMode::SpectrogramAnalysis => unreachable!("handled above"),
             };
-            for line in &viz_lines { print!("\n\r\x1B[K{}", line); }
-            lines_below += viz_lines.len();
+            for line in &viz_lines {
+                w.line(line);
+            }
         }
     }
 
     // === Footer command tray (boxed) ===
-    blank(&mut lines_below);
+    w.line("");
 
     if let Some(msg) = ui.take_status() {
-        print!(
-            "\n\r\x1B[K  {accent}{msg}{rst}",
+        w.line(&format!(
+            "  {accent}{msg}{rst}",
             accent = p.accent, rst = p.reset, msg = msg,
-        );
-        lines_below += 1;
+        ));
     } else {
         let inner_w = term_w.saturating_sub(4);
         let h_w = inner_w.saturating_sub(2);
         let bar = slim_cmd_bar_inner(p);
         let bar_visible = visible_len_ansi(&bar);
         let pad = inner_w.saturating_sub(bar_visible + 2);
-        print!(
-            "\n\r\x1B[K  {rule}┌{h}┐{rst}",
+        w.line(&format!(
+            "  {rule}┌{h}┐{rst}",
             rule = p.rule, rst = p.reset, h = "─".repeat(h_w),
-        );
-        lines_below += 1;
-        print!(
-            "\n\r\x1B[K  {rule}│{rst} {bar}{pad} {rule}│{rst}",
+        ));
+        w.line(&format!(
+            "  {rule}│{rst} {bar}{pad} {rule}│{rst}",
             rule = p.rule, rst = p.reset, bar = bar, pad = " ".repeat(pad),
-        );
-        lines_below += 1;
-        print!(
-            "\n\r\x1B[K  {rule}└{h}┘{rst}",
+        ));
+        w.line(&format!(
+            "  {rule}└{h}┘{rst}",
             rule = p.rule, rst = p.reset, h = "─".repeat(h_w),
-        );
-        lines_below += 1;
+        ));
     }
 
     print!("\x1B[J");
     io::stdout().flush().ok();
-    lines_below
+    w.count()
 }
 
-fn blank(lines_below: &mut usize) {
-    print!("\n\r\x1B[K");
-    *lines_below += 1;
-}
 
 /// Print the Minimal wordmark anchor row (no leading newline, full-line clear).
 /// Rendered every frame so it survives terminal scroll when viz pushes content
 /// past the bottom row. Uses bold for `K E E T` and dim for the subtitle so
 /// the line is always visible (the dim attribute alone can render invisible
 /// on some palette/background combos).
-fn print_wordmark_anchor(p: &crate::theme::Palette) {
-    print!(
-        "\r\x1B[K  {bold}{fg}K  E  E  T{rst}   {dim}music for terminals{rst}",
+fn wordmark_anchor(p: &crate::theme::Palette) -> String {
+    format!(
+        "  {bold}{fg}K  E  E  T{rst}   {dim}music for terminals{rst}",
         bold = p.bold, fg = p.fg, dim = p.dim, rst = p.reset,
-    );
+    )
 }
 
 /// Print a styled left-column string and a styled right-column string on the
 /// same line. Layout: `  {left}{pad} │ {right}` — the `│` is rendered in
 /// rule color so it reads as a quiet column divider.
-fn print_two_col(left: &str, left_visible_len: usize, right: &str, left_w: usize) {
+fn fmt_two_col(left: &str, left_visible_len: usize, right: &str, left_w: usize) -> String {
     let p = palette(ThemeKind::Minimal);
     let pad = left_w.saturating_sub(left_visible_len);
-    print!(
-        "\n\r\x1B[K  {left}{pad} {rule}│{rst} {right}",
+    format!(
+        "  {left}{pad} {rule}│{rst} {right}",
         left = left,
         pad = " ".repeat(pad),
         rule = p.rule, rst = p.reset,
         right = right,
-    );
+    )
 }
 
-fn print_two_col_padded(
+fn fmt_two_col_padded(
     left: &str,
     left_visible_len: usize,
     right: &str,
     _right_visible_len: usize,
     left_w: usize,
-) {
+) -> String {
     let p = palette(ThemeKind::Minimal);
     let pad = left_w.saturating_sub(left_visible_len.min(left_w));
-    print!(
-        "\n\r\x1B[K  {left}{pad} {rule}│{rst} {right}",
+    format!(
+        "  {left}{pad} {rule}│{rst} {right}",
         left = left,
         pad = " ".repeat(pad),
         rule = p.rule, rst = p.reset,
         right = right,
-    );
+    )
 }
 
 /// Render one SIGNAL row: "key" (dim, left) + value (fg or accent, right) padded
@@ -535,9 +517,8 @@ pub fn print_status_minimal_library(
     }
 
     // === Anchor (line 1): wordmark — survives terminal scroll ===
-    print_wordmark_anchor(p);
-
-    let mut lines_below: usize = 0;
+    let mut w = crate::ui::FrameWriter::new();
+    w.first_line(&wordmark_anchor(p));
 
     // === Library header row: "Library  N tracks · Hh Mm" + right hints ===
     let total_tracks = playlist.len();
@@ -559,21 +540,19 @@ pub fn print_status_minimal_library(
     let pad = term_w
         .saturating_sub(2 + left_visible + right_visible + 2)
         .max(1);
-    print!(
-        "\n\r\x1B[K  {left}{gap}{right}",
+    w.line(&format!(
+        "  {left}{gap}{right}",
         left = left_label,
         gap = " ".repeat(pad),
         right = right_hints,
-    );
-    lines_below += 1;
+    ));
 
     // Top rule
     let rule_w = term_w.saturating_sub(4);
-    print!(
-        "\n\r\x1B[K  {rule}{rl}{rst}",
+    w.line(&format!(
+        "  {rule}{rl}{rst}",
         rule = p.rule, rst = p.reset, rl = "─".repeat(rule_w),
-    );
-    lines_below += 1;
+    ));
 
     // === Column layout: # | TITLE | ALBUM | TIME ===
     let num_w = 4usize;
@@ -593,8 +572,7 @@ pub fn print_status_minimal_library(
         gap = " ".repeat(inter_gap),
         num_w = num_w, title_w = title_w, album_w = album_w.max(1), time_w = time_w,
     );
-    print!("\n\r\x1B[K{}", truncate_ansi(&header_line, term_w));
-    lines_below += 1;
+    w.line(&truncate_ansi(&header_line, term_w));
 
     // Compute visible rows. Header above the rows: library row + rule + col
     // headers = 3. Footer: top rule + key bar = 2. Anchor (+1) is the
@@ -610,10 +588,10 @@ pub fn print_status_minimal_library(
         let lines = crate::ui::render_tree_body(ui, visible_rows, term_w, p);
         let n = lines.len();
         for line in &lines {
-            print!("\n\r\x1B[K{}", line);
+            w.line(line);
         }
         for _ in n..visible_rows {
-            print!("\n\r\x1B[K");
+            w.line("");
         }
     } else {
     let search_active = matches!(&ui.input_mode, InputMode::Search(q) if !q.is_empty());
@@ -638,11 +616,11 @@ pub fn print_status_minimal_library(
     ui.scroll_offset = ui.scroll_offset.min(max_offset);
 
     if items_len == 0 && search_active {
-        print!(
-            "\n\r\x1B[K  {dim}(no matches){rst}",
+        w.line(&format!(
+            "  {dim}(no matches){rst}",
             dim = p.dim, rst = p.reset
-        );
-        for _ in 1..visible_rows { print!("\n\r\x1B[K"); }
+        ));
+        for _ in 1..visible_rows { w.line(""); }
     } else {
         let visible_count = visible_rows.min(items_len.saturating_sub(ui.scroll_offset));
         for row in 0..visible_count {
@@ -718,12 +696,11 @@ pub fn print_status_minimal_library(
             } else {
                 format!("  {}", body)
             };
-            print!("\n\r\x1B[K{}", truncate_ansi(&line, term_w));
+            w.line(&truncate_ansi(&line, term_w));
         }
-        for _ in visible_count..visible_rows { print!("\n\r\x1B[K"); }
+        for _ in visible_count..visible_rows { w.line(""); }
     }
     }
-    lines_below += visible_rows;
 
     // === Footer: rule-bordered cmd tray (3 lines) ===
     let footer_content: String = match &ui.input_mode {
@@ -748,16 +725,15 @@ pub fn print_status_minimal_library(
             }
         }
     };
-    print!(
-        "\n\r\x1B[K  {rule}{rl}{rst}",
+    w.line(&format!(
+        "  {rule}{rl}{rst}",
         rule = p.rule, rst = p.reset, rl = "─".repeat(rule_w),
-    );
-    print!("\n\r\x1B[K{}", truncate_ansi(&footer_content, term_w));
-    lines_below += 2;
+    ));
+    w.line(&truncate_ansi(&footer_content, term_w));
 
     print!("\x1B[J");
     io::stdout().flush().ok();
-    lines_below
+    w.count()
 }
 
 fn format_duration_total(secs: f64) -> String {
@@ -833,7 +809,8 @@ pub fn print_status_minimal_lyrics(
     }
 
     // === Anchor (line 1): wordmark — survives terminal scroll ===
-    print_wordmark_anchor(p);
+    let mut w = crate::ui::FrameWriter::new();
+    w.first_line(&wordmark_anchor(p));
 
     // === Line 2: title bold + dim metadata + accent time on right ===
     let idx = state.current_track.load(Ordering::Relaxed);
@@ -869,20 +846,17 @@ pub fn print_status_minimal_lyrics(
     let left_visible = visible_len_ansi(&left_str);
     let right_str = format!("{accent}{t}{rst}", accent = p.accent, rst = p.reset, t = time_str);
     let pad = term_w.saturating_sub(2 + left_visible + right_visible + 2).max(1);
-    print!(
-        "\n\r\x1B[K  {left}{gap}{right}",
+    w.line(&format!(
+        "  {left}{gap}{right}",
         left = left_str, gap = " ".repeat(pad), right = right_str,
-    );
-
-    let mut lines_below: usize = 1;
+    ));
 
     // Top rule
     let rule_w = term_w.saturating_sub(4);
-    print!(
-        "\n\r\x1B[K  {rule}{rl}{rst}",
+    w.line(&format!(
+        "  {rule}{rl}{rst}",
         rule = p.rule, rst = p.reset, rl = "─".repeat(rule_w),
-    );
-    lines_below += 1;
+    ));
 
     // === Body region: vertically padded, centered text with falloff ===
     // Header consumed below anchor (wordmark): title row + rule = 2.
@@ -893,8 +867,7 @@ pub fn print_status_minimal_lyrics(
         .saturating_sub(header_consumed + footer_consumed + ui.banner_lines + 1)
         .max(1);
 
-    print!("\n\r\x1B[K");
-    lines_below += 1;
+    w.line("");
     let body_rows = body_rows.saturating_sub(1).max(1);
 
     if let Some(ref lyrics) = ui.lyrics {
@@ -941,26 +914,24 @@ pub fn print_status_minimal_lyrics(
                         text = truncate_plain(text, term_w.saturating_sub(4)),
                     )
                 };
-                print!("\n\r\x1B[K{}", truncate_ansi(&line, term_w));
+                w.line(&truncate_ansi(&line, term_w));
             } else {
-                print!("\n\r\x1B[K");
+                w.line("");
             }
         }
     } else {
         let msg = "(no lyrics available)";
         let leading = term_w.saturating_sub(msg.chars().count()) / 2;
-        print!(
-            "\n\r\x1B[K{lead}{dim}{msg}{rst}",
+        w.line(&format!(
+            "{lead}{dim}{msg}{rst}",
             lead = " ".repeat(leading),
             dim = p.dim, rst = p.reset, msg = msg,
-        );
-        for _ in 1..body_rows { print!("\n\r\x1B[K"); }
+        ));
+        for _ in 1..body_rows { w.line(""); }
     }
-    lines_below += body_rows;
 
     // === Footer: blank + centered key bar ===
-    print!("\n\r\x1B[K");
-    lines_below += 1;
+    w.line("");
 
     let mut hints: Vec<(String, String)> = vec![
         (format!("{fg}W/S{rst}", fg = p.fg, rst = p.reset),
@@ -998,16 +969,15 @@ pub fn print_status_minimal_lyrics(
     }
     let _ = sep_v;
     let leading = term_w.saturating_sub(visible_count.min(term_w)) / 2;
-    print!(
-        "\n\r\x1B[K{lead}{bar}",
+    w.line(&format!(
+        "{lead}{bar}",
         lead = " ".repeat(leading),
         bar = bar,
-    );
-    lines_below += 1;
+    ));
 
     print!("\x1B[J");
     io::stdout().flush().ok();
-    lines_below
+    w.count()
 }
 
 /// ANSI-aware truncation: counts only printable characters against `max_width`,
