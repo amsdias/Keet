@@ -85,11 +85,6 @@ pub fn print_status_hifi(
         "{c}{rep}{rst}",
         c = if repeat_label != "RPT-OFF" { p.fg } else { p.dim }, rst = p.reset, rep = repeat_label,
     ));
-    header_left.push_str(&format!("  {dim}·{rst}  ", dim = p.dim, rst = p.reset));
-    header_left.push_str(&format!(
-        "{dim}VOL{rst} {fg}{vol}%{rst}",
-        dim = p.dim, fg = p.fg, rst = p.reset, vol = state.volume.load(Ordering::Relaxed),
-    ));
     let header_right = format!(
         "{dim}TRACK{rst} {fg}{n:02}{rst} {dim}/ {tot}{rst}",
         dim = p.dim, fg = p.fg, rst = p.reset, n = track_n, tot = track_total,
