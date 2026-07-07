@@ -151,7 +151,7 @@ pub(crate) fn http_agent() -> ureq::Agent {
                 .timeout_connect(Some(std::time::Duration::from_secs(5)))
                 .timeout_recv_response(Some(std::time::Duration::from_secs(15)))
                 .timeout_recv_body(Some(std::time::Duration::from_secs(15)))
-                .user_agent("Keet Audio Player (https://github.com/amsdias/rust_music_player)")
+                .user_agent("Keet Audio Player (https://github.com/amsdias/Keet)")
                 .build()
                 .new_agent()
         })
