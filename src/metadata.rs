@@ -7,7 +7,7 @@ use std::thread::{self, JoinHandle};
 
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
-use symphonia::core::meta::{MetadataOptions, StandardTagKey, Value};
+use symphonia::core::meta::{Limit, MetadataOptions, StandardTagKey, Value};
 use symphonia::core::probe::Hint;
 
 #[derive(Clone)]
@@ -141,24 +141,14 @@ impl MetadataCache {
         *entries = new_entries;
     }
 
-    pub fn remove_at(&self, index: usize) {
-        let mut entries = self.entries.write().unwrap();
-        if index < entries.len() {
-            entries.remove(index);
-        }
-    }
+    // NOTE: there are deliberately NO positional mutators (remove_at/move_entry)
+    // here. Scan workers write by the index of the playlist snapshot they were
+    // spawned with, so any reshape of the entries Vec must go through
+    // `ui::reindex_and_restart_scan` (cancel → join → remap by path → respawn).
 
     pub fn duration(&self, index: usize) -> Option<f64> {
         let entries = self.entries.read().unwrap();
         entries.get(index).and_then(|e| e.as_ref()).and_then(|m| m.duration_secs)
-    }
-
-    pub fn move_entry(&self, from: usize, to: usize) {
-        let mut entries = self.entries.write().unwrap();
-        if from >= entries.len() { return; }
-        let meta = entries.remove(from);
-        let dst = to.min(entries.len());
-        entries.insert(dst, meta);
     }
 
     pub fn is_set(&self, index: usize) -> bool {
@@ -255,8 +245,16 @@ fn read_metadata_full(path: &Path) -> Option<CachedMeta> {
     if let Some(ext) = path.extension() {
         hint.with_extension(ext.to_str().unwrap_or(""));
     }
+    // Skip embedded pictures: this scan only wants tags, and decoding every
+    // FLAC PICTURE block (often 0.5–2 MB each) across a whole library was pure
+    // allocator churn — covers are loaded separately by cover.rs, which does
+    // its own probe with visuals enabled. Same trick as the decode thread.
+    let meta_opts = MetadataOptions {
+        limit_visual_bytes: Limit::Maximum(0),
+        limit_metadata_bytes: Limit::Default,
+    };
     let mut probed = symphonia::default::get_probe()
-        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+        .format(&hint, mss, &FormatOptions::default(), &meta_opts)
         .ok()?;
 
     let duration_secs: Option<f64> = probed.format.tracks().iter()

@@ -13,7 +13,8 @@ use std::sync::atomic::Ordering;
 
 use crossterm::terminal;
 
-use crate::state::{InputMode, PlayerState, UiState, VizMode};
+use crate::ansi::{truncate_ansi, visible_len};
+use crate::state::{InputMode, PlayerState, UiState};
 use crate::theme::{palette, ThemeKind};
 use crate::viz::StatsMonitor;
 
@@ -90,8 +91,8 @@ pub fn print_status_hifi(
         dim = p.dim, fg = p.fg, rst = p.reset, n = track_n, tot = track_total,
     );
 
-    let lvis = visible_len_ansi(&header_left);
-    let rvis = visible_len_ansi(&header_right);
+    let lvis = visible_len(&header_left);
+    let rvis = visible_len(&header_right);
     let row_inner_w = inner_w.saturating_sub(2);
     let hpad = row_inner_w.saturating_sub(lvis + rvis).max(2);
     w.line(&format!(
@@ -216,7 +217,7 @@ pub fn print_status_hifi(
 
     // dB scale row: `   {scale}{tail} ` must total `inner_w`.
     let scale = render_db_scale(meter_w, p);
-    let scale_visible = visible_len_ansi(&scale);
+    let scale_visible = visible_len(&scale);
     let scale_pad = inner_w.saturating_sub(scale_visible + 4);
     w.line(&format!(
         "  {fg}│{rst}   {scale}{tail} {fg}│{rst}",
@@ -325,7 +326,7 @@ pub fn print_status_hifi(
     w.line("");
 
     // === Marquee key bar ===
-    let footer = if let Some(msg) = ui.take_status() {
+    let footer = if let Some(msg) = ui.active_status() {
         format!("  {accent}{msg}{rst}", accent = p.accent, rst = p.reset, msg = msg)
     } else {
         hifi_marquee_keys(p, term_w)
@@ -335,7 +336,6 @@ pub fn print_status_hifi(
     print!("\x1B[J");
     io::stdout().flush().ok();
 
-    let _ = VizMode::None;
     w.count()
 }
 
@@ -444,21 +444,6 @@ fn vu_bar(
     bar
 }
 
-/// Count visible (non-ANSI) characters in a styled string.
-fn visible_len_ansi(s: &str) -> usize {
-    let mut n = 0usize;
-    let mut in_esc = false;
-    for ch in s.chars() {
-        if in_esc {
-            if ch.is_ascii_alphabetic() { in_esc = false; }
-        } else if ch == '\x1B' {
-            in_esc = true;
-        } else {
-            n += 1;
-        }
-    }
-    n
-}
 
 fn render_solid_bar(progress: f64, width: usize) -> String {
     const PARTIALS: &[char] = &['▏', '▎', '▍', '▌', '▋', '▊', '▉', '█'];
@@ -566,8 +551,8 @@ pub fn print_status_hifi_library(
         "{dim}{n} TRK · {dur}{rst}",
         dim = p.dim, rst = p.reset, n = playlist.len(), dur = dur_summary,
     );
-    let lvis = visible_len_ansi(&header_left);
-    let rvis = visible_len_ansi(&header_right);
+    let lvis = visible_len(&header_left);
+    let rvis = visible_len(&header_right);
     let hpad = row_inner_w.saturating_sub(lvis + rvis).max(2);
     w.line(&format!(
         "  {fg}║{rst} {left}{gap}{right} {fg}║{rst}",
@@ -601,7 +586,7 @@ pub fn print_status_hifi_library(
         for i in 0..visible_rows {
             match lines.get(i) {
                 Some(line) => {
-                    let pad = inner_w.saturating_sub(visible_len_ansi(line));
+                    let pad = inner_w.saturating_sub(visible_len(line));
                     w.line(&format!(
                         "  {fg}│{rst}{line}{sp}{fg}│{rst}",
                         fg = p.fg, rst = p.reset, line = line, sp = " ".repeat(pad),
@@ -743,7 +728,7 @@ pub fn print_status_hifi_library(
             dim = p.dim, rst = p.reset, n = saved,
         ),
         InputMode::Normal => {
-            if let Some(msg) = ui.take_status() {
+            if let Some(msg) = ui.active_status() {
                 format!("  {accent}{msg}{rst}", accent = p.accent, rst = p.reset, msg = msg)
             } else if ui.library_tree_mode {
                 format!(
@@ -843,8 +828,8 @@ pub fn print_status_hifi_lyrics(
         "{dim}{m}{rst}",
         dim = p.dim, rst = p.reset, m = right_meta,
     );
-    let lvis = visible_len_ansi(&header_left);
-    let rvis = visible_len_ansi(&header_right);
+    let lvis = visible_len(&header_left);
+    let rvis = visible_len(&header_right);
     let allowed_left = row_inner_w.saturating_sub(rvis + 4);
     let header_left = if lvis > allowed_left {
         format!(
@@ -853,7 +838,7 @@ pub fn print_status_hifi_lyrics(
             title = pad_or_truncate(&title_up, allowed_left),
         )
     } else { header_left };
-    let lvis = visible_len_ansi(&header_left);
+    let lvis = visible_len(&header_left);
     let hpad = row_inner_w.saturating_sub(lvis + rvis).max(2);
     w.line(&format!(
         "  {fg}║{rst} {left}{gap}{right} {fg}║{rst}",
@@ -988,29 +973,6 @@ pub fn print_status_hifi_lyrics(
     w.count()
 }
 
-fn truncate_ansi(s: &str, max_width: usize) -> String {
-    let mut visible = 0usize;
-    let mut out = String::with_capacity(s.len());
-    let mut in_escape = false;
-    for ch in s.chars() {
-        if in_escape {
-            out.push(ch);
-            if ch.is_ascii_alphabetic() {
-                in_escape = false;
-            }
-        } else if ch == '\x1B' {
-            in_escape = true;
-            out.push(ch);
-        } else {
-            if visible >= max_width {
-                break;
-            }
-            out.push(ch);
-            visible += 1;
-        }
-    }
-    out
-}
 
 #[cfg(test)]
 mod hifi_tests {

@@ -13,8 +13,7 @@ use symphonia::core::probe::Hint;
 use symphonia::core::units::Time;
 
 use rubato::{Async, FixedAsync, Indexing, SincInterpolationType, SincInterpolationParameters, WindowFunction, Resampler};
-use audioadapter_buffers::direct::SequentialSliceOfVecs;
-use audioadapter_buffers::owned::InterleavedOwned;
+use audioadapter_buffers::direct::{InterleavedSlice, SequentialSliceOfVecs};
 
 use rtrb::Producer;
 
@@ -158,6 +157,165 @@ fn push_all(producer: &mut Producer<f32>, state: &PlayerState, mut data: &[f32])
             continue;
         }
         thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Scratch buffers for `apply_chain_and_push`, cleared (capacity retained) on
+/// each chunk so the steady-state producer path stays allocation-free.
+struct ChainBufs {
+    eq_buf: Vec<f32>,
+    fx_buf: Vec<f32>,
+    rg_buf: Vec<f32>,
+    xfeed_buf: Vec<f32>,
+    bal_buf: Vec<f32>,
+    // Only touched while a crossfade tail is being mixed in; steady-state
+    // playback reads the balance stage's output directly and skips this.
+    final_buf: Vec<f32>,
+}
+
+impl ChainBufs {
+    fn with_capacity(cap: usize) -> Self {
+        Self {
+            eq_buf: Vec::with_capacity(cap),
+            fx_buf: Vec::with_capacity(cap),
+            rg_buf: Vec::with_capacity(cap),
+            xfeed_buf: Vec::with_capacity(cap),
+            bal_buf: Vec::with_capacity(cap),
+            final_buf: Vec::with_capacity(cap),
+        }
+    }
+}
+
+/// Everything downstream of decode+resample for one stereo chunk:
+/// EQ → effects → ReplayGain → crossfeed → balance → crossfade mix →
+/// clipping flag → ring push (+ crossfade tail capture).
+///
+/// Both the packet loop AND the resampler EOF flush MUST route through here.
+/// The flush used to push raw resampled samples, so the last ~20 ms of every
+/// resampled track skipped the whole chain — an audible ReplayGain/EQ step
+/// right at track end, and those samples were missing from the crossfade tail.
+#[allow(clippy::too_many_arguments)] // producer-thread chain context; a struct adds no clarity
+fn apply_chain_and_push(
+    input: &[f32],
+    producer: &mut Producer<f32>,
+    state: &PlayerState,
+    eq: &mut crate::eq::EqChain,
+    effects: &mut crate::effects::EffectsChain,
+    crossfeed: &mut crate::crossfeed::CrossfeedFilter,
+    rg_linear: f32,
+    xfade_in: Option<&std::collections::VecDeque<f32>>,
+    crossfade_pos: &mut usize,
+    crossfade_samples: usize,
+    tail_buf: Option<&mut std::collections::VecDeque<f32>>,
+    bufs: &mut ChainBufs,
+) {
+    if input.is_empty() {
+        return;
+    }
+
+    // EQ processing
+    let eq_output = if eq.is_active() {
+        bufs.eq_buf.clear();
+        bufs.eq_buf.extend_from_slice(input);
+        eq.process_stereo(&mut bufs.eq_buf);
+        &bufs.eq_buf[..]
+    } else {
+        input
+    };
+
+    // Effects processing
+    let fx_output = if effects.is_active() {
+        bufs.fx_buf.clear();
+        bufs.fx_buf.extend_from_slice(eq_output);
+        effects.process_stereo(&mut bufs.fx_buf);
+        &bufs.fx_buf[..]
+    } else {
+        eq_output
+    };
+
+    // ReplayGain
+    let rg_output = if rg_linear != 1.0 {
+        bufs.rg_buf.clear();
+        bufs.rg_buf.extend_from_slice(fx_output);
+        for sample in bufs.rg_buf.iter_mut() {
+            *sample *= rg_linear;
+        }
+        &bufs.rg_buf[..]
+    } else {
+        fx_output
+    };
+
+    // Crossfeed processing (after RG, before balance)
+    let cf_output = if crossfeed.is_active() {
+        bufs.xfeed_buf.clear();
+        bufs.xfeed_buf.extend_from_slice(rg_output);
+        crossfeed.process_stereo(&mut bufs.xfeed_buf);
+        &bufs.xfeed_buf[..]
+    } else {
+        rg_output
+    };
+
+    // Balance processing (after crossfeed, before crossfade)
+    let balance = state.balance_value();
+    let bal_output = if balance != 0 {
+        bufs.bal_buf.clear();
+        bufs.bal_buf.extend_from_slice(cf_output);
+        let left_gain = ((100 - balance) as f32 / 100.0).clamp(0.0, 1.0);
+        let right_gain = ((100 + balance) as f32 / 100.0).clamp(0.0, 1.0);
+        for i in (0..bufs.bal_buf.len()).step_by(2) {
+            bufs.bal_buf[i] *= left_gain;
+            if i + 1 < bufs.bal_buf.len() {
+                bufs.bal_buf[i + 1] *= right_gain;
+            }
+        }
+        &bufs.bal_buf[..]
+    } else {
+        cf_output
+    };
+
+    // Crossfade mixing with the previous track's tail. Only populate final_buf
+    // when we actually need to mutate samples.
+    let mut using_final_buf = false;
+    if let Some(tail) = xfade_in {
+        if *crossfade_pos < crossfade_samples && crossfade_samples > 0 {
+            bufs.final_buf.clear();
+            bufs.final_buf.extend_from_slice(bal_output);
+            for sample in bufs.final_buf.iter_mut() {
+                if *crossfade_pos < crossfade_samples {
+                    let pos_f = *crossfade_pos as f32 / crossfade_samples as f32;
+                    let fade_in = (pos_f * std::f32::consts::FRAC_PI_2).sin();
+                    let fade_out = ((1.0 - pos_f) * std::f32::consts::FRAC_PI_2).sin();
+
+                    let tail_sample = if *crossfade_pos < tail.len() { tail[*crossfade_pos] } else { 0.0 };
+                    *sample = *sample * fade_in + tail_sample * fade_out;
+                    *crossfade_pos += 1;
+                }
+            }
+            using_final_buf = true;
+        }
+    }
+
+    let out: &[f32] = if using_final_buf { &bufs.final_buf } else { bal_output };
+
+    // Clipping detection only — flag for the UI when peak * volume would
+    // exceed 0dBFS at the DAC. Hard prevention happens in the audio callback
+    // (clamp post-gain), since volume can change between this scan and
+    // consumption (~ring-buffer-depth latency).
+    let vol = state.volume.load(Ordering::Relaxed) as f32 / 100.0;
+    let peak = out.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+    if peak * vol > 1.0 {
+        state.clipping.store(true, Ordering::Relaxed);
+    }
+
+    // Push to ring buffer, then capture the tail for the crossfade into the
+    // next track.
+    push_all(producer, state, out);
+    if let Some(tb) = tail_buf {
+        tb.extend(out.iter().copied());
+        if tb.len() > crossfade_samples {
+            let excess = tb.len() - crossfade_samples;
+            tb.drain(..excess);
+        }
     }
 }
 
@@ -470,6 +628,15 @@ pub fn decode_playlist(
         let chunk_size = resampler.as_ref().map(|r| r.input_frames_next()).unwrap_or(1024);
         let mut pending: Vec<f32> = Vec::with_capacity(chunk_size * channels * 2);
 
+        // Persistent resampler output, sized once to the worst case. Both the
+        // packet loop and the EOF flush process into this via InterleavedSlice —
+        // `resampler.process()` returned a freshly allocated buffer per chunk
+        // (~40 mallocs/s during resampled playback on the producer thread).
+        let mut resamp_out: Vec<f32> = resampler
+            .as_ref()
+            .map(|r| vec![0.0; r.output_frames_max() * channels])
+            .unwrap_or_default();
+
         // Reusable buffers
         let mut deinterleaved: Vec<Vec<f32>> =
             (0..channels).map(|_| Vec::with_capacity(chunk_size)).collect();
@@ -480,14 +647,9 @@ pub fn decode_playlist(
         let mut raw_buf: Vec<f32> = Vec::with_capacity(chunk_size * channels * 2);
         // Scratch for resampler flush deinterleave on EOF.
         let mut flush_planes: Vec<Vec<f32>> = Vec::with_capacity(channels);
-        let mut eq_buf: Vec<f32> = Vec::with_capacity(chunk_size * channels * 2);
-        let mut fx_buf: Vec<f32> = Vec::with_capacity(chunk_size * channels * 2);
-        let mut rg_buf: Vec<f32> = Vec::with_capacity(chunk_size * channels * 2);
-        let mut xfeed_buf: Vec<f32> = Vec::with_capacity(chunk_size * channels * 2);
-        let mut bal_buf: Vec<f32> = Vec::with_capacity(chunk_size * channels * 2);
-        // Scratch for crossfade-mixed output. Only touched while a tail is being
-        // mixed in; steady-state playback reads bal_output directly and skips this.
-        let mut final_buf: Vec<f32> = Vec::with_capacity(chunk_size * channels * 2);
+        // DSP-chain scratch (EQ/FX/RG/crossfeed/balance/crossfade), shared by
+        // the packet loop and the EOF flush via apply_chain_and_push.
+        let mut chain_bufs = ChainBufs::with_capacity(chunk_size * channels * 2);
 
         // --- Packet decode loop ---
         loop {
@@ -608,8 +770,15 @@ pub fn decode_playlist(
 
                     let frames_in = chunk_size;
                     if let Ok(adapter_in) = SequentialSliceOfVecs::new(&deinterleaved, channels, frames_in) {
-                        if let Ok(resampled) = resampler.process(&adapter_in, 0, None) {
-                            interleaved_out.extend(resampled.take_data());
+                        let out_frames = resampler.output_frames_next();
+                        if let Ok(mut adapter_out) =
+                            InterleavedSlice::new_mut(&mut resamp_out, channels, out_frames)
+                        {
+                            if let Ok((_, nbr_out)) =
+                                resampler.process_into_buffer(&adapter_in, &mut adapter_out, None)
+                            {
+                                interleaved_out.extend_from_slice(&resamp_out[..nbr_out * channels]);
+                            }
                         }
                     }
                 }
@@ -627,118 +796,12 @@ pub fn decode_playlist(
                 decoded_buf.extend_from_slice(&pending);
                 pending.clear();
             };
-            let output = &decoded_buf[..];
-
-            // EQ processing
-            let eq_output = if eq.is_active() {
-                eq_buf.clear();
-                eq_buf.extend_from_slice(output);
-                eq.process_stereo(&mut eq_buf);
-                &eq_buf[..]
-            } else {
-                output
-            };
-
-            // Effects processing
-            let fx_output = if effects.is_active() {
-                fx_buf.clear();
-                fx_buf.extend_from_slice(eq_output);
-                effects.process_stereo(&mut fx_buf);
-                &fx_buf[..]
-            } else {
-                eq_output
-            };
-
-            // ReplayGain
-            let rg_output = if rg_linear != 1.0 {
-                rg_buf.clear();
-                rg_buf.extend_from_slice(fx_output);
-                for sample in rg_buf.iter_mut() {
-                    *sample *= rg_linear;
-                }
-                &rg_buf[..]
-            } else {
-                fx_output
-            };
-
-            // Crossfeed processing (after RG, before balance)
-            let cf_output = if crossfeed.is_active() {
-                xfeed_buf.clear();
-                xfeed_buf.extend_from_slice(rg_output);
-                crossfeed.process_stereo(&mut xfeed_buf);
-                &xfeed_buf[..]
-            } else {
-                rg_output
-            };
-
-            // Balance processing (after crossfeed, before crossfade)
-            let balance = state.balance_value();
-            let bal_output = if balance != 0 {
-                bal_buf.clear();
-                bal_buf.extend_from_slice(cf_output);
-                let left_gain = ((100 - balance) as f32 / 100.0).clamp(0.0, 1.0);
-                let right_gain = ((100 + balance) as f32 / 100.0).clamp(0.0, 1.0);
-                for i in (0..bal_buf.len()).step_by(2) {
-                    bal_buf[i] *= left_gain;
-                    if i + 1 < bal_buf.len() {
-                        bal_buf[i + 1] *= right_gain;
-                    }
-                }
-                &bal_buf[..]
-            } else {
-                cf_output
-            };
-
-            // Crossfade mixing with previous track's tail.
-            // Only populate final_buf when we actually need to mutate samples —
-            // steady-state playback skips this and reads bal_output directly.
-            let mut using_final_buf = false;
-            if let Some(ref tail) = xfade_in {
-                if crossfade_pos < crossfade_samples && crossfade_samples > 0 {
-                    final_buf.clear();
-                    final_buf.extend_from_slice(bal_output);
-                    for sample in final_buf.iter_mut() {
-                        if crossfade_pos < crossfade_samples {
-                            let pos_f = crossfade_pos as f32 / crossfade_samples as f32;
-                            let fade_in = (pos_f * std::f32::consts::FRAC_PI_2).sin();
-                            let fade_out = ((1.0 - pos_f) * std::f32::consts::FRAC_PI_2).sin();
-
-                            let tail_sample = if crossfade_pos < tail.len() { tail[crossfade_pos] } else { 0.0 };
-                            *sample = *sample * fade_in + tail_sample * fade_out;
-                            crossfade_pos += 1;
-                        }
-                    }
-                    using_final_buf = true;
-                }
-            }
-
-            // Clipping detection only — flag for the UI when peak * volume would
-            // exceed 0dBFS at the DAC. Hard prevention happens in the audio
-            // callback (clamp post-gain), since volume can change between this
-            // scan and consumption (~ring-buffer-depth latency).
-            if !bal_output.is_empty() {
-                let vol = state.volume.load(Ordering::Relaxed) as f32 / 100.0;
-                let scan: &[f32] = if using_final_buf { &final_buf } else { bal_output };
-                let peak = scan.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
-                if peak * vol > 1.0 {
-                    state.clipping.store(true, Ordering::Relaxed);
-                }
-            }
-
-            // Push to ring buffer
-            let out: &[f32] = if using_final_buf { &final_buf } else { bal_output };
-            if !out.is_empty() {
-                push_all(producer, state, out);
-
-                // Capture tail for crossfade into next track
-                if capture_tail {
-                    tail_buf.extend(out.iter().copied());
-                    if tail_buf.len() > crossfade_samples {
-                        let excess = tail_buf.len() - crossfade_samples;
-                        tail_buf.drain(..excess);
-                    }
-                }
-            }
+            apply_chain_and_push(
+                &decoded_buf, producer, state, eq, effects, crossfeed, rg_linear,
+                xfade_in.as_ref(), &mut crossfade_pos, crossfade_samples,
+                if capture_tail { Some(&mut tail_buf) } else { None },
+                &mut chain_bufs,
+            );
         }
 
         // Flush the resampler tail. Zero-padding `pending` to a full chunk and
@@ -773,15 +836,27 @@ pub fn decode_playlist(
                         active_channels_mask: None,
                     };
                     let out_frames = resampler.output_frames_next();
-                    let mut out_buf = InterleavedOwned::<f32>::new(0.0f32, channels, out_frames);
+                    let Ok(mut out_buf) =
+                        InterleavedSlice::new_mut(&mut resamp_out, channels, out_frames)
+                    else {
+                        break;
+                    };
                     match resampler.process_into_buffer(&adapter_in, &mut out_buf, Some(&indexing)) {
                         Ok((_, nbr_out)) => {
                             if nbr_out == 0 {
                                 break;
                             }
-                            let data = out_buf.take_data();
                             let take = frames_wanted.min(nbr_out);
-                            push_all(producer, state, &data[..take * channels]);
+                            // Through the full DSP chain, same as the packet
+                            // loop — pushing raw here skipped EQ/RG/etc. for
+                            // the final ~20 ms of every resampled track.
+                            apply_chain_and_push(
+                                &resamp_out[..take * channels], producer, state,
+                                eq, effects, crossfeed, rg_linear,
+                                xfade_in.as_ref(), &mut crossfade_pos, crossfade_samples,
+                                if capture_tail { Some(&mut tail_buf) } else { None },
+                                &mut chain_bufs,
+                            );
                             frames_wanted -= take;
                         }
                         Err(_) => break,
@@ -1304,5 +1379,22 @@ mod chain_tests {
         let (l, _) = channels(&out);
         let amp = tone_amplitude(&l, 44100.0, 440.0);
         assert!((amp - 0.25).abs() < 0.04, "rg-adjusted level: {} (want ~0.25)", amp);
+    }
+
+    #[test]
+    fn chain_applies_replaygain_to_resampler_flush_tail() {
+        // 44.1 kHz RG-tagged file on a 48 kHz output engages the resampler's
+        // EOF flush. The flush used to push raw resampled samples straight to
+        // the ring — skipping EQ/FX/ReplayGain/crossfeed/balance — so the last
+        // ~20 ms of every resampled track stepped back up to unprocessed level
+        // (+6 dB here: 0.5 instead of 0.25).
+        let out = run_chain(&[fixture("sine_lr_rg.flac")], 48000, RgMode::Track);
+        assert!(out.len() > 2048, "not enough output to inspect: {}", out.len());
+        let tail = &out[out.len() - 600..];
+        let peak = tail.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        assert!(
+            peak < 0.35,
+            "flush tail must be ReplayGain-attenuated (~0.25 peak), got {peak}"
+        );
     }
 }

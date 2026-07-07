@@ -7,6 +7,7 @@
 // Usage: cargo run --release -- <file-or-folder> [--shuffle] [--repeat] [--quality]
 // Controls: Space=Pause, ↑↓=Tracks, ←→=Seek ±10s, V=Viz, +/-=Vol, Q=Quit
 
+mod ansi;
 mod state;
 mod theme;
 mod config;
@@ -121,7 +122,7 @@ fn spawn_cover_worker(ui: &mut state::UiState, path: std::path::PathBuf) {
             return;
         }
         let remote = match (cached_artist, cached_album) {
-            (Some(a), Some(al)) => cover::resolve_remote(&path, &a, &al),
+            (Some(a), Some(al)) => cover::resolve_remote(&a, &al),
             _ => None,
         };
         let _ = tx.send(remote);
@@ -1057,9 +1058,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let current_eq = &eq_presets[state.eq_index()];
             let current_fx = &fx_presets[state.effects_index()].name;
             let current_cf = &cf_presets[state.crossfeed_index()].name;
-            // Wait for ~1 second of audio in the buffer before starting the callback.
-            // Using stream_rate (rather than a fraction of the raw ring size) keeps
-            // the startup latency consistent across output rates.
+            // Wait for ~1 second of audio in the ring before entering the
+            // steady-state loop, so the already-running callback can't underrun
+            // right after the track starts. Using stream_rate (rather than a
+            // fraction of the raw ring size) keeps the cushion consistent
+            // across output rates.
             let startup_threshold = stream_rate as usize * 2;
             while state.buffer_level.load(Ordering::Relaxed) < startup_threshold
                   && !state.producer_done.load(Ordering::Relaxed)
@@ -1078,9 +1081,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Update OS media transport
+        // Update OS media transport. Title/artist/album come from the cache
+        // when the scan has reached this track; otherwise the display name
+        // stands in for the title (same fallback the UI itself uses).
         if let Some(ref mut mc) = media_controls {
-            media_keys::update_metadata(mc, &filename, state.total_secs());
+            let (mk_artist, mk_album) = ui.metadata_cache.artist_album(ui.current);
+            let mk_title = ui.metadata_cache.title(ui.current).unwrap_or_else(|| filename.clone());
+            media_keys::update_metadata(
+                mc, &mk_title, mk_artist.as_deref(), mk_album.as_deref(), state.total_secs(),
+            );
             media_keys::update_playback(mc, state.is_paused(), 0.0);
         }
 
@@ -1182,7 +1191,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     track_info = format!("{} • {}bit {} • {}", format_time(state.total_secs()), bits, ch_str, rate_str);
 
                     if let Some(ref mut mc) = media_controls {
-                        media_keys::update_metadata(mc, &filename, state.total_secs());
+                        let (mk_artist, mk_album) = ui.metadata_cache.artist_album(ui.current);
+                        let mk_title = ui.metadata_cache.title(ui.current)
+                            .unwrap_or_else(|| filename.clone());
+                        media_keys::update_metadata(
+                            mc, &mk_title, mk_artist.as_deref(), mk_album.as_deref(),
+                            state.total_secs(),
+                        );
                         media_keys::update_playback(mc, state.is_paused(), 0.0);
                     }
 

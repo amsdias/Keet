@@ -142,9 +142,10 @@ pub fn viz_image_clear_escape() -> String {
     format!("\x1B_Ga=d,d=i,i={},q=2\x1B\\", VIZ_IMAGE_ID)
 }
 
-/// Try local sources only: embedded tag, sidecar file, on-disk cache.
-/// Returns None if no local cover exists (callers can then fall back to
-/// `resolve_remote`, which is gated by track-change generation counters).
+/// Try local sources only: embedded tag, sidecar file, on-disk cache (the
+/// config-dir cache, then any legacy cache an older Keet wrote next to the
+/// music). Returns None if no local cover exists (callers can then fall back
+/// to `resolve_remote`, which is gated by track-change generation counters).
 pub fn resolve_local(
     track_path: &Path,
     artist: Option<&str>,
@@ -156,9 +157,12 @@ pub fn resolve_local(
     if let Some(bytes) = read_sidecar(track_path) {
         return decode_and_resize(&bytes);
     }
-    let cache_path = cache_path_for(track_path, artist, album);
-    if let Some(ref p) = cache_path {
-        if let Ok(bytes) = std::fs::read(p) {
+    let candidates = [
+        cache_path_for(artist, album),
+        legacy_cache_path_for(track_path, artist, album),
+    ];
+    for p in candidates.into_iter().flatten() {
+        if let Ok(bytes) = std::fs::read(&p) {
             return decode_and_resize(&bytes);
         }
     }
@@ -167,13 +171,12 @@ pub fn resolve_local(
 
 /// Fetch a cover from iTunes Search and persist it to the on-disk cache for
 /// next time. Requires both artist and album — returns None otherwise.
-pub fn resolve_remote(
-    track_path: &Path,
-    artist: &str,
-    album: &str,
-) -> Option<CoverImage> {
+pub fn resolve_remote(artist: &str, album: &str) -> Option<CoverImage> {
     let bytes = fetch_itunes(artist, album)?;
-    if let Some(p) = cache_path_for(track_path, Some(artist), Some(album)) {
+    if let Some(p) = cache_path_for(Some(artist), Some(album)) {
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
         let _ = std::fs::write(&p, &bytes);
     }
     decode_and_resize(&bytes)
@@ -223,7 +226,20 @@ fn read_sidecar(track_path: &Path) -> Option<Vec<u8>> {
     None
 }
 
-fn cache_path_for(track_path: &Path, artist: Option<&str>, album: Option<&str>) -> Option<PathBuf> {
+/// Cache path for a remote-fetched cover: `<config>/covers/{artist} - {album}
+/// .cover.jpg`. Lives in the keet config dir — writing next to the music
+/// polluted the user's library folders.
+fn cache_path_for(artist: Option<&str>, album: Option<&str>) -> Option<PathBuf> {
+    let a = sanitize_fs(artist?);
+    let al = sanitize_fs(album?);
+    if a.is_empty() || al.is_empty() { return None; }
+    let dir = crate::playlist::keet_config_dir()?.join("covers");
+    Some(dir.join(format!("{} - {}.cover.jpg", a, al)))
+}
+
+/// Where older Keet versions cached covers: next to the track. Still read
+/// (saves a refetch for existing users) but never written anymore.
+fn legacy_cache_path_for(track_path: &Path, artist: Option<&str>, album: Option<&str>) -> Option<PathBuf> {
     let parent = track_path.parent()?;
     let a = sanitize_fs(artist?);
     let al = sanitize_fs(album?);
@@ -252,21 +268,9 @@ fn fetch_itunes(artist: &str, album: &str) -> Option<Vec<u8>> {
         urlencoded(&query),
     );
 
-    // ureq 3.3 `timeout_global` trips before TLS finishes — split the budget
-    // across connect + receive instead. See lyrics.rs for the same workaround.
-    let tls = ureq::tls::TlsConfig::builder()
-        .provider(ureq::tls::TlsProvider::NativeTls)
-        .build();
-    // Split timeouts, NOT timeout_global: in ureq 3.3 the global timer trips
-    // during TCP/TLS setup, failing every HTTPS call before the handshake.
-    let agent = ureq::Agent::config_builder()
-        .tls_config(tls)
-        .timeout_connect(Some(Duration::from_secs(5)))
-        .timeout_recv_response(Some(Duration::from_secs(15)))
-        .timeout_recv_body(Some(Duration::from_secs(15)))
-        .user_agent("Keet Audio Player (https://github.com)")
-        .build()
-        .new_agent();
+    // Shared process-wide agent (native TLS, split timeouts — never
+    // `timeout_global`, see lyrics::http_agent).
+    let agent = crate::lyrics::http_agent();
 
     let response = agent.get(&url).call().ok()?;
     if response.status() != 200 {
@@ -859,6 +863,41 @@ fn base64_encode(bytes: &[u8]) -> String {
         out.push('=');
     }
     out
+}
+
+#[cfg(test)]
+mod cache_path_tests {
+    use super::*;
+
+    #[test]
+    fn cover_cache_lives_in_config_dir_not_music_folder() {
+        // Remote-fetch caches used to be written next to the music as
+        // `{artist} - {album}.cover.jpg`, polluting the user's library folders.
+        let path = cache_path_for(Some("AC/DC"), Some("Back in Black."))
+            .expect("cache path resolvable when HOME is set");
+        let covers = crate::playlist::keet_config_dir()
+            .expect("config dir resolvable in tests")
+            .join("covers");
+        assert!(
+            path.starts_with(&covers),
+            "cache must live under {covers:?}, got {path:?}"
+        );
+        // Filename sanitized: '/' replaced, trailing dot trimmed.
+        assert_eq!(
+            path.file_name().unwrap().to_string_lossy(),
+            "AC_DC - Back in Black.cover.jpg"
+        );
+        // Unusable without both tags.
+        assert!(cache_path_for(None, Some("X")).is_none());
+        assert!(cache_path_for(Some("X"), None).is_none());
+    }
+
+    #[test]
+    fn legacy_cache_path_stays_next_to_the_track_for_reads() {
+        let track = std::path::Path::new("/music/rock/song.flac");
+        let path = legacy_cache_path_for(track, Some("A"), Some("B")).unwrap();
+        assert_eq!(path, std::path::Path::new("/music/rock/A - B.cover.jpg"));
+    }
 }
 
 #[cfg(test)]

@@ -52,11 +52,17 @@ pub fn setup(state: Arc<PlayerState>) -> Option<MediaControls> {
     Some(controls)
 }
 
-pub fn update_metadata(controls: &mut MediaControls, title: &str, duration_secs: f64) {
+pub fn update_metadata(
+    controls: &mut MediaControls,
+    title: &str,
+    artist: Option<&str>,
+    album: Option<&str>,
+    duration_secs: f64,
+) {
     let _ = controls.set_metadata(MediaMetadata {
         title: Some(title),
-        artist: None,
-        album: None,
+        artist,
+        album,
         cover_url: None,
         duration: if duration_secs > 0.0 {
             Some(Duration::from_secs_f64(duration_secs))

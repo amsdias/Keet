@@ -229,12 +229,13 @@ pub fn render_eq_curve(gains: &[f32; EQ_BANDS]) -> String {
             gain += band_gain * weight;
         }
 
+        // One glyph step per dB of summed gain, capped at the 8-step block ramp.
         let (ch, color) = if gain > 0.1 {
-            let idx = ((gain / 8.0) * 8.0).clamp(1.0, 8.0) as usize;
+            let idx = gain.clamp(1.0, 8.0) as usize;
             let color = if gain > 5.0 { C_RED } else if gain > 3.0 { C_YELLOW } else { C_GREEN };
             (bars[idx], color)
         } else if gain < -0.1 {
-            let idx = ((-gain / 8.0) * 8.0).clamp(1.0, 8.0) as usize;
+            let idx = (-gain).clamp(1.0, 8.0) as usize;
             (bars[idx], C_CYAN)
         } else {
             ('·', C_DIM)

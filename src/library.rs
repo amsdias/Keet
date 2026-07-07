@@ -248,59 +248,13 @@ pub fn visible_rows_filtered(tree: &LibraryTree, query: &str) -> Vec<VisibleRow>
     rows
 }
 
+use crate::ansi::{truncate_visible, visible_len};
+
 /// Render the tree body as indented lines using the active theme palette. Shared
 /// across all themes — a tree is structurally identical everywhere; only colors
 /// and the cursor tint differ. Renders the window `[scroll, scroll+height)` of
 /// `visible`; the caller supplies `visible`, `cursor`, `scroll` (its own tree
 /// state) and pads/positions the block within its chrome.
-/// Visible (printed) length of a string, skipping SGR escape sequences.
-fn visible_len(s: &str) -> usize {
-    let mut n = 0;
-    let mut in_esc = false;
-    for c in s.chars() {
-        if in_esc {
-            if c == 'm' {
-                in_esc = false;
-            }
-        } else if c == '\x1B' {
-            in_esc = true;
-        } else {
-            n += 1;
-        }
-    }
-    n
-}
-
-/// Truncate to `max` visible columns, passing SGR escapes through untouched (so
-/// colors survive) and appending an ellipsis when it actually cuts. Prevents a
-/// long name from wrapping (which would drift the caller's line count) or
-/// overflowing a bordered frame.
-fn truncate_visible(s: &str, max: usize) -> String {
-    if visible_len(s) <= max {
-        return s.to_string();
-    }
-    let keep = max.saturating_sub(1); // room for the ellipsis
-    let mut out = String::new();
-    let mut n = 0;
-    let mut in_esc = false;
-    for c in s.chars() {
-        if in_esc {
-            out.push(c);
-            if c == 'm' {
-                in_esc = false;
-            }
-        } else if c == '\x1B' {
-            in_esc = true;
-            out.push(c);
-        } else if n < keep {
-            out.push(c);
-            n += 1;
-        }
-    }
-    out.push('…');
-    out
-}
-
 #[allow(clippy::too_many_arguments)] // cohesive render context
 pub fn render_library_tree(
     tree: &LibraryTree,

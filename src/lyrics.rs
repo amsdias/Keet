@@ -129,6 +129,35 @@ fn parse_lrc_time(inside: &str) -> Option<f64> {
     }
 }
 
+/// Process-wide HTTP agent shared by every fetch (LRCLIB lyrics, iTunes
+/// covers). One native-TLS context for the process instead of a fresh one per
+/// request — the per-fetch construction showed up as lingering
+/// Security.framework allocations on macOS.
+///
+/// Split timeouts, NOT `timeout_global`: in ureq 3.3 the global timer trips
+/// during TCP/TLS setup, failing every HTTPS call before the handshake even
+/// completes. LRCLIB can take >7 s to first byte on a slow day; fetches run on
+/// worker threads (generation-counter aborted on skip), so be generous.
+pub(crate) fn http_agent() -> ureq::Agent {
+    use std::sync::OnceLock;
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT
+        .get_or_init(|| {
+            let tls = ureq::tls::TlsConfig::builder()
+                .provider(ureq::tls::TlsProvider::NativeTls)
+                .build();
+            ureq::Agent::config_builder()
+                .tls_config(tls)
+                .timeout_connect(Some(std::time::Duration::from_secs(5)))
+                .timeout_recv_response(Some(std::time::Duration::from_secs(15)))
+                .timeout_recv_body(Some(std::time::Duration::from_secs(15)))
+                .user_agent("Keet Audio Player (https://github.com/amsdias/rust_music_player)")
+                .build()
+                .new_agent()
+        })
+        .clone() // Agent is an Arc handle — cloning shares the pool/TLS context
+}
+
 /// Fetch lyrics from LRCLIB (free, no API key, ~3M entries).
 /// Prefers synced (LRC) lyrics over plain.
 /// Returns raw lyrics text or None on failure/not found.
@@ -142,26 +171,7 @@ pub fn fetch_lrclib(artist: &str, title: &str, duration_secs: Option<u32>) -> Op
         url.push_str(&format!("&duration={}", dur));
     }
 
-    // Note: avoid `timeout_global` — in ureq 3.3 it trips before the TLS
-    // handshake even completes, making every fetch return None. Split the
-    // budget across connect + receive instead, which behaves as expected.
-    let tls = ureq::tls::TlsConfig::builder()
-        .provider(ureq::tls::TlsProvider::NativeTls)
-        .build();
-    // Split timeouts, NOT timeout_global: in ureq 3.3 the global timer trips
-    // during TCP/TLS setup, failing every HTTPS call before the handshake.
-    let agent = ureq::Agent::config_builder()
-        .tls_config(tls)
-        .timeout_connect(Some(std::time::Duration::from_secs(5)))
-        // LRCLIB can take >7s to first byte on a slow day; the fetch runs on a
-        // worker thread (generation-counter aborted on skip), so be generous.
-        .timeout_recv_response(Some(std::time::Duration::from_secs(15)))
-        .timeout_recv_body(Some(std::time::Duration::from_secs(15)))
-        .user_agent("Keet Audio Player (https://github.com)")
-        .build()
-        .new_agent();
-
-    let response = agent.get(&url).call().ok()?;
+    let response = http_agent().get(&url).call().ok()?;
 
     if response.status() != 200 {
         return None;

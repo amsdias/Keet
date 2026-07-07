@@ -12,6 +12,7 @@ use std::sync::atomic::Ordering;
 
 use crossterm::terminal;
 
+use crate::ansi::{truncate_ansi, truncate_plain, visible_len};
 use crate::state::{InputMode, PlayerState, UiState, VizMode, VizStyle};
 use crate::theme::{palette, ThemeKind};
 use crate::viz::{
@@ -199,8 +200,8 @@ pub fn print_status_minimal(
     }
 
     let meta_left_w = left_w.saturating_sub(2);
-    let meta_visible_len = visible_len_ansi(&meta).min(meta_left_w);
-    let meta_styled = if visible_len_ansi(&meta) > meta_left_w {
+    let meta_visible_len = visible_len(&meta).min(meta_left_w);
+    let meta_styled = if visible_len(&meta) > meta_left_w {
         format!("{dim}{m}{rst}", dim = p.dim, rst = p.reset, m = truncate_plain_ansi_aware(&meta, meta_left_w))
     } else {
         format!("{dim}{m}{rst}", dim = p.dim, rst = p.reset, m = meta)
@@ -277,7 +278,7 @@ pub fn print_status_minimal(
     // === Footer command tray (boxed) ===
     w.line("");
 
-    if let Some(msg) = ui.take_status() {
+    if let Some(msg) = ui.active_status() {
         w.line(&format!(
             "  {accent}{msg}{rst}",
             accent = p.accent, rst = p.reset, msg = msg,
@@ -286,7 +287,7 @@ pub fn print_status_minimal(
         let inner_w = term_w.saturating_sub(4);
         let h_w = inner_w.saturating_sub(2);
         let bar = slim_cmd_bar_inner(p);
-        let bar_visible = visible_len_ansi(&bar);
+        let bar_visible = visible_len(&bar);
         let pad = inner_w.saturating_sub(bar_visible + 2);
         w.line(&format!(
             "  {rule}┌{h}┐{rst}",
@@ -382,23 +383,8 @@ fn signal_row_plain_len(key: &str, value: &str, width: usize) -> usize {
     key.chars().count() + gap + value.chars().count()
 }
 
-fn visible_len_ansi(s: &str) -> usize {
-    let mut n = 0usize;
-    let mut in_esc = false;
-    for ch in s.chars() {
-        if in_esc {
-            if ch.is_ascii_alphabetic() { in_esc = false; }
-        } else if ch == '\x1B' {
-            in_esc = true;
-        } else {
-            n += 1;
-        }
-    }
-    n
-}
-
 fn truncate_plain_ansi_aware(s: &str, max_width: usize) -> String {
-    let visible = visible_len_ansi(s);
+    let visible = visible_len(s);
     if visible <= max_width { s.to_string() } else { truncate_ansi(s, max_width) }
 }
 
@@ -471,23 +457,6 @@ fn render_progress_bar(progress: f64, width: usize, fg: &str, rule: &str, reset:
     s
 }
 
-fn visible_len(s: &str) -> usize {
-    s.chars().count()
-}
-
-/// Plain-text truncation with a trailing ellipsis. Matches the helper in
-/// `ui.rs`; duplicated here to keep the module standalone.
-fn truncate_plain(s: &str, max_width: usize) -> String {
-    if s.chars().count() <= max_width {
-        s.to_string()
-    } else if max_width > 1 {
-        let mut out: String = s.chars().take(max_width - 1).collect();
-        out.push('…');
-        out
-    } else {
-        s.chars().take(max_width).collect()
-    }
-}
 
 /// Render the Minimal Library (playlist) view.
 ///
@@ -535,8 +504,8 @@ pub fn print_status_minimal_library(
         "{fg}/{rst} {dim}search{rst}   {fg}S{rst} {dim}save{rst}",
         fg = p.fg, rst = p.reset, dim = p.dim,
     );
-    let left_visible = visible_len_ansi(&left_label);
-    let right_visible = visible_len_ansi(&right_hints);
+    let left_visible = visible_len(&left_label);
+    let right_visible = visible_len(&right_hints);
     let pad = term_w
         .saturating_sub(2 + left_visible + right_visible + 2)
         .max(1);
@@ -657,7 +626,7 @@ pub fn print_status_minimal_library(
                 row_title.clone()
             };
             let title_truncated = truncate_plain_ansi_aware(&title_full, title_w);
-            let title_visible = visible_len_ansi(&title_truncated);
+            let title_visible = visible_len(&title_truncated);
             let title_pad = title_w.saturating_sub(title_visible);
 
             // Album cell: dim, fixed width.
@@ -713,7 +682,7 @@ pub fn print_status_minimal_library(
             dim = p.dim, rst = p.reset, name = n,
         ),
         InputMode::Normal => {
-            if let Some(msg) = ui.take_status() {
+            if let Some(msg) = ui.active_status() {
                 format!("  {accent}{msg}{rst}", accent = p.accent, rst = p.reset, msg = msg)
             } else if ui.library_tree_mode {
                 format!(
@@ -772,8 +741,8 @@ fn library_hint_bar(p: &crate::theme::Palette, term_w: usize) -> String {
         "{fg}?{rst} {dim}all commands{rst}",
         fg = p.fg, rst = p.reset, dim = p.dim,
     );
-    let lvis = visible_len_ansi(&left);
-    let rvis = visible_len_ansi(&right);
+    let lvis = visible_len(&left);
+    let rvis = visible_len(&right);
     let pad = term_w.saturating_sub(2 + lvis + rvis + 2).max(2);
     format!("  {left}{gap}{right}", left = left, gap = " ".repeat(pad), right = right)
 }
@@ -843,7 +812,7 @@ pub fn print_status_minimal_lyrics(
         gap = if meta.is_empty() { "" } else { "  " },
         meta = meta,
     );
-    let left_visible = visible_len_ansi(&left_str);
+    let left_visible = visible_len(&left_str);
     let right_str = format!("{accent}{t}{rst}", accent = p.accent, rst = p.reset, t = time_str);
     let pad = term_w.saturating_sub(2 + left_visible + right_visible + 2).max(1);
     w.line(&format!(
@@ -958,7 +927,7 @@ pub fn print_status_minimal_lyrics(
         bar.push_str(k);
         bar.push(' ');
         bar.push_str(v);
-        visible_count += visible_len_ansi(k) + 1 + visible_len_ansi(v);
+        visible_count += visible_len(k) + 1 + visible_len(v);
     }
     if is_synced && ui.lyrics_offset != 0.0 {
         bar.push_str(&format!(
@@ -980,28 +949,3 @@ pub fn print_status_minimal_lyrics(
     w.count()
 }
 
-/// ANSI-aware truncation: counts only printable characters against `max_width`,
-/// preserving any escape sequences that were emitted before the cut point.
-fn truncate_ansi(s: &str, max_width: usize) -> String {
-    let mut visible = 0usize;
-    let mut out = String::with_capacity(s.len());
-    let mut in_escape = false;
-    for ch in s.chars() {
-        if in_escape {
-            out.push(ch);
-            if ch.is_ascii_alphabetic() {
-                in_escape = false;
-            }
-        } else if ch == '\x1B' {
-            in_escape = true;
-            out.push(ch);
-        } else {
-            if visible >= max_width {
-                break;
-            }
-            out.push(ch);
-            visible += 1;
-        }
-    }
-    out
-}

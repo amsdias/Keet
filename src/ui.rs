@@ -41,48 +41,7 @@ fn icon_color_for_ext(ext: &str) -> &'static str {
     }
 }
 
-/// Truncate a string containing ANSI escape codes to fit within `max_width` visible characters.
-/// Returns the truncated string with all ANSI codes preserved up to the cut point.
-fn truncate_ansi(s: &str, max_width: usize) -> String {
-    let mut visible = 0;
-    let mut result = String::with_capacity(s.len());
-    let mut in_escape = false;
-
-    for ch in s.chars() {
-        if in_escape {
-            result.push(ch);
-            if ch.is_ascii_alphabetic() {
-                in_escape = false;
-            }
-        } else if ch == '\x1B' {
-            in_escape = true;
-            result.push(ch);
-        } else {
-            if visible >= max_width {
-                break;
-            }
-            result.push(ch);
-            visible += 1;
-        }
-    }
-    result
-}
-
-fn truncate_plain(s: &str, max_width: usize) -> String {
-    if s.chars().count() <= max_width {
-        s.to_string()
-    } else if max_width > 1 {
-        let mut out: String = s.chars().take(max_width - 1).collect();
-        out.push('…');
-        out
-    } else {
-        s.chars().take(max_width).collect()
-    }
-}
-
-fn visible_len(s: &str) -> usize {
-    s.chars().count()
-}
+use crate::ansi::{truncate_ansi, truncate_plain, visible_len};
 
 /// Counts the frame lines actually emitted below the first (anchor) row, so
 /// the caller's cursor-up math is derived from what was printed instead of
@@ -523,7 +482,7 @@ fn print_status_classic(state: &PlayerState, ui: &mut UiState, name: &str, track
                 format!("  Save playlist as: {}{C_DIM}_{C_RESET}", name)
             }
             InputMode::Normal => {
-                if let Some(msg) = ui.take_status() {
+                if let Some(msg) = ui.active_status() {
                     format!("  {C_GREEN}{msg}{C_RESET}")
                 } else if ui.library_tree_mode {
                     format!("  {C_DIM}[Tab] list  [←→] fold  [Enter] play  [/] filter  [D] remove  [L] close{C_RESET}")
@@ -667,7 +626,7 @@ fn print_status_classic(state: &PlayerState, ui: &mut UiState, name: &str, track
     }
 
     // Show status message in Player mode
-    if let Some(msg) = ui.take_status() {
+    if let Some(msg) = ui.active_status() {
         w.line(&format!("  {C_GREEN}{msg}{C_RESET}"));
         print!("\x1B[J");
         io::stdout().flush().ok();
@@ -868,6 +827,7 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
                                 ui.view_mode = ViewMode::Player;
                             } else {
                                 ui.tree_filter.clear();
+                                refresh_tree_rows(ui);
                                 ui.tree_cursor = 0;
                                 ui.tree_scroll = 0;
                             }
@@ -1082,6 +1042,7 @@ fn tree_search_input(ui: &mut UiState, key: KeyEvent) -> bool {
         KeyCode::Esc => {
             ui.input_mode = InputMode::Normal;
             ui.tree_filter.clear();
+            refresh_tree_rows(ui);
             ui.tree_cursor = 0;
             ui.tree_scroll = 0;
         }
@@ -1094,7 +1055,7 @@ fn tree_search_input(ui: &mut UiState, key: KeyEvent) -> bool {
             }
             rebuild_tree_filter(ui);
         }
-        KeyCode::Char(c) => {
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             if let InputMode::Search(ref mut q) = ui.input_mode {
                 q.push(c);
             }
@@ -1110,6 +1071,13 @@ fn tree_search_input(ui: &mut UiState, key: KeyEvent) -> bool {
 }
 
 fn handle_text_input(state: &PlayerState, ui: &mut UiState, _playlist: &mut Vec<PathBuf>, key: KeyEvent) -> bool {
+    // Ctrl+C quits from any text prompt, same as everywhere else. Without this
+    // the Char(c) arms below would type a literal 'c' into the query — the
+    // global Ctrl+C handler is never reached while a prompt is active.
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        state.quit();
+        return true;
+    }
     // The tree view filters itself; its `/` search has its own handling.
     if ui.library_tree_mode && matches!(ui.input_mode, InputMode::Search(_)) {
         return tree_search_input(ui, key);
@@ -1145,7 +1113,7 @@ fn handle_text_input(state: &PlayerState, ui: &mut UiState, _playlist: &mut Vec<
                     query.pop();
                     rebuild_filter(ui, _playlist);
                 }
-                KeyCode::Char(c) => {
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                     query.push(c);
                     rebuild_filter(ui, _playlist);
                 }
@@ -1193,7 +1161,7 @@ fn handle_text_input(state: &PlayerState, ui: &mut UiState, _playlist: &mut Vec<
                 KeyCode::Backspace => {
                     name.pop();
                 }
-                KeyCode::Char(c) => {
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                     name.push(c);
                 }
                 _ => {}
@@ -1331,9 +1299,13 @@ fn remove_track(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<PathBu
         ui.removed_paths.insert(playlist[track_idx].clone());
     }
 
-    // Remove from playlist and metadata cache
+    // Remove from the playlist, then remap the cache through the scan-safe
+    // path below. Shifting the cache positionally (remove_at) while the
+    // background scan is running would let in-flight workers — which write by
+    // the index of the playlist snapshot they were spawned with — land tags
+    // one slot off past the removal point.
+    let old_playlist = playlist.clone();
     playlist.remove(track_idx);
-    ui.metadata_cache.remove_at(track_idx);
 
     // Adjust current track index
     if track_idx == ui.current {
@@ -1348,6 +1320,7 @@ fn remove_track(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<PathBu
     state.total_tracks.store(playlist.len(), Ordering::Relaxed);
     state.current_track.store(ui.current, Ordering::Relaxed);
     ui.playlist_dirty = true;
+    reindex_and_restart_scan(ui, playlist, &old_playlist);
 
     // Rebuild filter if searching, otherwise just adjust cursor
     if !ui.filtered_indices.is_empty() {
@@ -1456,23 +1429,41 @@ pub fn rebuild_library_tree(ui: &mut UiState, playlist: &[PathBuf]) {
         })
         .collect();
     ui.library_tree = crate::library::build(&tags);
-    let n = crate::library::visible_rows(&ui.library_tree, &ui.tree_fold).len();
+    refresh_tree_rows(ui);
+    let n = ui.tree_rows.len();
     if ui.tree_cursor >= n {
         ui.tree_cursor = n.saturating_sub(1);
     }
     ui.tree_dirty = false;
 }
 
+/// Throttle for rebuilding the tree while the metadata scan is still loading
+/// tags: rebuild on the first frame, then at most every 500 ms. Rebuilding the
+/// whole tree (full tag projection + sort) at 20 fps for a large library
+/// burned CPU for the entire scan with no visible benefit.
+fn tree_scan_refresh_due(elapsed_since_last: Option<Duration>) -> bool {
+    elapsed_since_last.is_none_or(|e| e >= Duration::from_millis(500))
+}
+
 /// Called each UI frame: while the tree view is showing, keep it fresh — rebuild
-/// when the playlist changed (`tree_dirty`) or while the scan is still loading
-/// tags (so `Unknown` rows settle into their real artists as tags arrive).
+/// when the playlist changed (`tree_dirty`) or, throttled, while the scan is
+/// still loading tags (so `Unknown` rows settle into their real artists as tags
+/// arrive). One final rebuild fires when the scan completes, so the last tags
+/// to load always land.
 pub fn poll_library_tree(ui: &mut UiState, playlist: &[PathBuf]) {
     if !ui.library_tree_mode {
         return;
     }
     let scan_running = ui.scan_handle.as_ref().is_some_and(|h| !h.is_finished());
-    if ui.tree_dirty || scan_running {
+    if ui.tree_scan_was_running && !scan_running {
+        ui.tree_dirty = true; // scan just finished — settle the final tags
+    }
+    ui.tree_scan_was_running = scan_running;
+    let refresh_due = scan_running
+        && tree_scan_refresh_due(ui.tree_scan_refreshed_at.map(|t| t.elapsed()));
+    if ui.tree_dirty || refresh_due {
         rebuild_library_tree(ui, playlist);
+        ui.tree_scan_refreshed_at = Some(std::time::Instant::now());
     }
 }
 
@@ -1485,9 +1476,9 @@ pub fn render_tree_body(
     width: usize,
     p: &crate::theme::Palette,
 ) -> Vec<String> {
-    let visible = tree_visible(ui);
-    if ui.tree_cursor >= visible.len() {
-        ui.tree_cursor = visible.len().saturating_sub(1);
+    let n = ui.tree_rows.len();
+    if ui.tree_cursor >= n {
+        ui.tree_cursor = n.saturating_sub(1);
     }
     ui.tree_view_height = height;
     let margin = 4.min(height / 2);
@@ -1496,14 +1487,14 @@ pub fn render_tree_body(
     } else if ui.tree_cursor + margin + 1 > ui.tree_scroll + height {
         ui.tree_scroll = (ui.tree_cursor + margin + 1).saturating_sub(height);
     }
-    let max_scroll = visible.len().saturating_sub(height);
+    let max_scroll = n.saturating_sub(height);
     if ui.tree_scroll > max_scroll {
         ui.tree_scroll = max_scroll;
     }
     crate::library::render_library_tree(
         &ui.library_tree,
         &ui.tree_fold,
-        &visible,
+        &ui.tree_rows,
         ui.tree_cursor,
         ui.tree_scroll,
         height,
@@ -1513,22 +1504,25 @@ pub fn render_tree_body(
     )
 }
 
-/// The tree's on-screen rows: filtered projection when a `/` filter is active,
-/// else the normal fold-based rows.
-fn tree_visible(ui: &UiState) -> Vec<crate::library::VisibleRow> {
-    if ui.tree_filter.is_empty() {
+/// Re-materialize `ui.tree_rows`: the filtered projection when a `/` filter is
+/// active, else the normal fold-based rows. Must be called after every tree,
+/// fold, or filter mutation — navigation and rendering read the cache instead
+/// of rebuilding the projection per keypress/frame (which cloned artist/album
+/// names for every row, every time, on large libraries).
+fn refresh_tree_rows(ui: &mut UiState) {
+    ui.tree_rows = if ui.tree_filter.is_empty() {
         crate::library::visible_rows(&ui.library_tree, &ui.tree_fold)
     } else {
         crate::library::visible_rows_filtered(&ui.library_tree, &ui.tree_filter)
-    }
+    };
 }
 
 fn tree_visible_len(ui: &UiState) -> usize {
-    tree_visible(ui).len()
+    ui.tree_rows.len()
 }
 
 fn tree_row_at_cursor(ui: &UiState) -> Option<crate::library::VisibleRow> {
-    tree_visible(ui).get(ui.tree_cursor).copied()
+    ui.tree_rows.get(ui.tree_cursor).copied()
 }
 
 /// Re-read the `/` query into `ui.tree_filter` and clamp the cursor to the new
@@ -1538,6 +1532,7 @@ fn rebuild_tree_filter(ui: &mut UiState) {
         InputMode::Search(q) => q.clone(),
         _ => String::new(),
     };
+    refresh_tree_rows(ui);
     let n = tree_visible_len(ui);
     if ui.tree_cursor >= n {
         ui.tree_cursor = n.saturating_sub(1);
@@ -1562,6 +1557,7 @@ fn tree_page(ui: &mut UiState, dir: isize) {
 fn tree_expand_under_cursor(ui: &mut UiState) {
     if let Some(row) = tree_row_at_cursor(ui) {
         crate::library::expand(&ui.library_tree, &mut ui.tree_fold, row);
+        refresh_tree_rows(ui);
     }
 }
 
@@ -1572,11 +1568,13 @@ fn tree_collapse_under_cursor(ui: &mut UiState) {
             // Collapse the parent album and land the cursor on it.
             let album_row = VisibleRow::Album { artist, album };
             crate::library::collapse(&ui.library_tree, &mut ui.tree_fold, album_row);
-            if let Some(pos) = tree_visible(ui).iter().position(|r| *r == album_row) {
+            refresh_tree_rows(ui);
+            if let Some(pos) = ui.tree_rows.iter().position(|r| *r == album_row) {
                 ui.tree_cursor = pos;
             }
         } else {
             crate::library::collapse(&ui.library_tree, &mut ui.tree_fold, row);
+            refresh_tree_rows(ui);
         }
     }
     let n = tree_visible_len(ui);
@@ -1741,7 +1739,14 @@ fn toggle_shuffle(ui: &mut UiState, playlist: &mut [PathBuf]) {
                 sorted
             }
         };
-        playlist.clone_from_slice(&restored);
+        if restored.len() == playlist.len() {
+            playlist.clone_from_slice(&restored);
+        } else {
+            // Duplicate/uncanonicalizable paths can make restore_order return a
+            // different length; clone_from_slice would panic on the mismatch.
+            // Fall back to the same path sort used when no snapshot exists.
+            playlist.sort();
+        }
         if let Some(ref cp) = current_path {
             if let Some(idx) = playlist.iter().position(|p| p == cp) {
                 ui.current = idx;
@@ -1786,11 +1791,13 @@ fn enqueue_track(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<PathB
 
     let name = ui.metadata_cache.display_name(track_idx, &playlist[track_idx]);
 
-    // Move track in playlist and metadata cache
+    // Move the track in the playlist, then remap the cache through the
+    // scan-safe path below (same hazard as remove_track: a positional
+    // move_entry races in-flight scan workers writing by stale indices).
+    let old_playlist = playlist.clone();
     let path = playlist.remove(track_idx);
     let dst = if track_idx < target { target - 1 } else { target };
     playlist.insert(dst, path);
-    ui.metadata_cache.move_entry(track_idx, dst);
 
     // Recalculate ui.current — it may have shifted
     // If we removed before current, current shifted down; if we inserted at/before current, it shifted up
@@ -1812,6 +1819,7 @@ fn enqueue_track(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<PathB
     ui.enqueue_count += 1;
     ui.playlist_dirty = true;
     state.total_tracks.store(playlist.len(), Ordering::Relaxed);
+    reindex_and_restart_scan(ui, playlist, &old_playlist);
     ui.set_status(format!("Queued: {}", name));
 }
 
@@ -2101,5 +2109,164 @@ mod ui_tests {
         assert!(!auto_sort_should_run(false, true, false)); // not armed
         assert!(!auto_sort_should_run(true, false, false)); // scan not finished — tags not loaded
         assert!(!auto_sort_should_run(true, true, true)); // shuffling — leave the order alone
+    }
+
+    fn test_ui(playlist_len: usize) -> UiState {
+        let cache = crate::metadata::MetadataCache::new(playlist_len);
+        UiState::new(vec![PathBuf::from("/nonexistent-src")], cache)
+    }
+
+    fn p(s: &str) -> PathBuf {
+        PathBuf::from(s)
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_text_input_instead_of_typing_c() {
+        let state = PlayerState::new();
+        let mut ui = test_ui(2);
+        ui.input_mode = InputMode::Search(String::new());
+        let mut playlist = vec![p("/a.mp3"), p("/b.mp3")];
+
+        let quit = handle_text_input(
+            &state, &mut ui, &mut playlist,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+        assert!(quit && state.should_quit(), "Ctrl+C in text input must quit");
+        if let InputMode::Search(q) = &ui.input_mode {
+            assert!(q.is_empty(), "Ctrl+C must not type into the query: {q:?}");
+        }
+
+        // A plain 'c' (no modifier) still types.
+        let state = PlayerState::new();
+        let mut ui = test_ui(2);
+        ui.input_mode = InputMode::Search(String::new());
+        handle_text_input(
+            &state, &mut ui, &mut playlist,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+        );
+        assert!(matches!(&ui.input_mode, InputMode::Search(q) if q == "c"));
+        assert!(!state.should_quit());
+    }
+
+    #[test]
+    fn tree_scan_refresh_due_first_time_then_every_half_second() {
+        use std::time::Duration;
+        // Never refreshed → due immediately.
+        assert!(tree_scan_refresh_due(None));
+        // Refreshed recently → wait (rebuilding a large tree at 20 fps burned
+        // CPU for the whole scan duration with no visible benefit).
+        assert!(!tree_scan_refresh_due(Some(Duration::from_millis(100))));
+        // Half a second on → due again.
+        assert!(tree_scan_refresh_due(Some(Duration::from_millis(600))));
+    }
+
+    #[test]
+    fn tree_rows_cache_refreshes_on_expand_and_filter() {
+        let tag = |artist: &str, title: &str| crate::library::TrackTags {
+            artist: Some(artist.into()),
+            album: Some("Album".into()),
+            disc: None,
+            track: Some(1),
+            title: title.into(),
+        };
+        let mut ui = test_ui(2);
+        ui.library_tree = crate::library::build(&[tag("A", "t1"), tag("B", "t2")]);
+        refresh_tree_rows(&mut ui);
+        assert_eq!(ui.tree_rows.len(), 2, "two collapsed artist rows");
+
+        // Expanding must refresh the cache — navigation reads it, not a rebuild.
+        ui.tree_cursor = 0;
+        tree_expand_under_cursor(&mut ui);
+        assert_eq!(ui.tree_rows.len(), 3, "expand must refresh the cached rows");
+
+        // Filter change must refresh too.
+        ui.input_mode = InputMode::Search("t2".into());
+        rebuild_tree_filter(&mut ui);
+        assert_eq!(
+            ui.tree_rows.len(),
+            3, // artist B + album + track t2
+            "filter must refresh the cached rows: {:?}",
+            ui.tree_rows
+        );
+    }
+
+    #[test]
+    fn shuffle_off_with_mismatched_snapshot_falls_back_instead_of_panicking() {
+        // A duplicate path surviving dedup (e.g. canonicalize failed on one of
+        // two spellings) makes restore_order return FEWER entries than the live
+        // playlist — clone_from_slice would panic on the length mismatch.
+        let mut ui = test_ui(3);
+        ui.shuffle = true;
+        ui.pre_shuffle_order = Some(vec![p("/a.mp3")]);
+        let mut playlist = vec![p("/b.mp3"), p("/a.mp3"), p("/a.mp3")];
+
+        toggle_shuffle(&mut ui, &mut playlist);
+
+        assert!(!ui.shuffle);
+        assert_eq!(playlist.len(), 3, "fallback must keep every track");
+        let mut sorted = playlist.clone();
+        sorted.sort();
+        assert_eq!(playlist, sorted, "mismatch falls back to the path sort");
+    }
+
+    #[test]
+    fn remove_track_restarts_scan_and_marks_tree_dirty() {
+        // Flat-list remove must go through reindex_and_restart_scan: mutating
+        // the cache positionally (remove_at) while the background scan is
+        // running lets in-flight workers write tags into the wrong slots.
+        let state = PlayerState::new();
+        let mut ui = test_ui(3);
+        let mut playlist = vec![p("/a.mp3"), p("/b.mp3"), p("/c.mp3")];
+        ui.tree_dirty = false;
+        ui.cursor = 1; // not the playing track (current = 0)
+
+        remove_track(&state, &mut ui, &mut playlist);
+
+        assert_eq!(playlist, vec![p("/a.mp3"), p("/c.mp3")]);
+        assert!(ui.tree_dirty, "remove must reindex via the scan-safe path");
+        assert!(ui.scan_handle.is_some(), "scan must be restarted after reindex");
+    }
+
+    #[test]
+    fn enqueue_track_restarts_scan_and_marks_tree_dirty() {
+        // Same hazard as remove: move_entry during an active scan misplaces
+        // in-flight tag writes.
+        let state = PlayerState::new();
+        let mut ui = test_ui(3);
+        let mut playlist = vec![p("/a.mp3"), p("/b.mp3"), p("/c.mp3")];
+        ui.tree_dirty = false;
+        ui.cursor = 2; // enqueue /c.mp3 to play right after current (index 0)
+
+        enqueue_track(&state, &mut ui, &mut playlist);
+
+        assert_eq!(playlist, vec![p("/a.mp3"), p("/c.mp3"), p("/b.mp3")]);
+        assert!(ui.tree_dirty, "enqueue must reindex via the scan-safe path");
+        assert!(ui.scan_handle.is_some(), "scan must be restarted after reindex");
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_save_playlist_and_tree_filter_input() {
+        // SavePlaylist prompt.
+        let state = PlayerState::new();
+        let mut ui = test_ui(2);
+        ui.input_mode = InputMode::SavePlaylist(String::new());
+        let mut playlist = vec![p("/a.mp3"), p("/b.mp3")];
+        let quit = handle_text_input(
+            &state, &mut ui, &mut playlist,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+        assert!(quit && state.should_quit());
+
+        // Tree-filter search (`/` in the tree view) routes through tree_search_input.
+        let state = PlayerState::new();
+        let mut ui = test_ui(2);
+        ui.library_tree_mode = true;
+        ui.input_mode = InputMode::Search(String::new());
+        let quit = handle_text_input(
+            &state, &mut ui, &mut playlist,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+        assert!(quit && state.should_quit());
+        assert!(ui.tree_filter.is_empty(), "Ctrl+C must not type into the tree filter");
     }
 }

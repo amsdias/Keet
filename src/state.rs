@@ -425,7 +425,9 @@ impl PlayerState {
     }
     pub fn take_skip_next(&self) -> bool { self.skip_next.swap(false, Ordering::Relaxed) }
     pub fn take_skip_prev(&self) -> bool { self.skip_prev.swap(false, Ordering::Relaxed) }
-    pub fn seek(&self, secs: i64) { self.seek_request.store(secs, Ordering::Relaxed); }
+    // fetch_add, not store: rapid presses inside one producer-loop iteration
+    // must accumulate — a store made the second press overwrite the first.
+    pub fn seek(&self, secs: i64) { self.seek_request.fetch_add(secs, Ordering::Relaxed); }
     pub fn take_seek(&self) -> i64 { self.seek_request.swap(0, Ordering::Relaxed) }
 
     pub fn volume_up(&self) {
@@ -693,12 +695,23 @@ pub struct UiState {
     /// two presentations don't fight (esp. when the play queue is shuffled).
     pub library_tree: crate::library::LibraryTree,
     pub tree_fold: crate::library::FoldState,
+    /// Cached on-screen rows (fold/filter projection of `library_tree`).
+    /// Refreshed by `ui::refresh_tree_rows` whenever the tree, fold state, or
+    /// filter changes — navigation and rendering read this instead of
+    /// re-materializing the projection on every keypress and frame.
+    pub tree_rows: Vec<crate::library::VisibleRow>,
     pub tree_cursor: usize,
     pub tree_scroll: usize,
     /// Last rendered tree body height, so PageUp/Down can step by a viewport.
     pub tree_view_height: usize,
     /// The tree needs rebuilding (playlist changed, or tags still loading).
     pub tree_dirty: bool,
+    /// When the tree was last rebuilt due to a running scan (throttles the
+    /// while-scanning refresh to ~2/s instead of every frame).
+    pub tree_scan_refreshed_at: Option<Instant>,
+    /// Whether the scan was running last frame — a true→false edge triggers one
+    /// final rebuild so the last-loaded tags settle into the tree.
+    pub tree_scan_was_running: bool,
     /// Selected band (0..EQ_BANDS) in the EQ editor view.
     pub eq_band: usize,
     /// Active tree filter (from `/`). Empty = show the full fold-based tree.
@@ -758,10 +771,13 @@ impl UiState {
             library_tree_mode: false,
             library_tree: crate::library::LibraryTree::default(),
             tree_fold: crate::library::FoldState::default(),
+            tree_rows: Vec::new(),
             tree_cursor: 0,
             tree_scroll: 0,
             tree_view_height: 0,
             tree_dirty: true,
+            tree_scan_refreshed_at: None,
+            tree_scan_was_running: false,
             eq_band: 0,
             tree_filter: String::new(),
             tree_pending_remove: None,
@@ -792,7 +808,7 @@ impl UiState {
         self.status_message = Some((msg, Instant::now()));
     }
 
-    pub fn take_status(&mut self) -> Option<String> {
+    pub fn active_status(&mut self) -> Option<String> {
         if let Some((ref msg, when)) = self.status_message {
             if when.elapsed() < std::time::Duration::from_secs(2) {
                 return Some(msg.clone());
@@ -800,5 +816,23 @@ impl UiState {
             self.status_message = None;
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+
+    #[test]
+    fn seek_requests_accumulate_until_taken() {
+        // Two quick ←/→ presses inside one producer-loop iteration (~20 ms when
+        // the ring is full) must both apply. A plain store made the second
+        // press overwrite the first: +10 then +10 seeked only 10 s.
+        let s = PlayerState::new();
+        s.seek(10);
+        s.seek(10);
+        s.seek(-5);
+        assert_eq!(s.take_seek(), 15, "seeks must accumulate, not overwrite");
+        assert_eq!(s.take_seek(), 0, "take_seek must consume the request");
     }
 }
