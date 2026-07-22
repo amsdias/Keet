@@ -193,10 +193,10 @@ pub fn print_status_hifi(
     // Label row inside box. Inner content between the two `│` chars must span
     // `inner_w` columns to match the box top `┌─*inner_w┐`. The format adds a
     // leading and trailing space inside, so the label itself is `inner_w - 2`.
-    let label_inner = pad_or_truncate("VU METER", inner_w.saturating_sub(2));
     w.line(&format!(
-        "  {fg}│{rst} {dim}{label}{rst} {fg}│{rst}",
-        fg = p.fg, dim = p.dim, rst = p.reset, label = label_inner,
+        "  {fg}│{rst}{row}{fg}│{rst}",
+        fg = p.fg, rst = p.reset,
+        row = vu_label_row(inner_w, state.is_clipping(), p),
     ));
 
     // L/R bars: row inner content (between │ │) is " L {bar}{tail} " — that's
@@ -411,6 +411,21 @@ fn hifi_marquee_keys(p: &crate::theme::Palette, term_w: usize) -> String {
     }
     let _ = term_w;
     s
+}
+
+/// Inner content of the VU panel label row: "VU METER" on the left, a
+/// hardware-style CLIP lamp right-aligned (good-colored idle, danger on clip).
+/// Spans exactly `inner_w` visible columns so the box borders line up.
+fn vu_label_row(inner_w: usize, clipping: bool, p: &crate::theme::Palette) -> String {
+    let label = "VU METER";
+    let lamp = if clipping { p.danger } else { p.good };
+    // 1 lead space + label + pad + "CLIP" + space + dot + 1 trail space.
+    let pad = inner_w.saturating_sub(label.len() + 8);
+    format!(
+        " {dim}{label}{rst}{pad}{dim}CLIP{rst} {lamp}●{rst} ",
+        dim = p.dim, rst = p.reset, lamp = lamp,
+        label = label, pad = " ".repeat(pad),
+    )
 }
 
 /// VU bar without channel label (label is rendered outside the bar by the
@@ -1003,5 +1018,20 @@ mod hifi_tests {
         );
         // Background reset after the partial so the rail cells aren't tinted.
         assert!(bar.contains("\x1B[49m"), "background not reset after partial: {bar:?}");
+    }
+
+    #[test]
+    fn vu_label_row_spans_inner_width_with_clip_lamp() {
+        // The row sits between the box borders, so its visible width must be
+        // exactly inner_w — one column off and the right `│` breaks the frame.
+        let p = crate::theme::palette(crate::theme::ThemeKind::HiFi);
+        let idle = vu_label_row(60, false, p);
+        let hot = vu_label_row(60, true, p);
+        assert_eq!(crate::ansi::visible_len(&idle), 60, "idle row: {idle:?}");
+        assert_eq!(crate::ansi::visible_len(&hot), 60, "hot row: {hot:?}");
+        // Lamp is always present: good-colored dot idle, danger dot on clip.
+        assert!(idle.contains("CLIP"));
+        assert!(idle.contains(&format!("{}●", p.good)), "idle lamp not green: {idle:?}");
+        assert!(hot.contains(&format!("{}●", p.danger)), "hot lamp not red: {hot:?}");
     }
 }

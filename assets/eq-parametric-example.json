@@ -1,0 +1,12 @@
+{
+  "name": "Parametric Example",
+  "bands": [
+    { "type": "low_cut",    "freq": 20,   "q": 0.71 },
+    { "type": "low_shelf",  "freq": 105,  "gain": 4.0,  "q": 0.71 },
+    { "type": "peak",       "freq": 200,  "gain": -1.5, "q": 0.6 },
+    { "type": "peak",       "freq": 1400, "gain": 1.0,  "q": 1.0 },
+    { "type": "peak",       "freq": 3300, "gain": -2.5, "q": 2.0 },
+    { "type": "peak",       "freq": 5500, "gain": -3.0, "q": 4.0 },
+    { "type": "high_shelf", "freq": 9000, "gain": 1.5,  "q": 0.71 }
+  ]
+}

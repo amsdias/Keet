@@ -90,10 +90,10 @@ impl FrameWriter {
 #[allow(clippy::too_many_arguments)] // cohesive render context; bundling into a struct adds no clarity
 pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_info: &str, ext: &str, eq_preset: &crate::eq::EqPreset, fx_name: &str, cf_name: &str, stats: &mut StatsMonitor, prev_frame_lines: usize, playlist: &[PathBuf], analyser: &VizAnalyser) -> usize {
     use crate::theme::ThemeKind;
-    // Keep the live EQ gains mirroring the selected preset while not editing, so
+    // Keep the live EQ bands mirroring the selected preset while not editing, so
     // the curve/editor show the active shape and edits start from it.
     if !state.is_eq_custom() {
-        state.set_eq_gains(&eq_preset.gains_10());
+        state.set_eq_bands(&eq_preset.bands_10());
     }
     // The EQ+FX editor is one shared, palette-driven screen across all themes.
     if ui.view_mode == ViewMode::Eq {
@@ -178,9 +178,9 @@ fn print_status_eq_view(
         ("BAL", bal_str.as_str()),
         ("RG", rg_str),
     ];
-    let gains = state.eq_gains_array();
+    let bands = state.eq_bands_array();
     let body = crate::eq_ui::render_eq_screen(
-        &gains,
+        &bands,
         ui.eq_band,
         &title,
         &readouts,
@@ -200,7 +200,7 @@ fn print_status_eq_view(
         below += 1;
     }
     print!(
-        "\n\r\x1B[K  {dim}[←→] band   [↑↓] ±1 dB   [ [ / ] ] preset   [0] flatten band   [E/L/Esc] close{rst}",
+        "\n\r\x1B[K  {dim}[←→] band  [↑↓] gain  [t] type  [,.] Q  [<>] freq  [[]] preset  [0] reset  [E/Esc] close{rst}",
         dim = p.dim, rst = p.reset,
     );
     below += 1;
@@ -215,7 +215,8 @@ fn print_status_classic(state: &PlayerState, ui: &mut UiState, name: &str, track
     let viz_mode = state.viz_mode();
     let viz_style = state.viz_style();
     let eq_name = &eq_preset.name;
-    let eq_curve = crate::eq::render_eq_curve(&state.eq_gains_array());
+    let out_rate = state.output_rate.load(Ordering::Relaxed).max(44100) as f32;
+    let eq_curve = crate::eq::render_eq_curve(&state.eq_bands_array(), out_rate);
     let eq_line = !eq_curve.is_empty();
     let (term_w, term_h) = terminal::size()
         .map(|(w, h)| (w as usize, h as usize))
@@ -719,7 +720,8 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
                 }
             }
 
-            // EQ editor keys: arrows select/adjust bands; brackets cycle presets.
+            // EQ editor keys: arrows select/adjust bands; t / , . / < > edit the
+            // selected band's filter type, Q and frequency; brackets cycle presets.
             if ui.view_mode == ViewMode::Eq {
                 match k {
                     KeyEvent { code: KeyCode::Left, .. } => {
@@ -748,10 +750,34 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
                         state.step_eq_preset(1);
                         continue;
                     }
+                    KeyEvent { code: KeyCode::Char('t'), .. } => {
+                        state.cycle_eq_type(ui.eq_band, 1);
+                        continue;
+                    }
+                    KeyEvent { code: KeyCode::Char('T'), .. } => {
+                        state.cycle_eq_type(ui.eq_band, -1);
+                        continue;
+                    }
+                    KeyEvent { code: KeyCode::Char(','), .. } => {
+                        state.nudge_eq_q(ui.eq_band, -1);
+                        continue;
+                    }
+                    KeyEvent { code: KeyCode::Char('.'), .. } => {
+                        state.nudge_eq_q(ui.eq_band, 1);
+                        continue;
+                    }
+                    KeyEvent { code: KeyCode::Char('<'), .. } => {
+                        state.nudge_eq_freq(ui.eq_band, -1);
+                        continue;
+                    }
+                    KeyEvent { code: KeyCode::Char('>'), .. } => {
+                        state.nudge_eq_freq(ui.eq_band, 1);
+                        continue;
+                    }
                     KeyEvent { code: KeyCode::Char('0'), .. } => {
-                        // Flatten the selected band to 0 dB.
-                        let cur = state.eq_gains_array()[ui.eq_band];
-                        state.nudge_eq_gain(ui.eq_band, -cur);
+                        // Restore the selected band's graphic default
+                        // (peak, ISO centre, 0 dB, Q 1.41).
+                        state.reset_eq_band(ui.eq_band);
                         continue;
                     }
                     KeyEvent { code: KeyCode::Esc, .. } => {

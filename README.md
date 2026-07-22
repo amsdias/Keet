@@ -1,6 +1,6 @@
 # Keet
 
-A high-performance, low-CPU terminal audio player with real-time spectrum visualization, an interactive graphic EQ, synced lyrics, and switchable themes.
+A high-performance, low-CPU terminal audio player with real-time spectrum visualization, an interactive parametric EQ, synced lyrics, and switchable themes.
 
 ## Features
 
@@ -9,7 +9,7 @@ A high-performance, low-CPU terminal audio player with real-time spectrum visual
 - **Any channel layout**: Mono, stereo, quad, 5.1, and 7.1 sources all play correctly — surround is downmixed to stereo (ITU-style: center at -3dB into both sides, LFE dropped)
 - **Low CPU usage**: <0.5% total system CPU (release mode)
 - **Synced lyrics**: Embedded LRC lyrics + automatic fetching from LRCLIB (~3M songs), with adjustable sync offset
-- **10-band graphic EQ**: A full-screen interactive editor (`E`) — 10 ISO octave bands (31 Hz–16 kHz), ±12 dB each, adjusted live with the arrow keys; built-in preset shapes (Flat, Bass Boost, Treble Boost, Vocal, Loudness) + custom JSON presets
+- **10-band parametric EQ**: A full-screen interactive editor (`E`) — every band has filter type (peak / shelves / cuts), frequency, Q, and gain, adjusted live; starts out as a classic ISO-centre graphic EQ; built-in preset shapes (Flat, Bass Boost, Treble Boost, Vocal, Loudness) + custom JSON presets, including AutoEq-style parametric headphone corrections
 - **Audio effects**: Reverb, chorus, delay with built-in environment presets + custom JSON presets
 - **Gapless playback**: Sample-accurate track transitions with continuous audio stream
 - **ReplayGain**: Loudness normalization with peak-based clipping prevention (`--rg-mode track|album|off`)
@@ -29,7 +29,7 @@ A high-performance, low-CPU terminal audio player with real-time spectrum visual
 - **Volume control**: Adjustable 0-150% with per-sample gain
 - **Library browser**: The library view (`L`) has a flat track list *and* an artist → album → track **tree** (`Tab` to switch) with live filtering (`/`), play-node (`Enter` plays a track / album / artist), and remove; folder sources auto-sort into artist → album order once tags load (when not shuffling)
 - **Playlist features**: Shuffle (toggling off restores the previous order — M3U order survives), repeat (all/one), recursive folder scanning, playlist view with search/sort/track durations/album column, page navigation (Home/End/PgUp/PgDn + vim `g`/`G`/Ctrl+U/D), tag-based sort (artist → album → disc → track), play queue (enqueue tracks after current), M3U import/export, folder rescan, multiple source paths with deduplication
-- **Resume playback**: Save and restore last session (track, position, volume, EQ — including an edited Custom graphic EQ, effects, crossfeed, balance, theme, device, exclusive) automatically
+- **Resume playback**: Save and restore last session (track, position, volume, EQ — including an edited Custom parametric EQ, effects, crossfeed, balance, theme, device, exclusive) automatically
 - **HQ resampler mode**: Optional `--quality` flag for audiophile-grade resampling
 - **Resilient playback**: Skips missing/corrupt files with a status message, recovers from device disconnection (including USB DAC unplug)
 - **Terminal-safe UI**: Output adapts to terminal width, handles terminal resize gracefully
@@ -200,17 +200,20 @@ For a *persistent* default that applies on every launch (including with explicit
 
 ## EQ + FX Editor
 
-Press `E` to open the EQ + FX editor — a full-screen **10-band graphic EQ** at ISO octave centres (31 62 125 250 500 1k 2k 4k 8k 16k Hz), each adjustable ±12 dB, with the current effects / crossfeed / balance / ReplayGain shown beneath.
+Press `E` to open the EQ + FX editor — a full-screen **10-band parametric EQ**, with the current effects / crossfeed / balance / ReplayGain shown beneath. Every band has four parameters:
 
-| Key | Action |
-|-----|--------|
-| `←` / `→` | Select a band |
-| `↑` / `↓` | Raise / lower the selected band ±1 dB (applied live) |
-| `[` / `]` | Load the previous / next preset |
-| `0` | Flatten the selected band |
-| `E` / `L` / `Esc` | Close |
+| Parameter | Range | Keys |
+|-----------|-------|------|
+| Gain | ±12 dB, ±1 dB per press | `↑` / `↓` |
+| Filter type | Peak → Low Shelf → High Shelf → Low Cut → High Cut | `t` / `T` |
+| Frequency | 20 Hz – 20 kHz, ⅓-octave steps | `<` / `>` |
+| Q (bandwidth) | 0.3 – 10, √2 steps | `,` / `.` |
 
-Editing any band switches the EQ to **Custom** (starting from the active preset); a Custom EQ persists across sessions. Changes apply live, delayed by the audio buffer depth (a few seconds).
+Plus: `←` / `→` select a band, `[` / `]` cycle presets, `0` reset the selected band to its graphic default, `E` / `L` / `Esc` close. All changes apply live, delayed by the audio buffer depth (a few seconds).
+
+Bands start out as the classic graphic-EQ layout — peaking filters at the ISO octave centres (31 62 125 250 500 1k 2k 4k 8k 16k Hz) — so until you reach for the parametric keys it behaves exactly like a 10-band graphic EQ. The filters are standard RBJ-cookbook biquads. **Low Cut** (high-pass) and **High Cut** (low-pass) ignore gain: they filter by frequency and resonance (Q above 0.7 adds a resonant bump at the corner — a Low Cut at 20–30 Hz makes a clean subsonic/rumble filter). The response curve drawn in the editor and the player banner is the exact summed magnitude response of the active filters, so shelves and cuts render truthfully.
+
+Editing any band switches the EQ to **Custom** (starting from the active preset); a Custom EQ persists across sessions, parametric settings included.
 
 ### Built-in Presets
 
@@ -226,7 +229,9 @@ Editing any band switches the EQ to **Custom** (starting from the active preset)
 
 ### Custom Presets
 
-Drop JSON files into `~/.config/keet/eq/` (macOS/Linux) or `%APPDATA%\keet\eq\` (Windows) — one gain (dB) per band, matching the 10 fixed centres:
+Drop JSON files into `~/.config/keet/eq/` (macOS/Linux) or `%APPDATA%\keet\eq\` (Windows). Custom presets appear alongside the built-ins when cycling with `[` / `]` in the editor. Two formats:
+
+**Graphic** — one gain (dB) per band, at the 10 fixed ISO centres:
 
 ```json
 {
@@ -235,19 +240,39 @@ Drop JSON files into `~/.config/keet/eq/` (macOS/Linux) or `%APPDATA%\keet\eq\` 
 }
 ```
 
-Short lists are zero-padded and long lists truncated to 10 bands; gains clamp to ±12 dB. Custom presets appear alongside the built-ins when cycling with `[` / `]` in the editor.
+Short lists are zero-padded and long lists truncated to 10 bands; gains clamp to ±12 dB.
+
+**Parametric** — up to 10 bands of `{type, freq, gain, q}`:
+
+```json
+{
+  "name": "My Headphones",
+  "bands": [
+    { "type": "low_cut",    "freq": 20,   "q": 0.71 },
+    { "type": "low_shelf",  "freq": 105,  "gain": 5.5,  "q": 0.71 },
+    { "type": "peak",       "freq": 3300, "gain": -2.0, "q": 2.0 },
+    { "type": "peak",       "freq": 5500, "gain": -4.5, "q": 4.0 },
+    { "type": "high_shelf", "freq": 9500, "gain": 1.5,  "q": 0.71 }
+  ]
+}
+```
+
+Types: `peak`, `low_shelf`, `high_shelf`, `low_cut` (high-pass), `high_cut` (low-pass). `gain` defaults to 0 and `q` to 1.41 when omitted; unused slots stay flat. Frequency clamps to 20 Hz–20 kHz, gain to ±12 dB, Q to 0.3–10. When both `gains` and `bands` are present, `bands` wins.
+
+This is the same shape as [AutoEq](https://github.com/jaakkopasanen/AutoEq) parametric exports — to correct your headphones, find their ParametricEQ profile in the AutoEq results and transcribe its rows (LSC → `low_shelf`, PK → `peak`, HSC → `high_shelf`, with the same Fc/gain/Q values) into a preset file. Pairs well with the crossfeed filter.
 
 Example presets are included in `assets/` -- copy them to the presets folders as a starting point:
 
 ```bash
 # macOS/Linux
 mkdir -p ~/.config/keet/eq ~/.config/keet/effects
-cp assets/eq-example.json ~/.config/keet/eq/
+cp assets/eq-example.json assets/eq-parametric-example.json ~/.config/keet/eq/
 cp assets/fx-example.json ~/.config/keet/effects/
 cp assets/config-example.json ~/.config/keet/config.json   # default theme etc.
 
 # Windows
 copy assets\eq-example.json %APPDATA%\keet\eq\
+copy assets\eq-parametric-example.json %APPDATA%\keet\eq\
 copy assets\fx-example.json %APPDATA%\keet\effects\
 copy assets\config-example.json %APPDATA%\keet\config.json
 ```
@@ -363,7 +388,7 @@ src/
 ├── config.rs      User preferences from config.json (default theme, …)
 ├── audio.rs       Audio stream, sample rate switching, CoreAudio FFI
 ├── decode.rs      Continuous decoder thread, gapless playback, ReplayGain, resampling
-├── eq.rs          10-band graphic EQ (biquad filters), preset gain shapes, JSON parsing
+├── eq.rs          10-band parametric EQ (RBJ biquads: peak/shelf/cut), exact response curve, JSON presets
 ├── eq_ui.rs       EQ + FX editor screen renderer (shared across themes)
 ├── effects.rs     Reverb, chorus, delay effects with preset loading
 ├── playlist.rs    Playlist builder, M3U parser, shuffle

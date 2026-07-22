@@ -184,6 +184,7 @@ fn build_resume_state(
         state::RepeatMode::All => "all",
         state::RepeatMode::One => "one",
     };
+    let eq_bands = player_state.eq_bands_array();
     ResumeState {
         source_paths: ui.source_paths.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
         track_path: playlist.get(ui.current)
@@ -204,6 +205,9 @@ fn build_resume_state(
         theme: Some(player_state.theme_kind().name().to_string()),
         eq_gains: Some(player_state.eq_gains_array().to_vec()),
         eq_custom: Some(player_state.is_eq_custom()),
+        eq_types: Some(eq_bands.iter().map(|b| b.kind.name().to_string()).collect()),
+        eq_freqs: Some(eq_bands.iter().map(|b| b.freq).collect()),
+        eq_qs: Some(eq_bands.iter().map(|b| b.q).collect()),
     }
 }
 
@@ -536,13 +540,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(idx) = eq_presets.iter().position(|p| p.name == rs.eq_preset) {
             state.eq_preset_index.store(idx, Ordering::Relaxed);
         }
-        // Restore a Custom (edited) graphic EQ, if that's what was saved.
+        // Restore a Custom (edited) EQ, if that's what was saved. Older
+        // state.json files carry gains only — the parametric fields then fall
+        // back per band to the graphic defaults (peak at the ISO centre, Q 1.41).
         if rs.eq_custom == Some(true) {
             if let Some(ref g) = rs.eq_gains {
-                let arr: [f32; eq::EQ_BANDS] = std::array::from_fn(|i| {
-                    g.get(i).copied().unwrap_or(0.0).clamp(-eq::EQ_GAIN_LIMIT, eq::EQ_GAIN_LIMIT)
+                let bands: [eq::BandSettings; eq::EQ_BANDS] = std::array::from_fn(|i| {
+                    let d = eq::BandSettings::inert(i);
+                    eq::BandSettings {
+                        kind: rs.eq_types.as_ref()
+                            .and_then(|t| t.get(i))
+                            .and_then(|n| eq::BandType::from_name(n))
+                            .unwrap_or(d.kind),
+                        freq: rs.eq_freqs.as_ref()
+                            .and_then(|f| f.get(i).copied())
+                            .unwrap_or(d.freq),
+                        gain: g.get(i).copied().unwrap_or(0.0),
+                        q: rs.eq_qs.as_ref()
+                            .and_then(|q| q.get(i).copied())
+                            .unwrap_or(d.q),
+                    }
+                    .clamped()
                 });
-                state.set_eq_gains(&arr);
+                state.set_eq_bands(&bands);
                 state.eq_custom.store(true, Ordering::Relaxed);
             }
         }
@@ -964,7 +984,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let producer_handle = thread::spawn(move || {
             let mut eq_chain = eq::EqChain::new();
             if state_clone.is_eq_custom() {
-                eq_chain.load_gains(&state_clone.eq_gains_array(), sr as f32);
+                eq_chain.load_bands(&state_clone.eq_bands_array(), sr as f32);
             } else {
                 eq_chain.load_preset(&eq_presets_clone[state_clone.eq_index()], sr as f32);
             }

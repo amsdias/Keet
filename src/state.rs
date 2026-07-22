@@ -264,9 +264,14 @@ pub struct PlayerState {
     pub(crate) eq_preset_index: AtomicUsize,
     pub(crate) eq_preset_count: AtomicUsize,
     pub(crate) eq_changed: AtomicBool,
-    // Live 10-band graphic-EQ gains (dB, f32-as-bits) — the producer's source of
-    // truth. `eq_custom` = the gains were edited away from the named preset.
+    // Live parametric-EQ bands — the producer's source of truth. Gain/freq/Q
+    // as f32-as-bits, filter type as a BandType u8. Fixed-size atomic arrays
+    // keep the whole EQ lock-free (hence the hard 10-band cap). `eq_custom` =
+    // the bands were edited away from the named preset.
     pub(crate) eq_gains: [AtomicU32; crate::eq::EQ_BANDS],
+    pub(crate) eq_types: [AtomicU8; crate::eq::EQ_BANDS],
+    pub(crate) eq_freqs: [AtomicU32; crate::eq::EQ_BANDS],
+    pub(crate) eq_qs: [AtomicU32; crate::eq::EQ_BANDS],
     pub(crate) eq_custom: AtomicBool,
 
     // Effects preset index and count
@@ -358,6 +363,9 @@ impl PlayerState {
             eq_preset_count: AtomicUsize::new(0),
             eq_changed: AtomicBool::new(false),
             eq_gains: std::array::from_fn(|_| AtomicU32::new(0)),
+            eq_types: std::array::from_fn(|_| AtomicU8::new(0)),
+            eq_freqs: std::array::from_fn(|i| AtomicU32::new(crate::eq::EQ_FREQS[i].to_bits())),
+            eq_qs: std::array::from_fn(|_| AtomicU32::new(crate::eq::EQ_Q.to_bits())),
             eq_custom: AtomicBool::new(false),
             effects_preset_index: AtomicUsize::new(0),
             effects_preset_count: AtomicUsize::new(0),
@@ -483,15 +491,28 @@ impl PlayerState {
         self.eq_changed.swap(false, Ordering::Relaxed)
     }
 
-    // --- Live graphic-EQ gains ---
+    // --- Live parametric-EQ bands ---
 
     pub fn eq_gains_array(&self) -> [f32; crate::eq::EQ_BANDS] {
         std::array::from_fn(|i| f32::from_bits(self.eq_gains[i].load(Ordering::Relaxed)))
     }
 
-    pub fn set_eq_gains(&self, gains: &[f32; crate::eq::EQ_BANDS]) {
-        for (i, &g) in gains.iter().enumerate() {
-            self.eq_gains[i].store(g.to_bits(), Ordering::Relaxed);
+    /// Snapshot of the live band set (type/freq/gain/Q per band).
+    pub fn eq_bands_array(&self) -> [crate::eq::BandSettings; crate::eq::EQ_BANDS] {
+        std::array::from_fn(|i| crate::eq::BandSettings {
+            kind: crate::eq::BandType::from_u8(self.eq_types[i].load(Ordering::Relaxed)),
+            freq: f32::from_bits(self.eq_freqs[i].load(Ordering::Relaxed)),
+            gain: f32::from_bits(self.eq_gains[i].load(Ordering::Relaxed)),
+            q: f32::from_bits(self.eq_qs[i].load(Ordering::Relaxed)),
+        })
+    }
+
+    pub fn set_eq_bands(&self, bands: &[crate::eq::BandSettings; crate::eq::EQ_BANDS]) {
+        for (i, b) in bands.iter().enumerate() {
+            self.eq_types[i].store(b.kind.as_u8(), Ordering::Relaxed);
+            self.eq_freqs[i].store(b.freq.to_bits(), Ordering::Relaxed);
+            self.eq_gains[i].store(b.gain.to_bits(), Ordering::Relaxed);
+            self.eq_qs[i].store(b.q.to_bits(), Ordering::Relaxed);
         }
     }
 
@@ -508,9 +529,68 @@ impl PlayerState {
         let cur = f32::from_bits(self.eq_gains[band].load(Ordering::Relaxed));
         let next = (cur + delta).clamp(-crate::eq::EQ_GAIN_LIMIT, crate::eq::EQ_GAIN_LIMIT);
         self.eq_gains[band].store(next.to_bits(), Ordering::Relaxed);
+        self.mark_eq_edited();
+        next
+    }
+
+    /// Step one band's filter type by `dir` (+1/-1), wrapping through the five
+    /// types. Returns the new type.
+    pub fn cycle_eq_type(&self, band: usize, dir: i32) -> crate::eq::BandType {
+        if band >= crate::eq::EQ_BANDS {
+            return crate::eq::BandType::Peak;
+        }
+        let next = crate::eq::BandType::from_u8(self.eq_types[band].load(Ordering::Relaxed))
+            .cycled(dir);
+        self.eq_types[band].store(next.as_u8(), Ordering::Relaxed);
+        self.mark_eq_edited();
+        next
+    }
+
+    /// Step one band's Q by √2 in `dir` (+1 narrower / -1 broader), clamped.
+    /// Returns the new Q.
+    pub fn nudge_eq_q(&self, band: usize, dir: i32) -> f32 {
+        if band >= crate::eq::EQ_BANDS {
+            return crate::eq::EQ_Q;
+        }
+        let cur = f32::from_bits(self.eq_qs[band].load(Ordering::Relaxed));
+        let next = (cur * crate::eq::EQ_Q_STEP.powi(dir))
+            .clamp(crate::eq::EQ_Q_MIN, crate::eq::EQ_Q_MAX);
+        self.eq_qs[band].store(next.to_bits(), Ordering::Relaxed);
+        self.mark_eq_edited();
+        next
+    }
+
+    /// Step one band's frequency by ⅓ octave in `dir` (+1 up / -1 down),
+    /// clamped to the audible range. Returns the new frequency.
+    pub fn nudge_eq_freq(&self, band: usize, dir: i32) -> f32 {
+        if band >= crate::eq::EQ_BANDS {
+            return 0.0;
+        }
+        let cur = f32::from_bits(self.eq_freqs[band].load(Ordering::Relaxed));
+        let next = (cur * crate::eq::EQ_FREQ_STEP.powi(dir))
+            .clamp(crate::eq::EQ_FREQ_MIN, crate::eq::EQ_FREQ_MAX);
+        self.eq_freqs[band].store(next.to_bits(), Ordering::Relaxed);
+        self.mark_eq_edited();
+        next
+    }
+
+    /// Restore one band to its graphic default: peak at the slot's ISO centre,
+    /// 0 dB, default Q.
+    pub fn reset_eq_band(&self, band: usize) {
+        if band >= crate::eq::EQ_BANDS {
+            return;
+        }
+        let d = crate::eq::BandSettings::inert(band);
+        self.eq_types[band].store(d.kind.as_u8(), Ordering::Relaxed);
+        self.eq_freqs[band].store(d.freq.to_bits(), Ordering::Relaxed);
+        self.eq_gains[band].store(d.gain.to_bits(), Ordering::Relaxed);
+        self.eq_qs[band].store(d.q.to_bits(), Ordering::Relaxed);
+        self.mark_eq_edited();
+    }
+
+    fn mark_eq_edited(&self) {
         self.eq_custom.store(true, Ordering::Relaxed);
         self.eq_changed.store(true, Ordering::Relaxed);
-        next
     }
 
     pub fn cycle_effects(&self) {
@@ -834,5 +914,49 @@ mod state_tests {
         s.seek(-5);
         assert_eq!(s.take_seek(), 15, "seeks must accumulate, not overwrite");
         assert_eq!(s.take_seek(), 0, "take_seek must consume the request");
+    }
+
+    #[test]
+    fn parametric_band_nudges_step_mark_custom_and_signal() {
+        use crate::eq::{BandType, EQ_FREQS, EQ_FREQ_STEP, EQ_Q, EQ_Q_STEP};
+        let s = PlayerState::new();
+        assert!(!s.is_eq_custom());
+
+        // Type cycles forward and wraps; marks custom + signals the producer.
+        assert_eq!(s.cycle_eq_type(3, 1), BandType::LowShelf);
+        assert!(s.is_eq_custom() && s.take_eq_changed());
+        assert_eq!(s.cycle_eq_type(3, -1), BandType::Peak);
+        assert_eq!(s.cycle_eq_type(3, -1), BandType::HighCut);
+
+        // Q steps by √2 and clamps at the range ends.
+        let q1 = s.nudge_eq_q(0, 1);
+        assert!((q1 - EQ_Q * EQ_Q_STEP).abs() < 1e-3, "one step up from default: {q1}");
+        for _ in 0..20 {
+            s.nudge_eq_q(0, 1);
+        }
+        assert_eq!(s.eq_bands_array()[0].q, crate::eq::EQ_Q_MAX, "Q clamps high");
+
+        // Freq steps by ⅓ octave and clamps.
+        let f1 = s.nudge_eq_freq(5, 1);
+        assert!((f1 - EQ_FREQS[5] * EQ_FREQ_STEP).abs() < 1.0, "⅓ octave up from 1k: {f1}");
+        for _ in 0..60 {
+            s.nudge_eq_freq(5, -1);
+        }
+        assert_eq!(s.eq_bands_array()[5].freq, crate::eq::EQ_FREQ_MIN, "freq clamps low");
+
+        // Reset restores the slot's graphic default entirely.
+        s.nudge_eq_gain(5, 4.0);
+        s.reset_eq_band(5);
+        let b = s.eq_bands_array()[5];
+        assert_eq!(b.kind, BandType::Peak);
+        assert_eq!(b.freq, EQ_FREQS[5]);
+        assert_eq!(b.gain, 0.0);
+        assert_eq!(b.q, EQ_Q);
+
+        // Out-of-range band indices are ignored, not a panic.
+        s.cycle_eq_type(99, 1);
+        s.nudge_eq_q(99, 1);
+        s.nudge_eq_freq(99, 1);
+        s.reset_eq_band(99);
     }
 }

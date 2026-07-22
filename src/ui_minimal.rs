@@ -192,9 +192,10 @@ pub fn print_status_minimal(
     if eq_name != "Flat" { meta.push_str(&format!("  ·  eq {}", eq_name)); }
     if fx_name != "None" { meta.push_str(&format!("  ·  fx {}", fx_name)); }
     if cf_name != "Off"  { meta.push_str(&format!("  ·  cf {}", cf_name)); }
-    if state.is_clipping() {
-        meta.push_str(&format!("  ·  {danger}clipping{rst}", danger = p.danger, rst = p.reset));
-    }
+    // Clip lamp, same idiom as the Classic theme: always shown, good-colored
+    // dot when clean, danger red on clip (is_clipping is a read-once swap).
+    let clip_color = if state.is_clipping() { p.danger } else { p.good };
+    meta.push_str(&format!("  ·  {c}●{rst}", c = clip_color, rst = p.reset));
     if state.show_stats() {
         meta.push_str(&format!("  ·  cpu {:.1}%  ·  mem {:.0}M", stats.cpu_usage, stats.memory_mb));
     }

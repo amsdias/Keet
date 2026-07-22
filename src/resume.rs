@@ -31,11 +31,20 @@ pub struct ResumeState {
     pub balance: Option<i32>,
     #[serde(default)]
     pub theme: Option<String>,
-    /// Live 10-band graphic-EQ gains, saved when the EQ was edited to Custom.
+    /// Live 10-band EQ gains, saved when the EQ was edited to Custom.
     #[serde(default)]
     pub eq_gains: Option<Vec<f32>>,
     #[serde(default)]
     pub eq_custom: Option<bool>,
+    /// Parametric extension of `eq_gains`: per-band filter type (snake_case
+    /// names), frequency (Hz) and Q. Absent in pre-parametric files — those
+    /// bands fall back to the graphic defaults on load.
+    #[serde(default)]
+    pub eq_types: Option<Vec<String>>,
+    #[serde(default)]
+    pub eq_freqs: Option<Vec<f32>>,
+    #[serde(default)]
+    pub eq_qs: Option<Vec<f32>>,
 }
 
 fn state_file_path() -> Option<PathBuf> {
@@ -63,4 +72,40 @@ pub fn load_state() -> Option<ResumeState> {
     let path = state_file_path()?;
     let content = std::fs::read_to_string(&path).ok()?;
     serde_json::from_str(&content).ok()
+}
+
+#[cfg(test)]
+mod resume_tests {
+    use super::*;
+
+    #[test]
+    fn old_state_json_loads_and_parametric_fields_roundtrip() {
+        // A pre-parametric state file: gains only, no type/freq/Q keys.
+        let old = r#"{
+            "source_paths": ["/music"],
+            "track_path": "/music/a.flac",
+            "position_secs": 1.5,
+            "shuffle": false,
+            "volume": 90,
+            "eq_preset": "Flat",
+            "effects_preset": "None",
+            "eq_gains": [1.0, -2.0],
+            "eq_custom": true
+        }"#;
+        let mut rs: ResumeState = serde_json::from_str(old).expect("old format must load");
+        assert_eq!(rs.eq_types, None);
+        assert_eq!(rs.eq_freqs, None);
+        assert_eq!(rs.eq_qs, None);
+
+        // The parametric fields survive a save/load roundtrip.
+        rs.eq_types = Some(vec!["low_shelf".into(), "peak".into()]);
+        rs.eq_freqs = Some(vec![105.0, 3300.0]);
+        rs.eq_qs = Some(vec![0.71, 2.0]);
+        let json = serde_json::to_string(&rs).unwrap();
+        let back: ResumeState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.eq_types, Some(vec!["low_shelf".to_string(), "peak".to_string()]));
+        assert_eq!(back.eq_freqs, Some(vec![105.0, 3300.0]));
+        assert_eq!(back.eq_qs, Some(vec![0.71, 2.0]));
+        assert_eq!(back.eq_gains, Some(vec![1.0, -2.0]));
+    }
 }

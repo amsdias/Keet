@@ -703,11 +703,11 @@ pub fn decode_playlist(
                 continue;
             }
 
-            // Check for live EQ change: Custom → the edited live gains, else the
-            // selected named preset's gains.
+            // Check for live EQ change: Custom → the edited live bands, else
+            // the selected named preset's bands.
             if state.take_eq_changed() {
                 if state.is_eq_custom() {
-                    eq.load_gains(&state.eq_gains_array(), output_rate as f32);
+                    eq.load_bands(&state.eq_bands_array(), output_rate as f32);
                 } else {
                     let idx = state.eq_index();
                     if idx < eq_presets.len() {
