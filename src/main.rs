@@ -208,6 +208,7 @@ fn build_resume_state(
         eq_types: Some(eq_bands.iter().map(|b| b.kind.name().to_string()).collect()),
         eq_freqs: Some(eq_bands.iter().map(|b| b.freq).collect()),
         eq_qs: Some(eq_bands.iter().map(|b| b.q).collect()),
+        eq_preamp: Some(player_state.eq_preamp_db()),
     }
 }
 
@@ -563,6 +564,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .clamped()
                 });
                 state.set_eq_bands(&bands);
+                state.set_eq_preamp_db(rs.eq_preamp.unwrap_or(0.0));
                 state.eq_custom.store(true, Ordering::Relaxed);
             }
         }
@@ -984,7 +986,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let producer_handle = thread::spawn(move || {
             let mut eq_chain = eq::EqChain::new();
             if state_clone.is_eq_custom() {
-                eq_chain.load_bands(&state_clone.eq_bands_array(), sr as f32);
+                eq_chain.load_bands(&state_clone.eq_bands_array(), state_clone.eq_preamp_db(), sr as f32);
             } else {
                 eq_chain.load_preset(&eq_presets_clone[state_clone.eq_index()], sr as f32);
             }

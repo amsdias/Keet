@@ -152,11 +152,18 @@ pub fn render_eq_screen(
     }
     out.push(type_line);
 
-    // Signed-dB values; cuts show "cut" (they have no gain axis).
+    // Signed-dB values; cuts show "cut" (they have no gain axis). Whole dB
+    // stays compact ("+6"); fine-stepped gains show their decimal ("+5.5").
     let mut db_line = "      ".to_string();
     for (b, band) in bands.iter().enumerate() {
         let (val, active) = if band.kind.uses_gain() {
-            (format!("{:+}", band.gain.round() as i32), band.gain.round() as i32 != 0)
+            let g = band.gain;
+            let val = if (g - g.round()).abs() < 0.05 {
+                format!("{:+}", g.round() as i32)
+            } else {
+                format!("{:+.1}", g)
+            };
+            (val, g.abs() >= 0.05)
         } else {
             ("cut".to_string(), true)
         };
@@ -202,6 +209,7 @@ mod tests {
     fn eq_screen_has_header_labels_knobs_and_readouts() {
         let mut bands = flat_bands();
         bands[0].gain = 6.0; // boost the 31 Hz band
+        bands[1].gain = 2.5; // fractional gain (fine-step editing)
         bands[9].gain = -6.0; // cut the 16k band
         let p = crate::theme::palette(crate::theme::ThemeKind::HiFi);
         let readouts = [("FX", "None"), ("XFEED", "Off"), ("BAL", "C"), ("RG", "Track")];
@@ -212,6 +220,7 @@ mod tests {
         assert!(joined.contains('◆')); // a knob rendered
         assert!(joined.contains("16k")); // freq labels present
         assert!(joined.contains("+6")); // boosted band's dB value
+        assert!(joined.contains("+2.5")); // fractional gain shown exactly, not rounded
         assert!(joined.contains("-6")); // cut band's dB value
         assert!(joined.contains("XFEED") && joined.contains("Track")); // readouts
     }

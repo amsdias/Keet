@@ -204,7 +204,7 @@ Press `E` to open the EQ + FX editor — a full-screen **10-band parametric EQ**
 
 | Parameter | Range | Keys |
 |-----------|-------|------|
-| Gain | ±12 dB, ±1 dB per press | `↑` / `↓` |
+| Gain | ±12 dB — 0.5 dB per press, 0.1 dB with Shift | `↑` / `↓` |
 | Filter type | Peak → Low Shelf → High Shelf → Low Cut → High Cut | `t` / `T` |
 | Frequency | 20 Hz – 20 kHz, ⅓-octave steps | `<` / `>` |
 | Q (bandwidth) | 0.3 – 10, √2 steps | `,` / `.` |
@@ -247,6 +247,7 @@ Short lists are zero-padded and long lists truncated to 10 bands; gains clamp to
 ```json
 {
   "name": "My Headphones",
+  "preamp": -5.5,
   "bands": [
     { "type": "low_cut",    "freq": 20,   "q": 0.71 },
     { "type": "low_shelf",  "freq": 105,  "gain": 5.5,  "q": 0.71 },
@@ -257,9 +258,9 @@ Short lists are zero-padded and long lists truncated to 10 bands; gains clamp to
 }
 ```
 
-Types: `peak`, `low_shelf`, `high_shelf`, `low_cut` (high-pass), `high_cut` (low-pass). `gain` defaults to 0 and `q` to 1.41 when omitted; unused slots stay flat. Frequency clamps to 20 Hz–20 kHz, gain to ±12 dB, Q to 0.3–10. When both `gains` and `bands` are present, `bands` wins.
+Types: `peak`, `low_shelf`, `high_shelf`, `low_cut` (high-pass), `high_cut` (low-pass). `gain` defaults to 0 and `q` to 1.41 when omitted; unused slots stay flat. Frequency clamps to 20 Hz–20 kHz, gain to ±12 dB, Q to 0.3–10. When both `gains` and `bands` are present, `bands` wins. The optional `preamp` (dB, default 0, clamped ±12) is a flat gain applied ahead of the filters — set it negative to give boosted bands clipping headroom, exactly like AutoEq's preamp line.
 
-This is the same shape as [AutoEq](https://github.com/jaakkopasanen/AutoEq) parametric exports — to correct your headphones, find their ParametricEQ profile in the AutoEq results and transcribe its rows (LSC → `low_shelf`, PK → `peak`, HSC → `high_shelf`, with the same Fc/gain/Q values) into a preset file. Pairs well with the crossfeed filter.
+This is the same shape as [AutoEq](https://github.com/jaakkopasanen/AutoEq) parametric exports — to correct your headphones, find their ParametricEQ profile in the AutoEq results and transcribe its rows (LSC → `low_shelf`, PK → `peak`, HSC → `high_shelf`, with the same Fc/gain/Q values) into a preset file. AutoEq's **FixedBandEQ** export matches too, even more directly: it targets the same 10 ISO centres at Q 1.41, so its ten gain values drop straight into the `gains` form. (The GraphicEQ/Wavelet export is a 127-point drawn curve — that one can't be represented.) Copy the AutoEq profile's preamp line into the `preamp` field so boosted bands can't clip. Pairs well with the crossfeed filter.
 
 Example presets are included in `assets/` -- copy them to the presets folders as a starting point:
 

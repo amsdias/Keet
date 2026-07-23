@@ -94,6 +94,7 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
     // the curve/editor show the active shape and edits start from it.
     if !state.is_eq_custom() {
         state.set_eq_bands(&eq_preset.bands_10());
+        state.set_eq_preamp_db(eq_preset.preamp);
     }
     // The EQ+FX editor is one shared, palette-driven screen across all themes.
     if ui.view_mode == ViewMode::Eq {
@@ -172,12 +173,17 @@ fn print_status_eq_view(
         crate::state::RgMode::Off => "off",
         crate::state::RgMode::Track => "track",
     };
-    let readouts = [
+    let pre_db = state.eq_preamp_db();
+    let pre_str = format!("{:+.1} dB", pre_db);
+    let mut readouts = vec![
         ("FX", fx_name),
         ("XFEED", cf_name),
         ("BAL", bal_str.as_str()),
         ("RG", rg_str),
     ];
+    if pre_db.abs() >= 0.05 {
+        readouts.insert(0, ("PRE", pre_str.as_str()));
+    }
     let bands = state.eq_bands_array();
     let body = crate::eq_ui::render_eq_screen(
         &bands,
@@ -200,7 +206,7 @@ fn print_status_eq_view(
         below += 1;
     }
     print!(
-        "\n\r\x1B[K  {dim}[←→] band  [↑↓] gain  [t] type  [,.] Q  [<>] freq  [[]] preset  [0] reset  [E/Esc] close{rst}",
+        "\n\r\x1B[K  {dim}[←→] band  [↑↓] gain (⇧ fine)  [t] type  [,.] Q  [<>] freq  [[]] preset  [0] reset  [E/Esc] close{rst}",
         dim = p.dim, rst = p.reset,
     );
     below += 1;
@@ -734,12 +740,16 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
                         }
                         continue;
                     }
-                    KeyEvent { code: KeyCode::Up, .. } => {
-                        state.nudge_eq_gain(ui.eq_band, 1.0);
+                    KeyEvent { code: KeyCode::Up, modifiers, .. } => {
+                        // Plain: 0.5 dB. Shift: 0.1 dB fine step, enough to
+                        // dial in AutoEq-style fractional gains exactly.
+                        let step = if modifiers.contains(KeyModifiers::SHIFT) { 0.1 } else { 0.5 };
+                        state.nudge_eq_gain(ui.eq_band, step);
                         continue;
                     }
-                    KeyEvent { code: KeyCode::Down, .. } => {
-                        state.nudge_eq_gain(ui.eq_band, -1.0);
+                    KeyEvent { code: KeyCode::Down, modifiers, .. } => {
+                        let step = if modifiers.contains(KeyModifiers::SHIFT) { 0.1 } else { 0.5 };
+                        state.nudge_eq_gain(ui.eq_band, -step);
                         continue;
                     }
                     KeyEvent { code: KeyCode::Char('['), .. } => {

@@ -272,6 +272,9 @@ pub struct PlayerState {
     pub(crate) eq_types: [AtomicU8; crate::eq::EQ_BANDS],
     pub(crate) eq_freqs: [AtomicU32; crate::eq::EQ_BANDS],
     pub(crate) eq_qs: [AtomicU32; crate::eq::EQ_BANDS],
+    /// Flat pre-filter gain in dB (f32-as-bits) — the active preset's preamp,
+    /// carried into Custom so editing a band doesn't jump the loudness.
+    pub(crate) eq_preamp: AtomicU32,
     pub(crate) eq_custom: AtomicBool,
 
     // Effects preset index and count
@@ -366,6 +369,7 @@ impl PlayerState {
             eq_types: std::array::from_fn(|_| AtomicU8::new(0)),
             eq_freqs: std::array::from_fn(|i| AtomicU32::new(crate::eq::EQ_FREQS[i].to_bits())),
             eq_qs: std::array::from_fn(|_| AtomicU32::new(crate::eq::EQ_Q.to_bits())),
+            eq_preamp: AtomicU32::new(0f32.to_bits()),
             eq_custom: AtomicBool::new(false),
             effects_preset_index: AtomicUsize::new(0),
             effects_preset_count: AtomicUsize::new(0),
@@ -518,6 +522,14 @@ impl PlayerState {
 
     pub fn is_eq_custom(&self) -> bool {
         self.eq_custom.load(Ordering::Relaxed)
+    }
+
+    pub fn eq_preamp_db(&self) -> f32 {
+        f32::from_bits(self.eq_preamp.load(Ordering::Relaxed))
+    }
+
+    pub fn set_eq_preamp_db(&self, db: f32) {
+        self.eq_preamp.store(db.to_bits(), Ordering::Relaxed);
     }
 
     /// Nudge one band's gain by `delta` dB (clamped ±limit), mark the EQ Custom,

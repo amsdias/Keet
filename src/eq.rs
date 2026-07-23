@@ -353,6 +353,10 @@ pub struct EqPreset {
     pub gains: Vec<f32>,
     #[serde(default)]
     pub bands: Vec<BandSettings>,
+    /// Flat gain (dB) applied before the filters — AutoEq presets ship a
+    /// negative preamp so boosted bands can't clip. 0 = none; clamped ±12.
+    #[serde(default)]
+    pub preamp: f32,
 }
 
 impl EqPreset {
@@ -403,23 +407,26 @@ struct FilterBand {
 /// The runtime EQ processor
 pub struct EqChain {
     filters: Vec<FilterBand>,
+    /// Linear pre-filter gain (from the preset's preamp dB; 1.0 = none).
+    pre: f32,
     active: bool,
 }
 
 impl EqChain {
     pub fn new() -> Self {
-        Self { filters: Vec::new(), active: false }
+        Self { filters: Vec::new(), pre: 1.0, active: false }
     }
 
     pub fn load_preset(&mut self, preset: &EqPreset, sample_rate: f32) {
-        self.load_bands(&preset.bands_10(), sample_rate);
+        self.load_bands(&preset.bands_10(), preset.preamp, sample_rate);
     }
 
     /// Build the filter chain from a parametric band set — the EQ's single
     /// source of truth (presets and the live editor both feed this). No-op
     /// bands (peak/shelf at 0 dB) are skipped entirely, so a mostly-flat set
-    /// only pays for the bands that do something.
-    pub fn load_bands(&mut self, bands: &[BandSettings; EQ_BANDS], sample_rate: f32) {
+    /// only pays for the bands that do something. `preamp_db` is a flat gain
+    /// ahead of the filters (clamped ±12 dB) — headroom for boosted bands.
+    pub fn load_bands(&mut self, bands: &[BandSettings; EQ_BANDS], preamp_db: f32, sample_rate: f32) {
         self.filters.clear();
         for band in bands {
             if let Some(coeffs) = BiquadCoeffs::for_band(band, sample_rate) {
@@ -430,7 +437,13 @@ impl EqChain {
                 });
             }
         }
-        self.active = !self.filters.is_empty();
+        let preamp_db = preamp_db.clamp(-EQ_GAIN_LIMIT, EQ_GAIN_LIMIT);
+        self.pre = if preamp_db.abs() < 0.01 {
+            1.0
+        } else {
+            10.0f32.powf(preamp_db / 20.0)
+        };
+        self.active = !self.filters.is_empty() || self.pre != 1.0;
     }
 
     pub fn reset(&mut self) {
@@ -446,7 +459,8 @@ impl EqChain {
 
     /// Process interleaved stereo samples in-place
     pub fn process_stereo(&mut self, samples: &mut [f32]) {
-        if !self.active || self.filters.is_empty() {
+        // Note: active with zero filters is legal — a preamp-only chain.
+        if !self.active {
             return;
         }
 
@@ -454,8 +468,8 @@ impl EqChain {
         for frame in 0..frames {
             let li = frame * 2;
             let ri = frame * 2 + 1;
-            let mut left = samples[li];
-            let mut right = samples[ri];
+            let mut left = samples[li] * self.pre;
+            let mut right = samples[ri] * self.pre;
 
             for f in &mut self.filters {
                 let out_l = f.coeffs.b0 * left
@@ -538,6 +552,7 @@ pub fn builtin_presets() -> Vec<EqPreset> {
         name: name.to_string(),
         gains: gains.to_vec(),
         bands: Vec::new(),
+        preamp: 0.0,
     };
     vec![
         p("Flat", [0.0; EQ_BANDS]),
@@ -592,7 +607,7 @@ mod denormal_tests {
     }
 
     fn gains_preset(gains: Vec<f32>) -> EqPreset {
-        EqPreset { name: "x".into(), gains, bands: Vec::new() }
+        EqPreset { name: "x".into(), gains, bands: Vec::new(), preamp: 0.0 }
     }
 
     #[test]
@@ -748,12 +763,12 @@ mod parametric_tests {
         let mut eq = EqChain::new();
         let flat: [BandSettings; EQ_BANDS] =
             std::array::from_fn(BandSettings::inert);
-        eq.load_bands(&flat, 48000.0);
+        eq.load_bands(&flat, 0.0, 48000.0);
         assert!(!eq.is_active(), "all-flat peak bands must be inactive");
 
         let mut with_cut = flat;
         with_cut[0] = band(BandType::LowCut, 100.0, 0.0, 0.707);
-        eq.load_bands(&with_cut, 48000.0);
+        eq.load_bands(&with_cut, 0.0, 48000.0);
         assert!(eq.is_active(), "a cut filters regardless of gain — must be active");
     }
 
@@ -763,7 +778,7 @@ mod parametric_tests {
         let mut eq = EqChain::new();
         let mut bands: [BandSettings; EQ_BANDS] = std::array::from_fn(BandSettings::inert);
         bands[0] = band(BandType::LowCut, 500.0, 0.0, 0.707);
-        eq.load_bands(&bands, sr);
+        eq.load_bands(&bands, 0.0, sr);
 
         let peak_after = |freq: f32, eq: &mut EqChain| -> f32 {
             let n = 4800; // 0.1 s
@@ -801,19 +816,59 @@ mod parametric_tests {
     }
 
     #[test]
+    fn preamp_parses_from_json_and_scales_the_signal() {
+        // AutoEq-style preset: bands + negative preamp for clipping headroom.
+        let json = r#"{
+            "name": "with preamp",
+            "preamp": -6.02,
+            "bands": [{"type": "peak", "freq": 1000.0, "gain": 2.0}]
+        }"#;
+        let p: EqPreset = serde_json::from_str(json).unwrap();
+        assert!((p.preamp - -6.02).abs() < 1e-6);
+
+        // Preamp alone (flat bands) must still engage the chain and scale:
+        // -6.02 dB is amplitude x0.5.
+        let flat = r#"{"name": "pre only", "preamp": -6.02}"#;
+        let p: EqPreset = serde_json::from_str(flat).unwrap();
+        let mut eq = EqChain::new();
+        eq.load_preset(&p, 48000.0);
+        assert!(eq.is_active(), "nonzero preamp must activate the chain");
+        let mut buf = vec![0.8f32; 32];
+        eq.process_stereo(&mut buf);
+        for s in &buf {
+            assert!((s - 0.4).abs() < 0.002, "expected ~0.4 after -6.02 dB, got {s}");
+        }
+
+        // Absent preamp defaults to 0 dB and stays out of the way.
+        let none = r#"{"name": "no pre", "gains": [0.0]}"#;
+        let p: EqPreset = serde_json::from_str(none).unwrap();
+        assert_eq!(p.preamp, 0.0);
+        let mut eq = EqChain::new();
+        eq.load_preset(&p, 48000.0);
+        assert!(!eq.is_active(), "flat preset with no preamp stays inactive");
+    }
+
+    #[test]
     fn shipped_eq_example_assets_parse() {
         // The example presets in assets/ are user-facing documentation — they
         // must always load through the real deserializer.
-        for f in ["assets/eq-example.json", "assets/eq-parametric-example.json"] {
+        let load = |f: &str| -> EqPreset {
             let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(f);
             let s = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{f}: {e}"));
-            let p: EqPreset =
-                serde_json::from_str(&s).unwrap_or_else(|e| panic!("{f} must parse: {e}"));
-            let bands = p.bands_10();
-            assert!(
-                bands.iter().any(|b| b.is_effective()),
-                "{f} should describe a non-flat EQ"
-            );
+            serde_json::from_str(&s).unwrap_or_else(|e| panic!("{f} must parse: {e}"))
+        };
+
+        // The graphic example shows a real (non-flat) gain shape.
+        let graphic = load("assets/eq-example.json");
+        assert!(graphic.bands_10().iter().any(|b| b.is_effective()));
+
+        // The parametric example is a fill-in template: all 10 bands spelled
+        // out at their graphic defaults, plus the preamp field.
+        let parametric = load("assets/eq-parametric-example.json");
+        assert_eq!(parametric.bands.len(), EQ_BANDS, "template lists every slot");
+        assert_eq!(parametric.preamp, 0.0, "template shows the preamp field");
+        for (i, b) in parametric.bands_10().iter().enumerate() {
+            assert_eq!(*b, BandSettings::inert(i), "band {i} at graphic default");
         }
     }
 

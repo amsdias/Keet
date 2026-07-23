@@ -45,6 +45,9 @@ pub struct ResumeState {
     pub eq_freqs: Option<Vec<f32>>,
     #[serde(default)]
     pub eq_qs: Option<Vec<f32>>,
+    /// Flat pre-filter gain (dB) carried by the active preset (AutoEq preamp).
+    #[serde(default)]
+    pub eq_preamp: Option<f32>,
 }
 
 fn state_file_path() -> Option<PathBuf> {
@@ -96,16 +99,19 @@ mod resume_tests {
         assert_eq!(rs.eq_types, None);
         assert_eq!(rs.eq_freqs, None);
         assert_eq!(rs.eq_qs, None);
+        assert_eq!(rs.eq_preamp, None);
 
         // The parametric fields survive a save/load roundtrip.
         rs.eq_types = Some(vec!["low_shelf".into(), "peak".into()]);
         rs.eq_freqs = Some(vec![105.0, 3300.0]);
         rs.eq_qs = Some(vec![0.71, 2.0]);
+        rs.eq_preamp = Some(-6.4);
         let json = serde_json::to_string(&rs).unwrap();
         let back: ResumeState = serde_json::from_str(&json).unwrap();
         assert_eq!(back.eq_types, Some(vec!["low_shelf".to_string(), "peak".to_string()]));
         assert_eq!(back.eq_freqs, Some(vec![105.0, 3300.0]));
         assert_eq!(back.eq_qs, Some(vec![0.71, 2.0]));
+        assert_eq!(back.eq_preamp, Some(-6.4));
         assert_eq!(back.eq_gains, Some(vec![1.0, -2.0]));
     }
 }

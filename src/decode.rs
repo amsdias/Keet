@@ -707,7 +707,7 @@ pub fn decode_playlist(
             // the selected named preset's bands.
             if state.take_eq_changed() {
                 if state.is_eq_custom() {
-                    eq.load_bands(&state.eq_bands_array(), output_rate as f32);
+                    eq.load_bands(&state.eq_bands_array(), state.eq_preamp_db(), output_rate as f32);
                 } else {
                     let idx = state.eq_index();
                     if idx < eq_presets.len() {

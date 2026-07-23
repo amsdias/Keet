@@ -1,12 +1,16 @@
 {
   "name": "Parametric Example",
+  "preamp": 0.0,
   "bands": [
-    { "type": "low_cut",    "freq": 20,   "q": 0.71 },
-    { "type": "low_shelf",  "freq": 105,  "gain": 4.0,  "q": 0.71 },
-    { "type": "peak",       "freq": 200,  "gain": -1.5, "q": 0.6 },
-    { "type": "peak",       "freq": 1400, "gain": 1.0,  "q": 1.0 },
-    { "type": "peak",       "freq": 3300, "gain": -2.5, "q": 2.0 },
-    { "type": "peak",       "freq": 5500, "gain": -3.0, "q": 4.0 },
-    { "type": "high_shelf", "freq": 9000, "gain": 1.5,  "q": 0.71 }
+    { "type": "peak", "freq": 31,    "gain": 0.0, "q": 1.41 },
+    { "type": "peak", "freq": 62,    "gain": 0.0, "q": 1.41 },
+    { "type": "peak", "freq": 125,   "gain": 0.0, "q": 1.41 },
+    { "type": "peak", "freq": 250,   "gain": 0.0, "q": 1.41 },
+    { "type": "peak", "freq": 500,   "gain": 0.0, "q": 1.41 },
+    { "type": "peak", "freq": 1000,  "gain": 0.0, "q": 1.41 },
+    { "type": "peak", "freq": 2000,  "gain": 0.0, "q": 1.41 },
+    { "type": "peak", "freq": 4000,  "gain": 0.0, "q": 1.41 },
+    { "type": "peak", "freq": 8000,  "gain": 0.0, "q": 1.41 },
+    { "type": "peak", "freq": 16000, "gain": 0.0, "q": 1.41 }
   ]
 }
