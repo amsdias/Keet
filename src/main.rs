@@ -249,6 +249,7 @@ type StreamParts = (rtrb::Producer<f32>, rtrb::Consumer<f32>, cpal::Stream);
 fn rebuild_stream(
     device: &cpal::Device,
     stream_rate: u32,
+    channels: u16,
     buffer_size: cpal::BufferSize,
     state: &Arc<PlayerState>,
 ) -> Result<StreamParts, Box<dyn std::error::Error>> {
@@ -256,12 +257,59 @@ fn rebuild_stream(
     state.ring_capacity.store(ring_cap, Ordering::Relaxed);
     let (prod, cons) = RingBuffer::<f32>::new(ring_cap);
     let (viz_prod, viz_cons) = RingBuffer::<f32>::new(VIZ_BUFFER_SIZE);
+    // `channels` is the DEVICE's channel count, not the ring's. The ring is
+    // always stereo; the audio callback fans it out to however many channels
+    // the device wants (mono duplicates, >2 leaves the extras silent).
+    //
+    // Hardcoding 2 here broke Windows: WASAPI shared mode only accepts the
+    // mixer's own format, so a device whose shared format isn't stereo made
+    // `IsFormatSupported` return S_FALSE → "Stream configuration is not
+    // supported in shared mode". cpal 0.17 never noticed (its check was a stub
+    // returning true); 0.18 actually calls IsFormatSupported and rejects.
     let config = StreamConfig {
-        channels: 2,
+        channels,
         sample_rate: stream_rate,
         buffer_size,
     };
-    let stream = build_stream(device, &config, cons, viz_prod, Arc::clone(state))?;
+    let stream = match build_stream(device, &config, cons, viz_prod, Arc::clone(state)) {
+        Ok(s) => s,
+        Err(e) => {
+            // Last resort: take the device's default config verbatim. Rebuilds
+            // the rings because the rate may differ from what we asked for.
+            //
+            // Surfaced in the status line rather than swallowed: if this fires,
+            // the config we derived from the device was wrong, and we want to
+            // hear about it instead of silently running on different settings.
+            let fallback = device.default_output_config()?;
+            let note = format!(
+                "audio config {}ch/{}Hz rejected ({}) — fell back to {}ch/{}Hz",
+                channels, stream_rate, e, fallback.channels(), fallback.sample_rate()
+            );
+            // Status line AND stderr: the status line is painted over within a
+            // frame or two at startup, so `keet ... 2>log.txt` is the only way
+            // to actually catch this after the fact.
+            eprintln!("keet: {note}");
+            if let Ok(mut err) = state.decode_error.lock() {
+                *err = Some(note);
+            }
+            if fallback.channels() == channels && fallback.sample_rate() == stream_rate {
+                return Err(e);
+            }
+            let rate = fallback.sample_rate();
+            let ring_cap = ring_capacity_for(rate);
+            state.ring_capacity.store(ring_cap, Ordering::Relaxed);
+            state.output_rate.store(rate as u64, Ordering::Relaxed);
+            let (p, c) = RingBuffer::<f32>::new(ring_cap);
+            let (vp, vc) = RingBuffer::<f32>::new(VIZ_BUFFER_SIZE);
+            let cfg = StreamConfig {
+                channels: fallback.channels(),
+                sample_rate: rate,
+                buffer_size: cpal::BufferSize::Default,
+            };
+            let s = build_stream(device, &cfg, c, vp, Arc::clone(state))?;
+            return Ok((p, vc, s));
+        }
+    };
     Ok((prod, viz_cons, stream))
 }
 
@@ -857,12 +905,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(config) => config.sample_rate(),
         Err(_) => persistent_output_rate,
     };
+    // Output channel count comes from the device, not an assumption. WASAPI
+    // shared mode only accepts the mixer's own format, so a non-stereo device
+    // rejects a hardcoded 2 outright. The ring stays stereo either way — the
+    // callback fans it out.
+    let out_channels: u16 = device
+        .default_output_config()
+        .map(|c| c.channels())
+        .unwrap_or(2)
+        .max(1);
     let mut stream_rate = {
-        let channels = 2u16;
         let rate_supported = device.supported_output_configs()
             .map(|configs| {
                 configs.into_iter().any(|c| {
-                    c.channels() == channels
+                    c.channels() == out_channels
                         && c.min_sample_rate() <= actual_device_rate
                         && actual_device_rate <= c.max_sample_rate()
                 })
@@ -888,7 +944,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let saved_buffer_size = buffer_size;
 
     let (mut prod, mut viz_cons, mut stream) =
-        rebuild_stream(&device, stream_rate, saved_buffer_size, &state)?;
+        rebuild_stream(&device, stream_rate, out_channels, saved_buffer_size, &state)?;
     stream.play()?;
 
     // Set exclusive mode if requested (macOS only: hog mode + per-track rate switching)
@@ -1315,7 +1371,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 drop(stream);
 
                 let (new_prod, new_viz_cons, new_stream) =
-                    rebuild_stream(&device, stream_rate, saved_buffer_size, &state)?;
+                    rebuild_stream(&device, stream_rate, out_channels, saved_buffer_size, &state)?;
                 prod = new_prod;
                 viz_cons = new_viz_cons;
                 stream = new_stream;
@@ -1370,7 +1426,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     stream_rate = new_rate;
                     state.output_rate.store(stream_rate as u64, Ordering::Relaxed);
 
-                    match rebuild_stream(&device, stream_rate, saved_buffer_size, &state) {
+                    match rebuild_stream(&device, stream_rate, out_channels, saved_buffer_size, &state) {
                         Ok((new_prod, new_viz_cons, new_stream)) => {
                             prod = new_prod;
                             viz_cons = new_viz_cons;

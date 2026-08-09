@@ -143,8 +143,20 @@ pub(crate) fn http_agent() -> ureq::Agent {
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
     AGENT
         .get_or_init(|| {
+            // RootCerts::PlatformVerifier is REQUIRED, not a preference.
+            //
+            // ureq's default is `RootCerts::WebPki` (bundled Mozilla roots),
+            // which with native-tls calls `disable_built_in_roots(true)` and
+            // hands the platform a root set it must then find in the chain it
+            // built. On Windows/schannel that check always fails —
+            // "unable to find any user-specified roots in the final cert chain"
+            // — so every HTTPS call dies in ~40 ms while macOS's
+            // Security.framework happily accepts the same config. Using the
+            // platform's own trust store is the whole reason we're on
+            // native-tls instead of rustls.
             let tls = ureq::tls::TlsConfig::builder()
                 .provider(ureq::tls::TlsProvider::NativeTls)
+                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
                 .build();
             ureq::Agent::config_builder()
                 .tls_config(tls)
@@ -226,10 +238,33 @@ mod network_tests {
     #[test]
     #[ignore = "requires network"]
     fn lrclib_fetch_completes_over_tls() {
+        // Step 1: a plain HTTPS GET with the error NOT swallowed. fetch_lrclib
+        // discards the cause via `.ok()?`, so a TLS failure and a 404 both look
+        // identical (None) — this separates them.
+        let url = "https://lrclib.net/api/get?artist_name=Radiohead&track_name=Creep&duration=238";
+        let started = std::time::Instant::now();
+        match http_agent().get(url).call() {
+            Ok(resp) => {
+                println!("[1] raw GET ok in {:?}, status={}", started.elapsed(), resp.status());
+            }
+            Err(e) => {
+                println!("[1] raw GET FAILED in {:?}: {e}", started.elapsed());
+                println!("    (a TLS/proxy/firewall problem shows up here)");
+            }
+        }
+
+        // Step 2: is it LRCLIB specifically, or all outbound TLS? If this
+        // succeeds while step 1 fails, the TLS stack is fine and lrclib.net is
+        // being blocked or resolved wrong.
+        match http_agent().get("https://example.com").call() {
+            Ok(r) => println!("[2] control host ok, status={}", r.status()),
+            Err(e) => println!("[2] control host FAILED: {e}  <-- outbound TLS is broken, not LRCLIB"),
+        }
+
         let started = std::time::Instant::now();
         let got = fetch_lrclib("Radiohead", "Creep", Some(238));
         let elapsed = started.elapsed();
-        println!("LRCLIB replied in {:?}, some={}", elapsed, got.is_some());
+        println!("[3] fetch_lrclib in {:?}, some={}", elapsed, got.is_some());
 
         // A TLS/timeout misconfiguration shows up as an instant None (the
         // handshake never completes), so assert we actually got lyrics back.

@@ -62,6 +62,45 @@ pub fn list_output_devices(host: &cpal::Host) {
                     .unwrap_or_else(|_| "Unknown".to_string());
                 let suffix = if default_name.as_ref() == Some(&name) { " (default)" } else { "" };
                 println!("  {}. {}{}", i + 1, name, suffix);
+                // The shared-mode mixer format. On Windows this is the ONLY
+                // format WASAPI accepts without conversion, so it's the first
+                // thing to check when a stream fails to build.
+                match device.default_output_config() {
+                    Ok(c) => println!(
+                        "       default: {} ch, {} Hz, {:?}",
+                        c.channels(), c.sample_rate(), c.sample_format()
+                    ),
+                    Err(e) => println!("       default: <unavailable: {}>", e),
+                }
+                // Group by (channels, format) and list the rates — devices
+                // enumerate one entry per discrete rate, so a flat dump is
+                // dozens of near-identical lines (and truncating it hides the
+                // rate that actually matters).
+                if let Ok(configs) = device.supported_output_configs() {
+                    let mut groups: Vec<((u16, cpal::SampleFormat), Vec<u32>)> = Vec::new();
+                    for sc in configs {
+                        let key = (sc.channels(), sc.sample_format());
+                        let lo = sc.min_sample_rate();
+                        let hi = sc.max_sample_rate();
+                        let entry = match groups.iter_mut().find(|(k, _)| *k == key) {
+                            Some((_, rates)) => rates,
+                            None => {
+                                groups.push((key, Vec::new()));
+                                &mut groups.last_mut().unwrap().1
+                            }
+                        };
+                        entry.push(lo);
+                        if hi != lo {
+                            entry.push(hi);
+                        }
+                    }
+                    for ((ch, fmt), mut rates) in groups {
+                        rates.sort_unstable();
+                        rates.dedup();
+                        let list: Vec<String> = rates.iter().map(|r| r.to_string()).collect();
+                        println!("       supports: {} ch, {:?}, rates: {}", ch, fmt, list.join(", "));
+                    }
+                }
             }
         }
         Err(e) => eprintln!("Cannot enumerate devices: {}", e),
