@@ -9,7 +9,8 @@ use cpal::{Stream, StreamConfig};
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
+use symphonia::core::formats::probe::Hint;
+use symphonia::core::formats::TrackType;
 
 use rtrb::{Producer, Consumer};
 
@@ -37,12 +38,13 @@ pub fn probe_sample_rate(path: &Path) -> Option<u32> {
     if let Some(ext) = path.extension() {
         hint.with_extension(ext.to_str().unwrap_or(""));
     }
-    let probed = symphonia::default::get_probe()
-        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+    let format = symphonia::default::get_probe()
+        .probe(&hint, mss, FormatOptions::default(), MetadataOptions::default())
         .ok()?;
-    let track = probed.format.tracks().iter()
-        .find(|t| t.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL)?;
-    track.codec_params.sample_rate
+    // 0.6: codec_params is Option (None = unplayable track) and carries a
+    // per-media-type payload, so audio() replaces the old CODEC_TYPE_NULL check.
+    let track = format.default_track(TrackType::Audio)?;
+    track.codec_params.as_ref()?.audio()?.sample_rate
 }
 
 /// Print numbered list of output devices to stdout
@@ -611,7 +613,7 @@ pub fn build_stream(
     let err_state = Arc::clone(&state);
 
     let stream = device.build_output_stream(
-        config,
+        *config,
         move |data: &mut [f32], _| {
             let paused = state.is_paused();
 

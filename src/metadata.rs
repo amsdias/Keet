@@ -7,8 +7,10 @@ use std::thread::{self, JoinHandle};
 
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
-use symphonia::core::meta::{Limit, MetadataOptions, StandardTagKey, Value};
-use symphonia::core::probe::Hint;
+use symphonia::core::formats::probe::Hint;
+use symphonia::core::formats::TrackType;
+use symphonia::core::common::Limit;
+use symphonia::core::meta::{MetadataOptions, RawValue, StandardTag};
 
 #[derive(Clone)]
 struct CachedMeta {
@@ -193,29 +195,52 @@ struct TagFields {
 /// the container-metadata and probe-side passes so the extraction logic lives once.
 fn merge_metadata_tags(fields: &mut TagFields, tags: &[symphonia::core::meta::Tag]) {
     for tag in tags {
-        match tag.std_key {
-            Some(StandardTagKey::TrackTitle) if fields.title.is_none() => {
-                if let Value::String(ref s) = tag.value { fields.title = Some(s.clone()); }
+        // Symphonia 0.6 carries the parsed value inside the StandardTag variant
+        // itself, replacing 0.5's (std_key, value) pair — and it now maps
+        // ReplayGain to standard tags, which used to need raw-key matching.
+        match &tag.std {
+            Some(StandardTag::TrackTitle(s)) if fields.title.is_none() => {
+                fields.title = Some(s.to_string());
             }
-            Some(StandardTagKey::Artist) if fields.artist.is_none() => {
-                if let Value::String(ref s) = tag.value { fields.artist = Some(s.clone()); }
+            Some(StandardTag::Artist(s)) if fields.artist.is_none() => {
+                fields.artist = Some(s.to_string());
             }
-            Some(StandardTagKey::Album) if fields.album.is_none() => {
-                if let Value::String(ref s) = tag.value { fields.album = Some(s.clone()); }
+            Some(StandardTag::Album(s)) if fields.album.is_none() => {
+                fields.album = Some(s.to_string());
             }
-            Some(StandardTagKey::Lyrics) if fields.lyrics.is_none() => {
-                if let Value::String(ref s) = tag.value { fields.lyrics = Some(s.clone()); }
+            Some(StandardTag::Lyrics(s)) if fields.lyrics.is_none() => {
+                fields.lyrics = Some(s.to_string());
             }
-            Some(StandardTagKey::TrackNumber) if fields.track_number.is_none() => {
-                fields.track_number = parse_leading_u32(&tag.value);
+            Some(StandardTag::TrackNumber(n)) if fields.track_number.is_none() => {
+                fields.track_number = (*n).try_into().ok();
             }
-            Some(StandardTagKey::DiscNumber) if fields.disc_number.is_none() => {
-                fields.disc_number = parse_leading_u32(&tag.value);
+            Some(StandardTag::DiscNumber(n)) if fields.disc_number.is_none() => {
+                fields.disc_number = (*n).try_into().ok();
+            }
+            Some(StandardTag::ReplayGainTrackGain(s)) if fields.rg_track_gain.is_none() => {
+                fields.rg_track_gain = parse_rg_gain_value(s);
+            }
+            Some(StandardTag::ReplayGainTrackPeak(s)) if fields.rg_track_peak.is_none() => {
+                fields.rg_track_peak = parse_rg_peak_value(s);
+            }
+            Some(StandardTag::ReplayGainAlbumGain(s)) if fields.rg_album_gain.is_none() => {
+                fields.rg_album_gain = parse_rg_gain_value(s);
+            }
+            Some(StandardTag::ReplayGainAlbumPeak(s)) if fields.rg_album_peak.is_none() => {
+                fields.rg_album_peak = parse_rg_peak_value(s);
             }
             _ => {}
         }
-        let key_lower = tag.key.to_lowercase();
-        if let Value::String(ref s) = tag.value {
+        // Raw fallback: tags a reader didn't map to a standard one, plus the
+        // "5/12" track-number form that only appears in the raw value.
+        if fields.track_number.is_none() && tag.raw.key.eq_ignore_ascii_case("tracknumber") {
+            fields.track_number = parse_leading_u32(&tag.raw.value);
+        }
+        if fields.disc_number.is_none() && tag.raw.key.eq_ignore_ascii_case("discnumber") {
+            fields.disc_number = parse_leading_u32(&tag.raw.value);
+        }
+        let key_lower = tag.raw.key.to_lowercase();
+        if let RawValue::String(ref s) = tag.raw.value {
             match key_lower.as_str() {
                 "replaygain_track_gain" if fields.rg_track_gain.is_none() => {
                     fields.rg_track_gain = parse_rg_gain_value(s);
@@ -230,7 +255,7 @@ fn merge_metadata_tags(fields: &mut TagFields, tags: &[symphonia::core::meta::Ta
                     fields.rg_album_peak = parse_rg_peak_value(s);
                 }
                 "lyrics" | "unsyncedlyrics" if fields.lyrics.is_none() => {
-                    fields.lyrics = Some(s.clone());
+                    fields.lyrics = Some(s.to_string());
                 }
                 _ => {}
             }
@@ -249,41 +274,35 @@ fn read_metadata_full(path: &Path) -> Option<CachedMeta> {
     // FLAC PICTURE block (often 0.5–2 MB each) across a whole library was pure
     // allocator churn — covers are loaded separately by cover.rs, which does
     // its own probe with visuals enabled. Same trick as the decode thread.
-    let meta_opts = MetadataOptions {
-        limit_visual_bytes: Limit::Maximum(0),
-        limit_metadata_bytes: Limit::Default,
-    };
-    let mut probed = symphonia::default::get_probe()
-        .format(&hint, mss, &FormatOptions::default(), &meta_opts)
+    // 0.6's MetadataOptions is non-exhaustive, so it's built with the setters
+    // rather than a struct literal (limit_metadata_bytes is now limit_tag_bytes,
+    // left at its default).
+    let meta_opts = MetadataOptions::default().limit_visual_bytes(Limit::Maximum(0));
+    let mut format = symphonia::default::get_probe()
+        .probe(&hint, mss, FormatOptions::default(), meta_opts)
         .ok()?;
 
-    let duration_secs: Option<f64> = probed.format.tracks().iter()
-        .find(|t| t.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL)
-        .and_then(|t| {
-            if let (Some(n_frames), Some(rate)) = (t.codec_params.n_frames, t.codec_params.sample_rate) {
-                if rate > 0 { return Some(n_frames as f64 / rate as f64); }
+    // 0.6 moved track timing out of codec_params onto the Track itself, which
+    // is exactly why it's now reliably populated.
+    let duration_secs: Option<f64> = format.default_track(TrackType::Audio).and_then(|t| {
+        let rate = t.codec_params.as_ref().and_then(|c| c.audio()).and_then(|a| a.sample_rate);
+        if let (Some(n_frames), Some(rate)) = (t.num_frames, rate) {
+            if rate > 0 {
+                return Some(n_frames as f64 / rate as f64);
             }
-            if let (Some(tb), Some(n_frames)) = (t.codec_params.time_base, t.codec_params.n_frames) {
-                return Some(n_frames as f64 * tb.numer as f64 / tb.denom as f64);
-            }
-            None
-        });
+        }
+        if let (Some(tb), Some(n_frames)) = (t.time_base, t.num_frames) {
+            return Some(n_frames as f64 * tb.numer.get() as f64 / tb.denom.get() as f64);
+        }
+        None
+    });
 
     let mut fields = TagFields::default();
 
-    // Primary: container-level metadata (e.g. FLAC/Vorbis comments, MP4 atoms).
-    if let Some(rev) = probed.format.metadata().current() {
-        merge_metadata_tags(&mut fields, rev.tags());
-    }
-
-    // Fallback: probe-side metadata (e.g. an ID3v2 block ahead of the stream),
-    // used only to fill gaps the container metadata didn't cover.
-    if fields.title.is_none() || fields.artist.is_none() || fields.album.is_none() || fields.lyrics.is_none() {
-        if let Some(meta) = probed.metadata.get() {
-            if let Some(rev) = meta.current() {
-                merge_metadata_tags(&mut fields, rev.tags());
-            }
-        }
+    // 0.6 folds probe-side metadata (e.g. a leading ID3v2 block) into the
+    // format reader, so the separate second pass 0.5 needed is gone.
+    if let Some(rev) = format.metadata().current() {
+        merge_metadata_tags(&mut fields, &rev.media.tags);
     }
 
     let TagFields {
@@ -321,11 +340,11 @@ fn read_metadata_full(path: &Path) -> Option<CachedMeta> {
 }
 
 /// Parse a numeric prefix from a tag value: "5" → 5, "5/12" → 5, U32(7) → 7.
-fn parse_leading_u32(value: &Value) -> Option<u32> {
+fn parse_leading_u32(value: &RawValue) -> Option<u32> {
     match value {
-        Value::UnsignedInt(n) => (*n).try_into().ok(),
-        Value::SignedInt(n) => (*n).try_into().ok(),
-        Value::String(s) => {
+        RawValue::UnsignedInt(n) => (*n).try_into().ok(),
+        RawValue::SignedInt(n) => (*n).try_into().ok(),
+        RawValue::String(s) => {
             let digits: String = s.trim().chars().take_while(|c| c.is_ascii_digit()).collect();
             digits.parse().ok()
         }
@@ -392,4 +411,64 @@ pub fn spawn_metadata_scan(
             let _ = handle.join();
         }
     })
+}
+
+#[cfg(test)]
+mod real_file_tests {
+    use super::*;
+
+    /// Reads real tagged files from the user's library. Ignored by default;
+    /// run with `cargo test -- --ignored --nocapture`.
+    ///
+    /// Tag extraction is the part of the symphonia 0.6 migration that no
+    /// synthesized fixture covers — 0.6 replaced the (std_key, value) pair with
+    /// value-carrying StandardTag variants, so a mistake here silently yields
+    /// blank artists/titles rather than failing to compile.
+    #[test]
+    #[ignore = "requires a local music library"]
+    fn reads_tags_from_real_files() {
+        let dir = std::path::PathBuf::from(std::env::var("HOME").unwrap()).join("Music/local");
+        let mut files: Vec<_> = std::fs::read_dir(&dir)
+            .expect("music dir")
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                matches!(p.extension().and_then(|e| e.to_str()), Some("flac" | "mp3" | "m4a"))
+            })
+            .collect();
+        files.sort();
+        assert!(!files.is_empty(), "no audio files found in {}", dir.display());
+
+        let mut tagged = 0;
+        for p in files.iter().take(12) {
+            let m = read_metadata_full(p);
+            match &m {
+                Some(m) => {
+                    println!(
+                        "{:<52} artist={:?} title={:?} dur={:?} rg={:?}",
+                        p.file_name().unwrap().to_string_lossy(),
+                        m.artist, m.title, m.duration_secs.map(|d| d.round()), m.rg_track_gain
+                    );
+                    if m.artist.is_some() || m.title.is_some() {
+                        tagged += 1;
+                    }
+                }
+                None => println!("{:<52} FAILED TO READ", p.file_name().unwrap().to_string_lossy()),
+            }
+        }
+        assert!(tagged > 0, "no file yielded artist/title — tag extraction is broken");
+
+        // ReplayGain: symphonia 0.6 maps these to StandardTag variants, a path
+        // the library files above don't exercise. Uses a fixture written by
+        // ffmpeg if present (see the migration notes).
+        let rg_file = std::path::Path::new("/tmp/rgtagged.flac");
+        if rg_file.exists() {
+            let m = read_metadata_full(rg_file).expect("rg fixture readable");
+            println!("RG fixture: track_gain={:?} track_peak={:?} album_gain={:?}",
+                     m.rg_track_gain, m.rg_track_peak, m.rg_album_gain);
+            assert_eq!(m.rg_track_gain, Some(-7.25), "track gain");
+            assert_eq!(m.rg_album_gain, Some(-6.50), "album gain");
+            assert!((m.rg_track_peak.unwrap() - 0.988525).abs() < 1e-6, "track peak");
+        }
+    }
 }

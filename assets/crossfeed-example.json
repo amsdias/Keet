@@ -1,0 +1,6 @@
+{
+  "name": "Wide Soft",
+  "level_db": -5.0,
+  "cutoff_hz": 900.0,
+  "delay_us": 350.0
+}

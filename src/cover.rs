@@ -22,7 +22,7 @@ use std::time::Duration;
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
+use symphonia::core::formats::probe::Hint;
 
 /// Pixel dimensions used by the half-block renderer. Each terminal column is
 /// 1 pixel wide and each row covers 2 pixels tall (upper/lower half-block).
@@ -189,23 +189,17 @@ fn read_embedded(track_path: &Path) -> Option<Vec<u8>> {
     if let Some(ext) = track_path.extension() {
         hint.with_extension(ext.to_str().unwrap_or(""));
     }
-    let mut probed = symphonia::default::get_probe()
-        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+    let mut format = symphonia::default::get_probe()
+        .probe(&hint, mss, FormatOptions::default(), MetadataOptions::default())
         .ok()?;
 
-    if let Some(rev) = probed.format.metadata().current() {
-        if let Some(v) = rev.visuals().first() {
-            return Some(v.data.to_vec());
-        }
-    }
-    if let Some(meta) = probed.metadata.get() {
-        if let Some(rev) = meta.current() {
-            if let Some(v) = rev.visuals().first() {
-                return Some(v.data.to_vec());
-            }
-        }
-    }
-    None
+    // 0.6 folds the probe's own metadata into the format reader, so the
+    // separate `probed.metadata` pass this used to need is gone. The Metadata
+    // guard must outlive the revision borrowed out of it, hence the binding.
+    let meta = format.metadata();
+    let rev = meta.current()?;
+    let v = rev.media.visuals.first()?;
+    Some(v.data.to_vec())
 }
 
 fn read_sidecar(track_path: &Path) -> Option<Vec<u8>> {

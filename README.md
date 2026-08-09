@@ -5,9 +5,10 @@ A high-performance, low-CPU terminal audio player with real-time spectrum visual
 ## Features
 
 - **Switchable themes**: Three UI themes — **Classic** (green-on-default), **Minimal** (warm-cyan editorial), **Hi-Fi** (amber studio-monitor) — cycled at runtime with `T`, with a launch default via `--theme` or `~/.config/keet/config.json`. Every screen (Player, Library, Lyrics, EQ+FX) is themed
-- **Multi-format support**: MP3, FLAC, WAV, OGG, AAC/M4A, ALAC, AIFF
+- **Multi-format support**: MP3, FLAC, WAV, OGG, AAC/M4A, ALAC, AIFF — decoded by symphonia 0.6 with SIMD enabled
 - **Any channel layout**: Mono, stereo, quad, 5.1, and 7.1 sources all play correctly — surround is downmixed to stereo (ITU-style: center at -3dB into both sides, LFE dropped)
 - **Low CPU usage**: <0.5% total system CPU (release mode)
+- **64-bit filter math**: EQ and crossfeed biquads run in f64 internally. f32 coefficients disintegrate at low centre frequencies — a 20 Hz Q=10 +12 dB band at 192 kHz lands at +2.4 dB in f32 and +12.0 dB in f64
 - **Synced lyrics**: Embedded LRC lyrics + automatic fetching from LRCLIB (~3M songs), with adjustable sync offset
 - **10-band parametric EQ**: A full-screen interactive editor (`E`) — every band has filter type (peak / shelves / cuts), frequency, Q, and gain, adjusted live; starts out as a classic ISO-centre graphic EQ; built-in preset shapes (Flat, Bass Boost, Treble Boost, Vocal, Loudness) + custom JSON presets, including AutoEq-style parametric headphone corrections
 - **Audio effects**: Reverb, chorus, delay with built-in environment presets + custom JSON presets
@@ -22,7 +23,7 @@ A high-performance, low-CPU terminal audio player with real-time spectrum visual
 - **Format-colored icons**: File type indicated by icon color (green=MP3, cyan=FLAC, yellow=WAV, etc.)
 - **Output device selection**: `--device` selects by name, `--list-devices` enumerates
 - **Exclusive mode**: Per-track sample rate matching, macOS hog mode for bit-perfect playback (`--exclusive`)
-- **Headphone crossfeed**: Meier-style frequency-dependent crossfeed with three presets (Light/Medium/Strong)
+- **Headphone crossfeed**: Meier-style frequency-dependent crossfeed — three built-in presets plus custom JSON presets controlling level, corner frequency and interaural delay
 - **Balance control**: Stereo balance with `[`/`]` keys (5% steps, -100 to +100)
 - **Clipping indicator**: Persistent dot that turns red when signal exceeds 0dBFS, with peak safety limiter
 - **Smart audio processing**: Automatic sample rate switching (macOS), Bluetooth detection, conditional resampling, seamless device switching
@@ -34,6 +35,32 @@ A high-performance, low-CPU terminal audio player with real-time spectrum visual
 - **Resilient playback**: Skips missing/corrupt files with a status message, recovers from device disconnection (including USB DAC unplug)
 - **Terminal-safe UI**: Output adapts to terminal width, handles terminal resize gracefully
 - **Process stats**: Lightweight CPU/memory monitoring via direct platform syscalls (toggle with `I`)
+
+## Installation
+
+Keet builds from source with a stable Rust toolchain (install one from [rustup.rs](https://rustup.rs) if you don't have it).
+
+```bash
+git clone https://github.com/amsdias/Keet.git
+cd Keet
+cargo install --path .
+```
+
+That puts a release-optimized `keet` on your `PATH` (in `~/.cargo/bin`), so you can run it from anywhere:
+
+```bash
+keet ~/Music/
+```
+
+To update later, `git pull` and re-run `cargo install --path .`. To remove it, `cargo uninstall keet`.
+
+**Linux/WSL** needs ALSA and D-Bus headers before building — see [Building](#building):
+
+```bash
+sudo apt install libasound2-dev libdbus-1-dev
+```
+
+Prefer not to install system-wide? `cargo build --release` leaves the binary at `target/release/keet`.
 
 ## Quick Start
 
@@ -103,7 +130,7 @@ keet ~/Music/favorites.m3u
 | `O` | Open a new source (type a path) |
 | `P` | Open a new source (native folder picker) |
 | `F` | Toggle pre/post-fader metering |
-| `C` | Cycle crossfeed presets (Off/Light/Medium/Strong) |
+| `C` | Cycle crossfeed presets (Off/Light/Medium/Strong + custom) |
 | `I` | Toggle CPU/memory stats display |
 | `[` | Balance left (5% steps) |
 | `]` | Balance right (5% steps) |
@@ -196,7 +223,7 @@ For a *persistent* default that applies on every launch (including with explicit
 | `viz` | `none` \| `vu` \| `spectrum` \| `spectrum-vertical` \| `oscilloscope` \| `lissajous` \| `spectrogram` \| `analysis` |
 | `rg_mode` | `track` \| `album` \| `off` |
 | `eq` | any preset name (built-in or custom) |
-| `crossfeed` | `off` \| `light` \| `medium` \| `strong` |
+| `crossfeed` | `off` \| `light` \| `medium` \| `strong` \| any custom preset name |
 
 ## EQ + FX Editor
 
@@ -266,15 +293,17 @@ Example presets are included in `assets/` -- copy them to the presets folders as
 
 ```bash
 # macOS/Linux
-mkdir -p ~/.config/keet/eq ~/.config/keet/effects
+mkdir -p ~/.config/keet/eq ~/.config/keet/effects ~/.config/keet/crossfeed
 cp assets/eq-example.json assets/eq-parametric-example.json ~/.config/keet/eq/
 cp assets/fx-example.json ~/.config/keet/effects/
+cp assets/crossfeed-example.json ~/.config/keet/crossfeed/
 cp assets/config-example.json ~/.config/keet/config.json   # default theme etc.
 
 # Windows
 copy assets\eq-example.json %APPDATA%\keet\eq\
 copy assets\eq-parametric-example.json %APPDATA%\keet\eq\
 copy assets\fx-example.json %APPDATA%\keet\effects\
+copy assets\crossfeed-example.json %APPDATA%\keet\crossfeed\
 copy assets\config-example.json %APPDATA%\keet\config.json
 ```
 
@@ -321,6 +350,36 @@ All effect sections are optional -- omit any to disable that effect. Custom pres
 
 Processing order: chorus -> delay -> reverb.
 
+## Headphone Crossfeed
+
+Press `C` to cycle crossfeed presets. Crossfeed blends a low-passed, slightly delayed copy of each channel into the other, so hard-panned material stops sounding like it's inside your head — a Meier-style approximation of listening to speakers in a room.
+
+| Preset | Level | Corner | ITD |
+|--------|-------|--------|-----|
+| Off | — | — | — |
+| Light | −6 dB | 700 Hz | 300 µs |
+| Medium | −4.5 dB | 700 Hz | 300 µs |
+| Strong | −3 dB | 700 Hz | 300 µs |
+
+### Custom Presets
+
+Drop JSON files into `~/.config/keet/crossfeed/` (macOS/Linux) or `%APPDATA%\keet\crossfeed\` (Windows) to control all three parameters:
+
+```json
+{
+  "name": "Wide Soft",
+  "level_db": -5.0,
+  "cutoff_hz": 900.0,
+  "delay_us": 350.0
+}
+```
+
+- `level_db` — how loud the crossfed channel is. Lower is subtler; around −3 dB is a strong blend.
+- `cutoff_hz` *(optional, default 700)* — the corner of the crossfeed low-pass. Higher values cross more of the midrange over and make the effect more aggressive.
+- `delay_us` *(optional, default 300)* — the interaural time difference, i.e. how long sound takes to reach the far ear. Roughly 250–400 µs is the natural range.
+
+Custom presets appear alongside the built-ins when cycling with `C`.
+
 ## Crossfade
 
 Use `--crossfade <seconds>` (or `-x`) to enable smooth crossfade between tracks:
@@ -330,6 +389,30 @@ cargo run --release -- ~/Music/ --crossfade 3
 ```
 
 Uses an equal-power crossfade curve for natural-sounding transitions. The previous track's tail is captured and mixed into the next track's beginning.
+
+## Network Libraries (NAS)
+
+Keet has no UPnP/DLNA client, and doesn't need one: point it at a mounted network share and everything works exactly as it does locally — the library tree, seeking, the metadata scan, gapless, ReplayGain, and the full DSP chain. To Keet a mounted share is just a folder of files.
+
+```bash
+# macOS — Finder mounts appear under /Volumes
+keet /Volumes/nas/Music
+
+# Linux — mount an SMB share, then play it
+sudo mount -t cifs //nas.local/Music /mnt/music -o username=you,uid=$UID
+keet /mnt/music
+
+# Linux — NFS
+sudo mount -t nfs nas.local:/volume1/Music /mnt/music
+keet /mnt/music
+
+# Windows — map the drive, or use the UNC path directly
+keet \\nas\Music
+```
+
+Add the mount to `/etc/fstab` (or macOS login items) to make it persistent, then resume works across reboots like any local folder.
+
+**Performance note:** the metadata scan reads tags from every file, so the first scan of a large library over a slow link takes a while — it runs in the background on up to 4 threads and the UI stays responsive. Playback itself is undemanding: the decode thread stays ~4 seconds ahead, so ordinary Wi-Fi is comfortably fast enough even for hi-res FLAC.
 
 ## Visualization Modes
 
@@ -394,7 +477,7 @@ src/
 ├── effects.rs     Reverb, chorus, delay effects with preset loading
 ├── playlist.rs    Playlist builder, M3U parser, shuffle
 ├── library.rs     Artist→album→track tree (build/filter/navigation) + shared renderer
-├── crossfeed.rs   Meier-style headphone crossfeed filter
+├── crossfeed.rs   Meier-style headphone crossfeed (level/cutoff/ITD, JSON presets)
 ├── metadata.rs    Tag reading (artist, title, album, track #, lyrics, ReplayGain), background scan
 ├── lyrics.rs      LRC parser, LRCLIB API client, synced/plain lyrics state
 ├── cover.rs       Album cover decoding, Kitty/iTerm2/Sixel/half-block rendering
@@ -439,13 +522,13 @@ Multiple files, folders, and M3U playlists can be passed as arguments. Duplicate
 
 | Crate | Purpose |
 |-------|---------|
-| cpal 0.17 | Cross-platform audio I/O |
-| symphonia 0.5 | Audio decoding (MP3, FLAC, WAV, OGG, AAC, ALAC, AIFF, isomp4) |
-| rubato 1.0 | Sample rate conversion |
+| cpal 0.18 | Cross-platform audio I/O (native PipeWire + PulseAudio hosts on Linux) |
+| symphonia 0.6 | Audio decoding (MP3, FLAC, WAV, OGG, AAC, ALAC, AIFF, isomp4), SIMD by default |
+| rubato 4.0 | Sample rate conversion |
 | crossterm 0.29 | Terminal UI |
 | rtrb 0.3 | Lock-free ring buffer |
 | realfft 3.4 | FFT for spectrum analysis |
-| serde 1.0 | JSON deserialization for EQ/effects presets |
+| serde 1.0 | JSON deserialization for EQ/effects/crossfeed presets |
 | souvlaki 0.8 | OS media transport controls (media keys, AirPods, Bluetooth) |
 | ureq 3 | HTTP client for LRCLIB lyrics fetching (native-tls, no rustls bloat) |
 | image 0.25 | Album cover decoding/resizing (jpeg/png/webp) |
@@ -482,10 +565,11 @@ EOF
 ### Compile
 
 ```bash
-cargo build --release
+cargo build --release          # binary at target/release/keet
+cargo install --path .         # or install it onto your PATH
 ```
 
-The binary is at `target/release/keet`. Copy to `/usr/local/bin/` for system-wide access.
+Release mode is not optional — a debug build cannot keep the decode thread ahead of the audio callback and will glitch.
 
 Version is embedded automatically from git tags via `build.rs`.
 

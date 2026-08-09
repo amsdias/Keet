@@ -5,15 +5,15 @@ edition = "2021"
 
 [dependencies]
 # cpal - Cross-platform audio I/O library
-cpal = "0.17"
+cpal = "0.18"
 
 # symphonia - Pure Rust audio decoding
 # isomp4 container is required for .m4a/.mp4 alongside the aac/alac codec features.
-symphonia = { version = "0.5.5", features = ["mp3", "flac", "wav", "ogg", "aac", "alac", "aiff", "isomp4"] }
+symphonia = { version = "0.6.0", features = ["mp3", "flac", "wav", "ogg", "aac", "alac", "aiff", "isomp4"] }
 
 # rubato - High-quality audio resampling
-rubato = "1.0"
-audioadapter-buffers = "2.0"
+rubato = "4.0"
+audioadapter-buffers = "4.0"
 
 # crossterm - Cross-platform terminal input/output
 crossterm = "0.29"

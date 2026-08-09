@@ -211,3 +211,31 @@ fn urlencod(s: &str) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod network_tests {
+    use super::*;
+
+    /// Live HTTPS check against LRCLIB. Ignored by default (needs network);
+    /// run with `cargo test -- --ignored --nocapture`.
+    ///
+    /// Worth keeping: the ureq timeout config is a known landmine here. Using
+    /// `timeout_global` makes the global timer trip during TCP/TLS setup, so
+    /// every HTTPS call fails *at runtime* while compiling perfectly. Run this
+    /// after any bump to ureq, native-tls, or the TLS stack.
+    #[test]
+    #[ignore = "requires network"]
+    fn lrclib_fetch_completes_over_tls() {
+        let started = std::time::Instant::now();
+        let got = fetch_lrclib("Radiohead", "Creep", Some(238));
+        let elapsed = started.elapsed();
+        println!("LRCLIB replied in {:?}, some={}", elapsed, got.is_some());
+
+        // A TLS/timeout misconfiguration shows up as an instant None (the
+        // handshake never completes), so assert we actually got lyrics back.
+        let lyrics = got.expect("LRCLIB returned nothing — check TLS/timeout config");
+        assert!(!lyrics.trim().is_empty(), "empty lyrics body");
+        let parsed = parse_lyrics(&lyrics);
+        assert!(parsed.line_count() > 0, "parsed to zero lines");
+    }
+}

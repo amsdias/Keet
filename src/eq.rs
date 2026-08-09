@@ -10,11 +10,27 @@ pub(crate) fn flush_denormal(x: f32) -> f32 {
     if x.abs() < 1e-30 { 0.0 } else { x }
 }
 
-/// Single biquad filter state (2nd-order IIR) per channel
+/// f64 counterpart of [`flush_denormal`] for the biquad feedback path. The
+/// 1e-30 threshold is far above f64's denormal range (~2.2e-308) — flushing
+/// early costs nothing at -600 dB and keeps one rule for both widths.
+#[inline]
+pub(crate) fn flush_denormal_f64(x: f64) -> f64 {
+    if x.abs() < 1e-30 { 0.0 } else { x }
+}
+
+/// Single biquad filter state (2nd-order IIR) per channel.
+///
+/// **f64 on purpose.** At low centre frequencies w0 = 2*pi*f/sr approaches
+/// zero, so cos(w0) approaches 1 and the coefficients that carry the filter's
+/// shape (a1 = -2cos(w0), alpha) live in the last few bits of the mantissa. In
+/// f32 that's catastrophic: a 20 Hz Q=10 +12 dB band at 192 kHz delivers about
+/// +2.4 dB — the recursion `-a1*y1 - a2*y2` cancels away the signal. f64 has
+/// 29 more mantissa bits and lands it exactly. Scalar f64 costs the same as
+/// f32 on x86-64/ARM64 for ~1M evals/sec, so this is free.
 #[derive(Clone)]
 struct BiquadState {
-    x1: f32, x2: f32,
-    y1: f32, y2: f32,
+    x1: f64, x2: f64,
+    y1: f64, y2: f64,
 }
 
 impl BiquadState {
@@ -28,22 +44,22 @@ impl BiquadState {
     }
 }
 
-/// Biquad filter coefficients (normalized, a0 = 1.0)
+/// Biquad filter coefficients (normalized, a0 = 1.0). f64 — see [`BiquadState`].
 #[derive(Clone)]
 struct BiquadCoeffs {
-    b0: f32, b1: f32, b2: f32,
-    a1: f32, a2: f32,
+    b0: f64, b1: f64, b2: f64,
+    a1: f64, a2: f64,
 }
 
 impl BiquadCoeffs {
     /// Peaking EQ filter from Audio EQ Cookbook (Robert Bristow-Johnson)
-    fn peaking_eq(freq: f32, gain_db: f32, q: f32, sample_rate: f32) -> Self {
+    fn peaking_eq(freq: f64, gain_db: f64, q: f64, sample_rate: f64) -> Self {
         if gain_db.abs() < 0.01 {
             return Self { b0: 1.0, b1: 0.0, b2: 0.0, a1: 0.0, a2: 0.0 };
         }
 
-        let a = 10.0f32.powf(gain_db / 40.0);
-        let w0 = 2.0 * std::f32::consts::PI * freq / sample_rate;
+        let a = 10.0f64.powf(gain_db / 40.0);
+        let w0 = 2.0 * std::f64::consts::PI * freq / sample_rate;
         let sin_w0 = w0.sin();
         let cos_w0 = w0.cos();
         let alpha = sin_w0 / (2.0 * q);
@@ -62,9 +78,9 @@ impl BiquadCoeffs {
     }
 
     /// Low shelf (RBJ cookbook): boost/cut everything below `freq`.
-    fn low_shelf(freq: f32, gain_db: f32, q: f32, sample_rate: f32) -> Self {
-        let a = 10.0f32.powf(gain_db / 40.0);
-        let w0 = 2.0 * std::f32::consts::PI * freq / sample_rate;
+    fn low_shelf(freq: f64, gain_db: f64, q: f64, sample_rate: f64) -> Self {
+        let a = 10.0f64.powf(gain_db / 40.0);
+        let w0 = 2.0 * std::f64::consts::PI * freq / sample_rate;
         let (sin_w0, cos_w0) = w0.sin_cos();
         let alpha = sin_w0 / (2.0 * q);
         let two_sqrt_a_alpha = 2.0 * a.sqrt() * alpha;
@@ -83,9 +99,9 @@ impl BiquadCoeffs {
     }
 
     /// High shelf (RBJ cookbook): boost/cut everything above `freq`.
-    fn high_shelf(freq: f32, gain_db: f32, q: f32, sample_rate: f32) -> Self {
-        let a = 10.0f32.powf(gain_db / 40.0);
-        let w0 = 2.0 * std::f32::consts::PI * freq / sample_rate;
+    fn high_shelf(freq: f64, gain_db: f64, q: f64, sample_rate: f64) -> Self {
+        let a = 10.0f64.powf(gain_db / 40.0);
+        let w0 = 2.0 * std::f64::consts::PI * freq / sample_rate;
         let (sin_w0, cos_w0) = w0.sin_cos();
         let alpha = sin_w0 / (2.0 * q);
         let two_sqrt_a_alpha = 2.0 * a.sqrt() * alpha;
@@ -105,8 +121,8 @@ impl BiquadCoeffs {
 
     /// 2nd-order high-pass (RBJ cookbook) — the "low cut". Q > 0.707 adds a
     /// resonant bump at the corner, like an analog filter's emphasis.
-    fn high_pass(freq: f32, q: f32, sample_rate: f32) -> Self {
-        let w0 = 2.0 * std::f32::consts::PI * freq / sample_rate;
+    fn high_pass(freq: f64, q: f64, sample_rate: f64) -> Self {
+        let w0 = 2.0 * std::f64::consts::PI * freq / sample_rate;
         let (sin_w0, cos_w0) = w0.sin_cos();
         let alpha = sin_w0 / (2.0 * q);
 
@@ -124,8 +140,8 @@ impl BiquadCoeffs {
     }
 
     /// 2nd-order low-pass (RBJ cookbook) — the "high cut".
-    fn low_pass(freq: f32, q: f32, sample_rate: f32) -> Self {
-        let w0 = 2.0 * std::f32::consts::PI * freq / sample_rate;
+    fn low_pass(freq: f64, q: f64, sample_rate: f64) -> Self {
+        let w0 = 2.0 * std::f64::consts::PI * freq / sample_rate;
         let (sin_w0, cos_w0) = w0.sin_cos();
         let alpha = sin_w0 / (2.0 * q);
 
@@ -152,19 +168,21 @@ impl BiquadCoeffs {
         if band.kind.uses_gain() && gain.abs() < 0.01 {
             return None;
         }
+        // Widen once, here: every designer below runs in f64 (see BiquadState).
+        let (freq, q, gain, sr) = (freq as f64, q as f64, gain as f64, sample_rate as f64);
         Some(match band.kind {
-            BandType::Peak => Self::peaking_eq(freq, gain, q, sample_rate),
-            BandType::LowShelf => Self::low_shelf(freq, gain, q, sample_rate),
-            BandType::HighShelf => Self::high_shelf(freq, gain, q, sample_rate),
-            BandType::LowCut => Self::high_pass(freq, q, sample_rate),
-            BandType::HighCut => Self::low_pass(freq, q, sample_rate),
+            BandType::Peak => Self::peaking_eq(freq, gain, q, sr),
+            BandType::LowShelf => Self::low_shelf(freq, gain, q, sr),
+            BandType::HighShelf => Self::high_shelf(freq, gain, q, sr),
+            BandType::LowCut => Self::high_pass(freq, q, sr),
+            BandType::HighCut => Self::low_pass(freq, q, sr),
         })
     }
 
     /// Exact magnitude response (dB) at `freq`: |H(e^jω)| with
     /// H(z) = (b0 + b1·z⁻¹ + b2·z⁻²) / (1 + a1·z⁻¹ + a2·z⁻²).
-    fn response_at(&self, freq: f32, sample_rate: f32) -> f32 {
-        let w = 2.0 * std::f32::consts::PI * freq / sample_rate;
+    fn response_at(&self, freq: f64, sample_rate: f64) -> f64 {
+        let w = 2.0 * std::f64::consts::PI * freq / sample_rate;
         let (s1, c1) = w.sin_cos();
         let (s2, c2) = (2.0 * w).sin_cos();
         let nr = self.b0 + self.b1 * c1 + self.b2 * c2;
@@ -182,8 +200,8 @@ pub fn response_db(bands: &[BandSettings], freq: f32, sample_rate: f32) -> f32 {
     bands
         .iter()
         .filter_map(|b| BiquadCoeffs::for_band(b, sample_rate))
-        .map(|c| c.response_at(freq, sample_rate))
-        .sum()
+        .map(|c| c.response_at(freq as f64, sample_rate as f64))
+        .sum::<f64>() as f32
 }
 
 /// Default band centres (ISO octave, Hz) — the graphic-EQ layout every band
@@ -465,11 +483,13 @@ impl EqChain {
         }
 
         let frames = samples.len() / 2;
+        let pre = self.pre as f64;
         for frame in 0..frames {
             let li = frame * 2;
             let ri = frame * 2 + 1;
-            let mut left = samples[li] * self.pre;
-            let mut right = samples[ri] * self.pre;
+            // Widen at the boundary; the whole cascade runs in f64.
+            let mut left = samples[li] as f64 * pre;
+            let mut right = samples[ri] as f64 * pre;
 
             for f in &mut self.filters {
                 let out_l = f.coeffs.b0 * left
@@ -482,7 +502,7 @@ impl EqChain {
                 f.state_l.y2 = f.state_l.y1;
                 // Flush the feedback state: during silence y decays into
                 // denormal range, where x86 float ops are 10-100x slower.
-                f.state_l.y1 = flush_denormal(out_l);
+                f.state_l.y1 = flush_denormal_f64(out_l);
                 left = out_l;
 
                 let out_r = f.coeffs.b0 * right
@@ -493,12 +513,12 @@ impl EqChain {
                 f.state_r.x2 = f.state_r.x1;
                 f.state_r.x1 = right;
                 f.state_r.y2 = f.state_r.y1;
-                f.state_r.y1 = flush_denormal(out_r);
+                f.state_r.y1 = flush_denormal_f64(out_r);
                 right = out_r;
             }
 
-            samples[li] = left;
-            samples[ri] = right;
+            samples[li] = left as f32;
+            samples[ri] = right as f32;
         }
     }
 }
@@ -770,6 +790,46 @@ mod parametric_tests {
         with_cut[0] = band(BandType::LowCut, 100.0, 0.0, 0.707);
         eq.load_bands(&with_cut, 0.0, 48000.0);
         assert!(eq.is_active(), "a cut filters regardless of gain — must be active");
+    }
+
+    #[test]
+    fn low_freq_high_q_band_hits_its_target_gain_at_192k() {
+        // The f32 precision trap: at 20 Hz / 192 kHz, w0 = 6.5e-4, so
+        // cos(w0) = 0.99999979 — within a few ULP of 1.0 in f32. The
+        // coefficients that matter (a1 = -2cos(w0), alpha) then carry ~50%
+        // relative error, and DF-I's `-a1*y1 - a2*y2` recursion cancels
+        // catastrophically. This is EQ band 0 territory on a 192 kHz DAC.
+        let sr = 192000.0f32;
+        let fc = 20.0f32;
+        let gain_db = 12.0f32;
+        let mut eq = EqChain::new();
+        let mut bands: [BandSettings; EQ_BANDS] = std::array::from_fn(BandSettings::inert);
+        bands[0] = BandSettings { kind: BandType::Peak, freq: fc, gain: gain_db, q: 10.0 };
+        eq.load_bands(&bands, 0.0, sr);
+
+        // Drive a sine at the centre frequency long enough to settle. The
+        // envelope time constant is 2Q/w0 = 0.16 s, but a resonator needs many
+        // of those to land the last tenth of a dB: an exact f64 reference of
+        // this same filter reads 11.705 dB at 1 s and 11.999 dB at 3 s.
+        let secs = 3.0f32;
+        let n = (sr * secs) as usize;
+        let amp = 0.1f32;
+        let mut buf: Vec<f32> = (0..n)
+            .flat_map(|i| {
+                let s = amp * (2.0 * std::f32::consts::PI * fc * i as f32 / sr).sin();
+                [s, s]
+            })
+            .collect();
+        eq.process_stereo(&mut buf);
+
+        // Last 20% is well past the transient.
+        let tail = &buf[(n * 2 * 4) / 5..];
+        let peak = tail.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        let measured_db = 20.0 * (peak / amp).log10();
+        assert!(
+            (measured_db - gain_db).abs() < 0.1,
+            "20 Hz Q=10 +12 dB band at 192 kHz measured {measured_db:.2} dB (want {gain_db})"
+        );
     }
 
     #[test]

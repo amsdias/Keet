@@ -4,12 +4,12 @@ use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
 
-use symphonia::core::audio::{AudioBufferRef, Signal};
-use symphonia::core::codecs::DecoderOptions;
-use symphonia::core::formats::{FormatOptions, SeekMode, SeekTo};
+use symphonia::core::codecs::audio::AudioDecoderOptions;
+use symphonia::core::formats::probe::Hint;
+use symphonia::core::formats::{FormatOptions, SeekMode, SeekTo, TrackType};
 use symphonia::core::io::MediaSourceStream;
-use symphonia::core::meta::{Limit, MetadataOptions};
-use symphonia::core::probe::Hint;
+use symphonia::core::common::Limit;
+use symphonia::core::meta::MetadataOptions;
 use symphonia::core::units::Time;
 
 use rubato::{Async, FixedAsync, Indexing, SincInterpolationType, SincInterpolationParameters, WindowFunction, Resampler};
@@ -20,47 +20,10 @@ use rtrb::Producer;
 use crate::state::PlayerState;
 use crate::state::RgMode;
 
-fn interleave_f32_planes_into(buf: &symphonia::core::audio::AudioBuffer<f32>, out: &mut Vec<f32>) {
-    let spec = buf.planes();
-    let p = spec.planes();
-    out.reserve(buf.frames() * p.len());
-    for f in 0..buf.frames() {
-        for ch in p { out.push(ch[f]); }
-    }
-}
-
-fn convert_samples_into(buf: &AudioBufferRef, out: &mut Vec<f32>) {
-    match buf {
-        AudioBufferRef::F32(b) => interleave_f32_planes_into(b, out),
-        AudioBufferRef::S16(b) => {
-            let spec = b.planes();
-            let p = spec.planes();
-            out.reserve(b.frames() * p.len());
-            for f in 0..b.frames() {
-                for ch in p { out.push(ch[f] as f32 / 32768.0); }
-            }
-        }
-        AudioBufferRef::S32(b) => {
-            let spec = b.planes();
-            let p = spec.planes();
-            out.reserve(b.frames() * p.len());
-            for f in 0..b.frames() {
-                for ch in p { out.push(ch[f] as f32 / 2147483648.0); }
-            }
-        }
-        AudioBufferRef::S24(b) => {
-            let spec = b.planes();
-            let p = spec.planes();
-            out.reserve(b.frames() * p.len());
-            for f in 0..b.frames() {
-                // i24 carries its value in an i32; full scale is 2^23.
-                for ch in p { out.push(ch[f].inner() as f32 / 8_388_608.0); }
-            }
-        }
-        // Catchall for U8/U16/U24/U32/F64: convert via symphonia's make_equivalent.
-        _ => interleave_f32_planes_into(&buf.make_equivalent::<f32>(), out),
-    }
-}
+// NOTE: symphonia 0.5 needed a hand-written planar-to-interleaved walk with an
+// arm per sample format (S16/S24/S32/F32/…). 0.6's generic audio buffer does it
+// in one SIMD-optimized call — see `copy_to_slice_interleaved` in the decode
+// loop — so all of that is gone.
 
 /// Append `input` (interleaved, `channels`-channel) to `out` as interleaved
 /// stereo. The ring buffer, DSP chain, and audio callback all assume stereo;
@@ -329,9 +292,27 @@ pub struct RgTags {
 
 /// Extract ReplayGain tags from a Symphonia MetadataRevision.
 fn extract_rg_from_tags(tags: &[symphonia::core::meta::Tag], rg: &mut RgTags) {
+    use symphonia::core::meta::StandardTag;
     for tag in tags {
-        if let symphonia::core::meta::Value::String(ref s) = tag.value {
-            let key_lower = tag.key.to_lowercase();
+        // 0.6 maps ReplayGain to standard tags; the raw-key pass below still
+        // runs for readers/containers that leave them unmapped.
+        match &tag.std {
+            Some(StandardTag::ReplayGainTrackGain(s)) if rg.track_gain.is_none() => {
+                rg.track_gain = crate::metadata::parse_rg_gain_value(s);
+            }
+            Some(StandardTag::ReplayGainTrackPeak(s)) if rg.track_peak.is_none() => {
+                rg.track_peak = s.trim().parse::<f32>().ok();
+            }
+            Some(StandardTag::ReplayGainAlbumGain(s)) if rg.album_gain.is_none() => {
+                rg.album_gain = crate::metadata::parse_rg_gain_value(s);
+            }
+            Some(StandardTag::ReplayGainAlbumPeak(s)) if rg.album_peak.is_none() => {
+                rg.album_peak = s.trim().parse::<f32>().ok();
+            }
+            _ => {}
+        }
+        if let symphonia::core::meta::RawValue::String(ref s) = tag.raw.value {
+            let key_lower = tag.raw.key.to_lowercase();
             match key_lower.as_str() {
                 "replaygain_track_gain" if rg.track_gain.is_none() => {
                     rg.track_gain = crate::metadata::parse_rg_gain_value(s);
@@ -450,12 +431,9 @@ pub fn decode_playlist(
         // re-opens the file. Letting symphonia load a 1 MB+ FLAC PICTURE block
         // here is just allocator churn we throw away. `Limit::Maximum(0)`
         // makes the demuxer skip the visual entirely.
-        let meta_opts = MetadataOptions {
-            limit_visual_bytes: Limit::Maximum(0),
-            limit_metadata_bytes: Limit::Default,
-        };
-        let mut probed = match symphonia::default::get_probe()
-            .format(&hint, mss, &FormatOptions::default(), &meta_opts)
+        let meta_opts = MetadataOptions::default().limit_visual_bytes(Limit::Maximum(0));
+        let mut format = match symphonia::default::get_probe()
+            .probe(&hint, mss, FormatOptions::default(), meta_opts)
         {
             Ok(p) => p,
             Err(e) => {
@@ -468,9 +446,7 @@ pub fn decode_playlist(
             }
         };
 
-        let track = match probed.format.tracks().iter()
-            .find(|t| t.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL)
-        {
+        let track = match format.default_track(TrackType::Audio) {
             Some(t) => t.clone(),
             None => {
                 if let Ok(mut err) = state.decode_error.lock() {
@@ -483,17 +459,30 @@ pub fn decode_playlist(
         };
 
         let track_id = track.id;
-        let sample_rate = track.codec_params.sample_rate.unwrap_or(44100);
+        // 0.6: codec_params is Option and splits per media type, so the audio
+        // parameters come out of .audio(); track length moved onto Track.
+        let audio_params = match track.codec_params.as_ref().and_then(|c| c.audio()) {
+            Some(a) => a.clone(),
+            None => {
+                if let Ok(mut err) = state.decode_error.lock() {
+                    *err = Some(format!("{}: No audio codec parameters", path.display()));
+                }
+                state.signal_next_track(track_index + 1);
+                track_index += 1;
+                continue;
+            }
+        };
+        let sample_rate = audio_params.sample_rate.unwrap_or(44100);
         // Source layout, kept for the UI. Everything downstream of decode —
         // resampler, DSP chain, ring buffer, audio callback — runs on stereo;
         // interleaved_to_stereo converts right after each packet is decoded.
-        let src_channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(2);
+        let src_channels = audio_params.channels.as_ref().map(|c| c.count()).unwrap_or(2);
         let channels = 2usize;
-        let bits_per_sample = track.codec_params.bits_per_sample.unwrap_or(16);
-        let total = track.codec_params.n_frames.unwrap_or(0);
+        let bits_per_sample = audio_params.bits_per_sample.unwrap_or(16);
+        let total = track.num_frames.unwrap_or(0);
 
         let mut decoder = match symphonia::default::get_codecs()
-            .make(&track.codec_params, &DecoderOptions::default())
+            .make_audio_decoder(&audio_params, &AudioDecoderOptions::default())
         {
             Ok(d) => d,
             Err(e) => {
@@ -507,18 +496,14 @@ pub fn decode_playlist(
         };
 
         // --- Read ReplayGain tags ---
-        // Extract from both metadata sources (same pattern as metadata.rs)
+        // 0.6 unifies probe-side and container metadata into the format reader,
+        // so this is one pass instead of two (same as metadata.rs).
         let mut rg_tags = RgTags {
             track_gain: None, track_peak: None,
             album_gain: None, album_peak: None,
         };
-        if let Some(rev) = probed.format.metadata().current() {
-            extract_rg_from_tags(rev.tags(), &mut rg_tags);
-        }
-        if let Some(meta) = probed.metadata.get() {
-            if let Some(rev) = meta.current() {
-                extract_rg_from_tags(rev.tags(), &mut rg_tags);
-            }
+        if let Some(rev) = format.metadata().current() {
+            extract_rg_from_tags(&rev.media.tags, &mut rg_tags);
         }
         let rg_linear = compute_rg_gain(state.rg_mode(), &rg_tags);
 
@@ -530,7 +515,7 @@ pub fn decode_playlist(
             let params = if hq_resampler {
                 SincInterpolationParameters {
                     sinc_len: 256,
-                    f_cutoff: 0.95,
+                    f_cutoff: Some(0.95),
                     interpolation: SincInterpolationType::Cubic,
                     oversampling_factor: 128,
                     window: WindowFunction::BlackmanHarris2,
@@ -538,7 +523,7 @@ pub fn decode_playlist(
             } else {
                 SincInterpolationParameters {
                     sinc_len: 64,
-                    f_cutoff: 0.95,
+                    f_cutoff: Some(0.95),
                     interpolation: SincInterpolationType::Linear,
                     oversampling_factor: 128,
                     window: WindowFunction::BlackmanHarris2,
@@ -682,11 +667,15 @@ pub fn decode_playlist(
                 state.reset_consumer_counter.store(true, Ordering::Relaxed);
                 await_consumer_drain(state);
 
-                if probed.format.seek(SeekMode::Coarse, SeekTo::Time {
-                    time: Time::from(new_time),
-                    track_id: Some(track_id)
-                }).is_ok() {
-                    state.samples_played.store((new_time * output_rate as f64) as u64, Ordering::Relaxed);
+                // 0.6 replaced the infallible From<f64> with a checked
+                // constructor; an unrepresentable target just skips the seek.
+                if let Some(time) = Time::try_from_secs_f64(new_time) {
+                    if format.seek(SeekMode::Coarse, SeekTo::Time {
+                        time,
+                        track_id: Some(track_id),
+                    }).is_ok() {
+                        state.samples_played.store((new_time * output_rate as f64) as u64, Ordering::Relaxed);
+                    }
                 }
             }
 
@@ -732,21 +721,26 @@ pub fn decode_playlist(
                 }
             }
 
-            // Decode next packet
-            let packet = match probed.format.next_packet() {
-                Ok(p) => p,
-                Err(_) => break, // EOF
+            // Decode next packet. 0.6 signals end-of-stream with Ok(None)
+            // rather than an error, so both arms end the track.
+            let packet = match format.next_packet() {
+                Ok(Some(p)) => p,
+                Ok(None) => break,  // end of stream
+                Err(_) => break,    // read error
             };
 
-            if packet.track_id() != track_id { continue; }
+            if packet.track_id != track_id { continue; }
 
             let decoded = match decoder.decode(&packet) {
                 Ok(d) => d,
                 Err(_) => continue,
             };
 
+            // 0.6's generic audio buffer converts and interleaves in one call,
+            // replacing the hand-written per-sample-format planar walk.
             raw_buf.clear();
-            convert_samples_into(&decoded, &mut raw_buf);
+            raw_buf.resize(decoded.samples_interleaved(), 0.0);
+            decoded.copy_to_slice_interleaved(&mut raw_buf);
             if raw_buf.is_empty() { continue; }
 
             // Convert the source layout to interleaved stereo (appends to pending).

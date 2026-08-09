@@ -170,6 +170,32 @@ fn compose_banner(banner_text: &str, cover: Option<&cover::CoverImage>, term_w: 
     (out, line_count)
 }
 
+/// Show the terminal cursor again, ignoring write errors.
+///
+/// **Must not panic.** The panic hook calls this, and `print!` panics when the
+/// underlying write fails. With stdout closed (`keet --help | head`) the
+/// original panic would trigger a second panic here — and panicking while
+/// panicking aborts the process instead of exiting cleanly. Writing through a
+/// handle and discarding the `Result` keeps this total.
+fn restore_cursor(w: &mut impl Write) {
+    let _ = w.write_all(b"\x1B[?25h");
+    let _ = w.flush();
+}
+
+/// Whether a panic deserves a `crash.log` entry.
+///
+/// `println!` panics when stdout goes away, so `keet --help | head` panics with
+/// "failed printing to stdout: Broken pipe". That's the shell hanging up on us,
+/// not a crash — logging it would fill the file with noise from ordinary piping.
+fn should_log_crash(info: &str) -> bool {
+    const PIPE_CLOSED: [&str; 3] = [
+        "Broken pipe",              // Unix
+        "The pipe has been ended",  // Windows
+        "The pipe is being closed", // Windows
+    ];
+    !PIPE_CLOSED.iter().any(|m| info.contains(m))
+}
+
 fn build_resume_state(
     ui: &state::UiState,
     playlist: &[std::path::PathBuf],
@@ -249,31 +275,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let _ = crossterm::ansi_support::supports_ansi();
     }
-    // Full terminal reset in case previous run crashed mid-draw
-    // \x1Bc = RIS (Reset to Initial State) - clears screen, resets charset, tab stops, modes
-    print!("\x1Bc");
-    io::stdout().flush().ok();
+    // NOTE: the startup terminal reset lives further down, after the --help /
+    // --list-devices early exits — those just print to stdout and return, so
+    // resetting here would wipe the screen (and emit a stray ESC c into the
+    // output when piped) for commands that never draw the TUI.
 
     // Restore terminal on panic so it doesn't stay in raw mode
     let default_panic = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = terminal::disable_raw_mode();
-        print!("\x1B[?25h"); // Show cursor
-        let _ = io::stdout().flush();
+        restore_cursor(&mut io::stdout());
 
         // Write crash log to ~/.config/keet/crash.log
-        if let Some(config_dir) = playlist::keet_config_dir() {
-            let _ = std::fs::create_dir_all(&config_dir);
-            let log_path = config_dir.join("crash.log");
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let entry = format!("[{}] {}\n", timestamp, info);
-            // Append to log file
-            use std::io::Write as _;
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
-                let _ = f.write_all(entry.as_bytes());
+        let info_str = info.to_string();
+        if should_log_crash(&info_str) {
+            if let Some(config_dir) = playlist::keet_config_dir() {
+                let _ = std::fs::create_dir_all(&config_dir);
+                let log_path = config_dir.join("crash.log");
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let entry = format!("[{}] {}\n", timestamp, info_str);
+                // Append to log file
+                use std::io::Write as _;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+                    let _ = f.write_all(entry.as_bytes());
+                }
             }
         }
 
@@ -317,7 +345,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  F            Toggle pre/post-fader metering");
         println!("  E            Cycle EQ presets");
         println!("  X            Cycle effects presets");
-        println!("  C            Cycle crossfeed (Off → Light → Medium → Strong)");
+        println!("  C            Cycle crossfeed (Off → Light → Medium → Strong + custom)");
         println!("  [ / ]        Balance left / right (5% steps)");
         println!("  L            Toggle playlist view");
         println!("  Y            Toggle lyrics view (synced LRC auto-scrolls)");
@@ -350,6 +378,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("\x1B[1mCUSTOM PRESETS\x1B[0m");
         println!("  EQ:      ~/.config/keet/eq/*.json");
         println!("  Effects: ~/.config/keet/effects/*.json");
+        println!("  Crossfeed: ~/.config/keet/crossfeed/*.json");
         println!();
         println!("\x1B[1mCONFIG\x1B[0m");
         println!("  ~/.config/keet/config.json — persistent defaults, e.g. {{\"theme\": \"minimal\"}}");
@@ -362,6 +391,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         audio::list_output_devices(&host);
         return Ok(());
     }
+
+    // Full terminal reset in case a previous run crashed mid-draw.
+    // \x1Bc = RIS (Reset to Initial State) - clears screen, resets charset,
+    // tab stops, modes. Deliberately AFTER the print-and-exit flags above so
+    // it only fires on the path that actually draws the TUI.
+    print!("\x1Bc");
+    io::stdout().flush().ok();
 
     let flags = ["--shuffle", "-s", "--repeat", "-r", "--quality", "-q", "--eq", "-e", "--fx", "--crossfade", "-x", "--rg-mode", "--list-devices", "--device", "--exclusive", "--no-cover", "--theme", "--help", "-h"];
     // Loaded once and reused for the volume/EQ/device restore further down.
@@ -525,8 +561,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     state.rg_mode.store(rg_mode as u8, Ordering::Relaxed);
     state.exclusive.store(exclusive, Ordering::Relaxed);
 
-    // Load crossfeed presets (built-in only)
-    let cf_presets = crossfeed::builtin_presets();
+    // Load crossfeed presets: built-ins plus any custom JSON in the config dir.
+    let mut cf_presets = crossfeed::builtin_presets();
+    cf_presets.extend(crossfeed::load_custom_presets());
     state.crossfeed_preset_count.store(cf_presets.len(), Ordering::Relaxed);
     let cf_presets = Arc::new(cf_presets);
 
@@ -1571,4 +1608,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // souvlaki::MediaControls (D-Bus) can block indefinitely on Linux, hanging
     // the process after the user presses Q.
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod main_tests {
+    use super::*;
+
+    /// A stdout whose every write fails, like the read end of a pipe that the
+    /// other process already closed (`keet --help | head`).
+    struct DeadPipe;
+
+    impl Write for DeadPipe {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"))
+        }
+    }
+
+    #[test]
+    fn restore_cursor_survives_a_dead_stdout() {
+        // The panic hook calls this. `print!` panics when the write fails, so
+        // on a closed pipe the original panic triggered a SECOND panic here —
+        // and a panic while panicking aborts the process instead of exiting.
+        // This must return normally no matter what stdout does.
+        restore_cursor(&mut DeadPipe);
+    }
+
+    #[test]
+    fn restore_cursor_emits_the_show_cursor_sequence() {
+        let mut buf: Vec<u8> = Vec::new();
+        restore_cursor(&mut buf);
+        assert_eq!(buf, b"\x1B[?25h");
+    }
+
+    #[test]
+    fn closed_pipe_panics_are_not_logged_as_crashes() {
+        // Now that the hook survives a dead stdout it actually reaches the
+        // logging step, so ordinary piping must not accumulate crash.log noise.
+        assert!(!should_log_crash(
+            "panicked at 'failed printing to stdout: Broken pipe (os error 32)'"
+        ));
+        assert!(!should_log_crash("failed printing to stdout: The pipe has been ended. (os error 109)"));
+        // Real crashes still get logged.
+        assert!(should_log_crash("panicked at 'index out of bounds: len is 3'"));
+        assert!(should_log_crash("called `Option::unwrap()` on a `None` value"));
+    }
 }
