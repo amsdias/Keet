@@ -16,7 +16,7 @@ use crate::ansi::{truncate_ansi, truncate_plain, visible_len};
 use crate::state::{InputMode, PlayerState, UiState, VizMode, VizStyle};
 use crate::theme::{palette, ThemeKind};
 use crate::viz::{
-    StatsMonitor, VizAnalyser, analysis_needs_raw_lines, analysis_rows_for_window,
+    StatsMonitor, VizAnalyser, analysis_needs_raw_lines, analysis_rows_reserving,
     render_lissajous, render_oscilloscope, render_spectrogram,
     render_spectrogram_analysis, render_spectrum_horizontal,
     render_spectrum_vertical, render_vu_meter,
@@ -24,19 +24,29 @@ use crate::viz::{
 
 /// Render the Minimal Now Playing screen.
 ///
-/// Layout (single-column for now; SIGNAL details fold into the metadata line):
+/// Layout. The identity block owns its width outright; the cover and SIGNAL are
+/// right-aligned and drawn only when they fit in the space left over, so the
+/// progress bar never shifts as the window is resized. The command tray sits
+/// ABOVE the visualisation, whose height changes with the mode.
 /// ```text
-/// Do I Wanna Know?                                         ← line 1 (anchor, bold)
-/// Arctic Monkeys · AM                                      ← line 2 (dim)
-///                                                          ← blank
-/// NOW PLAYING                                              ← dim small-caps
-/// 02:28  ████████░░░░░░░░░░░░  04:32                      ← time + bar + total
-/// track 5 of 34 · 24-bit stereo · 44.1k → 96k · vol 100% · buf 76%
-///                                                          ← blank
+/// K E E T  music for terminals                             ← line 1 (anchor)
+/// ─────────────────────────────────────────────────────────
+/// Do I Wanna Know?                                         ← bold title
+/// Arctic Monkeys · AM                   ▄▄▄▄▄▄▄▄  │ SIGNAL
+///                                       ████████  │ output   48.0k
+/// NOW PLAYING                           ████████  │ volume   80%
+/// 02:28  ████████░░░░░░░░░░░░  04:32    ████████  │ buffer   76%
+/// track 5 of 34 · 24-bit stereo · 44.1k ████████  │ fader    post
+///                                       ████████  │ balance  centred
+///                                       ████████  │ cpu      0.4%
+///                                       ▀▀▀▀▀▀▀▀  │ mem      17M
+///
+/// ┌──────────────────────────────────────────────────────┐
+/// │ ␣ play  ←→ seek  ↑↓ track  V viz  L library  … │
+/// └──────────────────────────────────────────────────────┘
+///
 /// SPECTRUM                                                 ← dim small-caps (if viz on)
 /// [N viz lines]
-///                                                          ← blank
-/// ␣ play  ←→ seek  ↑↓ track  L lib  Y lyrics  E eq  ? all
 /// ```
 #[allow(clippy::too_many_arguments)] // cohesive render context; bundling into a struct adds no clarity
 pub fn print_status_minimal(
@@ -91,38 +101,16 @@ pub fn print_status_minimal(
         rule = p.rule, rst = p.reset, rl = "─".repeat(rule_w),
     ));
 
-    // === Line 3: bold title (pushed down so the wordmark survives scroll) ===
-    let title_truncated = truncate_plain(&title, term_w.saturating_sub(2));
-    w.line(&format!(
-        "  {bold}{fg}{title}{rst}",
-        bold = p.bold, fg = p.fg, rst = p.reset, title = title_truncated,
-    ));
+    // === Width budget, decided before anything is emitted ===
+    // The identity block wins: `ident_w` depends on the terminal alone, so the
+    // progress bar and total time hold still while the cover and SIGNAL come
+    // and go in the space to their right.
+    let cover_size = crate::cover::CoverSize::MINIMAL;
+    let (ident_w, show_signal, show_cover, gap) = minimal_layout(term_w, ui.cover_enabled);
+    let signal_w = SIGNAL_W;
 
-    // === Line 4: dim Artist · Album ===
-    let mut sub = String::new();
-    if let Some(a) = artist.as_ref() { sub.push_str(a); }
-    if let Some(al) = album.as_ref() {
-        if !sub.is_empty() { sub.push_str("  ·  "); }
-        sub.push_str(al);
-    }
-    w.line(&format!(
-        "  {dim}{sub}{rst}",
-        dim = p.dim, rst = p.reset,
-        sub = truncate_plain(&sub, term_w.saturating_sub(2)),
-    ));
-
-    // === Whitespace gap before NOW PLAYING / SIGNAL block ===
-    w.line("");
-
-    // === Two-column block: NOW PLAYING (left) │ SIGNAL (right) ===
-    // Layout: 2 (margin) + left_w + 1 (space) + 1 (│) + 1 (space) + signal_w
-    //         + 2 (margin) = term_w → left_w = term_w - signal_w - 7
-    let signal_w: usize = 30; // right column reserved
-    let two_col = term_w >= 70 + signal_w;
-    let left_w = if two_col { term_w.saturating_sub(signal_w + 7) } else { term_w.saturating_sub(4) };
-
-    // Build SIGNAL rows (k/v pairs) — only shown if two-col fits. Device name
-    // is in the banner already, so SIGNAL focuses on per-frame state.
+    // Build the SIGNAL pairs up front; they render either as the right column
+    // (no cover) or as a strip under the identity block (cover shown).
     let out_rate = state.output_rate.load(Ordering::Relaxed) as u32;
     let vol = state.volume.load(Ordering::Relaxed);
     let bal = state.balance_value();
@@ -136,43 +124,58 @@ pub fn print_status_minimal(
         ("buffer",  format!("{}%", buf_pct), buf_pct >= 60),
         ("fader",   fader.to_string(), false),
         ("balance", bal_str, false),
+        // cpu/mem live here permanently rather than on the meta line, where the
+        // column was too narrow to fit both and silently dropped `mem`.
+        ("cpu",     format!("{:.1}%", stats.cpu_usage), stats.cpu_usage >= 25.0),
+        ("mem",     format!("{:.0}M", stats.memory_mb), false),
     ];
 
-    // === Header row: "NOW PLAYING" │ "SIGNAL" ===
-    let np_label = if state.is_paused() { "PAUSED" } else { "NOW PLAYING" };
-    if two_col {
-        let left = format!("{dim}{l}{rst}", dim = p.dim, rst = p.reset, l = np_label);
-        let right = format!("{dim}SIGNAL{rst}", dim = p.dim, rst = p.reset);
-        w.line(&fmt_two_col(&left, np_label.len(), &right, left_w));
-    } else {
-        w.line(&format!("  {dim}{l}{rst}", dim = p.dim, rst = p.reset, l = np_label));
-    }
+    // === Identity block: title → artist → NOW PLAYING → time → meta ===
+    // Collected as (rendered, visible width) so the cover column can be zipped
+    // onto the right at a fixed offset.
+    let mut ident: Vec<(String, usize)> = Vec::with_capacity(8);
 
-    // === Time/bar/total row paired with first SIGNAL row (output) ===
+    let title_truncated = truncate_plain(&title, ident_w);
+    ident.push((
+        format!("{bold}{fg}{t}{rst}", bold = p.bold, fg = p.fg, rst = p.reset, t = title_truncated),
+        title_truncated.chars().count(),
+    ));
+
+    let mut sub = String::new();
+    if let Some(a) = artist.as_ref() { sub.push_str(a); }
+    if let Some(al) = album.as_ref() {
+        if !sub.is_empty() { sub.push_str("  ·  "); }
+        sub.push_str(al);
+    }
+    let sub_truncated = truncate_plain(&sub, ident_w);
+    ident.push((
+        format!("{dim}{s}{rst}", dim = p.dim, rst = p.reset, s = sub_truncated),
+        sub_truncated.chars().count(),
+    ));
+
+    ident.push((String::new(), 0));
+
+    let np_label = if state.is_paused() { "PAUSED" } else { "NOW PLAYING" };
+    ident.push((
+        format!("{dim}{l}{rst}", dim = p.dim, rst = p.reset, l = np_label),
+        np_label.chars().count(),
+    ));
+
     let progress = if state.total_secs() > 0.0 {
         (state.time_secs() / state.total_secs()).min(1.0)
     } else { 0.0 };
     let cur = format_time(state.time_secs());
     let tot = format_time(state.total_secs());
-    let bar_w = left_w.saturating_sub(20).clamp(20, 60);
+    let bar_w = progress_bar_width(ident_w, &cur, &tot);
     let bar = render_progress_bar(progress, bar_w, p.accent, p.rule, p.reset);
-    let time_line_plain_len = cur.len() + 3 + bar_w + 3 + tot.len();
-    let time_line = format!(
-        "{accent}{cur}{rst}   {bar}   {dim}{tot}{rst}",
-        accent = p.accent, rst = p.reset, dim = p.dim,
-        cur = cur, bar = bar, tot = tot,
-    );
+    ident.push((
+        format!(
+            "{accent}{cur}{rst}   {bar}   {dim}{tot}{rst}",
+            accent = p.accent, rst = p.reset, dim = p.dim, cur = cur, bar = bar, tot = tot,
+        ),
+        cur.chars().count() + 3 + bar_w + 3 + tot.chars().count(),
+    ));
 
-    if two_col {
-        let (k, v, good) = &signal_rows[0];
-        let row = render_signal_row(p, k, v, *good, signal_w);
-        let row_plain_len = signal_row_plain_len(k, v, signal_w);
-        w.line(&fmt_two_col_padded(&time_line, time_line_plain_len, &row, row_plain_len, left_w));
-    } else {
-        w.line(&format!("  {}", time_line));
-    }
-
-    // === Track meta line paired with second SIGNAL row (volume) ===
     let track_n = state.current_track.load(Ordering::Relaxed) + 1;
     let track_total = state.total_tracks.load(Ordering::Relaxed);
     let src_rate = state.sample_rate.load(Ordering::Relaxed) as u32;
@@ -188,40 +191,101 @@ pub fn print_status_minimal(
         "track {n} of {tot}  ·  {bits}-bit {ch}  ·  {rate}",
         n = track_n, tot = track_total, bits = bits, ch = ch_label, rate = rate_label,
     );
-    let eq_name = &eq_preset.name;
-    if eq_name != "Flat" { meta.push_str(&format!("  ·  eq {}", eq_name)); }
+    if eq_preset.name != "Flat" { meta.push_str(&format!("  ·  eq {}", eq_preset.name)); }
     if fx_name != "None" { meta.push_str(&format!("  ·  fx {}", fx_name)); }
     if cf_name != "Off"  { meta.push_str(&format!("  ·  cf {}", cf_name)); }
-    // Clip lamp, same idiom as the Classic theme: always shown, good-colored
-    // dot when clean, danger red on clip (is_clipping is a read-once swap).
     let clip_color = if state.is_clipping() { p.danger } else { p.good };
     meta.push_str(&format!("  ·  {c}●{rst}", c = clip_color, rst = p.reset));
-    if state.show_stats() {
-        meta.push_str(&format!("  ·  cpu {:.1}%  ·  mem {:.0}M", stats.cpu_usage, stats.memory_mb));
+    let meta_visible = visible_len(&meta).min(ident_w);
+    let meta_styled = format!(
+        "{dim}{m}{rst}",
+        dim = p.dim, rst = p.reset,
+        m = if visible_len(&meta) > ident_w { truncate_plain_ansi_aware(&meta, ident_w) } else { meta },
+    );
+    ident.push((meta_styled, meta_visible));
+
+    // Right column: SIGNAL's label sits two rows above NOW PLAYING so its eight
+    // rows (label + six values + mem) still finish level with the meta line,
+    // keeping the block the same overall height as before.
+    const SIGNAL_TOP: usize = 1;
+    let mut right_col: Vec<String> = vec![String::new(); SIGNAL_TOP];
+    right_col.push(format!("{dim}SIGNAL{rst}", dim = p.dim, rst = p.reset));
+    for (k, v, good) in signal_rows.iter() {
+        right_col.push(render_signal_row(p, k, v, *good, signal_w));
     }
 
-    let meta_left_w = left_w.saturating_sub(2);
-    let meta_visible_len = visible_len(&meta).min(meta_left_w);
-    let meta_styled = if visible_len(&meta) > meta_left_w {
-        format!("{dim}{m}{rst}", dim = p.dim, rst = p.reset, m = truncate_plain_ansi_aware(&meta, meta_left_w))
+    if show_signal {
+        // The cover is vertically aligned with SIGNAL: its top row sits on the
+        // SIGNAL label and its bottom on `balance`, so the two right-hand
+        // blocks read as one group rather than two staggered ones.
+        let cover_w = cover_size.cols as usize;
+        let cover_rows = cover_size.rows as usize;
+        let sticky = crate::cover::image_is_sticky();
+        let cover_lines: Vec<String> = if !show_cover {
+            Vec::new()
+        } else {
+            let repaint = !sticky
+                || prev_viz_lines == usize::MAX
+                || !ui.cover_block_intact
+                || ui.cover_dirty_frame;
+            if repaint {
+                match ui.cover.as_ref() {
+                    Some(img) => crate::cover::render(img),
+                    None => crate::cover::placeholder_lines(cover_size),
+                }
+            } else {
+                crate::cover::passive_lines(cover_size)
+            }
+        };
+        ui.cover_block_intact = show_cover;
+        if show_cover {
+            ui.cover_dirty_frame = false;
+        }
+
+        let blank_cover = " ".repeat(cover_w);
+        let rows = ident.len().max(right_col.len());
+        for i in 0..rows {
+            let (content, vis) = ident.get(i).cloned().unwrap_or((String::new(), 0));
+            let cell = ident_cell(&content, vis, ident_w);
+            let right = right_col.get(i).map(|s| s.as_str()).unwrap_or("");
+            let mid = if show_cover {
+                let within = i.checked_sub(SIGNAL_TOP).filter(|r| *r < cover_rows);
+                match within.and_then(|r| cover_lines.get(r)) {
+                    Some(l) => format!("{l} "),
+                    None => format!("{blank_cover} "),
+                }
+            } else {
+                String::new()
+            };
+            let line = format!(
+                "  {cell}{g}{mid}{rule}│{rst} {right}",
+                g = " ".repeat(gap), rule = p.rule, rst = p.reset,
+            );
+            // A placed image must not be erased-to-EOL; the cells are blanked by
+            // explicit padding instead.
+            if show_cover && sticky { w.line_raw(&line); } else { w.line(&line); }
+        }
     } else {
-        format!("{dim}{m}{rst}", dim = p.dim, rst = p.reset, m = meta)
-    };
-    if two_col {
-        let (k, v, good) = &signal_rows[1];
-        let row = render_signal_row(p, k, v, *good, signal_w);
-        let row_plain_len = signal_row_plain_len(k, v, signal_w);
-        w.line(&fmt_two_col_padded(&meta_styled, meta_visible_len, &row, row_plain_len, left_w));
-    } else {
-        w.line(&format!("  {}", meta_styled));
+        ui.cover_block_intact = false;
+        for (content, vis) in ident.iter() {
+            w.line(&format!("  {}", ident_cell(content, *vis, ident_w)));
+        }
     }
 
-    // === Remaining SIGNAL rows on the right (left side blank) ===
-    if two_col {
-        for (k, v, good) in signal_rows.iter().skip(2) {
-            let row = render_signal_row(p, k, v, *good, signal_w);
-            let row_plain_len = signal_row_plain_len(k, v, signal_w);
-            w.line(&fmt_two_col_padded("", 0, &row, row_plain_len, left_w));
+    // === Command tray ===
+    // Above the visualisation, not below it: the viz block changes height with
+    // the mode (VU is a few rows, the analysis spectrogram many), which dragged
+    // the tray up and down the screen every time it changed.
+    w.line("");
+
+    if let Some(msg) = ui.active_status() {
+        w.line(&format!(
+            "  {accent}{msg}{rst}",
+            accent = p.accent, rst = p.reset, msg = msg,
+        ));
+    } else {
+        for line in slim_cmd_box(p, term_w) {
+            w.line(&line);
         }
     }
 
@@ -241,11 +305,10 @@ pub fn print_status_minimal(
             // Sixel image down to a strip — and the block height is clamped so
             // it can't overflow past the window bottom (auto-scroll storm).
             let log_axis = matches!(viz_style, VizStyle::Dots);
-            // Rows above the image = anchor (1) + everything through the label.
-            // Minimal's footer below the viz is a blank line + the 3-line
-            // command-bar box (4 rows); analysis_rows_for_window reserves 3, so
-            // pass +1 to reserve the tallest footer and never overflow.
-            let ana_rows = analysis_rows_for_window(term_h, 1 + w.count() + 1);
+            // Rows above = anchor (1) + everything already emitted, which now
+            // includes the command tray. Nothing follows the image, so only one
+            // row of bottom slack is reserved rather than a footer's worth.
+            let ana_rows = analysis_rows_reserving(term_h, 1 + w.count(), 1);
             let raw = analysis_needs_raw_lines();
             let force = prev_viz_lines == usize::MAX || !block_was_intact;
             ui.spectro_block_intact = true;
@@ -276,34 +339,6 @@ pub fn print_status_minimal(
         }
     }
 
-    // === Footer command tray (boxed) ===
-    w.line("");
-
-    if let Some(msg) = ui.active_status() {
-        w.line(&format!(
-            "  {accent}{msg}{rst}",
-            accent = p.accent, rst = p.reset, msg = msg,
-        ));
-    } else {
-        let inner_w = term_w.saturating_sub(4);
-        let h_w = inner_w.saturating_sub(2);
-        let bar = slim_cmd_bar_inner(p);
-        let bar_visible = visible_len(&bar);
-        let pad = inner_w.saturating_sub(bar_visible + 2);
-        w.line(&format!(
-            "  {rule}┌{h}┐{rst}",
-            rule = p.rule, rst = p.reset, h = "─".repeat(h_w),
-        ));
-        w.line(&format!(
-            "  {rule}│{rst} {bar}{pad} {rule}│{rst}",
-            rule = p.rule, rst = p.reset, bar = bar, pad = " ".repeat(pad),
-        ));
-        w.line(&format!(
-            "  {rule}└{h}┘{rst}",
-            rule = p.rule, rst = p.reset, h = "─".repeat(h_w),
-        ));
-    }
-
     print!("\x1B[J");
     io::stdout().flush().ok();
     w.count()
@@ -325,34 +360,69 @@ fn wordmark_anchor(p: &crate::theme::Palette) -> String {
 /// Print a styled left-column string and a styled right-column string on the
 /// same line. Layout: `  {left}{pad} │ {right}` — the `│` is rendered in
 /// rule color so it reads as a quiet column divider.
-fn fmt_two_col(left: &str, left_visible_len: usize, right: &str, left_w: usize) -> String {
-    let p = palette(ThemeKind::Minimal);
-    let pad = left_w.saturating_sub(left_visible_len);
-    format!(
-        "  {left}{pad} {rule}│{rst} {right}",
-        left = left,
-        pad = " ".repeat(pad),
-        rule = p.rule, rst = p.reset,
-        right = right,
-    )
+/// Truncate a rendered cell to `width` visible columns and pad it out to
+/// exactly that width.
+///
+/// Both halves matter. Truncating stops an over-wide cell from pushing into
+/// the next column and wrapping at the terminal edge — a wrap adds a PHYSICAL
+/// line that `FrameWriter` doesn't know about, so the cursor-up math is off by
+/// one and the frame scrolls on every repaint. Padding blanks stale text from
+/// a wider previous frame without an erase-to-EOL, which the cover rows can't
+/// use (an EL wipes a placed image).
+fn ident_cell(content: &str, visible: usize, width: usize) -> String {
+    if visible > width {
+        truncate_ansi(content, width)
+    } else {
+        format!("{content}{}", " ".repeat(width - visible))
+    }
 }
 
-fn fmt_two_col_padded(
-    left: &str,
-    left_visible_len: usize,
-    right: &str,
-    _right_visible_len: usize,
-    left_w: usize,
-) -> String {
-    let p = palette(ThemeKind::Minimal);
-    let pad = left_w.saturating_sub(left_visible_len.min(left_w));
-    format!(
-        "  {left}{pad} {rule}│{rst} {right}",
-        left = left,
-        pad = " ".repeat(pad),
-        rule = p.rule, rst = p.reset,
-        right = right,
-    )
+/// Progress-bar width that leaves room for the timestamps either side.
+///
+/// Derived from the column actually available: an earlier `clamp(20, 60)`
+/// imposed a *minimum* of 20, so the row stayed ~36 columns wide however
+/// narrow the column became, and overflowed while the window was dragged in.
+fn progress_bar_width(ident_w: usize, cur: &str, tot: &str) -> usize {
+    let fixed = cur.chars().count() + 3 + 3 + tot.chars().count();
+    ident_w.saturating_sub(fixed).min(60)
+}
+
+/// Width of the reserved SIGNAL column.
+const SIGNAL_W: usize = 30;
+/// Widest the identity block is allowed to get.
+///
+/// The identity column has absolute priority: its width depends on the terminal
+/// alone, never on whether the cover or SIGNAL happen to be visible. That is
+/// what stops the progress bar and total time shifting sideways as those
+/// columns come and go — they appear in, or vanish from, the space to the
+/// right instead. Chosen so SIGNAL still arrives at 100 columns.
+const IDENT_W_MAX: usize = 61;
+
+/// Column budget for the Minimal player screen.
+///
+/// Returns `(ident_w, show_signal, show_cover, gap)`, `gap` being the space
+/// between the identity block and the right-hand group.
+///
+/// The cover and SIGNAL are right-aligned and drawn only when they fit in the
+/// leftover space. Nothing is ever squeezed to accommodate them: as the window
+/// narrows they simply stop being drawn, so the progress bar and total time are
+/// never pushed left or overdrawn.
+fn minimal_layout(term_w: usize, cover_enabled: bool) -> (usize, bool, bool, usize) {
+    let ident_w = term_w.saturating_sub(4).min(IDENT_W_MAX);
+    let cover_w = crate::cover::CoverSize::MINIMAL.cols as usize;
+    // 2 margin + ident + gap + [cover + 1] + │ + 1 + signal + 2 margin
+    let room = |extra: usize| -> Option<usize> {
+        term_w.checked_sub(ident_w + SIGNAL_W + extra + 7).filter(|g| *g >= 2)
+    };
+    if cover_enabled {
+        if let Some(gap) = room(cover_w + 1) {
+            return (ident_w, true, true, gap);
+        }
+    }
+    match room(0) {
+        Some(gap) => (ident_w, true, false, gap),
+        None => (ident_w, false, false, 0),
+    }
 }
 
 /// Render one SIGNAL row: "key" (dim, left) + value (fg or accent, right) padded
@@ -378,12 +448,6 @@ fn render_signal_row(
     )
 }
 
-fn signal_row_plain_len(key: &str, value: &str, width: usize) -> usize {
-    let visible = key.chars().count() + value.chars().count();
-    let gap = width.saturating_sub(visible).max(1);
-    key.chars().count() + gap + value.chars().count()
-}
-
 fn truncate_plain_ansi_aware(s: &str, max_width: usize) -> String {
     let visible = visible_len(s);
     if visible <= max_width { s.to_string() } else { truncate_ansi(s, max_width) }
@@ -391,11 +455,38 @@ fn truncate_plain_ansi_aware(s: &str, max_width: usize) -> String {
 
 /// Inner content of the player slim cmd bar (no leading margin spaces). The
 /// caller wraps it in a box frame.
+/// The three rows of the footer command box, as `[top, content, bottom]`.
+///
+/// Kept together (and width-tested) because the borders and the content row
+/// derive their width separately, and they drifted: the row adds four columns
+/// of chrome (`│` + space on each side) but the padding only subtracted two,
+/// so the right-hand bar sat two columns past the box edge.
+fn slim_cmd_box(p: &crate::theme::Palette, term_w: usize) -> [String; 3] {
+    let inner_w = term_w.saturating_sub(4);
+    let h_w = inner_w.saturating_sub(2);
+    // Content row chrome is 4 columns: │, space, space, │. Whatever is left is
+    // all the key bar may occupy — unpadded it simply ran past the right border
+    // on narrow terminals, since saturating_sub bottomed out at zero padding
+    // instead of cutting the text.
+    let avail = inner_w.saturating_sub(4);
+    let bar = truncate_ansi(&slim_cmd_bar_inner(p), avail);
+    let pad = avail.saturating_sub(visible_len(&bar));
+    [
+        format!("  {rule}┌{h}┐{rst}", rule = p.rule, rst = p.reset, h = "─".repeat(h_w)),
+        format!(
+            "  {rule}│{rst} {bar}{pad} {rule}│{rst}",
+            rule = p.rule, rst = p.reset, bar = bar, pad = " ".repeat(pad),
+        ),
+        format!("  {rule}└{h}┘{rst}", rule = p.rule, rst = p.reset, h = "─".repeat(h_w)),
+    ]
+}
+
 fn slim_cmd_bar_inner(p: &crate::theme::Palette) -> String {
     let pairs: &[(&str, &str)] = &[
         ("␣", "play"),
         ("←→", "seek"),
         ("↑↓", "track"),
+        ("V", "viz"),
         ("L", "library"),
         ("Y", "lyrics"),
         ("E", "eq"),
@@ -950,3 +1041,161 @@ pub fn print_status_minimal_lyrics(
     w.count()
 }
 
+
+#[cfg(test)]
+mod minimal_tests {
+    use super::*;
+
+    #[test]
+    fn command_box_borders_line_up_with_its_content_row() {
+        // The right-hand │ sat two columns right of the box edge:
+        //   ┌────┐
+        //   │ …    │
+        //   └────┘
+        // pad subtracted 2 for the bars but the row adds 4 (│ + space either
+        // side), so the content row was always inner_w + 2 against a border of
+        // inner_w. Independent of font or platform — it just showed up first on
+        // Windows.
+        let p = crate::theme::palette(ThemeKind::Minimal);
+        for term_w in [60usize, 80, 100, 140] {
+            let [top, mid, bot] = slim_cmd_box(p, term_w);
+            assert_eq!(
+                visible_len(&top), visible_len(&mid),
+                "term_w={term_w}: content row does not match the top border"
+            );
+            assert_eq!(visible_len(&top), visible_len(&bot));
+            assert!(visible_len(&top) <= term_w, "term_w={term_w}: box exceeds the terminal");
+        }
+    }
+
+    #[test]
+    fn identity_cells_never_exceed_their_column() {
+        // An over-wide cell is not a cosmetic problem: it pushes into SIGNAL,
+        // wraps at the terminal edge, and the extra PHYSICAL line desyncs
+        // FrameWriter's count from reality — so every repaint scrolls. It also
+        // leaves the cursor at column 0, which is where the cover then gets
+        // placed (the "cover flickers on the left" report).
+        let plain = "0:42   ████████████████████████   3:01";
+        let cell = ident_cell(plain, visible_len(plain), 20);
+        assert_eq!(visible_len(&cell), 20, "over-long cell must be cut to the column");
+
+        // Short content is padded out to the full column so stale text from a
+        // wider previous frame is blanked without needing erase-to-EOL.
+        let cell = ident_cell("hi", 2, 20);
+        assert_eq!(visible_len(&cell), 20);
+
+        // Colour codes survive truncation and don't count toward the width.
+        let styled = "\x1B[1mFireside and a very long album title here\x1B[0m";
+        let cell = ident_cell(styled, visible_len(styled), 12);
+        assert_eq!(visible_len(&cell), 12);
+        assert!(cell.contains("\x1B[1m"));
+
+        // Degenerate widths must not panic.
+        assert_eq!(visible_len(&ident_cell("abc", 3, 0)), 0);
+    }
+
+    #[test]
+    fn progress_row_fits_the_column_it_is_given() {
+        // bar_w used to clamp to a MINIMUM of 20, so the row stayed ~36 cols
+        // wide however narrow the column got — the actual overflow source.
+        // The timestamps and their gaps are irreducible (16 cols); below that
+        // `ident_cell` does the cutting. Above it, the row must always fit.
+        const FIXED: usize = 5 + 3 + 3 + 5;
+        for ident_w in [0usize, 8, 16, 20, 30, 36, 63, 200] {
+            let w = progress_bar_width(ident_w, "00:42", "03:01");
+            let row = FIXED + w;
+            assert!(
+                row <= ident_w.max(FIXED),
+                "ident_w={ident_w}: row {row} overflows its column (bar {w})"
+            );
+        }
+        // Narrower than the timestamps: the bar vanishes rather than forcing width.
+        assert_eq!(progress_bar_width(10, "00:42", "03:01"), 0);
+        // Longer h:mm:ss stamps take their room from the bar, not the column.
+        assert_eq!(progress_bar_width(60, "1:02:03", "1:59:59"), 60 - (7 + 3 + 3 + 7));
+        // Wide columns still cap the bar rather than stretching forever.
+        assert_eq!(progress_bar_width(400, "00:42", "03:01"), 60);
+    }
+
+    #[test]
+    fn identity_column_never_moves_as_extras_come_and_go() {
+        // The regression this replaces: the cover being inserted shrank the
+        // left column, so the progress bar and total time slid left as the
+        // window narrowed, then jumped back when the cover dropped out.
+        let widths = [70usize, 99, 100, 118, 119, 140, 200];
+        let mut seen = std::collections::BTreeSet::new();
+        for w in widths {
+            let (ident_w, _, _, _) = minimal_layout(w, true);
+            let (ident_no_cover, _, _, _) = minimal_layout(w, false);
+            assert_eq!(
+                ident_w, ident_no_cover,
+                "term_w={w}: identity width must not depend on the cover"
+            );
+            seen.insert(ident_w);
+        }
+        // Above the cap it is completely stable, whatever else is drawn.
+        assert_eq!(minimal_layout(119, true).0, minimal_layout(200, true).0);
+        assert_eq!(minimal_layout(200, true).0, IDENT_W_MAX);
+        assert!(seen.contains(&IDENT_W_MAX));
+    }
+
+    #[test]
+    fn extras_appear_only_in_spare_room() {
+        let cover_w = crate::cover::CoverSize::MINIMAL.cols as usize;
+
+        // Too narrow for either: identity only, full width.
+        let (ident_w, sig, cov, _) = minimal_layout(90, true);
+        assert!(!sig && !cov);
+        assert_eq!(ident_w, IDENT_W_MAX);
+
+        // SIGNAL arrives at 100, still no cover.
+        let (_, sig, cov, gap) = minimal_layout(100, true);
+        assert!(sig && !cov, "SIGNAL at 100, cover must wait");
+        assert!(gap >= 2);
+
+        // The cover needs its own width plus a gap on top of that.
+        assert!(!minimal_layout(118, true).2, "118 is one short for the cover");
+        let (ident_w, sig, cov, gap) = minimal_layout(119, true);
+        assert!(sig && cov, "cover fits at 119");
+        assert_eq!(ident_w, IDENT_W_MAX, "and it did NOT come out of the identity block");
+        // 2 margin + ident + gap + cover + space + │ + space + signal + 2 margin,
+        // leaving a column of slack so nothing ever sits on the last cell.
+        assert_eq!(ident_w + gap + cover_w + SIGNAL_W + 7, 119 - 1);
+
+        // --no-cover keeps SIGNAL and simply widens the gap.
+        let (_, sig, cov, gap_nc) = minimal_layout(119, false);
+        assert!(sig && !cov);
+        assert_eq!(gap_nc, gap + cover_w + 1);
+
+        // Degenerate widths must not panic or underflow.
+        assert_eq!(minimal_layout(1, true).0, 0);
+    }
+
+    #[test]
+    fn minimal_cover_slot_matches_the_signal_panel_height() {
+        let m = crate::cover::CoverSize::MINIMAL;
+        let c = crate::cover::CoverSize::CLASSIC;
+        assert!(m.cols < c.cols && m.rows < c.rows, "Minimal slot is the smaller one");
+        // SIGNAL is a label plus seven values (output, volume, buffer, fader,
+        // balance, cpu, mem), and the cover is aligned to exactly that block.
+        assert_eq!(m.rows, 8);
+        // Cells are roughly 1:2, so keep the slot near square rather than wide.
+        let aspect = m.cols as f32 / (m.rows as f32 * 2.0);
+        assert!((0.9..=1.25).contains(&aspect), "slot aspect {aspect} is distorted");
+    }
+
+    #[test]
+    fn signal_block_and_identity_block_end_level() {
+        // SIGNAL sits two rows above NOW PLAYING so its eight rows finish on the
+        // meta line — the whole block stays nine rows tall, as it was with six.
+        const SIGNAL_TOP: usize = 1;
+        const SIGNAL_ROWS: usize = 8; // label + 7 values
+        // Nine rows total — the same height the block had with six SIGNAL rows
+        // starting at index 3, so nothing below it shifts.
+        assert_eq!(SIGNAL_TOP + SIGNAL_ROWS, 9);
+        assert_eq!(
+            crate::cover::CoverSize::MINIMAL.rows as usize, SIGNAL_ROWS,
+            "cover must span exactly the SIGNAL block"
+        );
+    }
+}

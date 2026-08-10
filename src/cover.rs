@@ -24,12 +24,11 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::formats::probe::Hint;
 
-/// Pixel dimensions used by the half-block renderer. Each terminal column is
-/// 1 pixel wide and each row covers 2 pixels tall (upper/lower half-block).
+/// Cell footprint of the banner cover slot (Classic). Each terminal column is
+/// 1 pixel wide and each row covers 2 pixels tall (upper/lower half-block), so
+/// a slot of C×R cells decodes to C×2R pixels — see `CoverSize`.
 pub const COVER_COLS: u32 = 20;
 pub const COVER_ROWS: u32 = 10;
-const HALF_BLOCK_W: u32 = COVER_COLS;
-const HALF_BLOCK_H: u32 = COVER_ROWS * 2;
 /// Square target for Kitty-protocol transmissions. Chosen large enough for
 /// good quality on high-DPI terminals but small enough to keep PNG/base64
 /// transmission cost trivial.
@@ -38,10 +37,6 @@ const KITTY_SIZE: u32 = 320;
 const KITTY_IMAGE_ID: u32 = 1;
 /// Separate Kitty image id for the viz (cover uses id 1; avoid clobbering it).
 const VIZ_IMAGE_ID: u32 = 2;
-/// Sixel target pixel size. Sixel renders 1:1 pixels, so this needs to fit
-/// the cover slot at typical cell dimensions (~10x20 px on Windows Terminal
-/// default font). 200×200 ≈ 20 cols × 10 rows in those units.
-const SIXEL_SIZE: u32 = 200;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GraphicsProtocol {
@@ -118,16 +113,82 @@ fn protocol_from_env(
     GraphicsProtocol::HalfBlock
 }
 
+/// Cell footprint of a cover slot.
+///
+/// Half-block and Sixel bake the target size in at DECODE time (raw pixels /
+/// pre-encoded escape data), while Kitty and iTerm2 carry a PNG and state the
+/// footprint at placement time. Carrying one value from decode through render
+/// is what stops those two ever disagreeing — a mismatch paints the image
+/// outside its reserved rows and the frame below it gets overwritten.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CoverSize {
+    pub cols: u32,
+    pub rows: u32,
+}
+
+impl CoverSize {
+    /// Classic's banner slot.
+    pub const CLASSIC: Self = Self { cols: COVER_COLS, rows: COVER_ROWS };
+    /// Minimal's slot, vertically aligned with the SIGNAL column (label row
+    /// through `mem` = 8 rows).
+    pub const MINIMAL: Self = Self { cols: 18, rows: 8 };
+
+    /// The slot a theme reserves. Minimal keeps its cover beside the identity
+    /// block; Classic and Hi-Fi use the banner slot.
+    pub fn for_theme(kind: crate::theme::ThemeKind) -> Self {
+        match kind {
+            crate::theme::ThemeKind::Minimal => Self::MINIMAL,
+            _ => Self::CLASSIC,
+        }
+    }
+
+    /// Sixel is pixel-exact, so its target is derived from the cell box at a
+    /// conservative 10×20 px per cell (the Windows Terminal default font).
+    fn sixel_px(&self) -> (u32, u32) {
+        (self.cols * 10, self.rows * 20)
+    }
+}
+
 /// Decoded cover, shape depending on the detected rendering protocol.
+/// Every variant remembers the slot it was sized for.
 pub enum CoverImage {
-    /// Raw RGB pixels at exactly HALF_BLOCK_W × HALF_BLOCK_H.
-    HalfBlock { width: u32, height: u32, pixels: Vec<u8> },
+    /// Raw RGB pixels at exactly `size.cols` × `size.rows * 2`.
+    HalfBlock { width: u32, height: u32, pixels: Vec<u8>, size: CoverSize },
     /// PNG bytes ready for Kitty-protocol transmission (base64-encoded at render time).
-    Kitty { png: Vec<u8> },
+    Kitty { png: Vec<u8>, size: CoverSize },
     /// PNG bytes ready for iTerm2 inline image protocol (OSC 1337).
-    Iterm2 { png: Vec<u8> },
+    Iterm2 { png: Vec<u8>, size: CoverSize },
     /// Pre-encoded Sixel escape data, ready to print verbatim.
-    Sixel { data: String },
+    Sixel { data: String, size: CoverSize },
+}
+
+impl CoverImage {
+    pub fn size(&self) -> CoverSize {
+        match self {
+            CoverImage::HalfBlock { size, .. }
+            | CoverImage::Kitty { size, .. }
+            | CoverImage::Iterm2 { size, .. }
+            | CoverImage::Sixel { size, .. } => *size,
+        }
+    }
+}
+
+/// Whether the detected protocol places an image that PERSISTS in its cells.
+///
+/// Kitty, iTerm2 and Sixel all do: once transmitted, the image stays until
+/// something overwrites those cells, so an unchanged frame can skip the
+/// transmit entirely (and must skip erase-to-EOL over them). Half-block *is*
+/// ordinary text, so it has to be repainted like any other content.
+pub fn image_is_sticky() -> bool {
+    !matches!(detect_protocol(), GraphicsProtocol::HalfBlock)
+}
+
+/// Rows that step past an already-placed image without drawing over it.
+/// Used on frames where the cover hasn't changed — re-transmitting a PNG or
+/// Sixel blob 20x/s through the terminal is exactly the cost the analysis
+/// spectrogram's emit-on-change rule exists to avoid.
+pub fn passive_lines(size: CoverSize) -> Vec<String> {
+    (0..size.rows).map(|_| format!("\x1B[{}C", size.cols)).collect()
 }
 
 /// Escape sequence that removes any placement of our reserved image ID.
@@ -150,12 +211,13 @@ pub fn resolve_local(
     track_path: &Path,
     artist: Option<&str>,
     album: Option<&str>,
+    size: CoverSize,
 ) -> Option<CoverImage> {
     if let Some(bytes) = read_embedded(track_path) {
-        return decode_and_resize(&bytes);
+        return decode_and_resize(&bytes, size);
     }
     if let Some(bytes) = read_sidecar(track_path) {
-        return decode_and_resize(&bytes);
+        return decode_and_resize(&bytes, size);
     }
     let candidates = [
         cache_path_for(artist, album),
@@ -163,7 +225,7 @@ pub fn resolve_local(
     ];
     for p in candidates.into_iter().flatten() {
         if let Ok(bytes) = std::fs::read(&p) {
-            return decode_and_resize(&bytes);
+            return decode_and_resize(&bytes, size);
         }
     }
     None
@@ -171,7 +233,7 @@ pub fn resolve_local(
 
 /// Fetch a cover from iTunes Search and persist it to the on-disk cache for
 /// next time. Requires both artist and album — returns None otherwise.
-pub fn resolve_remote(artist: &str, album: &str) -> Option<CoverImage> {
+pub fn resolve_remote(artist: &str, album: &str, size: CoverSize) -> Option<CoverImage> {
     let bytes = fetch_itunes(artist, album)?;
     if let Some(p) = cache_path_for(Some(artist), Some(album)) {
         if let Some(dir) = p.parent() {
@@ -179,7 +241,7 @@ pub fn resolve_remote(artist: &str, album: &str) -> Option<CoverImage> {
         }
         let _ = std::fs::write(&p, &bytes);
     }
-    decode_and_resize(&bytes)
+    decode_and_resize(&bytes, size)
 }
 
 fn read_embedded(track_path: &Path) -> Option<Vec<u8>> {
@@ -303,7 +365,7 @@ fn urlencoded(s: &str) -> String {
     out
 }
 
-fn decode_and_resize(bytes: &[u8]) -> Option<CoverImage> {
+fn decode_and_resize(bytes: &[u8], size: CoverSize) -> Option<CoverImage> {
     let img = image::load_from_memory(bytes).ok()?;
     // `thumbnail_exact` uses nearest-neighbor and allocates only the output
     // buffer. `resize_exact(_, _, Lanczos3)` allocates two intermediate f32
@@ -313,37 +375,40 @@ fn decode_and_resize(bytes: &[u8]) -> Option<CoverImage> {
     // magnitude.
     match detect_protocol() {
         GraphicsProtocol::Kitty => {
+            // The PNG is slot-independent — the terminal scales it into the
+            // c=/r= cell box at placement time.
             let resized = img.thumbnail_exact(KITTY_SIZE, KITTY_SIZE);
             let mut png: Vec<u8> = Vec::new();
             resized.write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png).ok()?;
-            Some(CoverImage::Kitty { png })
+            Some(CoverImage::Kitty { png, size })
         }
         GraphicsProtocol::Iterm2 => {
             let resized = img.thumbnail_exact(KITTY_SIZE, KITTY_SIZE);
             let mut png: Vec<u8> = Vec::new();
             resized.write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png).ok()?;
-            Some(CoverImage::Iterm2 { png })
+            Some(CoverImage::Iterm2 { png, size })
         }
         GraphicsProtocol::Sixel => {
-            let resized = img.thumbnail_exact(SIXEL_SIZE, SIXEL_SIZE);
+            // Pixel-exact: encode to the slot's pixel box, or the image spills
+            // past its reserved rows.
+            let (px_w, px_h) = size.sixel_px();
+            let resized = img.thumbnail_exact(px_w, px_h);
             let rgba = resized.to_rgba8();
             let opts = icy_sixel::EncodeOptions::default();
             let data = icy_sixel::sixel_encode(
                 rgba.as_raw(),
-                SIXEL_SIZE as usize,
-                SIXEL_SIZE as usize,
+                px_w as usize,
+                px_h as usize,
                 &opts,
             ).ok()?;
-            Some(CoverImage::Sixel { data })
+            Some(CoverImage::Sixel { data, size })
         }
         GraphicsProtocol::HalfBlock => {
-            let resized = img.thumbnail_exact(HALF_BLOCK_W, HALF_BLOCK_H);
+            // Two pixel rows per cell row (upper/lower half-block).
+            let (w, h) = (size.cols, size.rows * 2);
+            let resized = img.thumbnail_exact(w, h);
             let rgb = resized.to_rgb8();
-            Some(CoverImage::HalfBlock {
-                width: HALF_BLOCK_W,
-                height: HALF_BLOCK_H,
-                pixels: rgb.into_raw(),
-            })
+            Some(CoverImage::HalfBlock { width: w, height: h, pixels: rgb.into_raw(), size })
         }
     }
 }
@@ -710,64 +775,65 @@ fn viz_sixel_lines(data: &str, cols: u32, rows: u32) -> Vec<String> {
 /// Solid black cells filling the cover slot. Used as a placeholder when no
 /// cover is available so the banner layout doesn't shift while one loads or
 /// for tracks without artwork.
-pub fn placeholder_lines() -> Vec<String> {
-    let cells = " ".repeat(COVER_COLS as usize);
+pub fn placeholder_lines(size: CoverSize) -> Vec<String> {
+    let cells = " ".repeat(size.cols as usize);
     let line = format!("\x1B[48;2;0;0;0m{}\x1B[0m", cells);
-    (0..COVER_ROWS).map(|_| line.clone()).collect()
+    (0..size.rows).map(|_| line.clone()).collect()
 }
 
 /// Render the cover to a Vec of COVER_ROWS lines, each COVER_COLS wide.
 /// For Kitty, line 0 carries the image-transmit escape plus blank spaces;
 /// subsequent lines are blank spaces that the image overlays.
 pub fn render(img: &CoverImage) -> Vec<String> {
+    let size = img.size();
     match img {
-        CoverImage::HalfBlock { width, height, pixels } => {
+        CoverImage::HalfBlock { width, height, pixels, .. } => {
             render_half_block(*width, *height, pixels)
         }
-        CoverImage::Kitty { png } => render_kitty(png),
-        CoverImage::Iterm2 { png } => render_iterm2(png),
-        CoverImage::Sixel { data } => render_sixel(data),
+        CoverImage::Kitty { png, .. } => render_kitty(png, size),
+        CoverImage::Iterm2 { png, .. } => render_iterm2(png, size),
+        CoverImage::Sixel { data, .. } => render_sixel(data, size),
     }
 }
 
-fn render_kitty(png: &[u8]) -> Vec<String> {
-    let cols = COVER_COLS as usize;
-    let mut lines = Vec::with_capacity(COVER_ROWS as usize);
+fn render_kitty(png: &[u8], size: CoverSize) -> Vec<String> {
+    let cols = size.cols as usize;
+    let mut lines = Vec::with_capacity(size.rows as usize);
     let blank = " ".repeat(cols);
     let mut first = String::with_capacity(png.len() * 2);
-    first.push_str(&kitty_transmit(png));
+    first.push_str(&kitty_transmit(png, size));
     first.push_str(&blank);
     lines.push(first);
-    for _ in 1..COVER_ROWS {
+    for _ in 1..size.rows {
         lines.push(blank.clone());
     }
     lines
 }
 
-fn render_sixel(data: &str) -> Vec<String> {
+fn render_sixel(data: &str, size: CoverSize) -> Vec<String> {
     // Same trick as iTerm2: save cursor, blast the sixel data (which leaves
     // the cursor in implementation-defined positions), restore, then advance
-    // by COVER_COLS via cursor-right so we don't paint over the image cells.
-    let mut lines = Vec::with_capacity(COVER_ROWS as usize);
+    // by size.cols via cursor-right so we don't paint over the image cells.
+    let mut lines = Vec::with_capacity(size.rows as usize);
     let mut first = String::with_capacity(data.len() + 16);
     first.push_str("\x1B[s");
     first.push_str(data);
     first.push_str("\x1B[u");
-    let _ = write!(first, "\x1B[{}C", COVER_COLS);
+    let _ = write!(first, "\x1B[{}C", size.cols);
     lines.push(first);
-    let skip = format!("\x1B[{}C", COVER_COLS);
-    for _ in 1..COVER_ROWS {
+    let skip = format!("\x1B[{}C", size.cols);
+    for _ in 1..size.rows {
         lines.push(skip.clone());
     }
     lines
 }
 
-fn render_iterm2(png: &[u8]) -> Vec<String> {
-    let mut lines = Vec::with_capacity(COVER_ROWS as usize);
+fn render_iterm2(png: &[u8], size: CoverSize) -> Vec<String> {
+    let mut lines = Vec::with_capacity(size.rows as usize);
     let b64 = base64_encode(png);
     // Save cursor, emit the image (which would otherwise leave the cursor
     // in an implementation-defined position), restore cursor, then advance
-    // exactly COVER_COLS cells. The image is "attached" to the cells it
+    // exactly size.cols cells. The image is "attached" to the cells it
     // occupies; using \x1B[NC instead of literal spaces avoids overwriting
     // those image cells on rows 1-9.
     let mut first = String::with_capacity(b64.len() + 128);
@@ -776,21 +842,21 @@ fn render_iterm2(png: &[u8]) -> Vec<String> {
     let _ = write!(
         first,
         ";width={};height={};inline=1;preserveAspectRatio=1:",
-        COVER_COLS, COVER_ROWS
+        size.cols, size.rows
     );
     first.push_str(&b64);
     first.push('\x07');
     first.push_str("\x1B[u");
-    let _ = write!(first, "\x1B[{}C", COVER_COLS);
+    let _ = write!(first, "\x1B[{}C", size.cols);
     lines.push(first);
-    let skip = format!("\x1B[{}C", COVER_COLS);
-    for _ in 1..COVER_ROWS {
+    let skip = format!("\x1B[{}C", size.cols);
+    for _ in 1..size.rows {
         lines.push(skip.clone());
     }
     lines
 }
 
-fn kitty_transmit(png: &[u8]) -> String {
+fn kitty_transmit(png: &[u8], size: CoverSize) -> String {
     let b64 = base64_encode(png);
     let chunk_size = 4096;
     let total = b64.len();
@@ -809,8 +875,8 @@ fn kitty_transmit(png: &[u8]) -> String {
                 out,
                 "a=T,f=100,i={},c={},r={},C=1,q=2,m={}",
                 KITTY_IMAGE_ID,
-                COVER_COLS,
-                COVER_ROWS,
+                size.cols,
+                size.rows,
                 if is_last { 0 } else { 1 }
             );
             first = false;

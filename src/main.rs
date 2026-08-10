@@ -93,14 +93,16 @@ fn spawn_lyrics_worker(ui: &mut state::UiState, path: std::path::PathBuf, dur: O
 /// Kick off the album-cover loader on a background thread. Tries embedded,
 /// sidecar, on-disk cache, then iTunes Search (saving result back to cache).
 /// Exits early (before HTTP) if a newer track has been selected.
-fn spawn_cover_worker(ui: &mut state::UiState, path: std::path::PathBuf) {
+fn spawn_cover_worker(ui: &mut state::UiState, path: std::path::PathBuf, size: cover::CoverSize) {
     if !ui.cover_enabled {
         ui.cover = None;
         ui.cover_receiver = None;
+        ui.cover_dirty_frame = true;
         return;
     }
     let (cached_artist, cached_album) = ui.metadata_cache.artist_album(ui.current);
     ui.cover = None;
+    ui.cover_dirty_frame = true;
     let (tx, rx) = std::sync::mpsc::channel();
     ui.cover_receiver = Some(rx);
     let gen_snap = ui.cover_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -111,6 +113,7 @@ fn spawn_cover_worker(ui: &mut state::UiState, path: std::path::PathBuf) {
             &path,
             cached_artist.as_deref(),
             cached_album.as_deref(),
+            size,
         );
         if let Some(img) = local {
             let _ = tx.send(Some(img));
@@ -122,7 +125,7 @@ fn spawn_cover_worker(ui: &mut state::UiState, path: std::path::PathBuf) {
             return;
         }
         let remote = match (cached_artist, cached_album) {
-            (Some(a), Some(al)) => cover::resolve_remote(&a, &al),
+            (Some(a), Some(al)) => cover::resolve_remote(&a, &al, size),
             _ => None,
         };
         let _ = tx.send(remote);
@@ -134,14 +137,14 @@ fn spawn_cover_worker(ui: &mut state::UiState, path: std::path::PathBuf) {
 /// doesn't shift between tracks. Falls back to the plain banner only when
 /// the terminal is too narrow to fit both side-by-side.
 fn compose_banner(banner_text: &str, cover: Option<&cover::CoverImage>, term_w: usize) -> (String, usize) {
-    let cover_cols = cover::COVER_COLS as usize;
+    let cover_cols = cover::CoverSize::CLASSIC.cols as usize;
     // Banner box is ~59 cols; need room for cover + 2-space gap + banner.
     if term_w < cover_cols + 2 + 59 {
         return (banner_text.to_string(), banner_text.lines().count());
     }
     let cover_lines = match cover {
         Some(img) => cover::render(img),
-        None => cover::placeholder_lines(),
+        None => cover::placeholder_lines(cover::CoverSize::CLASSIC),
     };
     let has_trailing_nl = banner_text.ends_with('\n');
     let banner_content = if has_trailing_nl {
@@ -180,6 +183,33 @@ fn compose_banner(banner_text: &str, cover: Option<&cover::CoverImage>, term_w: 
 fn restore_cursor(w: &mut impl Write) {
     let _ = w.write_all(b"\x1B[?25h");
     let _ = w.flush();
+}
+
+/// Swap the name on the Classic banner's `Device:` line.
+///
+/// The banner tail is built once at startup, so after stream-error recovery
+/// fails over to a different output device the banner would otherwise keep
+/// naming the device that was unplugged. `split_inclusive` keeps each line's
+/// terminator attached so the tail's shape is byte-identical apart from the
+/// name — `banner_lines` drives the cursor-up math for every repaint, and a
+/// shifted line count corrupts the whole frame.
+///
+/// Tails without a device line (Minimal and HiFi surface the device inline)
+/// pass through unchanged.
+fn replace_device_line(tail: &str, name: &str) -> String {
+    let mut out = String::with_capacity(tail.len() + name.len());
+    for seg in tail.split_inclusive('\n') {
+        if seg.starts_with("Device: ") {
+            out.push_str("Device: ");
+            out.push_str(name);
+            if seg.ends_with('\n') {
+                out.push('\n');
+            }
+        } else {
+            out.push_str(seg);
+        }
+    }
+    out
 }
 
 /// Whether a panic deserves a `crash.log` entry.
@@ -776,6 +806,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // Name currently shown on the banner's Device: line, plus the throttle for
+    // the poll that keeps it honest — the OS can move playback without telling
+    // us (see the poll in the main loop).
+    let mut shown_device_name: String;
+    let mut last_device_poll = Instant::now();
+
     // Create UI state before the banner so shuffle/repeat have a single home
     // (ui.*). The parsed `shuffle`/`repeat_mode` locals feed it once here and
     // are not read again — every later reader (banner rebuild, main loop) uses
@@ -803,6 +839,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let device_name = device.description()
             .map(|d| d.name().to_string())
             .unwrap_or_else(|_| "Unknown device".to_string());
+        shown_device_name = device_name.clone();
         // Device info banner is Classic-only — Minimal/HiFi surface device
         // and rate inline (SIGNAL block / header strip), and the extra rows
         // would push content past the terminal bottom.
@@ -1159,7 +1196,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ui.lyrics_auto_scroll = true;
         let lyrics_path = playlist[ui.current].clone();
         spawn_lyrics_worker(&mut ui, lyrics_path.clone(), dur);
-        spawn_cover_worker(&mut ui, lyrics_path);
+        spawn_cover_worker(&mut ui, lyrics_path, cover::CoverSize::for_theme(state.theme_kind()));
 
         // Visualization analyzer (created before the startup wait so print_status
         // can draw the waveform/lissajous/spectrogram viz modes during buffering).
@@ -1241,6 +1278,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Keep the library tree fresh while it's showing (no-op otherwise).
             poll_library_tree(&mut ui, &playlist);
 
+            // A theme switch changes the cover slot's cell size, and half-block
+            // and Sixel bake that in at decode time — so re-decode rather than
+            // stretch. Cheap: local sources are hit first and the worker is
+            // generation-counted like any other cover load.
+            if ui.cover_resize_pending {
+                ui.cover_resize_pending = false;
+                if let Some(path) = playlist.get(ui.current).cloned() {
+                    spawn_cover_worker(&mut ui, path, cover::CoverSize::for_theme(state.theme_kind()));
+                }
+            }
+
             // Check for track transitions from the producer
             let current_count = state.track_transition_count.load(Ordering::Acquire);
             if current_count != last_transition_count {
@@ -1288,7 +1336,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ui.lyrics_auto_scroll = true;
                     let dur = { let t = state.total_secs(); if t > 0.0 { Some(t as u32) } else { None } };
                     spawn_lyrics_worker(&mut ui, new_path.clone(), dur);
-                    spawn_cover_worker(&mut ui, new_path.clone());
+                    spawn_cover_worker(&mut ui, new_path.clone(), cover::CoverSize::for_theme(state.theme_kind()));
 
                     let src_rate = state.sample_rate.load(Ordering::Relaxed) as u32;
                     let channels = state.channels.load(Ordering::Relaxed);
@@ -1390,6 +1438,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if state.stream_error.swap(false, Ordering::Relaxed) {
                 // Try to switch to the current default output device
                 if let Some(new_device) = host.default_output_device() {
+                    // Recovery tears down the producer and re-enters the
+                    // playlist loop, which starts the track from 0:00. Capture
+                    // where we were so it can seek back: changing output device
+                    // should not lose your place in the song. Read before the
+                    // teardown — the producer zeroes samples_played on restart.
+                    let resume_at = state.time_secs().floor().max(0.0) as i64;
                     // Signal the producer to exit — it may be stuck in the
                     // buffer-full sleep loop since the audio callback stopped
                     // draining the ring buffer.
@@ -1406,6 +1460,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     drop(stream);
 
                     device = new_device;
+
+                    // Re-label the banner: recovery has moved playback to a
+                    // different endpoint, and the tail still names the one that
+                    // was unplugged.
+                    if let Ok(desc) = device.description() {
+                        let new_name = desc.name().to_string();
+                        ui.banner_tail = replace_device_line(&ui.banner_tail, &new_name);
+                        ui.banner_dirty = true;
+                        ui.set_status(format!("output moved to {new_name}"));
+                    }
 
                     // Re-acquire exclusive (hog) mode on the new device if it
                     // was active before the disconnect. The old hog_device_id
@@ -1437,7 +1501,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         Err(_) => break 'playlist,
                     }
-                    // Resume from current track
+                    // Resume the current track where it left off.
+                    resume_position = resume_at;
                     continue 'playlist;
                 } else {
                     // No default device right now — Windows can report none
@@ -1498,7 +1563,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                if state.show_stats() { stats.update(); }
+                // Minimal keeps cpu/mem in its SIGNAL panel permanently, so the
+                // sampler has to run there regardless of the `I` toggle.
+                if state.show_stats() || state.theme_kind() == theme::ThemeKind::Minimal {
+                    stats.update();
+                }
+
+                // Detect an endpoint change the stream never reported.
+                //
+                // Unplugging a device does not always raise a stream error:
+                // WASAPI shared mode reroutes the stream to the new default
+                // endpoint transparently, so playback carries on and the error
+                // callback never fires — leaving the banner naming a device
+                // that is no longer producing sound. Only meaningful when we
+                // follow the default (an explicit --device stays put), and
+                // polled at ~1 Hz because enumerating endpoints is a COM call.
+                if device_arg.is_none() && last_device_poll.elapsed() >= Duration::from_secs(1) {
+                    last_device_poll = Instant::now();
+                    let current = host
+                        .default_output_device()
+                        .and_then(|d| d.description().ok().map(|desc| desc.name().to_string()));
+                    if let Some(name) = current {
+                        if name != shown_device_name {
+                            shown_device_name = name.clone();
+                            ui.banner_tail = replace_device_line(&ui.banner_tail, &name);
+                            ui.banner_dirty = true;
+                            ui.set_status(format!("output now on {name}"));
+                        }
+                    }
+                }
 
                 // Check if background lyrics fetch has completed
                 if let Some(ref rx) = ui.lyrics_receiver {
@@ -1515,6 +1608,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Ok(cover) = rx.try_recv() {
                         ui.cover = cover;
                         ui.cover_receiver = None;
+                        // Minimal draws the cover per-frame with emit-on-change,
+                        // so a newly arrived image needs exactly one repaint.
+                        ui.cover_dirty_frame = true;
                         // Only Classic shows the cover, so only Classic needs
                         // a banner repaint when it arrives. For Minimal/HiFi
                         // we skip the dirty flag — the full-screen redraw
@@ -1697,6 +1793,29 @@ mod main_tests {
         let mut buf: Vec<u8> = Vec::new();
         restore_cursor(&mut buf);
         assert_eq!(buf, b"\x1B[?25h");
+    }
+
+    #[test]
+    fn device_line_is_rewritten_without_disturbing_the_banner_shape() {
+        // The banner tail is built once at startup, so after stream-error
+        // recovery swaps to a different output device it kept naming the one
+        // that was unplugged. Rewriting must preserve the line structure
+        // exactly — banner_lines drives the cursor-up math for every repaint.
+        let tail = "\nDevice: SteelSeries Sonar - Media\nInitial output: 48000Hz\n";
+        let out = replace_device_line(tail, "Speakers (Focusrite USB Audio)");
+        assert_eq!(
+            out,
+            "\nDevice: Speakers (Focusrite USB Audio)\nInitial output: 48000Hz\n"
+        );
+        assert_eq!(out.lines().count(), tail.lines().count(), "line count must not shift");
+
+        // Minimal/HiFi tails carry no device line — must pass through untouched.
+        let no_device = "\n{Space} Pause  {Q} Quit\n";
+        assert_eq!(replace_device_line(no_device, "Anything"), no_device);
+
+        // A tail with no trailing newline keeps not having one.
+        let no_nl = "\nDevice: Old";
+        assert_eq!(replace_device_line(no_nl, "New"), "\nDevice: New");
     }
 
     #[test]

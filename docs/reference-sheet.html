@@ -1,0 +1,609 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Keet — Reference Sheet</title>
+<meta name="description" content="Reference sheet for Keet - capabilities, command-line switches, in-app controls, presets and config.">
+<style>*,*::before,*::after{box-sizing:border-box}body{margin:0}</style>
+</head>
+<body>
+<style>
+  :root {
+    /* Palette lifted from Keet's Hi-Fi theme (src/theme.rs) */
+    --amber:      #FFB347;
+    --ink:        #F0C878;
+    --dim:        #7A5E3A;
+    --rule:       #3A2A14;
+    --sage:       #A8C87A;
+    --burnt:      #E07A4A;
+    --ground:     #100C07;
+    --panel:      #191207;
+    --cap-face:   #241A0C;
+    --cap-edge:   #0A0704;
+    --cap-ink:    #FFCB77;
+    --shadow:     rgba(0,0,0,.55);
+
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+    --cond: "Avenir Next Condensed", "Roboto Condensed", "Arial Narrow", "Helvetica Neue", sans-serif;
+
+    --measure: 68ch;
+    --gap: 1.5rem;
+  }
+
+  @media (prefers-color-scheme: light) {
+    :root {
+      --amber:    #8A4F08;
+      --ink:      #221B12;
+      --dim:      #6E6152;
+      --rule:     #C9C4B8;
+      --sage:     #4F6B2C;
+      --burnt:    #A8481B;
+      --ground:   #E3E0D9;
+      --panel:    #EEEBE4;
+      --cap-face: #FBFAF7;
+      --cap-edge: #B8B2A5;
+      --cap-ink:  #2A2118;
+      --shadow:   rgba(60,50,35,.18);
+    }
+  }
+  :root[data-theme="light"] {
+    --amber:    #8A4F08;
+    --ink:      #221B12;
+    --dim:      #6E6152;
+    --rule:     #C9C4B8;
+    --sage:     #4F6B2C;
+    --burnt:    #A8481B;
+    --ground:   #E3E0D9;
+    --panel:    #EEEBE4;
+    --cap-face: #FBFAF7;
+    --cap-edge: #B8B2A5;
+    --cap-ink:  #2A2118;
+    --shadow:   rgba(60,50,35,.18);
+  }
+  :root[data-theme="dark"] {
+    --amber:    #FFB347;
+    --ink:      #F0C878;
+    --dim:      #7A5E3A;
+    --rule:     #3A2A14;
+    --sage:     #A8C87A;
+    --burnt:    #E07A4A;
+    --ground:   #100C07;
+    --panel:    #191207;
+    --cap-face: #241A0C;
+    --cap-edge: #0A0704;
+    --cap-ink:  #FFCB77;
+    --shadow:   rgba(0,0,0,.55);
+  }
+
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--mono);
+    font-size: 15px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .sheet {
+    max-width: 1140px;
+    margin: 0 auto;
+    padding: clamp(1.5rem, 4vw, 3.5rem) clamp(1rem, 4vw, 2.5rem) 5rem;
+    display: flex;
+    flex-direction: column;
+    gap: clamp(2rem, 5vw, 3.25rem);
+  }
+
+  /* ---- masthead ---- */
+  .masthead { display: flex; flex-direction: column; gap: 1rem; }
+  .brandline { display: flex; align-items: baseline; gap: .85rem; flex-wrap: wrap; }
+  .lamp {
+    width: .6rem; height: .6rem; border-radius: 50%;
+    background: var(--amber);
+    box-shadow: 0 0 .55rem var(--amber);
+    align-self: center;
+    flex: none;
+  }
+  h1 {
+    font-family: var(--cond);
+    font-size: clamp(2.6rem, 8vw, 4.25rem);
+    font-weight: 700;
+    letter-spacing: .22em;
+    text-transform: uppercase;
+    color: var(--amber);
+    line-height: 1;
+    text-wrap: balance;
+    margin: 0;
+  }
+  .tagline {
+    font-family: var(--cond);
+    font-size: clamp(.95rem, 2.2vw, 1.15rem);
+    letter-spacing: .13em;
+    text-transform: uppercase;
+    color: var(--dim);
+  }
+
+  .curve {
+    font-size: 1.05rem;
+    line-height: 1;
+    color: var(--amber);
+    opacity: .85;
+    letter-spacing: .04em;
+    overflow: hidden;
+    white-space: nowrap;
+    user-select: none;
+  }
+
+  .specstrip {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(148px, 1fr));
+    gap: 1px;
+    background: var(--rule);
+    border: 1px solid var(--rule);
+  }
+  .spec { background: var(--panel); padding: .8rem .95rem; display: flex; flex-direction: column; gap: .18rem; }
+  .spec dt {
+    font-family: var(--cond);
+    font-size: .72rem; letter-spacing: .17em; text-transform: uppercase; color: var(--dim);
+  }
+  .spec dd { margin: 0; font-size: .88rem; color: var(--ink); font-variant-numeric: tabular-nums; }
+
+  /* ---- sections ---- */
+  section { display: flex; flex-direction: column; gap: 1.1rem; }
+  h2 {
+    font-family: var(--cond);
+    font-size: 1.05rem;
+    font-weight: 700;
+    letter-spacing: .2em;
+    text-transform: uppercase;
+    color: var(--amber);
+    margin: 0;
+    padding-bottom: .5rem;
+    border-bottom: 1px solid var(--rule);
+    display: flex; align-items: baseline; gap: .7rem;
+  }
+  h2 .idx { color: var(--dim); font-size: .8rem; letter-spacing: .1em; }
+  h3 {
+    font-family: var(--cond);
+    font-size: .82rem; font-weight: 700; letter-spacing: .17em; text-transform: uppercase;
+    color: var(--ink); margin: 0 0 .1rem;
+  }
+  p { max-width: var(--measure); margin: 0; color: var(--dim); font-size: .87rem; }
+  p strong { color: var(--ink); font-weight: 400; }
+
+  /* ---- signal chain ---- */
+  .chain {
+    display: flex; flex-wrap: wrap; align-items: center; gap: .4rem .55rem;
+    padding: 1rem 1.1rem; background: var(--panel); border: 1px solid var(--rule);
+  }
+  .chain span { font-size: .8rem; color: var(--ink); white-space: nowrap; }
+  .chain .arrow { color: var(--dim); }
+  .chain .hl { color: var(--amber); }
+
+  /* ---- tables ---- */
+  .scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: .87rem; }
+  caption { text-align: left; font-family: var(--cond); font-size: .8rem;
+            letter-spacing: .17em; text-transform: uppercase; color: var(--dim);
+            padding-bottom: .55rem; }
+  th {
+    text-align: left; font-family: var(--cond); font-weight: 700;
+    font-size: .72rem; letter-spacing: .15em; text-transform: uppercase;
+    color: var(--dim); padding: 0 1rem .45rem 0; border-bottom: 1px solid var(--rule);
+    white-space: nowrap;
+  }
+  td { padding: .45rem 1rem .45rem 0; border-bottom: 1px solid var(--rule); vertical-align: top; }
+  tbody tr:hover td { background: var(--panel); }
+  td:last-child, th:last-child { padding-right: 0; }
+  .flag { color: var(--amber); white-space: nowrap; }
+  .arg  { color: var(--sage); white-space: nowrap; }
+  .desc { color: var(--ink); }
+  .note { color: var(--dim); }
+  .keycell { white-space: nowrap; width: 1%; }
+
+  /* ---- keycaps ---- */
+  kbd {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: .76rem;
+    line-height: 1;
+    padding: .32rem .45rem .38rem;
+    min-width: 1.75rem;
+    text-align: center;
+    color: var(--cap-ink);
+    background: var(--cap-face);
+    border: 1px solid var(--cap-edge);
+    border-radius: 3px;
+    box-shadow: 0 1.5px 0 var(--cap-edge), 0 2px 3px var(--shadow);
+    white-space: nowrap;
+  }
+  .kbsep { color: var(--dim); padding: 0 .12rem; font-size: .78rem; }
+
+  /* ---- panel grid ---- */
+  .panels { display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: var(--gap); }
+  .panel { display: flex; flex-direction: column; gap: .7rem; min-width: 0; }
+
+  /* ---- code / paths ---- */
+  pre {
+    margin: 0; padding: .95rem 1.1rem; background: var(--panel);
+    border: 1px solid var(--rule); overflow-x: auto; font-size: .82rem; line-height: 1.65;
+    color: var(--ink);
+  }
+  pre .k { color: var(--amber); }
+  pre .s { color: var(--sage); }
+  pre .c { color: var(--dim); }
+  code { color: var(--amber); }
+
+  .paths { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1px;
+           background: var(--rule); border: 1px solid var(--rule); }
+  .path { background: var(--panel); padding: .8rem .95rem; display: flex; flex-direction: column; gap: .2rem; }
+  .path .what { font-family: var(--cond); font-size: .72rem; letter-spacing: .16em;
+                text-transform: uppercase; color: var(--dim); }
+  .path .where { font-size: .8rem; color: var(--ink); word-break: break-all; }
+
+  footer {
+    border-top: 1px solid var(--rule); padding-top: 1.1rem;
+    font-size: .78rem; color: var(--dim);
+    display: flex; justify-content: space-between; gap: 1rem; flex-wrap: wrap;
+  }
+  a { color: var(--amber); text-decoration: none; border-bottom: 1px solid var(--rule); }
+  a:hover { border-bottom-color: var(--amber); }
+  a:focus-visible, kbd:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+</style>
+
+<div class="sheet">
+
+  <header class="masthead">
+    <div class="brandline">
+      <span class="lamp" aria-hidden="true"></span>
+      <h1>Keet</h1>
+      <span class="tagline">Terminal audio player — reference sheet</span>
+    </div>
+    <div class="curve" aria-hidden="true">▁▁▂▂▃▄▅▆▇█▇▆▅▄▄▃▃▂▂▁▁▁▂▂▃▃▄▅▆▇█▇▆▅▄▃▂▂▁▁▂▃▄▅▆▇█▇▆▅▄▃▂▁▁▂▃▄▅▆▇█▇▆▅▄▃▂▁▁▁▂▃▄▅▆▇█▇▆▅▄▃▂▁▁</div>
+
+    <dl class="specstrip">
+      <div class="spec"><dt>Formats</dt><dd>MP3 · FLAC · WAV · OGG · AAC/M4A · ALAC · AIFF</dd></div>
+      <div class="spec"><dt>Platforms</dt><dd>macOS · Windows · Linux</dd></div>
+      <div class="spec"><dt>CPU</dt><dd>&lt; 0.5% (release build)</dd></div>
+      <div class="spec"><dt>Equaliser</dt><dd>10-band parametric, f64 biquads</dd></div>
+      <div class="spec"><dt>Channels</dt><dd>Mono → 7.1 in, stereo out</dd></div>
+      <div class="spec"><dt>Threads</dt><dd>UI · decode · audio callback</dd></div>
+    </dl>
+  </header>
+
+  <section>
+    <h2><span class="idx">01</span> Signal chain</h2>
+    <p>Applied in order on the decode thread. The audio callback is lock-free and allocation-free — volume is the only stage past the ring buffer.</p>
+    <div class="chain">
+      <span>decode</span><span class="arrow">→</span>
+      <span>to-stereo</span><span class="arrow">→</span>
+      <span>resample</span><span class="arrow">→</span>
+      <span class="hl">EQ</span><span class="arrow">→</span>
+      <span class="hl">effects</span><span class="arrow">→</span>
+      <span class="hl">ReplayGain</span><span class="arrow">→</span>
+      <span class="hl">crossfeed</span><span class="arrow">→</span>
+      <span class="hl">balance</span><span class="arrow">→</span>
+      <span>crossfade</span><span class="arrow">→</span>
+      <span>limiter</span><span class="arrow">→</span>
+      <span>ring buffer</span><span class="arrow">→</span>
+      <span>volume</span><span class="arrow">→</span>
+      <span>output</span>
+    </div>
+  </section>
+
+  <section>
+    <h2><span class="idx">02</span> Capabilities</h2>
+    <div class="panels">
+
+      <div class="panel">
+        <h3>Playback</h3>
+        <div class="scroll"><table><tbody>
+          <tr><td class="desc">Gapless transitions <span class="note">— continuous stream across tracks</span></td></tr>
+          <tr><td class="desc">Equal-power crossfade <span class="note">— <code>--crossfade</code></span></td></tr>
+          <tr><td class="desc">ReplayGain, track or album, with peak-based clip prevention</td></tr>
+          <tr><td class="desc">Session resume — track, position, volume, EQ, effects, theme</td></tr>
+          <tr><td class="desc">Shuffle with order restore · repeat all / one · play queue</td></tr>
+        </tbody></table></div>
+      </div>
+
+      <div class="panel">
+        <h3>Output</h3>
+        <div class="scroll"><table><tbody>
+          <tr><td class="desc">Device selection by name; format and rate enumeration</td></tr>
+          <tr><td class="desc">Exclusive mode — per-track rate matching, macOS hog mode</td></tr>
+          <tr><td class="desc">Automatic recovery from device disconnect <span class="note">(USB DAC, AirPods)</span></td></tr>
+          <tr><td class="desc">Mono, stereo, quad, 5.1 and 7.1 sources — ITU downmix to stereo</td></tr>
+          <tr><td class="desc">Bluetooth detection · conditional resampling · HQ resampler mode</td></tr>
+        </tbody></table></div>
+      </div>
+
+      <div class="panel">
+        <h3>Sound shaping</h3>
+        <div class="scroll"><table><tbody>
+          <tr><td class="desc">10-band parametric EQ — f64 biquads, AutoEq-compatible presets</td></tr>
+          <tr><td class="desc">Effects — reverb, chorus, delay</td></tr>
+          <tr><td class="desc">Meier headphone crossfeed — level, corner, interaural delay</td></tr>
+          <tr><td class="desc">Stereo balance · peak limiter · clipping indicator</td></tr>
+          <tr><td class="desc">Pre / post-fader metering</td></tr>
+        </tbody></table></div>
+      </div>
+
+      <div class="panel">
+        <h3>Library</h3>
+        <div class="scroll"><table><tbody>
+          <tr><td class="desc">Recursive folder scan, multiple sources, deduplicated</td></tr>
+          <tr><td class="desc">Artist → album → track tree with live filtering</td></tr>
+          <tr><td class="desc">Tag-based sort; parallel background metadata scan</td></tr>
+          <tr><td class="desc">M3U import and export · folder rescan</td></tr>
+          <tr><td class="desc">NAS libraries via any mounted SMB / NFS share</td></tr>
+        </tbody></table></div>
+      </div>
+
+      <div class="panel">
+        <h3>On screen</h3>
+        <div class="scroll"><table><tbody>
+          <tr><td class="desc">Eight visualisations, including a pixel-image analysis spectrogram</td></tr>
+          <tr><td class="desc">Album cover art — Kitty, iTerm2 and Sixel graphics, half-block fallback</td></tr>
+          <tr><td class="desc">Synced lyrics — embedded LRC, else fetched from LRCLIB</td></tr>
+          <tr><td class="desc">Three themes across all four screens</td></tr>
+          <tr><td class="desc">Artist / title / album / track from ID3, Vorbis and MP4 tags</td></tr>
+          <tr><td class="desc">CPU and memory stats via direct platform syscalls</td></tr>
+        </tbody></table></div>
+      </div>
+
+      <div class="panel">
+        <h3>System integration</h3>
+        <div class="scroll"><table><tbody>
+          <tr><td class="desc">OS media keys — MPRIS, SMTC, macOS Now Playing</td></tr>
+          <tr><td class="desc">AirPods stalk and Bluetooth headphone controls</td></tr>
+          <tr><td class="desc">OS seek bar and skip-by seeking</td></tr>
+          <tr><td class="desc">Now-playing metadata pushed to the system, throttled to ~1 Hz</td></tr>
+        </tbody></table></div>
+      </div>
+
+    </div>
+  </section>
+
+  <section>
+    <h2><span class="idx">03</span> Command line</h2>
+    <pre><span class="c"># play files, folders and M3U playlists (deduplicated)</span>
+<span class="k">keet</span> <span class="s">&lt;file|folder|playlist&gt;...</span> [options]
+
+<span class="c"># resume the last session</span>
+<span class="k">keet</span></pre>
+
+    <div class="scroll">
+      <table>
+        <caption>Options</caption>
+        <thead>
+          <tr><th>Flag</th><th>Argument</th><th>Effect</th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="flag">-s, --shuffle</td><td class="arg">—</td><td class="desc">Randomise order. Re-shuffles on each repeat cycle.</td></tr>
+          <tr><td class="flag">-r, --repeat</td><td class="arg">—</td><td class="desc">Loop the playlist, rescanning sources for new files each cycle.</td></tr>
+          <tr><td class="flag">-q, --quality</td><td class="arg">—</td><td class="desc">HQ resampler. Higher CPU, inaudible difference.</td></tr>
+          <tr><td class="flag">-e, --eq</td><td class="arg">&lt;name|path&gt;</td><td class="desc">Start with an EQ preset by name, or a JSON file path.</td></tr>
+          <tr><td class="flag">--fx</td><td class="arg">&lt;name|path&gt;</td><td class="desc">Start with an effects preset by name, or a JSON file path.</td></tr>
+          <tr><td class="flag">-x, --crossfade</td><td class="arg">&lt;secs&gt;</td><td class="desc">Equal-power crossfade between tracks. <span class="note">0 disables.</span></td></tr>
+          <tr><td class="flag">--rg-mode</td><td class="arg">track|album|off</td><td class="desc">ReplayGain mode. <span class="note">Default: track.</span></td></tr>
+          <tr><td class="flag">--device</td><td class="arg">&lt;name&gt;</td><td class="desc">Output device, matched by case-insensitive substring.</td></tr>
+          <tr><td class="flag">--exclusive</td><td class="arg">—</td><td class="desc">Per-track sample-rate matching; device lock (hog mode) on macOS.</td></tr>
+          <tr><td class="flag">--no-cover</td><td class="arg">—</td><td class="desc">Disable album cover rendering.</td></tr>
+          <tr><td class="flag">--theme</td><td class="arg">classic|minimal|hifi</td><td class="desc">Launch theme. <span class="note">Default: classic.</span></td></tr>
+          <tr><td class="flag">--list-devices</td><td class="arg">—</td><td class="desc">Print output devices with their formats and rates, then exit.</td></tr>
+          <tr><td class="flag">-h, --help</td><td class="arg">—</td><td class="desc">Print usage and exit.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2><span class="idx">04</span> Player controls</h2>
+    <div class="panels">
+
+      <div class="panel">
+        <h3>Transport</h3>
+        <div class="scroll"><table><tbody>
+          <tr><td class="keycell"><kbd>Space</kbd></td><td class="desc">Pause / resume</td></tr>
+          <tr><td class="keycell"><kbd>↑</kbd></td><td class="desc">Next track</td></tr>
+          <tr><td class="keycell"><kbd>↓</kbd></td><td class="desc">Previous track</td></tr>
+          <tr><td class="keycell"><kbd>→</kbd></td><td class="desc">Seek forward 10 s</td></tr>
+          <tr><td class="keycell"><kbd>←</kbd></td><td class="desc">Seek back 10 s</td></tr>
+          <tr><td class="keycell"><kbd>Z</kbd></td><td class="desc">Toggle shuffle</td></tr>
+          <tr><td class="keycell"><kbd>Shift</kbd><span class="kbsep">+</span><kbd>R</kbd></td><td class="desc">Repeat: off → all → one</td></tr>
+          <tr><td class="keycell"><kbd>Q</kbd><span class="kbsep">/</span><kbd>Esc</kbd></td><td class="desc">Quit</td></tr>
+        </tbody></table></div>
+      </div>
+
+      <div class="panel">
+        <h3>Sound</h3>
+        <div class="scroll"><table><tbody>
+          <tr><td class="keycell"><kbd>+</kbd><span class="kbsep">/</span><kbd>-</kbd></td><td class="desc">Volume ±5% <span class="note">(0–150%)</span></td></tr>
+          <tr><td class="keycell"><kbd>[</kbd><span class="kbsep">/</span><kbd>]</kbd></td><td class="desc">Balance left / right, 5% steps</td></tr>
+          <tr><td class="keycell"><kbd>E</kbd></td><td class="desc">Open the EQ + FX editor</td></tr>
+          <tr><td class="keycell"><kbd>X</kbd></td><td class="desc">Cycle effects presets</td></tr>
+          <tr><td class="keycell"><kbd>C</kbd></td><td class="desc">Cycle crossfeed presets</td></tr>
+          <tr><td class="keycell"><kbd>F</kbd></td><td class="desc">Pre / post-fader metering</td></tr>
+        </tbody></table></div>
+      </div>
+
+      <div class="panel">
+        <h3>Display</h3>
+        <div class="scroll"><table><tbody>
+          <tr><td class="keycell"><kbd>V</kbd></td><td class="desc">Cycle visualisation</td></tr>
+          <tr><td class="keycell"><kbd>B</kbd></td><td class="desc">Viz style: bars / dots <span class="note">(lin/log on the analysis view)</span></td></tr>
+          <tr><td class="keycell"><kbd>T</kbd></td><td class="desc">Theme: classic → minimal → hi-fi</td></tr>
+          <tr><td class="keycell"><kbd>L</kbd></td><td class="desc">Toggle library view</td></tr>
+          <tr><td class="keycell"><kbd>Y</kbd></td><td class="desc">Toggle lyrics view</td></tr>
+          <tr><td class="keycell"><kbd>I</kbd></td><td class="desc">CPU / memory stats</td></tr>
+        </tbody></table></div>
+      </div>
+
+      <div class="panel">
+        <h3>Library management</h3>
+        <div class="scroll"><table><tbody>
+          <tr><td class="keycell"><kbd>R</kbd></td><td class="desc">Rescan source folders for changes</td></tr>
+          <tr><td class="keycell"><kbd>S</kbd></td><td class="desc">Save playlist as M3U</td></tr>
+          <tr><td class="keycell"><kbd>O</kbd></td><td class="desc">Open a new source — type a path</td></tr>
+          <tr><td class="keycell"><kbd>P</kbd></td><td class="desc">Open a new source — native folder picker</td></tr>
+        </tbody></table></div>
+      </div>
+
+    </div>
+  </section>
+
+  <section>
+    <h2><span class="idx">05</span> Library view <span class="idx">— <kbd>L</kbd></span></h2>
+    <p><kbd>Tab</kbd> switches between two presentations of the same library. Each keeps its own cursor position.</p>
+    <div class="panels">
+
+      <div class="panel">
+        <h3>Flat list</h3>
+        <div class="scroll"><table><tbody>
+          <tr><td class="keycell"><kbd>Tab</kbd></td><td class="desc">Switch to the tree</td></tr>
+          <tr><td class="keycell"><kbd>↑</kbd><span class="kbsep">/</span><kbd>↓</kbd></td><td class="desc">Move cursor</td></tr>
+          <tr><td class="keycell"><kbd>Home</kbd><span class="kbsep">/</span><kbd>End</kbd></td><td class="desc">Top / bottom <span class="note">(also <kbd>g</kbd> / <kbd>G</kbd>)</span></td></tr>
+          <tr><td class="keycell"><kbd>PgUp</kbd><span class="kbsep">/</span><kbd>PgDn</kbd></td><td class="desc">Page <span class="note">(also <kbd>Ctrl</kbd>+<kbd>U</kbd> / <kbd>D</kbd>)</span></td></tr>
+          <tr><td class="keycell"><kbd>Enter</kbd></td><td class="desc">Jump to selected track</td></tr>
+          <tr><td class="keycell"><kbd>A</kbd></td><td class="desc">Enqueue — play next</td></tr>
+          <tr><td class="keycell"><kbd>Shift</kbd><span class="kbsep">+</span><kbd>S</kbd></td><td class="desc">Sort by tags <span class="note">(turns shuffle off)</span></td></tr>
+          <tr><td class="keycell"><kbd>/</kbd></td><td class="desc">Filter by filename or tags</td></tr>
+          <tr><td class="keycell"><kbd>D</kbd><span class="kbsep">/</span><kbd>Del</kbd></td><td class="desc">Remove track</td></tr>
+          <tr><td class="keycell"><kbd>Esc</kbd><span class="kbsep">/</span><kbd>L</kbd></td><td class="desc">Close</td></tr>
+        </tbody></table></div>
+      </div>
+
+      <div class="panel">
+        <h3>Artist → album tree</h3>
+        <div class="scroll"><table><tbody>
+          <tr><td class="keycell"><kbd>Tab</kbd></td><td class="desc">Switch to the flat list</td></tr>
+          <tr><td class="keycell"><kbd>↑</kbd><span class="kbsep">/</span><kbd>↓</kbd></td><td class="desc">Move cursor</td></tr>
+          <tr><td class="keycell"><kbd>←</kbd><span class="kbsep">/</span><kbd>→</kbd></td><td class="desc">Collapse / expand node</td></tr>
+          <tr><td class="keycell"><kbd>Enter</kbd></td><td class="desc">Play track, or album / artist from its first track</td></tr>
+          <tr><td class="keycell"><kbd>/</kbd></td><td class="desc">Filter at any level <span class="note">(<kbd>Esc</kbd> clears)</span></td></tr>
+          <tr><td class="keycell"><kbd>D</kbd></td><td class="desc">Remove — album / artist asks <span class="note">[y/n]</span></td></tr>
+          <tr><td class="keycell"><kbd>PgUp</kbd><span class="kbsep">/</span><kbd>PgDn</kbd></td><td class="desc">Page up / down</td></tr>
+          <tr><td class="keycell"><kbd>Esc</kbd><span class="kbsep">/</span><kbd>L</kbd></td><td class="desc">Close</td></tr>
+        </tbody></table></div>
+      </div>
+
+    </div>
+  </section>
+
+  <section>
+    <h2><span class="idx">06</span> EQ + FX editor <span class="idx">— <kbd>E</kbd></span></h2>
+    <p>Ten fully parametric bands. Every band starts as a peaking filter on the ISO octave centres, so until you reach for the parametric keys it behaves as a classic graphic EQ. Editing any band switches the EQ to <strong>Custom</strong> and persists across sessions.</p>
+
+    <div class="scroll">
+      <table>
+        <caption>Per-band parameters</caption>
+        <thead><tr><th>Parameter</th><th>Range</th><th>Keys</th></tr></thead>
+        <tbody>
+          <tr><td class="desc">Gain</td><td class="arg">±12 dB — 0.5 dB steps</td><td class="keycell"><kbd>↑</kbd><span class="kbsep">/</span><kbd>↓</kbd> <span class="note">— hold <kbd>Shift</kbd> for 0.1 dB</span></td></tr>
+          <tr><td class="desc">Filter type</td><td class="arg">peak · low/high shelf · low/high cut</td><td class="keycell"><kbd>t</kbd><span class="kbsep">/</span><kbd>T</kbd></td></tr>
+          <tr><td class="desc">Frequency</td><td class="arg">20 Hz – 20 kHz, ⅓-octave</td><td class="keycell"><kbd>&lt;</kbd><span class="kbsep">/</span><kbd>&gt;</kbd></td></tr>
+          <tr><td class="desc">Q (bandwidth)</td><td class="arg">0.3 – 10, √2 steps</td><td class="keycell"><kbd>,</kbd><span class="kbsep">/</span><kbd>.</kbd></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="panels">
+      <div class="panel">
+        <h3>Editor keys</h3>
+        <div class="scroll"><table><tbody>
+          <tr><td class="keycell"><kbd>←</kbd><span class="kbsep">/</span><kbd>→</kbd></td><td class="desc">Select band</td></tr>
+          <tr><td class="keycell"><kbd>[</kbd><span class="kbsep">/</span><kbd>]</kbd></td><td class="desc">Previous / next preset</td></tr>
+          <tr><td class="keycell"><kbd>0</kbd></td><td class="desc">Reset band to its graphic default</td></tr>
+          <tr><td class="keycell"><kbd>E</kbd><span class="kbsep">/</span><kbd>Esc</kbd></td><td class="desc">Close</td></tr>
+        </tbody></table></div>
+      </div>
+
+      <div class="panel">
+        <h3>Lyrics view — <kbd>Y</kbd></h3>
+        <div class="scroll"><table><tbody>
+          <tr><td class="keycell"><kbd>W</kbd><span class="kbsep">/</span><kbd>S</kbd></td><td class="desc">Scroll <span class="note">(disables auto-scroll)</span></td></tr>
+          <tr><td class="keycell"><kbd>A</kbd><span class="kbsep">/</span><kbd>D</kbd></td><td class="desc">Sync offset ∓0.5 s</td></tr>
+          <tr><td class="keycell"><kbd>Esc</kbd><span class="kbsep">/</span><kbd>Y</kbd></td><td class="desc">Close</td></tr>
+        </tbody></table></div>
+        <p>Embedded tags first, then <a href="https://lrclib.net">LRCLIB</a> matched on artist, title and duration. Synced LRC preferred over plain text.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2><span class="idx">07</span> Presets</h2>
+    <div class="panels">
+      <div class="panel">
+        <h3>Built in</h3>
+        <div class="scroll"><table><tbody>
+          <tr><td class="keycell desc">EQ</td><td class="desc">Flat · Bass Boost · Treble Boost · Vocal · Loudness</td></tr>
+          <tr><td class="keycell desc">Effects</td><td class="desc">None · Small Room · Concert Hall · Cathedral · Studio · Chorus · Echo</td></tr>
+          <tr><td class="keycell desc">Crossfeed</td><td class="desc">Off · Light · Medium · Strong</td></tr>
+          <tr><td class="keycell desc">Themes</td><td class="desc">Classic · Minimal · Hi-Fi</td></tr>
+        </tbody></table></div>
+      </div>
+      <div class="panel">
+        <h3>Visualisations — <kbd>V</kbd></h3>
+        <div class="scroll"><table><tbody>
+          <tr><td class="desc">Off · VU meter · Spectrum (horizontal / vertical) · Oscilloscope · Lissajous vector scope · Spectrogram · Analysis spectrogram <span class="note">(Kitty graphics / Sixel pixel image)</span></td></tr>
+        </tbody></table></div>
+      </div>
+    </div>
+
+    <p>Custom presets are JSON files dropped into the folders below. The parametric EQ form accepts AutoEq exports directly — transcribe the ParametricEQ rows and copy the preamp line.</p>
+    <pre><span class="c">// ~/.config/keet/eq/my-headphones.json</span>
+{
+  <span class="k">"name"</span>: <span class="s">"My Headphones"</span>,
+  <span class="k">"preamp"</span>: -5.5,
+  <span class="k">"bands"</span>: [
+    { <span class="k">"type"</span>: <span class="s">"low_shelf"</span>,  <span class="k">"freq"</span>: 105,  <span class="k">"gain"</span>: 5.5,  <span class="k">"q"</span>: 0.71 },
+    { <span class="k">"type"</span>: <span class="s">"peak"</span>,       <span class="k">"freq"</span>: 3300, <span class="k">"gain"</span>: -2.0, <span class="k">"q"</span>: 2.0 },
+    { <span class="k">"type"</span>: <span class="s">"high_shelf"</span>, <span class="k">"freq"</span>: 9500, <span class="k">"gain"</span>: 1.5,  <span class="k">"q"</span>: 0.71 }
+  ]
+}</pre>
+  </section>
+
+  <section>
+    <h2><span class="idx">08</span> Configuration</h2>
+    <p>Every key is optional and applies on top of the resumed session. An explicit command-line flag still wins.</p>
+    <pre><span class="c">// ~/.config/keet/config.json  ·  %APPDATA%\keet\config.json</span>
+{
+  <span class="k">"theme"</span>:     <span class="s">"minimal"</span>,   <span class="c">// classic | minimal | hifi</span>
+  <span class="k">"viz"</span>:       <span class="s">"analysis"</span>,  <span class="c">// none | vu | spectrum | spectrum-vertical</span>
+                              <span class="c">// oscilloscope | lissajous | spectrogram | analysis</span>
+  <span class="k">"rg_mode"</span>:   <span class="s">"track"</span>,     <span class="c">// track | album | off</span>
+  <span class="k">"eq"</span>:        <span class="s">"Bass Boost"</span>,<span class="c">// any preset name</span>
+  <span class="k">"crossfeed"</span>: <span class="s">"off"</span>       <span class="c">// off | light | medium | strong | custom name</span>
+}</pre>
+
+    <div class="paths">
+      <div class="path"><span class="what">Config</span><span class="where">~/.config/keet/config.json</span></div>
+      <div class="path"><span class="what">EQ presets</span><span class="where">~/.config/keet/eq/*.json</span></div>
+      <div class="path"><span class="what">Effects presets</span><span class="where">~/.config/keet/effects/*.json</span></div>
+      <div class="path"><span class="what">Crossfeed presets</span><span class="where">~/.config/keet/crossfeed/*.json</span></div>
+      <div class="path"><span class="what">Session state</span><span class="where">~/.config/keet/state.json</span></div>
+      <div class="path"><span class="what">Crash log</span><span class="where">~/.config/keet/crash.log</span></div>
+    </div>
+    <p>On Windows every path above lives under <code>%APPDATA%\keet\</code>.</p>
+  </section>
+
+  <section>
+    <h2><span class="idx">09</span> Install</h2>
+    <pre><span class="c"># Linux/WSL first: sudo apt install libasound2-dev libdbus-1-dev</span>
+git clone https://github.com/amsdias/Keet.git
+<span class="k">cd</span> Keet
+cargo install --path .</pre>
+    <p>Release mode is not optional — a debug build cannot keep the decode thread ahead of the audio callback and will glitch. Point Keet at a mounted SMB or NFS share and network libraries work exactly like local folders.</p>
+  </section>
+
+  <footer>
+    <span>Keet — terminal audio player</span>
+    <span><a href="https://github.com/amsdias/Keet">github.com/amsdias/Keet</a></span>
+  </footer>
+
+</div>
+
+</body>
+</html>

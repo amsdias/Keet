@@ -1421,7 +1421,19 @@ fn analysis_can_skip_emit(
 /// = banner + status lines above the viz block; 3 more rows are reserved for
 /// the viz separator line, the transient status line, and one row of slack.
 pub fn analysis_rows_for_window(term_h: usize, rows_above: usize) -> usize {
-    SPECTRO_ANALYSIS_ROWS.min(4.max(term_h.saturating_sub(rows_above + 3)))
+    analysis_rows_reserving(term_h, rows_above, 3)
+}
+
+/// As [`analysis_rows_for_window`], but with the rows kept free BELOW the image
+/// stated explicitly.
+///
+/// The default of 3 assumes a footer under the spectrogram. Minimal draws its
+/// command tray *above* it — those rows are already counted in `rows_above`, so
+/// reserving three more would shrink the image for no reason. One row of slack
+/// is still kept: an image ending on the very last line makes the terminal
+/// scroll on the next write.
+pub fn analysis_rows_reserving(term_h: usize, rows_above: usize, below: usize) -> usize {
+    SPECTRO_ANALYSIS_ROWS.min(4.max(term_h.saturating_sub(rows_above + below)))
 }
 
 /// Whether the analysis-spectrogram lines must be printed WITHOUT the usual
@@ -1544,6 +1556,33 @@ mod analysis_tests {
         assert!((analysis_intensity(-40.0, -70.0, -10.0) - 0.5).abs() < 1e-6);
         assert_eq!(analysis_intensity(-90.0, -70.0, -10.0), 0.0);
         assert_eq!(analysis_intensity(0.0, -70.0, -10.0), 1.0);
+    }
+
+    #[test]
+    fn analysis_row_budget_respects_what_sits_below() {
+        // Window chosen so the SPECTRO_ANALYSIS_ROWS cap doesn't bind and the
+        // reserve is what's actually being measured.
+        // Default (3 rows reserved) is for a footer under the image.
+        let with_footer = analysis_rows_for_window(24, 10);
+        // Minimal draws its tray above, so only the bottom-slack row is kept —
+        // same window, same content above, but two more rows of image.
+        let tray_above = analysis_rows_reserving(24, 10, 1);
+        assert_eq!(with_footer, 24 - 10 - 3);
+        assert_eq!(tray_above, 24 - 10 - 1);
+        assert!(tray_above > with_footer);
+
+        // The frame must still fit: rows_above + image + reserve <= term_h.
+        for term_h in [12usize, 20, 24, 40, 60] {
+            for rows_above in [5usize, 10, 18] {
+                let r = analysis_rows_reserving(term_h, rows_above, 1);
+                assert!(
+                    rows_above + r < term_h || r == 4,
+                    "term_h={term_h} above={rows_above} rows={r} overflows"
+                );
+            }
+        }
+        // Never grows past the cap however tall the window is.
+        assert_eq!(analysis_rows_reserving(200, 0, 1), analysis_rows_for_window(200, 0));
     }
 
     #[test]

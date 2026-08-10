@@ -382,7 +382,10 @@ fn render_db_scale(meter_w: usize, p: &crate::theme::Palette) -> String {
 }
 
 fn hifi_marquee_keys(p: &crate::theme::Palette, term_w: usize) -> String {
-    // Variant-c key bar: " ␣ PLAY · ←→ SEEK · ↑↓ TRACK · +/− VOL · E EQ · X FX · V VIZ · L LIB · Y LYRICS · Q QUIT"
+    // Variant-c key bar. Deliberately NO "V VIZ": this theme's visualisation is
+    // the fixed VU panel above, so V changed nothing visible — and cycling to
+    // VizMode::None stopped the analyser that drives those meters, leaving them
+    // dead. `V` is a no-op while Hi-Fi is active (see the key handler in ui.rs).
     let pairs: &[(&str, &str)] = &[
         ("␣",   "PLAY"),
         ("←→",  "SEEK"),
@@ -390,7 +393,7 @@ fn hifi_marquee_keys(p: &crate::theme::Palette, term_w: usize) -> String {
         ("+/−", "VOL"),
         ("E",   "EQ"),
         ("X",   "FX"),
-        ("V",   "VIZ"),
+        ("C",   "XFEED"),
         ("L",   "LIB"),
         ("Y",   "LYRICS"),
         ("T",   "THEME"),
@@ -1018,6 +1021,21 @@ mod hifi_tests {
         );
         // Background reset after the partial so the rail cells aren't tinted.
         assert!(bar.contains("\x1B[49m"), "background not reset after partial: {bar:?}");
+    }
+
+    #[test]
+    fn key_bar_does_not_advertise_a_viz_control() {
+        // Hi-Fi draws a fixed VU panel and renders no switchable visualisation,
+        // so a VIZ hint pointed at a key that changes nothing on screen — and
+        // cycling round to VizMode::None starved the analyser that feeds these
+        // very meters, killing them.
+        let p = crate::theme::palette(crate::theme::ThemeKind::HiFi);
+        let bar = hifi_marquee_keys(p, 200);
+        assert!(!bar.contains("VIZ"), "Hi-Fi key bar still offers VIZ: {bar:?}");
+        // The controls it does have must survive.
+        for expected in ["PLAY", "SEEK", "TRACK", "VOL", "EQ", "FX", "LIB", "LYRICS", "THEME"] {
+            assert!(bar.contains(expected), "key bar lost {expected}: {bar:?}");
+        }
     }
 
     #[test]

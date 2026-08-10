@@ -835,6 +835,16 @@ pub struct UiState {
 
     /// Currently-resolved album cover (half-block pre-rendered lines if decoded).
     pub cover: Option<crate::cover::CoverImage>,
+    /// Emit-on-change bookkeeping for the Minimal cover slot, mirroring
+    /// `spectro_block_intact`: false means another view painted over the
+    /// block, so the image must be re-transmitted rather than stepped past.
+    pub cover_block_intact: bool,
+    /// Set when the cover itself changed (new track, load completed, theme
+    /// switch re-decoded it at a different size) — forces one repaint.
+    pub cover_dirty_frame: bool,
+    /// Theme changed, so the cover must be re-decoded for the new slot size.
+    /// Main consumes this and respawns the cover worker.
+    pub cover_resize_pending: bool,
     pub cover_receiver: Option<std::sync::mpsc::Receiver<Option<crate::cover::CoverImage>>>,
     pub cover_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub cover_enabled: bool,
@@ -889,6 +899,9 @@ impl UiState {
             lyrics_offset: 0.0,
             lyrics_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             cover: None,
+            cover_block_intact: false,
+            cover_dirty_frame: true,
+            cover_resize_pending: false,
             cover_receiver: None,
             cover_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             cover_enabled: true,

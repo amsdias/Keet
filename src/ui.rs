@@ -96,6 +96,26 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
         state.set_eq_bands(&eq_preset.bands_10());
         state.set_eq_preamp_db(eq_preset.preamp);
     }
+    // Leaving the player view has to take the album cover with it.
+    //
+    // A Kitty image is an OVERLAY bound to an image id, not cell content, so
+    // the lyrics/library/EQ screens drawing text over those cells does not
+    // remove it — the cover just sits on top of them. (Sixel, iTerm2 and
+    // half-block are cell content and get erased naturally.) Only the Minimal
+    // player draws a per-frame cover, and it is the only thing that sets
+    // `cover_block_intact`, so Classic's banner cover is unaffected.
+    //
+    // Clearing the flag for every protocol is deliberate: it forces one repaint
+    // when the player comes back, which Sixel and iTerm2 need because their
+    // pixels really were overwritten while away.
+    if ui.view_mode != ViewMode::Player && ui.cover_block_intact {
+        if matches!(crate::cover::detect_protocol(), crate::cover::GraphicsProtocol::Kitty) {
+            print!("{}", crate::cover::kitty_clear_escape());
+        }
+        ui.cover_block_intact = false;
+        ui.cover_dirty_frame = true;
+    }
+
     // The EQ+FX editor is one shared, palette-driven screen across all themes.
     if ui.view_mode == ViewMode::Eq {
         return print_status_eq_view(state, ui, eq_preset, fx_name, cf_name, prev_frame_lines);
@@ -965,6 +985,15 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
                 KeyEvent { code: KeyCode::Right, .. } => state.seek(10),
                 KeyEvent { code: KeyCode::Left, .. } => state.seek(-10),
                 KeyEvent { code: KeyCode::Char('v'), .. } => {
+                    // Hi-Fi renders a fixed VU panel and no switchable viz, so
+                    // cycling here changed nothing on screen — and landing on
+                    // VizMode::None starved the analyser those meters read,
+                    // leaving them flat. Ignore the key rather than let it
+                    // silently break the panel.
+                    if state.theme_kind() == crate::theme::ThemeKind::HiFi {
+                        ui.set_status("Hi-Fi uses its VU panel — press T for another theme".to_string());
+                        continue;
+                    }
                     state.cycle_viz_mode();
                     // Re-anchor the UI at the top of the screen (resize-repaint
                     // path): a taller viz then grows into the reclaimed rows
@@ -1052,7 +1081,16 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
                     state.quit(); return true;
                 }
                 KeyEvent { code: KeyCode::Char('c'), .. } => state.cycle_crossfeed(),
-                KeyEvent { code: KeyCode::Char('i'), .. } => state.toggle_stats(),
+                KeyEvent { code: KeyCode::Char('i'), .. } => {
+                    // Minimal shows cpu/mem permanently in SIGNAL, so there is
+                    // nothing to toggle — say so instead of silently flipping a
+                    // flag that changes nothing on screen.
+                    if state.theme_kind() == crate::theme::ThemeKind::Minimal {
+                        ui.set_status("cpu/mem are always shown in this theme".to_string());
+                    } else {
+                        state.toggle_stats();
+                    }
+                }
                 KeyEvent { code: KeyCode::Char('['), .. } => state.balance_left(),
                 KeyEvent { code: KeyCode::Char(']'), .. } => state.balance_right(),
                 KeyEvent { code: KeyCode::Char('t'), .. } => {
@@ -1063,6 +1101,12 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
                     // Banner also changes shape per theme, so trigger a banner rebuild.
                     ui.banner_dirty = true;
                     ui.terminal_resized = true;
+                    // Themes reserve different cover slots (Minimal's is
+                    // smaller), and half-block/Sixel bake the size in at decode
+                    // time — so the image has to be re-decoded, not just
+                    // re-placed. Flagged here; main respawns the worker.
+                    ui.cover_resize_pending = true;
+                    ui.cover_dirty_frame = true;
                 }
                 _ => {}
             }
