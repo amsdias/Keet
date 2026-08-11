@@ -191,6 +191,25 @@ pub fn passive_lines(size: CoverSize) -> Vec<String> {
     (0..size.rows).map(|_| format!("\x1B[{}C", size.cols)).collect()
 }
 
+/// Rows for an EMPTY cover slot: blank cells, preceded by whatever it takes to
+/// remove an image already sitting there.
+///
+/// A Kitty placement is an overlay bound to an image id — painting the cells
+/// underneath does not remove it. Without the explicit delete, moving from a
+/// track with artwork to one without left the previous cover on screen.
+/// Sixel, iTerm2 and half-block are ordinary cell content, so blanking the
+/// cells is enough for them.
+pub fn empty_slot_lines(size: CoverSize) -> Vec<String> {
+    let blank = " ".repeat(size.cols as usize);
+    let mut lines: Vec<String> = (0..size.rows).map(|_| blank.clone()).collect();
+    if matches!(detect_protocol(), GraphicsProtocol::Kitty) {
+        if let Some(first) = lines.first_mut() {
+            first.insert_str(0, &kitty_clear_escape());
+        }
+    }
+    lines
+}
+
 /// Escape sequence that removes any placement of our reserved image ID.
 /// Safe to emit even when no image is currently on screen.
 pub fn kitty_clear_escape() -> String {
@@ -923,6 +942,38 @@ fn base64_encode(bytes: &[u8]) -> String {
         out.push('=');
     }
     out
+}
+
+#[cfg(test)]
+mod slot_tests {
+    use super::*;
+
+    #[test]
+    fn empty_slot_is_blank_and_matches_the_reserved_box() {
+        // The slot must occupy exactly its reserved cells whether or not there
+        // is artwork — a short row would let the │ separator beside it jump.
+        for size in [CoverSize::MINIMAL, CoverSize::CLASSIC] {
+            let lines = empty_slot_lines(size);
+            assert_eq!(lines.len(), size.rows as usize, "row count");
+            for l in &lines {
+                // Escapes (the Kitty delete) carry no width, so measure visibly.
+                assert_eq!(crate::ansi::visible_len(l), size.cols as usize);
+                assert!(
+                    l.chars().all(|c| c == ' ' || c == '\x1B' || c.is_ascii_graphic()),
+                    "empty slot should paint nothing but blanks: {l:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn passive_and_empty_slots_agree_on_width() {
+        // Unchanged frames step past the slot; empty frames blank it. Both must
+        // land the cursor in the same column or the row's tail shifts.
+        let size = CoverSize::MINIMAL;
+        assert_eq!(passive_lines(size).len(), size.rows as usize);
+        assert_eq!(empty_slot_lines(size).len(), size.rows as usize);
+    }
 }
 
 #[cfg(test)]

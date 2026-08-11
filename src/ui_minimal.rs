@@ -231,7 +231,9 @@ pub fn print_status_minimal(
             if repaint {
                 match ui.cover.as_ref() {
                     Some(img) => crate::cover::render(img),
-                    None => crate::cover::placeholder_lines(cover_size),
+                    // No artwork for this track: blank the slot AND remove any
+                    // image still placed there from the previous one.
+                    None => crate::cover::empty_slot_lines(cover_size),
                 }
             } else {
                 crate::cover::passive_lines(cover_size)
