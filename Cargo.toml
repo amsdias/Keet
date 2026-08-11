@@ -12,8 +12,8 @@ cpal = "0.18"
 symphonia = { version = "0.6.0", features = ["mp3", "flac", "wav", "ogg", "aac", "alac", "aiff", "isomp4"] }
 
 # rubato - High-quality audio resampling
-rubato = "4.0"
-audioadapter-buffers = "4.0"
+rubato = "5.0"
+audioadapter-buffers = "5.1"
 
 # crossterm - Cross-platform terminal input/output
 crossterm = "0.29"
