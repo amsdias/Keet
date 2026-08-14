@@ -263,9 +263,19 @@ pub fn print_status_minimal(
                 "  {cell}{g}{mid}{rule}│{rst} {right}",
                 g = " ".repeat(gap), rule = p.rule, rst = p.reset,
             );
-            // A placed image must not be erased-to-EOL; the cells are blanked by
-            // explicit padding instead.
-            if show_cover && sticky { w.line_raw(&line); } else { w.line(&line); }
+            if show_cover && sticky {
+                // FrameWriter::line erases from the START of the row, which
+                // would wipe the placed image — hence line_raw. But without any
+                // erase, a longer line drawn earlier survives past this one's
+                // end: coming back from the playlist view left the tail of its
+                // TIME column stranded beside SIGNAL.
+                //
+                // Erase from the END instead. The cursor is past the image by
+                // then, so this clears only the unused tail of the row.
+                w.line_raw(&format!("{line}\x1B[K"));
+            } else {
+                w.line(&line);
+            }
         }
     } else {
         ui.cover_block_intact = false;
