@@ -1313,7 +1313,10 @@ pub fn render_spectrogram_analysis(analyser: &VizAnalyser, width: usize, log_axi
         static LAST_EMIT: RefCell<(u64, usize, bool, usize)> =
             const { RefCell::new((u64::MAX, 0, false, 0)) };
     }
-    let cols = width.saturating_sub(4).clamp(8, 320);
+    // Frequency legend down the left edge; costs cells the image would
+    // otherwise use, and drops out entirely in narrow terminals.
+    let (gutter, gutter_w) = analysis_gutter(width, rows, log_axis, analyser.sample_rate as f32);
+    let cols = analysis_cols_for(width, gutter_w);
     let gen = analyser.spectro_last_gen;
     let key = (gen, width, log_axis, rows);
     let sixel = analysis_needs_raw_lines();
@@ -1374,7 +1377,10 @@ pub fn render_spectrogram_analysis(analyser: &VizAnalyser, width: usize, log_axi
         let mut lines = if image_geom.is_some() && sixel {
             // Fixed-palette indexed sixel — no quantizer, no shimmer.
             for lv in levels.iter_mut() { *lv >>= 1; }
-            crate::cover::render_viz_sixel_indexed(levels, analysis_sixel_palette(), w, h, cols as u32, rows as u32)
+            let g = crate::cover::Gutter { lines: &gutter, width: gutter_w as u32 };
+            crate::cover::render_viz_sixel_indexed(
+                levels, analysis_sixel_palette(), w, h, cols as u32, rows as u32, g,
+            )
         } else {
             RGB_BUF.with(|cell| {
                 let mut guard = cell.borrow_mut();
@@ -1387,6 +1393,15 @@ pub fn render_spectrogram_analysis(analyser: &VizAnalyser, width: usize, log_axi
                 }
             })
         };
+        // Sixel weaves the gutter in itself — its self-erase pass would wipe a
+        // plain prefix off row 0 (see cover::viz_sixel_lines). Kitty places the
+        // image at the cursor and half-block is ordinary text, so both just
+        // take the legend as a prefix.
+        if gutter_w > 0 && !(image_geom.is_some() && sixel) {
+            for (line, g) in lines.iter_mut().zip(gutter.iter()) {
+                line.insert_str(0, g);
+            }
+        }
         for line in lines.iter_mut() { line.insert_str(0, "  "); }
         lines
     });
@@ -1512,15 +1527,166 @@ fn analysis_row_to_bin_linear(row: usize, rows: usize, nbins: usize) -> usize {
     ((frac * (nbins - 1) as f32).round() as usize).min(nbins - 1)
 }
 
+/// Bottom of the log frequency axis. Below this the FFT has no resolution to
+/// speak of and the rows would all collapse onto bin 0.
+const SPECTRO_LOG_F_MIN: f32 = 30.0;
+
 /// Map a display row to an FFT bin, logarithmic in Hz over [F_MIN, Nyquist].
 fn analysis_row_to_bin_log(row: usize, rows: usize, nbins: usize, sample_rate: f32) -> usize {
-    const F_MIN: f32 = 30.0;
     if rows <= 1 || nbins == 0 { return 0; }
-    let nyquist = sample_rate * 0.5;
-    let bin_hz = nyquist / (nbins - 1).max(1) as f32;
-    let frac = (rows - 1 - row) as f32 / (rows - 1) as f32; // 0 bottom, 1 top
-    let f = F_MIN * (nyquist / F_MIN).powf(frac);
+    let bin_hz = (sample_rate * 0.5) / (nbins - 1).max(1) as f32;
+    let f = analysis_row_freq(row, rows, true, sample_rate);
     ((f / bin_hz).round() as usize).min(nbins - 1)
+}
+
+// --- frequency gutter --------------------------------------------------------
+//
+// A vertical axis legend down the left edge of the analysis spectrogram. The
+// image rows carry frequency, so the labels have to sit on the row the renderer
+// actually drew that frequency on: `analysis_row_freq` is the exact inverse of
+// the two row->bin maps above, pinned by a test that round-trips both.
+//
+// Which ladder gets used follows the axis, because the axes differ in kind, not
+// just scale. Log spacing makes octaves evenly spaced, so it carries note names
+// (C1, C2, ... - what the {B} "Dots" axis is *for*). Linear spacing crushes
+// every musical pitch into the bottom rows, so it carries plain Hz instead.
+
+/// Narrowest the gutter ever gets: a 3-char label plus the rule glyph. Every
+/// label fits 3 chars at ordinary rates; only the linear ladder above 100 kHz
+/// (192/384 kHz hardware) needs a fourth, and then the field widens to suit.
+const GUTTER_W: usize = 4;
+/// Terminal width below which the gutter is dropped, so narrow windows spend
+/// their columns on the image. Matches the Minimal theme's panel breakpoints.
+const GUTTER_MIN_TERM_W: usize = 60;
+
+/// Image cells at this terminal width, once the 2-cell left indent, the right
+/// margin and the frequency gutter are taken out. The block must never exceed
+/// the window: a sixel image overflowing its reserved cells triggers auto-scroll
+/// on every frame, so the gutter narrows the image rather than pushing it out.
+fn analysis_cols_for(term_w: usize, gutter_w: usize) -> usize {
+    term_w.saturating_sub(4 + gutter_w).clamp(8, 320)
+}
+
+/// Frequency drawn on display row `row` (0 = top = highest). Exact inverse of
+/// `analysis_row_to_bin_linear` / `analysis_row_to_bin_log`.
+fn analysis_row_freq(row: usize, rows: usize, log_axis: bool, sample_rate: f32) -> f32 {
+    let nyquist = sample_rate * 0.5;
+    if rows <= 1 { return nyquist; }
+    let frac = (rows - 1 - row) as f32 / (rows - 1) as f32; // 0 bottom, 1 top
+    if log_axis {
+        SPECTRO_LOG_F_MIN * (nyquist / SPECTRO_LOG_F_MIN).powf(frac)
+    } else {
+        frac * nyquist
+    }
+}
+
+/// Frequency of C in octave `n`, scientific pitch notation (A4 = 440 Hz).
+/// C4 is middle C at 261.63 Hz; MIDI note number for Cn is 12*(n+1).
+fn c_octave_hz(n: i32) -> f32 {
+    440.0 * 2f32.powf(((12 * (n + 1)) as f32 - 69.0) / 12.0)
+}
+
+/// Round `target` up or down to the nearest 1/2/5 x 10^n value, so a linear
+/// ladder lands on readable numbers instead of 4800 Hz steps.
+fn nice_step(target: f32) -> f32 {
+    if target <= 0.0 { return 1.0; }
+    let base = 10f32.powf(target.log10().floor());
+    let m = target / base;
+    let mult = if m <= 1.5 { 1.0 } else if m <= 3.5 { 2.0 } else if m <= 7.5 { 5.0 } else { 10.0 };
+    mult * base
+}
+
+/// Format a frequency for the gutter, 3 chars max: "500", "2k", "20k".
+fn fmt_gutter_hz(f: f32) -> String {
+    let hz = f.round() as i64;
+    if hz < 1000 { format!("{hz}") } else { format!("{}k", hz / 1000) }
+}
+
+/// Candidate `(frequency, label)` marks for the axis, ascending.
+fn gutter_ladder(log_axis: bool, sample_rate: f32) -> Vec<(f32, String)> {
+    let nyquist = sample_rate * 0.5;
+    if nyquist < SPECTRO_LOG_F_MIN {
+        return Vec::new();
+    }
+    if log_axis {
+        // Octave anchors. C0 (16.35 Hz) sits below the axis floor, so the
+        // ladder naturally starts at C1 and runs until it passes Nyquist.
+        (0..12)
+            .map(|n| (c_octave_hz(n), format!("C{n}")))
+            .filter(|(f, _)| *f >= SPECTRO_LOG_F_MIN && *f <= nyquist)
+            .collect()
+    } else {
+        // Aim for roughly six marks across the axis, snapped to round numbers.
+        let step = nice_step(nyquist / 5.0);
+        let mut out = Vec::new();
+        let mut f = 0.0;
+        while f <= nyquist {
+            out.push((f, fmt_gutter_hz(f)));
+            f += step;
+        }
+        out
+    }
+}
+
+/// Place the ladder's marks on rows: one label per row, each on the row whose
+/// drawn frequency is nearest. A mark whose row is already taken is dropped
+/// rather than overwriting - at 16 rows the ladder can out-number the rows.
+fn gutter_labels(rows: usize, log_axis: bool, sample_rate: f32) -> Vec<Option<String>> {
+    let mut out = vec![None; rows];
+    if rows == 0 {
+        return out;
+    }
+    // Distance in the axis's own metric, so "nearest" means nearest as drawn.
+    let pos = |f: f32| if log_axis { f.max(1e-6).log2() } else { f };
+    for (f, text) in gutter_ladder(log_axis, sample_rate) {
+        let target = pos(f);
+        let best = (0..rows).min_by(|&a, &b| {
+            let da = (pos(analysis_row_freq(a, rows, log_axis, sample_rate)) - target).abs();
+            let db = (pos(analysis_row_freq(b, rows, log_axis, sample_rate)) - target).abs();
+            da.total_cmp(&db)
+        });
+        if let Some(row) = best {
+            if out[row].is_none() {
+                out[row] = Some(text);
+            }
+        }
+    }
+    out
+}
+
+/// Build the gutter for a block: one dim string per row, plus the visible cell
+/// width they all share. Returns `(vec![], 0)` when the terminal is too narrow
+/// to spend the columns. The label field sizes itself to its widest member so
+/// a 4-char label (150k, on 384 kHz hardware) widens the column instead of
+/// overflowing it; the width is returned rather than assumed because the image
+/// geometry and the sixel cursor arithmetic both have to agree with it.
+///
+/// Labelled rows get a tick on the rule so the eye can follow the label across.
+fn analysis_gutter(
+    term_w: usize,
+    rows: usize,
+    log_axis: bool,
+    sample_rate: f32,
+) -> (Vec<String>, usize) {
+    if term_w < GUTTER_MIN_TERM_W {
+        return (Vec::new(), 0);
+    }
+    let labels = gutter_labels(rows, log_axis, sample_rate);
+    let label_w = labels
+        .iter()
+        .flatten()
+        .map(|t| t.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(GUTTER_W - 1);
+    let lines = labels
+        .into_iter()
+        .map(|label| match label {
+            Some(text) => format!("{C_DIM}{text:>label_w$}\u{2524}{C_RESET}"),
+            None => format!("{C_DIM}{:label_w$}\u{2502}{C_RESET}", ""),
+        })
+        .collect();
+    (lines, label_w + 1)
 }
 
 /// Perceptual "magma"-ish ramp: black -> purple -> red -> orange -> yellow -> white.
@@ -1745,5 +1911,200 @@ mod analysis_tests {
         assert!(sum(hi) > 600);
         let _ = analysis_colormap(-1.0);
         let _ = analysis_colormap(2.0);
+    }
+
+    // --- frequency gutter -------------------------------------------------
+
+    #[test]
+    fn row_freq_spans_the_axis_endpoints() {
+        let sr = 48000.0;
+        // Bottom row is the axis floor, top row is Nyquist, on both axes.
+        assert!((analysis_row_freq(15, 16, true, sr) - SPECTRO_LOG_F_MIN).abs() < 0.01);
+        assert!((analysis_row_freq(0, 16, true, sr) - 24000.0).abs() < 1.0);
+        assert!((analysis_row_freq(15, 16, false, sr) - 0.0).abs() < 0.01);
+        assert!((analysis_row_freq(0, 16, false, sr) - 24000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn row_freq_rises_from_bottom_row_to_top_row() {
+        for log_axis in [true, false] {
+            let mut prev = f32::INFINITY;
+            for row in 0..16 {
+                let f = analysis_row_freq(row, 16, log_axis, 48000.0);
+                assert!(f < prev, "row {row} freq {f} not below row {}", row - 1);
+                prev = f;
+            }
+        }
+    }
+
+    #[test]
+    fn row_freq_agrees_with_the_bin_map_it_inverts() {
+        // The gutter labels a row with the frequency the image actually drew
+        // there, so the inverse must land on the same bin the renderer picked.
+        let (nbins, rows, sr) = (2049usize, 16usize, 48000.0f32);
+        let bin_hz = (sr * 0.5) / (nbins - 1) as f32;
+        for row in 0..rows {
+            for log_axis in [true, false] {
+                let f = analysis_row_freq(row, rows, log_axis, sr);
+                let bin = if log_axis {
+                    analysis_row_to_bin_log(row, rows, nbins, sr)
+                } else {
+                    analysis_row_to_bin_linear(row, rows, nbins)
+                };
+                assert_eq!(bin, ((f / bin_hz).round() as usize).min(nbins - 1));
+            }
+        }
+    }
+
+    #[test]
+    fn c_octaves_match_scientific_pitch() {
+        assert!((c_octave_hz(4) - 261.626).abs() < 0.01);
+        assert!((c_octave_hz(0) - 16.352).abs() < 0.01);
+        assert!((c_octave_hz(8) - 4186.01).abs() < 0.1);
+    }
+
+    #[test]
+    fn log_axis_gutter_labels_octaves_bottom_up() {
+        let labels = gutter_labels(16, true, 48000.0);
+        assert_eq!(labels.len(), 16);
+        let placed: Vec<(usize, String)> = labels
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| l.clone().map(|t| (i, t)))
+            .collect();
+        assert!(placed.len() >= 6, "expected several octave marks, got {placed:?}");
+        // Every label is a C octave, and octave number falls as the row index
+        // rises (row 0 = top = highest frequency).
+        let mut prev_octave = i32::MAX;
+        for (_, text) in &placed {
+            let n: i32 = text.trim_start_matches('C').parse().expect("Cn label");
+            assert!(n < prev_octave, "octaves out of order: {placed:?}");
+            prev_octave = n;
+        }
+        // C4 (middle C, 262 Hz) must be somewhere on a 30 Hz..24 kHz axis.
+        assert!(placed.iter().any(|(_, t)| t == "C4"), "{placed:?}");
+    }
+
+    #[test]
+    fn linear_axis_gutter_labels_hz_not_notes() {
+        let labels = gutter_labels(16, false, 48000.0);
+        let placed: Vec<String> = labels.iter().flatten().cloned().collect();
+        assert!(placed.len() >= 4, "{placed:?}");
+        assert!(placed.iter().all(|t| !t.starts_with('C')), "{placed:?}");
+        // Bottom row is DC on the linear axis.
+        assert_eq!(labels[15].as_deref(), Some("0"));
+        assert!(placed.iter().any(|t| t.ends_with('k')), "{placed:?}");
+    }
+
+    #[test]
+    fn gutter_rows_all_match_the_reported_width() {
+        // The reported width drives the image geometry and the sixel cursor
+        // arithmetic, so a row that disagrees with it shoves the image sideways.
+        for sr in [8000.0, 44100.0, 48000.0, 96000.0, 192000.0, 384000.0] {
+            for log_axis in [true, false] {
+                for rows in 4..=16 {
+                    let (lines, w) = analysis_gutter(120, rows, log_axis, sr);
+                    assert_eq!(lines.len(), rows);
+                    assert!(w >= GUTTER_W, "gutter narrower than the floor at sr {sr}");
+                    for line in &lines {
+                        assert_eq!(
+                            crate::ansi::visible_len(line),
+                            w,
+                            "row width != reported (sr {sr}, log {log_axis}): {line:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gutter_widens_for_labels_that_outgrow_the_field() {
+        // Ordinary rates stay at the 4-cell floor...
+        assert_eq!(analysis_gutter(120, 16, false, 48000.0).1, GUTTER_W);
+        assert_eq!(analysis_gutter(120, 16, true, 192000.0).1, GUTTER_W);
+        // ...while the linear ladder past 100 kHz needs one cell more.
+        let (_, w) = analysis_gutter(120, 16, false, 384000.0);
+        assert_eq!(w, GUTTER_W + 1);
+    }
+
+    #[test]
+    fn gutter_labels_stay_inside_the_displayed_range() {
+        for sr in [44100.0, 48000.0, 192000.0] {
+            for log_axis in [true, false] {
+                let rows = 16;
+                let labels = gutter_labels(rows, log_axis, sr);
+                for (row, _) in labels.iter().enumerate().filter(|(_, l)| l.is_some()) {
+                    let f = analysis_row_freq(row, rows, log_axis, sr);
+                    assert!(f <= sr * 0.5 + 1.0, "label above Nyquist at row {row}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gutter_labels_never_collide_on_a_row() {
+        // One label per row; a crowded ladder drops candidates rather than
+        // overwriting, so the count can never exceed the row count.
+        for rows in 1..=16 {
+            let labels = gutter_labels(rows, true, 192000.0);
+            assert_eq!(labels.len(), rows);
+            assert!(labels.iter().flatten().count() <= rows);
+        }
+    }
+
+    #[test]
+    fn gutter_narrows_the_image_instead_of_overflowing_the_window() {
+        // Indent + gutter + image + right margin must fit the terminal at every
+        // width the gutter is shown at. Overflow is the sixel auto-scroll storm.
+        for term_w in 12..=300 {
+            let (_, gutter_w) = analysis_gutter(term_w, 16, true, 48000.0);
+            let cols = analysis_cols_for(term_w, gutter_w);
+            assert!(
+                2 + gutter_w + cols + 2 <= term_w,
+                "block overflows at term_w {term_w}: gutter {gutter_w} + image {cols}"
+            );
+        }
+    }
+
+    #[test]
+    fn gutter_costs_exactly_its_width_in_image_cells() {
+        // Turning the legend on must take cells from the image, not add them.
+        let bare = analysis_cols_for(120, 0);
+        let (_, gutter_w) = analysis_gutter(120, 16, true, 48000.0);
+        assert_eq!(analysis_cols_for(120, gutter_w), bare - gutter_w);
+    }
+
+    #[test]
+    fn gutter_is_dropped_in_narrow_terminals() {
+        assert_eq!(analysis_gutter(120, 16, true, 48000.0).1, GUTTER_W);
+        assert_eq!(analysis_gutter(GUTTER_MIN_TERM_W, 16, true, 48000.0).1, GUTTER_W);
+        let (lines, w) = analysis_gutter(GUTTER_MIN_TERM_W - 1, 16, true, 48000.0);
+        assert_eq!(w, 0);
+        assert!(lines.is_empty());
+        assert_eq!(analysis_gutter(20, 16, true, 48000.0).1, 0);
+    }
+
+    #[test]
+    fn gutter_survives_a_silent_analyser() {
+        // Before the first packet the sample rate is 0: keep the column's
+        // width stable (layout must not shift) but print no bogus labels.
+        let (lines, w) = analysis_gutter(120, 16, true, 0.0);
+        assert_eq!(lines.len(), 16);
+        assert_eq!(w, GUTTER_W);
+        for line in &lines {
+            assert_eq!(crate::ansi::visible_len(line), GUTTER_W);
+        }
+        assert!(gutter_labels(16, true, 0.0).iter().all(|l| l.is_none()));
+        assert!(gutter_labels(16, false, 0.0).iter().all(|l| l.is_none()));
+    }
+
+    #[test]
+    fn nice_step_snaps_to_the_one_two_five_ladder() {
+        assert_eq!(nice_step(4800.0), 5000.0);
+        assert_eq!(nice_step(19200.0), 20000.0);
+        assert_eq!(nice_step(1.2), 1.0);
+        assert_eq!(nice_step(3.0), 2.0);
+        assert_eq!(nice_step(8.0), 10.0);
     }
 }

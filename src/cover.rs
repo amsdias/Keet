@@ -519,7 +519,7 @@ pub fn render_image_block(rgb: &[u8], w: u32, h: u32, cols: u32, rows: u32) -> V
                 ..icy_sixel::EncodeOptions::default()
             };
             match icy_sixel::sixel_encode(&rgba, w as usize, h as usize, &opts) {
-                Ok(data) => viz_sixel_lines(&data, cols, rows),
+                Ok(data) => viz_sixel_lines(&data, cols, rows, Gutter::NONE),
                 Err(_) => blank(),
             }
         }
@@ -754,6 +754,20 @@ pub(crate) fn sixel_encode_indexed(indices: &[u8], palette: &[(u8, u8, u8)], w: 
 
 /// Sixel viz block from pre-indexed pixels and a fixed palette — the
 /// shimmer-free path for the analysis spectrogram (see sixel_encode_indexed).
+/// A per-row text column drawn to the LEFT of a viz image — the analysis
+/// spectrogram's frequency legend. Every entry must occupy exactly `width`
+/// cells: the renderer advances the cursor by that count rather than measuring,
+/// so a row that disagrees shifts the image on that row alone.
+pub(crate) struct Gutter<'a> {
+    pub(crate) lines: &'a [String],
+    pub(crate) width: u32,
+}
+
+impl Gutter<'_> {
+    /// No legend — the image starts at the left edge of the block.
+    pub(crate) const NONE: Gutter<'static> = Gutter { lines: &[], width: 0 };
+}
+
 pub(crate) fn render_viz_sixel_indexed(
     indices: &[u8],
     palette: &[(u8, u8, u8)],
@@ -761,12 +775,13 @@ pub(crate) fn render_viz_sixel_indexed(
     h: usize,
     cols: u32,
     rows: u32,
+    gutter: Gutter<'_>,
 ) -> Vec<String> {
     let data = sixel_encode_indexed(indices, palette, w, h);
-    viz_sixel_lines(&data, cols, rows)
+    viz_sixel_lines(&data, cols, rows, gutter)
 }
 
-fn viz_sixel_lines(data: &str, cols: u32, rows: u32) -> Vec<String> {
+fn viz_sixel_lines(data: &str, cols: u32, rows: u32, gutter: Gutter<'_>) -> Vec<String> {
     // Sixel pixels are ordinary cell content — no Kitty-style image layer or
     // id-replacement. Two consequences: (1) the block must clear ITSELF (one
     // erase pass over all rows here, before painting) because stale cells are
@@ -775,19 +790,45 @@ fn viz_sixel_lines(data: &str, cols: u32, rows: u32) -> Vec<String> {
     // row's slice of the image (seen on Windows Terminal: 16-row image reduced
     // to a 1-row strip). See viz::analysis_needs_raw_lines.
     // SCORC (ESC[u) restores without consuming the save, so it's used twice.
+    //
+    // That self-erase is also why the gutter can't simply be prefixed to these
+    // lines the way every other protocol takes it: ESC[2K wipes the WHOLE row,
+    // so text printed before the pass is gone by the time the image lands. Row
+    // 0's gutter is therefore emitted after the paint (cursor rewound with
+    // ESC[u), and the image is pushed right by a cursor-forward instead.
+    // Rows 1..N are separate lines printed later, so they just carry their own.
+    let skip_gutter = |s: &mut String| {
+        // CSI 0 C still moves one column, so an absent gutter must emit nothing.
+        if gutter.width > 0 {
+            let _ = write!(s, "\x1B[{}C", gutter.width);
+        }
+    };
     let mut first = String::with_capacity(data.len() + 8 * rows as usize + 16);
     first.push_str("\x1B[s");
     for _ in 0..rows {
         first.push_str("\x1B[2K\x1B[B");
     }
     first.push_str("\x1B[u");
+    skip_gutter(&mut first);
     first.push_str(data);
     first.push_str("\x1B[u");
+    match gutter.lines.first() {
+        Some(g) => first.push_str(g),
+        None => skip_gutter(&mut first),
+    }
     let _ = write!(first, "\x1B[{}C", cols);
     let skip = format!("\x1B[{}C", cols);
     let mut lines = Vec::with_capacity(rows as usize);
     lines.push(first);
-    for _ in 1..rows { lines.push(skip.clone()); }
+    for row in 1..rows as usize {
+        let mut line = String::with_capacity(skip.len() + gutter.width as usize + 16);
+        match gutter.lines.get(row) {
+            Some(g) => line.push_str(g),
+            None => skip_gutter(&mut line),
+        }
+        line.push_str(&skip);
+        lines.push(line);
+    }
     lines
 }
 
@@ -1060,7 +1101,7 @@ mod viz_sixel_tests {
         // its rows up front, inside the same line as the transmit — if the
         // caller erased rows 2..N after this line painted them, the image
         // would be wiped down to a 1-row strip (observed on Windows Terminal).
-        let lines = viz_sixel_lines("SIXELDATA", 120, 16);
+        let lines = viz_sixel_lines("SIXELDATA", 120, 16, Gutter::NONE);
         assert_eq!(lines.len(), 16);
         let erase_pass = "\x1B[2K\x1B[B".repeat(16);
         let want_prefix = format!("\x1B[s{}\x1B[u", erase_pass);
@@ -1127,10 +1168,50 @@ mod viz_sixel_tests {
     }
 
     #[test]
+    fn viz_sixel_gutter_is_drawn_after_the_erase_pass() {
+        // The block erases all its rows before painting, so a legend prefixed
+        // to row 0 the ordinary way would be wiped by that pass. Row 0's
+        // gutter has to come after the paint, with the image pushed right by a
+        // cursor-forward instead.
+        let gutter: Vec<String> = (0..4).map(|i| format!("{i:>3}|")).collect();
+        let lines = viz_sixel_lines("SIXELDATA", 80, 4, Gutter { lines: &gutter, width: 4 });
+        assert_eq!(lines.len(), 4);
+        let erase_pass = "\x1B[2K\x1B[B".repeat(4);
+        assert_eq!(
+            lines[0],
+            format!("\x1B[s{erase_pass}\x1B[u\x1B[4CSIXELDATA\x1B[u  0|\x1B[80C")
+        );
+        // No gutter text may appear before the erase pass finishes.
+        let paint_start = lines[0].find("SIXELDATA").unwrap();
+        assert!(!lines[0][..paint_start].contains("0|"));
+    }
+
+    #[test]
+    fn viz_sixel_gutter_rows_advance_past_gutter_and_image() {
+        // Each row must leave the cursor at the same column, or the next
+        // frame's lines start at staggered offsets.
+        let gutter: Vec<String> = (0..4).map(|i| format!("{i:>3}|")).collect();
+        let lines = viz_sixel_lines("SIXELDATA", 80, 4, Gutter { lines: &gutter, width: 4 });
+        for (row, line) in lines.iter().enumerate().skip(1) {
+            assert_eq!(*line, format!("{:>3}|\x1B[80C", row));
+        }
+    }
+
+    #[test]
+    fn viz_sixel_without_gutter_emits_no_zero_width_cursor_move() {
+        // CSI 0 C moves one column on most terminals — a stray one would shear
+        // the image one cell right of the legend-free block.
+        let lines = viz_sixel_lines("SIXELDATA", 80, 4, Gutter::NONE);
+        for line in &lines {
+            assert!(!line.contains("\x1B[0C"), "zero-width cursor move in {line:?}");
+        }
+    }
+
+    #[test]
     fn viz_sixel_skip_lines_write_nothing_destructive() {
         // Rows 2..N must be pure cursor-right skips: no erase, no spaces —
         // anything that touches the cells wipes that row's slice of the image.
-        let lines = viz_sixel_lines("SIXELDATA", 80, 4);
+        let lines = viz_sixel_lines("SIXELDATA", 80, 4, Gutter::NONE);
         for line in &lines[1..] {
             assert_eq!(line, "\x1B[80C");
         }
