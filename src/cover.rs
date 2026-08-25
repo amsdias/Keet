@@ -510,7 +510,7 @@ pub fn render_image_block(rgb: &[u8], w: u32, h: u32, cols: u32, rows: u32) -> V
             // serves hypothetical future RGB viz images on sixel terminals.
             // icy_sixel wants RGBA; expand the borrowed RGB without an RgbImage copy.
             let mut rgba = Vec::with_capacity(rgb.len() / 3 * 4);
-            for px in rgb.chunks_exact(3) {
+            for px in rgb.as_chunks::<3>().0 {
                 rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
             }
             let opts = icy_sixel::EncodeOptions {

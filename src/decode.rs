@@ -45,7 +45,7 @@ fn interleaved_to_stereo(input: &[f32], channels: usize, out: &mut Vec<f32>) {
         4 => {
             // Quad: FL FR BL BR — rears fold into their own sides.
             out.reserve(input.len() / 2);
-            for frame in input.chunks_exact(4) {
+            for frame in input.as_chunks::<4>().0 {
                 out.push(frame[0] + G * frame[2]);
                 out.push(frame[1] + G * frame[3]);
             }
