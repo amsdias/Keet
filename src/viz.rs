@@ -1239,7 +1239,7 @@ pub fn render_spectrogram(analyser: &VizAnalyser, style: VizStyle, width: usize)
 /// Fill `rgb` (resized to width_px·height_px·3, reused across frames) with the
 /// analysis-spectrogram image: x = time (newest right), y = frequency (linear or
 /// log), pixel = colormap(dB in contrast window). `log_axis` selects the freq map.
-fn analysis_levels_into(out: &mut Vec<u8>, analyser: &VizAnalyser, width_px: usize, height_px: usize, log_axis: bool, logical_cols: usize) {
+fn analysis_levels_into(out: &mut Vec<u8>, analyser: &VizAnalyser, width_px: usize, height_px: usize, log_axis: bool, logical_cols: usize, left_px: usize) {
     out.clear();
     out.resize(width_px * height_px, 0);
     let hist = &analyser.spectro_raw_history;
@@ -1265,14 +1265,17 @@ fn analysis_levels_into(out: &mut Vec<u8>, analyser: &VizAnalyser, width_px: usi
     let filled = n.min(logical_cols);
     let blank_slots = logical_cols - filled;
     let oldest_shown = n - filled;
-    for x in 0..width_px {
-        let slot = x * logical_cols / width_px.max(1);
+    // The leftmost `left_px` columns are reserved for the frequency legend and
+    // stay at the floor; the timeline is mapped across what remains.
+    let content_w = width_px.saturating_sub(left_px);
+    for x in 0..content_w {
+        let slot = x * logical_cols / content_w.max(1);
         if slot < blank_slots { continue; }
         let col = &hist[oldest_shown + (slot - blank_slots)];
         for (y, &bin) in row_bin.iter().enumerate() {
             let db = col.get(bin).copied().unwrap_or(SPECTRO_ANALYSIS_FLOOR_DB);
             let t = analysis_intensity(db, SPECTRO_ANALYSIS_FLOOR_DB, SPECTRO_ANALYSIS_CEIL_DB);
-            out[y * width_px + x] = (t * 255.0).round() as u8;
+            out[y * width_px + left_px + x] = (t * 255.0).round() as u8;
         }
     }
 }
@@ -1292,9 +1295,21 @@ fn colorize_levels(levels: &[u8], rgb: &mut Vec<u8>) {
 /// uniformly, so intensity `level >> 1` is exactly the palette index. A fixed
 /// palette keeps unchanged pixels byte-identical between emissions — the
 /// per-frame re-quantization it replaces made the scrolling image shimmer.
+/// Palette slot for the in-image legend: one past the 128 colormap entries,
+/// so `level >> 1` can never collide with it.
+const LEGEND_IDX: u8 = 128;
+const LEGEND_RGB: (u8, u8, u8) = (190, 190, 190);
+
 fn analysis_sixel_palette() -> &'static [(u8, u8, u8)] {
     static PALETTE: OnceLock<Vec<(u8, u8, u8)>> = OnceLock::new();
-    PALETTE.get_or_init(|| (0..128).map(|i| analysis_colormap(i as f32 / 127.0)).collect())
+    // 128 colormap entries (index = level >> 1) plus one for the in-image
+    // frequency legend, which must not be any shade the spectrogram can paint.
+    PALETTE.get_or_init(|| {
+        let mut p: Vec<(u8, u8, u8)> =
+            (0..128).map(|i| analysis_colormap(i as f32 / 127.0)).collect();
+        p.push(LEGEND_RGB);
+        p
+    })
 }
 
 pub fn render_spectrogram_analysis(analyser: &VizAnalyser, width: usize, log_axis: bool, paused: bool, rows: usize, force: bool) -> Vec<String> {
@@ -1313,13 +1328,22 @@ pub fn render_spectrogram_analysis(analyser: &VizAnalyser, width: usize, log_axi
         static LAST_EMIT: RefCell<(u64, usize, bool, usize)> =
             const { RefCell::new((u64::MAX, 0, false, 0)) };
     }
-    // Frequency legend down the left edge; costs cells the image would
-    // otherwise use, and drops out entirely in narrow terminals.
-    let (gutter, gutter_w) = analysis_gutter(width, rows, log_axis, analyser.sample_rate as f32);
+    let sixel = analysis_needs_raw_lines();
+    let protocol = crate::cover::detect_protocol();
+    // Frequency legend. Both image protocols draw it INTO the image: cells and
+    // pixels are different coordinate systems, and a legend snapped to cell
+    // rows clumps badly — roughly 1.1 rows per octave means integer rounding
+    // bunches C1/C2/C3 together and then skips a row. In pixel space an octave
+    // is ~15 px and every label lands on its own frequency. Only half-block,
+    // which really is cells, takes the legend as prefix text.
+    let (gutter, gutter_w) = if protocol_draws_image_legend(protocol) {
+        (Vec::new(), 0)
+    } else {
+        analysis_gutter(width, rows, log_axis, analyser.sample_rate as f32)
+    };
     let cols = analysis_cols_for(width, gutter_w);
     let gen = analyser.spectro_last_gen;
     let key = (gen, width, log_axis, rows);
-    let sixel = analysis_needs_raw_lines();
 
     // Sixel emit-on-change: the image only changes when a new hop lands
     // (gen bump) or the geometry/axis changes. Re-encoding + re-sending the
@@ -1352,7 +1376,7 @@ pub fn render_spectrogram_analysis(analyser: &VizAnalyser, width: usize, log_axi
     // Protocol-dependent geometry: Some((w, h)) renders a pixel image that big,
     // None falls back to half-block truecolor (text, so it redraws cleanly and
     // fills the width). Per-protocol rationale lives in analysis_image_geometry.
-    let image_geom = analysis_image_geometry(crate::cover::detect_protocol(), cols, rows);
+    let image_geom = analysis_image_geometry(protocol, cols, rows);
     // Half-block: 1 px/col, 2 px-rows/char row, sized directly to the cell area.
     let (w, h) = image_geom.unwrap_or((cols, rows * 2));
     let lines = LEVELS_BUF.with(|lcell| {
@@ -1363,23 +1387,47 @@ pub fn render_spectrogram_analysis(analyser: &VizAnalyser, width: usize, log_axi
         // the full 512-hop history (terminal scales smoothly). Sixel shows
         // the most recent w/k hops at exactly k px each (w is a multiple of
         // k, see analysis_image_geometry) — uniform hop widths, no shimmer.
-        let logical_cols = if image_geom.is_some() {
-            if sixel {
-                let k = w.div_ceil(SPECTRO_ANALYSIS_COLS).max(1);
-                w / k
-            } else {
-                SPECTRO_ANALYSIS_COLS
-            }
+        // Sixel reserves a pixel strip on the left for the legend, then trims
+        // what remains to a whole number of px-per-hop so scrolling features
+        // keep a uniform width (see analysis_image_geometry). The trim's
+        // remainder is absorbed into the strip, which is only background.
+        let scale = legend_scale(h, rows);
+        let strip = if image_geom.is_some() {
+            legend_strip_w(h, log_axis, analyser.sample_rate as f32, scale)
         } else {
-            w
+            0
         };
-        analysis_levels_into(levels, analyser, w, h, log_axis, logical_cols);
+        let (left_px, logical_cols) = if image_geom.is_some() && sixel {
+            // Sixel is 1:1 pixels, so what remains after the strip is trimmed
+            // to a whole number of px-per-hop (uniform hop widths, no shimmer);
+            // the trim remainder is absorbed into the strip, which is only
+            // background. Kitty scales its image, so it needs no such trim.
+            let content = w.saturating_sub(strip);
+            let k = content.div_ceil(SPECTRO_ANALYSIS_COLS).max(1);
+            let content = (content / k) * k;
+            (w - content, content / k)
+        } else if image_geom.is_some() {
+            (strip, SPECTRO_ANALYSIS_COLS)
+        } else {
+            (0, w)
+        };
+        analysis_levels_into(levels, analyser, w, h, log_axis, logical_cols, left_px);
         let mut lines = if image_geom.is_some() && sixel {
             // Fixed-palette indexed sixel — no quantizer, no shimmer.
             for lv in levels.iter_mut() { *lv >>= 1; }
-            let g = crate::cover::Gutter { lines: &gutter, width: gutter_w as u32 };
+            // Painted into the same pixels as the spectrogram, so the two share
+            // one coordinate space and cannot drift apart.
+            let mut plot = |x: usize, y: usize| {
+                if x < w && y < h {
+                    levels[y * w + x] = LEGEND_IDX;
+                }
+            };
+            draw_pixel_legend(
+                &mut plot, h, left_px, log_axis, analyser.sample_rate as f32, scale,
+            );
             crate::cover::render_viz_sixel_indexed(
-                levels, analysis_sixel_palette(), w, h, cols as u32, rows as u32, g,
+                levels, analysis_sixel_palette(), w, h, cols as u32, rows as u32,
+                crate::cover::Gutter::NONE,
             )
         } else {
             RGB_BUF.with(|cell| {
@@ -1387,6 +1435,19 @@ pub fn render_spectrogram_analysis(analyser: &VizAnalyser, width: usize, log_axi
                 let rgb: &mut Vec<u8> = &mut guard;
                 colorize_levels(levels, rgb);
                 if image_geom.is_some() {
+                    // Drawn after colorising: the legend is a flat colour, not
+                    // a colormap entry, so it must not go through the ramp.
+                    let mut plot = |x: usize, y: usize| {
+                        if x < w && y < h {
+                            let i = (y * w + x) * 3;
+                            rgb[i] = LEGEND_RGB.0;
+                            rgb[i + 1] = LEGEND_RGB.1;
+                            rgb[i + 2] = LEGEND_RGB.2;
+                        }
+                    };
+                    draw_pixel_legend(
+                        &mut plot, h, left_px, log_axis, analyser.sample_rate as f32, scale,
+                    );
                     crate::cover::render_image_block(rgb.as_slice(), w as u32, h as u32, cols as u32, rows as u32)
                 } else {
                     crate::cover::render_half_block_public(w as u32, h as u32, rgb.as_slice())
@@ -1467,13 +1528,29 @@ pub fn analysis_needs_raw_lines() -> bool {
 /// `Some((w, h))` = render the image that big; `None` = half-block fallback.
 /// Sixel sizing uses the probed terminal cell metrics when available
 /// (pixel-exact block fill), else the conservative 8×16 px floor.
+/// Whether this protocol renders a pixel image, and so carries the frequency
+/// legend INSIDE it rather than as prefix text. Must agree with
+/// `analysis_image_geometry_with` returning `Some` — a mismatch either strands
+/// the legend outside the image or reserves cells nothing draws into.
+fn protocol_draws_image_legend(protocol: crate::cover::GraphicsProtocol) -> bool {
+    use crate::cover::GraphicsProtocol as GP;
+    matches!(protocol, GP::Kitty | GP::Sixel)
+}
+
+/// Assumed terminal cell size in px for Sixel sizing: small enough that the
+/// image cannot spill past its reserved rows on any real terminal.
+const SIXEL_CELL_FLOOR: (usize, usize) = (8, 16);
+
 fn analysis_image_geometry(
     protocol: crate::cover::GraphicsProtocol,
     cols: usize,
     rows: usize,
 ) -> Option<(usize, usize)> {
-    let (cw, ch) = crate::cover::cell_metrics().unwrap_or((8, 16));
-    analysis_image_geometry_with(protocol, cols, rows, (cw as usize, ch as usize))
+    // A conservative floor, never queried. Sixel must not overflow its block
+    // (auto-scroll storm), and underfilling is only cosmetic now that the
+    // frequency legend is drawn inside the image rather than in cells beside
+    // it — nothing depends on knowing the terminal's real cell size.
+    analysis_image_geometry_with(protocol, cols, rows, SIXEL_CELL_FLOOR)
 }
 
 /// Pure core of `analysis_image_geometry`, parameterized on the cell size.
@@ -1488,7 +1565,15 @@ fn analysis_image_geometry_with(
         // Kitty scales the image to the cell box and its id-addressed images
         // survive the per-frame cursor-up redraw as a separate layer: render
         // one pixel column per stored hop (history depth) + oversampled height.
-        GP::Kitty => Some((SPECTRO_ANALYSIS_COLS, rows * 16)),
+        // Kitty scales the image into its cell box, so the image is sized to
+        // that box using the SAME assumed cell as Sixel. Rendering a fixed 512
+        // px width instead made the terminal stretch it much further
+        // horizontally than vertically, and the legend glyphs came out wide
+        // and coarse. Matching the cell aspect keeps the terminal's scale
+        // factor equal in both axes, whatever the real cell size is. The full
+        // hop history is still stretched across the width (logical_cols stays
+        // at SPECTRO_ANALYSIS_COLS), so depth is unchanged.
+        GP::Kitty => Some((cols * cell.0, rows * cell.1)),
         // Sixel renders 1:1 pixels with no scaling. `cell` is the probed cell
         // size (pixel-exact fill) or the conservative 8×16 floor when the
         // CSI 16 t probe got no answer. Overflowing the reserved block is
@@ -1525,6 +1610,140 @@ fn analysis_row_to_bin_linear(row: usize, rows: usize, nbins: usize) -> usize {
     if rows <= 1 || nbins == 0 { return 0; }
     let frac = (rows - 1 - row) as f32 / (rows - 1) as f32; // 0 at bottom, 1 at top
     ((frac * (nbins - 1) as f32).round() as usize).min(nbins - 1)
+}
+
+/// 3x5 bitmaps for the characters the frequency legend uses, one byte per
+/// glyph row with bit 2 as the leftmost pixel. Small, but it is drawn INTO the
+/// spectrogram image rather than printed as terminal text, which is the whole
+/// point: pixels and cells are different coordinate systems, and a legend in
+/// cells can only line up with a pixel image if the terminal's cell size is
+/// known. In the image it shares one coordinate space and cannot drift.
+const GLYPH_W: usize = 3;
+const GLYPH_H: usize = 5;
+
+fn glyph(c: char) -> Option<[u8; GLYPH_H]> {
+    Some(match c {
+        '0' => [0b111, 0b101, 0b101, 0b101, 0b111],
+        '1' => [0b010, 0b110, 0b010, 0b010, 0b111],
+        '2' => [0b111, 0b001, 0b111, 0b100, 0b111],
+        '3' => [0b111, 0b001, 0b111, 0b001, 0b111],
+        '4' => [0b101, 0b101, 0b111, 0b001, 0b001],
+        '5' => [0b111, 0b100, 0b111, 0b001, 0b111],
+        '6' => [0b111, 0b100, 0b111, 0b101, 0b111],
+        '7' => [0b111, 0b001, 0b010, 0b010, 0b010],
+        '8' => [0b111, 0b101, 0b111, 0b101, 0b111],
+        '9' => [0b111, 0b101, 0b111, 0b001, 0b111],
+        'C' => [0b111, 0b100, 0b100, 0b100, 0b111],
+        'k' => [0b100, 0b101, 0b110, 0b101, 0b101],
+        _ => return None,
+    })
+}
+
+/// Width in pixels of `text` rendered at `scale`, including inter-glyph gaps.
+fn label_px_w(text: &str, scale: usize) -> usize {
+    let n = text.chars().count();
+    if n == 0 { return 0; }
+    (n * GLYPH_W + n - 1) * scale
+}
+
+/// Blit `text` at (x, y) = top-left by calling `plot` for each lit pixel.
+/// Indexed (Sixel) and truecolor (Kitty) images differ only in how one pixel
+/// is stored, so the glyph rasterising is shared and each caller supplies a
+/// plotter that clips to its own bounds.
+fn draw_label(plot: &mut impl FnMut(usize, usize), x: usize, y: usize, text: &str, scale: usize) {
+    let mut pen = x;
+    for ch in text.chars() {
+        let Some(rows) = glyph(ch) else { continue };
+        for (gy, bits) in rows.iter().enumerate() {
+            for gx in 0..GLYPH_W {
+                if bits & (1 << (GLYPH_W - 1 - gx)) == 0 {
+                    continue;
+                }
+                for sy in 0..scale {
+                    for sx in 0..scale {
+                        plot(pen + gx * scale + sx, y + gy * scale + sy);
+                    }
+                }
+            }
+        }
+        pen += (GLYPH_W + 1) * scale;
+    }
+}
+
+/// Pixel row (0 = top) where `f` Hz lands on an image `h` pixels tall — the
+/// exact inverse of the row/frequency mapping the spectrogram itself uses.
+fn freq_to_pixel_row(f: f32, h: usize, log_axis: bool, sample_rate: f32) -> usize {
+    if h <= 1 {
+        return 0;
+    }
+    let nyquist = sample_rate * 0.5;
+    if nyquist <= 0.0 {
+        return h - 1;
+    }
+    let frac = if log_axis {
+        if f <= SPECTRO_LOG_F_MIN {
+            0.0
+        } else {
+            (f / SPECTRO_LOG_F_MIN).ln() / (nyquist / SPECTRO_LOG_F_MIN).ln()
+        }
+    } else {
+        f / nyquist
+    };
+    let y = (1.0 - frac.clamp(0.0, 1.0)) * (h - 1) as f32;
+    (y.round() as usize).min(h - 1)
+}
+
+/// Glyph scale for an image `h` px tall covering `rows` cells: big enough to
+/// read, never so tall that consecutive octaves overlap.
+fn legend_scale(h: usize, rows: usize) -> usize {
+    let px_per_row = if rows == 0 { GLYPH_H + 2 } else { h / rows.max(1) };
+    (px_per_row / (GLYPH_H + 2)).clamp(1, 3)
+}
+
+/// Legend ticks as (pixel row, label), thinned so labels cannot overlap.
+/// Built bottom-up: on a log axis the low octaves are the ones worth keeping
+/// when there isn't room for all of them.
+fn pixel_legend(h: usize, log_axis: bool, sample_rate: f32, scale: usize) -> Vec<(usize, String)> {
+    let glyph_h = GLYPH_H * scale;
+    let mut out: Vec<(usize, String)> = Vec::new();
+    let mut last: Option<usize> = None;
+    for (f, text) in gutter_ladder(log_axis, sample_rate) {
+        let y = freq_to_pixel_row(f, h, log_axis, sample_rate);
+        if last.is_some_and(|p| p.abs_diff(y) < glyph_h + 1) {
+            continue;
+        }
+        last = Some(y);
+        out.push((y, text));
+    }
+    out
+}
+
+/// Width in pixels the legend strip needs: widest label, a gap, and the tick.
+fn legend_strip_w(h: usize, log_axis: bool, sample_rate: f32, scale: usize) -> usize {
+    let widest = pixel_legend(h, log_axis, sample_rate, scale)
+        .iter()
+        .map(|(_, t)| label_px_w(t, scale))
+        .max()
+        .unwrap_or(0);
+    if widest == 0 { 0 } else { widest + 2 * scale + scale }
+}
+
+/// Draw the frequency legend into the left `strip_w` px of an indexed image.
+/// Labels are centred on their tick, which sits at the exact pixel row that
+/// frequency occupies in the spectrogram beside it.
+fn draw_pixel_legend(plot: &mut impl FnMut(usize, usize), h: usize, strip_w: usize,
+                     log_axis: bool, sample_rate: f32, scale: usize) {
+    if strip_w == 0 {
+        return;
+    }
+    let (glyph_h, tick) = (GLYPH_H * scale, 2 * scale);
+    for (y, text) in pixel_legend(h, log_axis, sample_rate, scale) {
+        let top = y.saturating_sub(glyph_h / 2).min(h.saturating_sub(glyph_h));
+        draw_label(plot, 0, top, &text, scale);
+        for tx in strip_w.saturating_sub(tick)..strip_w {
+            plot(tx, y);
+        }
+    }
 }
 
 /// Bottom of the log frequency axis. Below this the FFT has no resolution to
@@ -1716,6 +1935,143 @@ mod analysis_tests {
     use super::*;
 
     #[test]
+    fn pixel_row_for_a_frequency_inverts_the_rows_own_mapping() {
+        // The legend and the image must agree exactly; this is the property
+        // that made a cell-based legend impossible without knowing cell size.
+        let sr = 48000.0;
+        for &log in &[true, false] {
+            for h in [32usize, 144, 300] {
+                for y in [0usize, 1, h / 3, h / 2, h - 2, h - 1] {
+                    let f = analysis_row_freq(y, h, log, sr);
+                    let back = freq_to_pixel_row(f, h, log, sr);
+                    assert!(back.abs_diff(y) <= 1, "log={log} h={h} y={y} -> {f}Hz -> {back}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn legend_ticks_sit_at_their_own_frequency_and_never_overlap() {
+        let sr = 48000.0;
+        for &log in &[true, false] {
+            for h in [48usize, 144, 320] {
+                let scale = legend_scale(h, 9);
+                let marks = pixel_legend(h, log, sr, scale);
+                for (y, text) in &marks {
+                    assert!(*y < h, "tick off the image: {text} at {y} of {h}");
+                }
+                for pair in marks.windows(2) {
+                    let gap = pair[1].0.abs_diff(pair[0].0);
+                    assert!(gap >= GLYPH_H * scale, "labels collide: {pair:?} h={h}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn legend_strip_leaves_room_for_its_widest_label() {
+        let sr = 96000.0;
+        for &log in &[true, false] {
+            let h = 200;
+            let scale = legend_scale(h, 10);
+            let strip = legend_strip_w(h, log, sr, scale);
+            for (_, text) in pixel_legend(h, log, sr, scale) {
+                assert!(label_px_w(&text, scale) <= strip, "{text} wider than {strip}px");
+            }
+        }
+    }
+
+    #[test]
+    fn legend_is_drawn_inside_its_strip_and_never_over_the_spectrogram() {
+        let (w, h) = (200usize, 144usize);
+        let scale = legend_scale(h, 9);
+        let strip = legend_strip_w(h, true, 48000.0, scale);
+        let mut buf = vec![0u8; w * h];
+        draw_pixel_legend(&mut |x: usize, y: usize| { if x < w && y < h { buf[y * w + x] = 200; } },
+                          h, strip, true, 48000.0, scale);
+        assert!(buf.contains(&200), "legend drew nothing");
+        for y in 0..h {
+            for x in strip..w {
+                assert_eq!(buf[y * w + x], 0, "legend bled into the image at ({x},{y})");
+            }
+        }
+    }
+
+    #[test]
+    fn image_legend_protocols_match_the_ones_that_render_images() {
+        use crate::cover::GraphicsProtocol as GP;
+        // If these disagree the legend is either stranded outside the image or
+        // cells are reserved that nothing draws into.
+        for p in [GP::Kitty, GP::Sixel, GP::Iterm2, GP::HalfBlock] {
+            assert_eq!(
+                protocol_draws_image_legend(p),
+                analysis_image_geometry_with(p, 120, 16, SIXEL_CELL_FLOOR).is_some(),
+                "{p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn octaves_are_evenly_spaced_in_pixels_unlike_snapped_cell_rows() {
+        // The Kitty bug this fixes: at ~1.1 cell rows per octave the cell
+        // gutter rounds several octaves onto adjacent rows and then skips one,
+        // so labels clump (C1/C2/C3 together, gap, C4/C5...). In pixel space
+        // every octave gets the same distance.
+        let (h, sr) = (144usize, 48000.0f32);
+        let scale = legend_scale(h, 9);
+        let marks = pixel_legend(h, true, sr, scale);
+        let gaps: Vec<usize> = marks.windows(2).map(|p| p[0].0.abs_diff(p[1].0)).collect();
+        assert!(gaps.len() >= 8, "expected most octaves to be labelled, got {marks:?}");
+        let (lo, hi) = (*gaps.iter().min().unwrap(), *gaps.iter().max().unwrap());
+        assert!(hi - lo <= 1, "octave spacing varies by more than rounding: {gaps:?}");
+    }
+
+    #[test]
+    fn label_glyphs_land_where_they_are_placed_and_clip_at_the_edges() {
+        let (w, h) = (24usize, 8usize);
+        let mut buf = vec![0u8; w * h];
+        draw_label(&mut |x: usize, y: usize| { if x < w && y < h { buf[y * w + x] = 9; } },
+                   1, 1, "1", 1);
+        // '1' is [010,110,010,010,111]: row 0 of the glyph sets only the middle
+        // column, which at x=1 scale=1 is pixel x=2.
+        assert_eq!(buf[w + 2], 9, "glyph pixel set");
+        assert_eq!(buf[w + 1], 0, "left column of that row stays clear");
+        assert_eq!(buf[0], 0, "nothing drawn above the origin");
+
+        // Running off the right edge must clip, never wrap to the next row.
+        let mut edge = vec![0u8; w * h];
+        draw_label(&mut |x: usize, y: usize| { if x < w && y < h { edge[y * w + x] = 7; } },
+                   w - 1, 0, "8", 1);
+        for y in 0..h {
+            assert_eq!(edge[y * w], 0, "row {y} column 0 untouched by clipping");
+        }
+    }
+
+    #[test]
+    fn label_width_accounts_for_scale_and_gaps() {
+        assert_eq!(label_px_w("", 2), 0);
+        assert_eq!(label_px_w("C", 1), GLYPH_W);
+        // Two glyphs plus one 1px gap, doubled.
+        assert_eq!(label_px_w("C1", 2), (2 * GLYPH_W + 1) * 2);
+        assert_eq!(label_px_w("10k", 1), 3 * GLYPH_W + 2);
+    }
+
+    #[test]
+    fn every_legend_character_has_a_glyph() {
+        // The ladders only ever emit digits, 'C' and 'k'; a missing glyph would
+        // silently drop a character and misreport a frequency.
+        for c in "0123456789Ck".chars() {
+            assert!(glyph(c).is_some(), "no glyph for {c:?}");
+        }
+        for (_, text) in gutter_ladder(true, 48000.0) {
+            assert!(text.chars().all(|c| glyph(c).is_some()), "log label {text:?}");
+        }
+        for (_, text) in gutter_ladder(false, 48000.0) {
+            assert!(text.chars().all(|c| glyph(c).is_some()), "linear label {text:?}");
+        }
+    }
+
+    #[test]
     fn intensity_maps_window_to_unit_range() {
         assert!((analysis_intensity(-70.0, -70.0, -10.0) - 0.0).abs() < 1e-6);
         assert!((analysis_intensity(-10.0, -70.0, -10.0) - 1.0).abs() < 1e-6);
@@ -1806,7 +2162,7 @@ mod analysis_tests {
         a.spectro_raw_history.push_back(vec![-70.0]); // floor column (newer)
         let mut lv = Vec::new();
         // 4 px wide, full history (n == logical == 2): each slot covers 2 px.
-        analysis_levels_into(&mut lv, &a, 4, 1, false, 2);
+        analysis_levels_into(&mut lv, &a, 4, 1, false, 2, 0);
         assert_eq!(lv[0], lv[1], "first history column must cover px 0..2");
         assert_eq!(lv[2], lv[3], "second history column must cover px 2..4");
         assert_ne!(lv[0], lv[2]);
@@ -1822,18 +2178,27 @@ mod analysis_tests {
         }
         let mut lv = Vec::new();
         // logical == width: a 2-px window shows the most recent 2 hops 1:1.
-        analysis_levels_into(&mut lv, &a, 2, 1, false, 2);
+        analysis_levels_into(&mut lv, &a, 2, 1, false, 2, 0);
         assert_ne!(lv[0], lv[1]);
         assert_ne!(lv[1], 0, "newest (hot) hop lands at the right edge");
     }
 
     #[test]
-    fn analysis_geometry_kitty_renders_history_depth() {
+    fn analysis_geometry_kitty_matches_the_cell_box_aspect() {
         use crate::cover::GraphicsProtocol as GP;
+        // Sized to the assumed cell box, so the terminal's upscale is the same
+        // in both axes; a fixed-width image stretched the legend glyphs wide.
+        let (cw, ch) = SIXEL_CELL_FLOOR;
         assert_eq!(
             analysis_image_geometry(GP::Kitty, 120, 16),
-            Some((SPECTRO_ANALYSIS_COLS, 16 * 16))
+            Some((120 * cw, 16 * ch))
         );
+        // Whatever the real cell turns out to be, the scale factor the terminal
+        // applies is uniform: image aspect == cell-box aspect.
+        for (cols, rows) in [(40usize, 6usize), (120, 16), (300, 20)] {
+            let (w, h) = analysis_image_geometry(GP::Kitty, cols, rows).unwrap();
+            assert_eq!(w * rows * ch, h * cols * cw, "cols={cols} rows={rows}");
+        }
     }
 
     #[test]
@@ -1850,7 +2215,7 @@ mod analysis_tests {
     }
 
     #[test]
-    fn analysis_geometry_sixel_uses_probed_cell_metrics() {
+    fn analysis_geometry_sixel_keeps_uniform_hops_at_any_cell_size() {
         // With probed 9×19 px cells, the image fills the block exactly
         // (modulo the px-per-hop width trim) instead of the 8×16 floor.
         use crate::cover::GraphicsProtocol as GP;

@@ -895,16 +895,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     print!("\x1B[?25l");
     io::stdout().flush().ok();
 
-    // Probe the terminal cell size (Sixel-only, bounded ~300 ms) for
-    // pixel-exact spectrogram sizing. Must happen after raw mode and before
-    // the first poll_input — a late reply's Esc would read as the quit key.
-    let resize_during_probe = cover::probe_cell_metrics();
-
     ui.banner_lines = banner_lines;
     ui.banner_text = banner;
     ui.cover_enabled = cover_enabled;
     ui.banner_tail = banner_tail;
-    ui.terminal_resized = resize_during_probe;
+    ui.terminal_resized = false;
     ui.scan_handle = Some(metadata::spawn_metadata_scan(
         playlist.clone(),
         std::sync::Arc::clone(&metadata_cache),

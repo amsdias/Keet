@@ -14,10 +14,8 @@ use std::fs::File;
 use std::fmt::Write as _;
 use std::io::Cursor;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use image::ImageEncoder;
-use std::time::Duration;
 
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
@@ -587,111 +585,6 @@ fn viz_iterm2_lines(png: &[u8], cols: u32, rows: u32) -> Vec<String> {
     lines
 }
 
-/// Probed terminal cell size in pixels, packed `(w << 8) | h`; 0 = unknown.
-/// Settable (not OnceLock) because a terminal resize invalidates it — a
-/// font-zoom-out with stale metrics would make the sixel image overflow its
-/// block and trigger the auto-scroll storm, so Resize resets to unknown.
-static CELL_METRICS: AtomicU32 = AtomicU32::new(0);
-
-pub fn set_cell_metrics(m: Option<(u16, u16)>) {
-    let packed = m.map(|(w, h)| ((w as u32) << 8) | h as u32).unwrap_or(0);
-    CELL_METRICS.store(packed, Ordering::Relaxed);
-}
-
-/// Probed cell size (w, h) in pixels, if a probe succeeded since the last resize.
-pub fn cell_metrics() -> Option<(u16, u16)> {
-    match CELL_METRICS.load(Ordering::Relaxed) {
-        0 => None,
-        p => Some(((p >> 8) as u16, (p & 0xFF) as u16)),
-    }
-}
-
-/// Parse an XTWINOPS reply out of harvested input chars. Accepts either
-/// `CSI 6 ; h ; w t` (reply to CSI 16 t: cell size in px, used directly) or
-/// `CSI 4 ; h ; w t` (reply to CSI 14 t: text-area px, divided by the cell
-/// grid). Prefers the 16 t form when both are present. Values outside sane
-/// bounds (w 4..=64, h 8..=128) are rejected — a wrong cell size resurrects
-/// the sixel auto-scroll storm, so "no metrics" beats bad metrics.
-pub(crate) fn parse_cell_metrics_reply(buf: &str, term_cols: u16, term_rows: u16) -> Option<(u16, u16)> {
-    let sane = |w: u32, h: u32| -> Option<(u16, u16)> {
-        if (4..=64).contains(&w) && (8..=128).contains(&h) {
-            Some((w as u16, h as u16))
-        } else {
-            None
-        }
-    };
-    let mut from_14t: Option<(u16, u16)> = None;
-    for (start, _) in buf.match_indices("\x1B[") {
-        let body = &buf[start + 2..];
-        let Some(end) = body.find('t') else { continue };
-        let mut parts = body[..end].split(';').map(|p| p.parse::<u32>());
-        match (parts.next(), parts.next(), parts.next(), parts.next()) {
-            // CSI 16 t reply: cell size in px directly — exact, wins outright.
-            (Some(Ok(6)), Some(Ok(h)), Some(Ok(w)), None) => {
-                if let Some(m) = sane(w, h) {
-                    return Some(m);
-                }
-            }
-            // CSI 14 t reply: text-area px / character grid.
-            (Some(Ok(4)), Some(Ok(h)), Some(Ok(w)), None)
-                if from_14t.is_none() && term_cols > 0 && term_rows > 0 =>
-            {
-                from_14t = sane(w / term_cols as u32, h / term_rows as u32);
-            }
-            _ => {}
-        }
-    }
-    from_14t
-}
-
-/// One-shot startup probe for the terminal cell size, used for pixel-exact
-/// Sixel sizing. Sends XTWINOPS 16 (cell px) and 14 (text-area px) and
-/// harvests the reply from crossterm key events — through ConPTY the reply
-/// surfaces as a burst of Esc/Char key events. MUST run after raw mode is
-/// enabled and BEFORE the first poll_input: once the main input loop owns
-/// stdin, a late reply's Esc would read as the quit key. Bounded ~300 ms and
-/// only runs when the detected protocol is Sixel, so non-answering terminals
-/// cost one short startup pause at worst. Returns true if a Resize event was
-/// swallowed during the harvest (caller should force a layout repaint).
-pub fn probe_cell_metrics() -> bool {
-    let mut resize_seen = false;
-    if !matches!(detect_protocol(), GraphicsProtocol::Sixel) {
-        return resize_seen;
-    }
-    {
-        use std::io::Write as _;
-        print!("\x1B[16t\x1B[14t");
-        let _ = std::io::stdout().flush();
-    }
-    let (tc, tr) = crossterm::terminal::size().unwrap_or((120, 30));
-    let deadline = std::time::Instant::now() + Duration::from_millis(300);
-    let mut buf = String::new();
-    while std::time::Instant::now() < deadline {
-        if !matches!(crossterm::event::poll(Duration::from_millis(25)), Ok(true)) {
-            continue;
-        }
-        let Ok(ev) = crossterm::event::read() else { continue };
-        match ev {
-            crossterm::event::Event::Key(k) => match k.code {
-                crossterm::event::KeyCode::Esc => buf.push('\x1B'),
-                crossterm::event::KeyCode::Char(c) => buf.push(c),
-                _ => {}
-            },
-            crossterm::event::Event::Resize(_, _) => resize_seen = true,
-            _ => {}
-        }
-        if let Some(m) = parse_cell_metrics_reply(&buf, tc, tr) {
-            set_cell_metrics(Some(m));
-            return resize_seen;
-        }
-    }
-    // Whatever arrived by the deadline (e.g. only the 14 t reply).
-    if let Some(m) = parse_cell_metrics_reply(&buf, tc, tr) {
-        set_cell_metrics(Some(m));
-    }
-    resize_seen
-}
-
 /// Encode an indexed-color image as a sixel blob with a caller-supplied FIXED
 /// palette (same DCS framing icy_sixel emits, which Windows Terminal renders:
 /// `\x1bP9;1;0q`, `#i;2;r;g;b` in percent, per-color RLE bands). Bypassing the
@@ -1114,34 +1007,10 @@ mod viz_sixel_tests {
         assert!(lines[0].ends_with("\x1B[u\x1B[120C"));
     }
 
-    #[test]
-    fn cell_metrics_parses_direct_16t_reply() {
-        // CSI 16 t reply: ESC [ 6 ; height ; width t — height comes first.
-        assert_eq!(parse_cell_metrics_reply("\x1B[6;19;9t", 120, 30), Some((9, 19)));
-    }
-
-    #[test]
-    fn cell_metrics_parses_14t_text_area_fallback() {
-        // CSI 14 t reply: text area in px, divided by the character grid.
-        assert_eq!(parse_cell_metrics_reply("\x1B[4;570;1080t", 120, 30), Some((9, 19)));
-    }
-
-    #[test]
-    fn cell_metrics_found_amid_other_input_and_prefers_16t() {
-        // Replies can arrive surrounded by unrelated chars, and both replies
-        // may land in one harvest — the exact 16 t form wins.
-        let buf = "x\x1B[4;600;1200t..\x1B[6;20;10t!";
-        assert_eq!(parse_cell_metrics_reply(buf, 120, 30), Some((10, 20)));
-    }
-
-    #[test]
-    fn cell_metrics_rejects_insane_or_missing_replies() {
-        assert_eq!(parse_cell_metrics_reply("\x1B[6;0;0t", 120, 30), None);
-        assert_eq!(parse_cell_metrics_reply("\x1B[6;500;3t", 120, 30), None);
-        assert_eq!(parse_cell_metrics_reply("no reply here", 120, 30), None);
-        assert_eq!(parse_cell_metrics_reply("", 120, 30), None);
-    }
-
+    
+    
+    
+    
     #[test]
     fn sixel_indexed_emits_fixed_palette_and_rle() {
         // 8×6 image, all palette index 0 → one band, every column has all six
