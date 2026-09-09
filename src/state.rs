@@ -102,7 +102,7 @@ impl RepeatMode {
 }
 
 // Visualization style
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum VizStyle {
     Bars = 0,
@@ -155,7 +155,7 @@ impl RgMode {
 }
 
 // Visualization modes
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum VizMode {
     None = 0,
@@ -293,6 +293,15 @@ pub struct PlayerState {
 
     // Visualization style (bars vs dots)
     pub(crate) viz_style: AtomicU8,
+    /// Full-window viz: the banner is dropped and the visualization takes every
+    /// row the frame can spare. Relaxed — UI-thread state with no ordering
+    /// relationship to anything else.
+    pub(crate) viz_fullscreen: AtomicBool,
+    /// Per-mode optional detail, toggled by Shift+L: the level-history strip on
+    /// the VU meter, the frequency legend on either spectrum. One flag because
+    /// it is one key — each mode decides what "more detail" means for it, and
+    /// the modes with nothing useful to add ignore it.
+    pub(crate) viz_extras: AtomicBool,
 
     // Decode error from producer thread (None = no error)
     pub(crate) decode_error: Mutex<Option<String>>,
@@ -378,6 +387,8 @@ impl PlayerState {
             show_stats: AtomicBool::new(false),
             crossfade_secs: AtomicU32::new(0),
             viz_style: AtomicU8::new(VizStyle::Dots as u8),
+            viz_fullscreen: AtomicBool::new(false),
+            viz_extras: AtomicBool::new(false),
             decode_error: Mutex::new(None),
             track_transition_count: AtomicUsize::new(0),
             producer_track_index: AtomicUsize::new(0),
@@ -637,6 +648,31 @@ impl PlayerState {
         self.show_stats.load(Ordering::Relaxed)
     }
 
+    pub fn viz_extras(&self) -> bool {
+        self.viz_extras.load(Ordering::Relaxed)
+    }
+
+    /// Returns the new state. Like the full-window toggle, this changes the
+    /// frame's height, so callers must force a layout repaint.
+    pub fn toggle_viz_extras(&self) -> bool {
+        let next = !self.viz_extras();
+        self.viz_extras.store(next, Ordering::Relaxed);
+        next
+    }
+
+    pub fn viz_fullscreen(&self) -> bool {
+        self.viz_fullscreen.load(Ordering::Relaxed)
+    }
+
+    /// Returns the new state. Callers must also force a layout repaint: the
+    /// frame changes height by many rows, and letting it grow in place scrolls
+    /// the screen instead of re-anchoring it.
+    pub fn toggle_viz_fullscreen(&self) -> bool {
+        let next = !self.viz_fullscreen();
+        self.viz_fullscreen.store(next, Ordering::Relaxed);
+        next
+    }
+
     pub fn viz_style(&self) -> VizStyle {
         VizStyle::from_u8(self.viz_style.load(Ordering::Relaxed))
     }
@@ -824,6 +860,10 @@ pub struct UiState {
     /// view, another viz mode) leaves it false, forcing a full re-emit when
     /// the spectrogram next renders over whatever that frame painted.
     pub spectro_block_intact: bool,
+    /// (top padding, body height) of the viz block the last frame drew. A
+    /// change in EITHER means the block moved or resized, so a Sixel image must
+    /// be re-emitted rather than left where it was.
+    pub last_viz_block: (usize, usize),
     pub lyrics: Option<crate::lyrics::Lyrics>,
     pub lyrics_receiver: Option<std::sync::mpsc::Receiver<Option<crate::lyrics::Lyrics>>>,
     pub lyrics_scroll: usize,
@@ -892,6 +932,7 @@ impl UiState {
             current_track_removed: false,
             terminal_resized: false,
             spectro_block_intact: false,
+            last_viz_block: (0, 0),
             lyrics: None,
             lyrics_receiver: None,
             lyrics_scroll: 0,

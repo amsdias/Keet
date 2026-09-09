@@ -14,8 +14,9 @@ use crate::state::{
 use crate::viz::{
     StatsMonitor, VizAnalyser, render_vu_meter, render_spectrum_horizontal,
     render_spectrum_vertical, render_oscilloscope, render_lissajous,
-    render_spectrogram, render_spectrogram_analysis, get_viz_line_count,
-    analysis_needs_raw_lines, analysis_rows_for_window,
+    render_spectrogram, render_spectrogram_analysis, viz_body_rows,
+    viz_rows_available, viz_top_pad,
+    analysis_needs_raw_lines,
 };
 
 pub fn format_time(secs: f64) -> String {
@@ -250,13 +251,43 @@ fn print_status_classic(state: &PlayerState, ui: &mut UiState, name: &str, track
     // Clamp the analysis spectrogram (the tallest viz) so the full frame fits
     // the window: an overflowing frame makes every full repaint (viz switch,
     // track skip) scroll the banner top into scrollback.
-    let rows_above_viz = ui.banner_lines + 2 + if eq_line { 1 } else { 0 };
-    let ana_rows = analysis_rows_for_window(term_h, rows_above_viz);
-    let viz_lines = if viz_mode == VizMode::SpectrogramAnalysis {
-        ana_rows + 1
+    // Full window is the Player view only, and it is the difference between
+    // "the viz got more room" and "the viz IS the screen": the banner is gone
+    // (main.rs), and below it only one info line survives — no transport line,
+    // no EQ curve, no separator.
+    let fullscreen = state.viz_fullscreen() && ui.view_mode == ViewMode::Player;
+    let extras = state.viz_extras();
+    let eq_line = eq_line && !fullscreen;
+    let rows_above_viz = if fullscreen {
+        1
     } else {
-        get_viz_line_count(viz_mode, viz_style)
-    } + if eq_line { 1 } else { 0 };
+        ui.banner_lines + 2 + if eq_line { 1 } else { 0 }
+    };
+    // Rows kept free below the block: normally separator + transient status +
+    // slack; in full window there is no footer, only the status message row and
+    // one row of slack (a block ending on the last line scrolls on the next
+    // write).
+    let below = if fullscreen { 2 } else { 3 };
+    // Full window hands the viz every row the frame can spare; otherwise each
+    // mode keeps its natural height. Both go through the same clamp, so a
+    // window too short to hold the natural size shrinks instead of overflowing.
+    // One path for both: the budget is whatever the window has spare, and the
+    // mode's own ceiling decides how much of it to take. Resizing is therefore
+    // responsive without any key press; full window just lifts the ceiling.
+    let viz_avail = viz_rows_available(term_h, rows_above_viz, below);
+    let viz_body = viz_body_rows(viz_mode, viz_avail, fullscreen, extras);
+    // Full window centres the block in the space it chose not to fill. A mode
+    // that stops short of the ceiling — the VU meter with history off, a square
+    // vectorscope — otherwise sits pinned to the top with the rest blank.
+    let viz_pad = viz_top_pad(viz_avail, viz_body, fullscreen);
+    let sep = if viz_mode == VizMode::None || fullscreen { 0 } else { 1 };
+    let viz_lines = if viz_mode == VizMode::None { 0 } else { viz_body + sep + viz_pad }
+        + if eq_line { 1 } else { 0 };
+    // Lines this frame emits below the anchor row: the transport line (gone in
+    // full window), then everything viz_lines covers. Compared against the
+    // previous frame's DERIVED count to decide whether the sixel block moved —
+    // a prediction that drifts from reality forces a re-emit on every frame.
+    let predicted_lines = if fullscreen { 0 } else { 1 } + viz_lines;
     // Sixel emit-on-change bookkeeping: cleared every frame, re-asserted only
     // by the analysis branch below. Any frame that doesn't reach that branch
     // (playlist/lyrics view, another viz) may paint over the block, so the
@@ -329,7 +360,14 @@ fn print_status_classic(state: &PlayerState, ui: &mut UiState, name: &str, track
 
     // Line 1: Track info (truncated to terminal width)
     let ic = icon_color_for_ext(ext);
-    let line1 = format!("{C_DIM}[{track}/{total}]{C_RESET} {ic}♪{C_RESET} {C_BOLD}{C_CYAN}{display_name}{C_RESET} {C_DIM}{track_info}{C_RESET}");
+    // In full window this is the only line of chrome left, so it carries the
+    // transport essentials the suppressed line below would have shown — and
+    // the way back out, which is otherwise unguessable with the UI gone.
+    let line1 = if fullscreen {
+        format!("{C_DIM}[{track}/{total}]{C_RESET} {icon_color}{icon}{C_RESET}                  {C_BOLD}{C_CYAN}{display_name}{C_RESET} {C_DIM}{track_info}                   {cur}/{tot}  {{⇧F}} exit{C_RESET}")
+    } else {
+        format!("{C_DIM}[{track}/{total}]{C_RESET} {ic}♪{C_RESET} {C_BOLD}{C_CYAN}{display_name}{C_RESET} {C_DIM}{track_info}{C_RESET}")
+    };
     w.first_line(&truncate_ansi(&line1, term_w));
 
     // Line 2: Progress (truncated to terminal width)
@@ -368,12 +406,15 @@ fn print_status_classic(state: &PlayerState, ui: &mut UiState, name: &str, track
         String::new()
     };
     let line2 = format!("  {icon_color}{icon}{C_RESET} {C_BOLD}[{cur}/{tot}]{C_RESET} {C_GREEN}{bar_filled}{C_RESET} {C_DIM}vol:{vol}%{eq_display}{fx_display}{cf_display}{clip_display}{bal_display} {fader} buf:{buf_pct}%{stats_display} {{V}}:{next_viz} {{B}}:{next_style}{C_RESET}");
-    w.line(&truncate_ansi(&line2, term_w));
+    if !fullscreen {
+        w.line(&truncate_ansi(&line2, term_w));
+    }
 
     // EQ curve visualization (when non-Flat preset is active)
     if eq_line {
         w.line(&eq_curve);
     }
+
 
     // Separation line and content area
     if ui.view_mode == ViewMode::Playlist {
@@ -592,39 +633,42 @@ fn print_status_classic(state: &PlayerState, ui: &mut UiState, name: &str, track
     }
 
     // Original Player mode rendering below
-    if viz_mode != VizMode::None {
+    if viz_mode != VizMode::None && !fullscreen {
         w.line(&format!("  {C_DIM}{}{C_RESET}", "─".repeat(term_w.saturating_sub(2))));
+    }
+    for _ in 0..viz_pad {
+        w.line("");
     }
 
     match viz_mode {
         VizMode::None => {}
         VizMode::VuMeter => {
-            for line in render_vu_meter(state, viz_style, term_w) {
+            for line in render_vu_meter(state, viz_style, term_w, viz_body, extras) {
                 w.line(&line);
             }
         }
         VizMode::SpectrumHorizontal => {
-            for line in render_spectrum_horizontal(state, viz_style) {
+            for line in render_spectrum_horizontal(state, viz_style, term_w, viz_body, extras) {
                 w.line(&line);
             }
         }
         VizMode::SpectrumVertical => {
-            for line in render_spectrum_vertical(state, viz_style) {
+            for line in render_spectrum_vertical(state, viz_style, term_w, viz_body, extras) {
                 w.line(&line);
             }
         }
         VizMode::Oscilloscope => {
-            for line in render_oscilloscope(analyser, viz_style, term_w) {
+            for line in render_oscilloscope(analyser, viz_style, term_w, viz_body) {
                 w.line(&line);
             }
         }
         VizMode::Lissajous => {
-            for line in render_lissajous(analyser, viz_style, term_w) {
+            for line in render_lissajous(analyser, viz_style, term_w, viz_body) {
                 w.line(&line);
             }
         }
         VizMode::Spectrogram => {
-            for line in render_spectrogram(analyser, viz_style, term_w) {
+            for line in render_spectrogram(analyser, viz_style, term_w, viz_body) {
                 w.line(&line);
             }
         }
@@ -644,9 +688,9 @@ fn print_status_classic(state: &PlayerState, ui: &mut UiState, name: &str, track
             // viz_lines; compared against the previous frame's derived count.
             let force = prev_frame_lines == usize::MAX
                 || !block_was_intact
-                || 1 + viz_lines != prev_frame_lines;
+                || predicted_lines != prev_frame_lines;
             ui.spectro_block_intact = true;
-            for line in render_spectrogram_analysis(analyser, term_w, log_axis, state.is_paused(), ana_rows, force) {
+            for line in render_spectrogram_analysis(analyser, term_w, log_axis, state.is_paused(), viz_body, force) {
                 if raw { w.line_raw(&line); } else { w.line(&line); }
             }
         }
@@ -1087,6 +1131,26 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
                 }
                 KeyEvent { code: KeyCode::Char('['), .. } => state.balance_left(),
                 KeyEvent { code: KeyCode::Char(']'), .. } => state.balance_right(),
+                KeyEvent { code: KeyCode::Char('L'), .. } => {
+                    let on = state.toggle_viz_extras();
+                    let what = match state.viz_mode() {
+                        VizMode::VuMeter => "level history",
+                        VizMode::SpectrumHorizontal | VizMode::SpectrumVertical => "band legend",
+                        _ => "detail (not used by this viz)",
+                    };
+                    ui.set_status(format!("{what}: {}", if on { "on" } else { "off" }));
+                    // Costs or frees a row, so the frame changes height.
+                    ui.terminal_resized = true;
+                    continue;
+                }
+                KeyEvent { code: KeyCode::Char('F'), .. } => {
+                    let on = state.toggle_viz_fullscreen();
+                    ui.set_status(if on { "full window: on".into() } else { String::from("full window: off") });
+                    // The frame changes height by many rows; re-anchor at row 1
+                    // instead of letting it grow downward and scroll the screen.
+                    ui.terminal_resized = true;
+                    continue;
+                }
                 KeyEvent { code: KeyCode::Char('t'), .. } => {
                     let kind = state.cycle_theme();
                     ui.set_status(format!("theme: {}", kind.name()));

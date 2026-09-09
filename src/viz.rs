@@ -76,6 +76,15 @@ fn viz_palette(kind: ThemeKind) -> VizPalette {
 /// already baked into `BAND_COLORS`; Minimal/HiFi project onto a 3-stop ramp
 /// (low→mid→hot) sized to the band index so the visual identity stays
 /// consistent with the rest of the theme.
+/// ISO ⅓-octave centre frequency of each spectrum band. Drives both the band
+/// energies and the frequency legend, so the labels cannot drift from the bins.
+pub(crate) const ISO_CENTERS: [f32; SPECTRUM_BANDS] = [
+    20.0, 25.0, 31.5, 40.0, 50.0, 63.0, 80.0, 100.0, 125.0, 160.0,
+    200.0, 250.0, 315.0, 400.0, 500.0, 630.0, 800.0, 1000.0, 1250.0, 1600.0,
+    2000.0, 2500.0, 3150.0, 4000.0, 5000.0, 6300.0, 8000.0, 10000.0, 12500.0, 16000.0,
+    20000.0,
+];
+
 fn band_color(idx: usize, vp: &VizPalette, kind: ThemeKind) -> &'static str {
     if matches!(kind, ThemeKind::Classic) {
         BAND_COLORS.get(idx).copied().unwrap_or(C_YELLOW)
@@ -286,7 +295,10 @@ impl ChannelBands {
 pub const WAVEFORM_BUF_SIZE: usize = 1024;
 // Max spectrogram columns kept in history (time axis). The render shows up to the
 // terminal width; this is the cap (and history depth) for very wide terminals.
-pub const SPECTROGRAM_COLS: usize = 240;
+/// Stored spectrogram history, and therefore the widest the character
+/// spectrogram can be drawn — it is the only viz whose WIDTH is capped by data
+/// rather than by the display. 31 floats a hop, so depth is nearly free.
+pub const SPECTROGRAM_COLS: usize = 512;
 // Each column averages this many FFT hops, dilating the time axis so the display
 // scrolls slower and smoother. At ~43 ms/hop: 1 = ~2.6 s window (was), 4 = ~10 s.
 pub const SPECTROGRAM_HOPS_PER_COL: usize = 4;
@@ -295,6 +307,10 @@ pub const SPECTROGRAM_HOPS_PER_COL: usize = 4;
 // vertical rows, and dB contrast window.
 const SPECTRO_ANALYSIS_COLS: usize = 512;
 const SPECTRO_ANALYSIS_ROWS: usize = 16;
+/// Full-window ceiling for the analysis block. Sixel cost scales with the pixel
+/// count, and the image is re-encoded whenever a hop lands, so this is a
+/// throughput limit as much as a visual one.
+const SPECTRO_ANALYSIS_MAX_ROWS: usize = 32;
 // dB contrast window (tune by eye). With the 1/FFT_SIZE magnitude normalization a
 // full-scale tone peaks near -12 dB, so the ceiling sits a little below that and
 // the floor spans a ~60 dB range down to quiet detail. CEIL = brightest, FLOOR = dark.
@@ -584,12 +600,6 @@ impl VizAnalyser {
         let window_correction = 2.0;
         let psd_norm = 2.0 / (n * n);
 
-        const ISO_CENTERS: [f32; 31] = [
-            20.0, 25.0, 31.5, 40.0, 50.0, 63.0, 80.0, 100.0, 125.0, 160.0,
-            200.0, 250.0, 315.0, 400.0, 500.0, 630.0, 800.0, 1000.0, 1250.0, 1600.0,
-            2000.0, 2500.0, 3150.0, 4000.0, 5000.0, 6300.0, 8000.0, 10000.0, 12500.0, 16000.0,
-            20000.0,
-        ];
         let factor = 2.0f32.powf(1.0 / 6.0);
         let mut freq_bands = [0.0f32; SPECTRUM_BANDS + 1];
         for i in 0..SPECTRUM_BANDS {
@@ -667,7 +677,191 @@ impl VizAnalyser {
 
 const SPECTRUM_H_CHARS: &[char] = &[' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
-pub fn render_vu_meter(state: &PlayerState, style: VizStyle, width: usize) -> Vec<String> {
+const VU_MAX_ROWS: usize = 40;
+/// Bar thickness caps here. It buys weight, not information — the meter still
+/// shows two numbers — but a full window has the room, and a bar that fills it
+/// reads better than one stranded at the top. Always an ODD number of rows so
+/// the channel label has a true middle row to sit on.
+const VU_MAX_THICKNESS: usize = 7;
+/// Level history for the full-window strip, newest last.
+const VU_HISTORY: usize = 512;
+/// Height of the bars alone: both channels at the thickness cap, the gap, and
+/// the permanent scale row.
+const VU_BARS_ROWS: usize = 2 * VU_MAX_THICKNESS + 2;
+
+
+/// How the VU meter spends `rows`.
+///
+/// Two peak values plus two hold dots is all the data there is, so extra height
+/// cannot be filled by drawing them larger indefinitely. It buys weight first
+/// (thickness, capped), then a dB ruler, and everything beyond that goes to a
+/// level-over-time strip — the one part of a tall VU meter that shows something
+/// a single row could not.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct VuLayout {
+    thickness: usize,
+    gap: usize,
+    ruler: usize,
+    history: usize,
+    /// Rows the budget gave us that nothing wants — only when the history strip
+    /// is switched off and the block was sized for it.
+    blank: usize,
+}
+
+#[cfg(test)]
+impl VuLayout {
+    /// Every row the layout accounts for; must equal the budget it was given.
+    fn total(self) -> usize {
+        self.thickness * 2 + self.gap + self.ruler + self.history + self.blank
+    }
+}
+
+fn vu_layout(rows: usize, style: VizStyle, extras: bool) -> VuLayout {
+    if rows == 0 {
+        return VuLayout { thickness: 0, gap: 0, ruler: 0, history: 0, blank: 0 };
+    }
+    if rows < 4 {
+        // Natural size: one row per channel, and the Bars style's spacer.
+        let gap = if rows >= 3 { rows - 2 } else { 0 };
+        let thickness = if rows == 1 { 0 } else { 1 };
+        // rows == 1 has no room for two channels; give the single row to L.
+        return VuLayout {
+            thickness: thickness.max(if rows == 1 { 0 } else { 1 }),
+            gap,
+            ruler: 0,
+            history: 0,
+            blank: if rows == 1 { 1 } else { 0 },
+        };
+    }
+    // The scale is permanent from here up: a meter without one is just a
+    // moving bar, and it costs a single row.
+    let ruler = 1;
+    let gap = if matches!(style, VizStyle::Bars) { 1 } else { 0 };
+    let body = rows - ruler - gap;
+    // Snap down to odd: 1, 3, 5, 7. An even block has no middle row, so the
+    // channel label would have to sit off-centre.
+    let raw = (body / 2).clamp(1, VU_MAX_THICKNESS);
+    let thickness = if raw.is_multiple_of(2) { raw - 1 } else { raw };
+    let spare = rows - (thickness * 2 + gap + ruler);
+    let history = if extras { spare } else { 0 };
+    VuLayout { thickness, gap, ruler, history, blank: spare - history }
+}
+
+/// Push this frame's levels onto the history ring and read it back.
+///
+/// Render-driven rather than analyser-driven: the meter is the only consumer,
+/// and it is drawn once per UI frame, so the strip advances at a steady ~20 px
+/// per second without another buffer in the analyser.
+fn vu_push_history(l: f32, r: f32) -> Vec<(f32, f32)> {
+    use std::cell::RefCell;
+    thread_local! {
+        static HIST: RefCell<std::collections::VecDeque<(f32, f32)>> =
+            const { RefCell::new(std::collections::VecDeque::new()) };
+    }
+    HIST.with(|h| {
+        let mut h = h.borrow_mut();
+        if h.len() == VU_HISTORY {
+            h.pop_front();
+        }
+        h.push_back((l, r));
+        h.iter().copied().collect()
+    })
+}
+
+/// Marks for the dB scale: label and its column on a `bar_width` bar.
+///
+/// The bar is linear in amplitude, so a decibel sits at 10^(dB/20) of its
+/// length — 0 dB at the far right, -6 dB halfway, -20 dB at a tenth. Marks are
+/// dropped from the quiet end first when they would collide, since that end is
+/// where a linear bar crowds them together.
+fn vu_scale_marks(bar_width: usize) -> Vec<(usize, &'static str)> {
+    const DB: [(f32, &str); 6] = [
+        (-40.0, "-40"), (-20.0, "-20"), (-12.0, "-12"),
+        (-6.0, "-6"), (-3.0, "-3"), (0.0, "0"),
+    ];
+    let mut out: Vec<(usize, &'static str)> = Vec::new();
+    for (db, text) in DB.iter().rev() {
+        let frac = 10f32.powf(db / 20.0);
+        let col = ((frac * bar_width as f32).round() as usize)
+            .min(bar_width.saturating_sub(text.len()));
+        // Walking loud-to-quiet, keep a mark only if it clears the one already
+        // placed to its right.
+        if out.last().is_some_and(|(c, _): &(usize, &str)| col + text.len() + 1 > *c) {
+            continue;
+        }
+        out.push((col, text));
+    }
+    out.reverse();
+    out
+}
+
+/// The permanent dB scale under the bars.
+fn vu_scale_row(bar_width: usize, label_w: usize, vp: &VizPalette) -> String {
+    let mut cells = vec![' '; bar_width];
+    for (col, text) in vu_scale_marks(bar_width) {
+        for (i, ch) in text.chars().enumerate() {
+            if let Some(slot) = cells.get_mut(col + i) {
+                *slot = ch;
+            }
+        }
+    }
+    let mut line = String::from("  ");
+    for _ in 0..label_w {
+        line.push(' ');
+    }
+    line.push_str(vp.dim);
+    line.extend(cells);
+    line.push_str(vp.reset);
+    line
+}
+
+/// The level-over-time strip: newest at the right, filled from the bottom.
+fn vu_history_lines(hist: &[(f32, f32)], w: usize, rows: usize, style: VizStyle,
+                    vp: &VizPalette) -> Vec<String> {
+    // The strip is drawn in the same alphabet as the bars above it — braille in
+    // Dots, blocks in Bars — or the two halves of the meter read as different
+    // visualizations stacked on top of each other.
+    const BLOCKS: [char; 8] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇'];
+    const BRAILLE: [char; 8] = [' ', '⣀', '⣀', '⣤', '⣤', '⣶', '⣶', '⣿'];
+    let partials = match style { VizStyle::Bars => BLOCKS, VizStyle::Dots => BRAILLE };
+    let full = match style { VizStyle::Bars => '█', VizStyle::Dots => '⣿' };
+    let mut lines = Vec::with_capacity(rows);
+    let start = hist.len().saturating_sub(w);
+    let shown = &hist[start..];
+    for row in 0..rows {
+        // Row 0 is the top of the strip, so it covers the highest level slice.
+        let row_bottom = (rows - 1 - row) as f32 / rows as f32;
+        let row_top = (rows - row) as f32 / rows as f32;
+        let mut line = String::from("  ");
+        let pad = w.saturating_sub(shown.len());
+        for _ in 0..pad {
+            line.push(' ');
+        }
+        let mut last = "";
+        for &(l, r) in shown {
+            let level = l.max(r).clamp(0.0, 1.0);
+            let color = if level >= 0.8 { vp.hot } else if level >= 0.6 { vp.mid } else { vp.low };
+            if color != last {
+                line.push_str(color);
+                last = color;
+            }
+            if level >= row_top {
+                line.push(full);
+            } else if level > row_bottom {
+                let frac = (level - row_bottom) / (row_top - row_bottom);
+                line.push(partials[((frac * 7.0) as usize).clamp(1, 7)]);
+            } else {
+                line.push(' ');
+            }
+        }
+        line.push_str(vp.reset);
+        lines.push(line);
+    }
+    lines
+}
+
+pub fn render_vu_meter(state: &PlayerState, style: VizStyle, width: usize, rows: usize,
+                       extras: bool) -> Vec<String> {
     let (left, right) = state.get_peaks();
     let (dot_l, dot_r) = state.get_vu_dots();
     // Fill the width: 2-space pad + "L " label (2) + 2-col safety margin = 6 overhead.
@@ -726,20 +920,46 @@ pub fn render_vu_meter(state: &PlayerState, style: VizStyle, width: usize) -> Ve
         bar
     }
 
-    let mut lines = vec![
-        make_bar(left, dot_l, "L", bar_width, style, &vp),
-    ];
-    if matches!(style, VizStyle::Bars) {
-        lines.push(String::new()); // minimal empty line gap
+    let hist = vu_push_history(left, right);
+    let lay = vu_layout(rows, style, extras);
+    let mut lines: Vec<String> = Vec::with_capacity(rows);
+    if lay.thickness > 0 {
+        // One label per channel, on the block's middle row. Repeating it on
+        // every row of a thick bar reads as three separate meters.
+        let mid = lay.thickness / 2;
+        for i in 0..lay.thickness {
+            let label = if i == mid { "L" } else { " " };
+            lines.push(make_bar(left, dot_l, label, bar_width, style, &vp));
+        }
+        for _ in 0..lay.gap {
+            lines.push(String::new());
+        }
+        for i in 0..lay.thickness {
+            let label = if i == mid { "R" } else { " " };
+            lines.push(make_bar(right, dot_r, label, bar_width, style, &vp));
+        }
     }
-    lines.push(make_bar(right, dot_r, "R", bar_width, style, &vp));
+    for _ in 0..lay.ruler {
+        lines.push(vu_scale_row(bar_width, 2, &vp));
+    }
+    if lay.history > 0 {
+        lines.extend(vu_history_lines(&hist, bar_width + 2, lay.history, style, &vp));
+    }
+    // The layout is the contract: return exactly the rows we were given.
+    lines.truncate(rows);
+    while lines.len() < rows {
+        lines.push(String::new());
+    }
     lines
 }
 
 // The horizontal spectrum is stacked over SPECTRUM_H_ROWS braille rows per channel
 // (was a single row) for more height. Per-row partial fills index by quarters filled
 // (1..4): up fills from the bottom (L channel), down fills from the top (R channel).
-const SPECTRUM_H_ROWS: usize = 3;
+/// Ceiling both spectrum modes grow to in full window. Rows are pure magnitude
+/// resolution here, so the cap is about taste rather than data — past this the
+/// bars read as a wall.
+const SPECTRUM_MAX_ROWS: usize = 40;
 const H_UP_BRAILLE: [char; 5] = [' ', '⣀', '⣤', '⣶', '⣿'];
 const H_DN_BRAILLE: [char; 5] = [' ', '⠉', '⠛', '⠿', '⣿'];
 // Block chars inverted: index N → bar fills N/8 from the top
@@ -758,26 +978,46 @@ const BAND_COLORS: [&str; 31] = [
     C_MAGENTA,
 ];
 
-pub fn render_spectrum_horizontal(state: &PlayerState, style: VizStyle) -> Vec<String> {
+pub fn render_spectrum_horizontal(state: &PlayerState, style: VizStyle, width: usize,
+                                  rows: usize, extras: bool) -> Vec<String> {
     let spec_l = state.get_spectrum();
     let spec_r = state.get_spectrum_r();
     let kind = state.theme_kind();
     let vp = viz_palette(kind);
-    let n = SPECTRUM_H_ROWS;
-    let mut lines: Vec<String> = Vec::with_capacity(n * 2);
+    let cw = spectrum_cell_w(width);
+    let cols = spectrum_col_count(width, cw);
+    let groups = spectrum_columns(cols);
+    let indent = " ".repeat(spectrum_indent(width, groups.len(), cw));
+    // Rows split evenly between the two channels; an odd budget leaves one
+    // blank row on the centre line rather than making the channels unequal.
+    // With the legend on, the centre line between the up-growing L bars and the
+    // down-growing R bars is exactly where a frequency axis belongs.
+    let legend = extras && rows >= 3;
+    let n = ((rows.saturating_sub(usize::from(legend))) / 2).max(1);
+    let centre = rows.saturating_sub(n * 2);
+    let mut lines: Vec<String> = Vec::with_capacity(rows);
 
     // L channel: bars grow upward. Rows print top→bottom, so row 0 covers the
     // highest magnitude slice [(n-1)/n, 1.0] and the last row the base [0, 1/n].
     for r in 0..n {
         let lo = (n - 1 - r) as f32 / n as f32;
         let hi = (n - r) as f32 / n as f32;
-        let mut line = String::from("  ");
-        for (i, &level) in spec_l.iter().enumerate() {
-            let color = band_color(i, &vp, kind);
-            line.push_str(&h_cell(level, lo, hi, style, color, true));
+        let mut line = indent.clone();
+        for &g in &groups {
+            let (level, src) = spectrum_group(&spec_l, g);
+            let color = band_color(src, &vp, kind);
+            line.push_str(&h_cell(level, lo, hi, style, color, true, cw));
         }
         line.push_str(vp.reset);
         lines.push(line);
+    }
+
+    for i in 0..centre {
+        if legend && i == 0 {
+            lines.push(spectrum_legend_row(&groups, cw, indent.len(), &vp));
+        } else {
+            lines.push(String::new());
+        }
     }
 
     // R channel: bars grow downward. Rows print top→bottom, so row 0 is the base
@@ -785,68 +1025,85 @@ pub fn render_spectrum_horizontal(state: &PlayerState, style: VizStyle) -> Vec<S
     for r in 0..n {
         let lo = r as f32 / n as f32;
         let hi = (r + 1) as f32 / n as f32;
-        let mut line = String::from("  ");
-        for (i, &level) in spec_r.iter().enumerate() {
-            let color = band_color(i, &vp, kind);
-            line.push_str(&h_cell(level, lo, hi, style, color, false));
+        let mut line = indent.clone();
+        for &g in &groups {
+            let (level, src) = spectrum_group(&spec_r, g);
+            let color = band_color(src, &vp, kind);
+            line.push_str(&h_cell(level, lo, hi, style, color, false, cw));
         }
         line.push_str(vp.reset);
         lines.push(line);
     }
 
+    lines.truncate(rows);
     lines
 }
 
 /// Render one 2-char-wide spectrum cell for a horizontal-spectrum row spanning the
 /// magnitude range `[lo, hi)`. `up` selects bottom-up fill (L channel) vs top-down
 /// fill (R channel).
-fn h_cell(level: f32, lo: f32, hi: f32, style: VizStyle, color: &str, up: bool) -> String {
+fn h_cell(level: f32, lo: f32, hi: f32, style: VizStyle, color: &str, up: bool, cw: usize) -> String {
     if level >= hi {
         let full = match style { VizStyle::Bars => '█', VizStyle::Dots => '⣿' };
-        return format!("{}{} ", color, full);
+        return spectrum_cell(color, full, cw);
     }
     if level <= lo {
-        return String::from("  ");
+        return " ".repeat(cw);
     }
     let frac = (level - lo) / (hi - lo); // fraction of this row that's filled
     match style {
         VizStyle::Dots => {
             let idx = ((frac * 4.0).ceil() as usize).clamp(1, 4);
             let ch = if up { H_UP_BRAILLE[idx] } else { H_DN_BRAILLE[idx] };
-            format!("{}{} ", color, ch)
+            spectrum_cell(color, ch, cw)
         }
         VizStyle::Bars => {
             let idx = ((frac * 8.0).ceil() as usize).clamp(1, 8);
             if up {
-                format!("{}{} ", color, SPECTRUM_H_CHARS[idx])
+                spectrum_cell(color, SPECTRUM_H_CHARS[idx], cw)
             } else if idx >= 8 {
-                format!("{}█ ", color)
+                spectrum_cell(color, '█', cw)
             } else {
                 // Reverse video: FG becomes BG and vice versa, so the block's
                 // "empty" part uses the terminal's real background (invisible),
                 // making the block fill from the top of the cell.
-                format!("{}\x1B[7m{}\x1B[27m{C_RESET} ", color, SPECTRUM_H_BLOCKS_DN[idx])
+                // Reverse video fills from the top of the cell; the glyph is
+                // repeated across the bar's width like every other cell.
+                format!("{}\x1B[7m{}\x1B[27m{C_RESET} ", color,
+                        SPECTRUM_H_BLOCKS_DN[idx].to_string().repeat(cw - 1))
             }
         }
     }
 }
 
-pub fn render_spectrum_vertical(state: &PlayerState, style: VizStyle) -> Vec<String> {
+pub fn render_spectrum_vertical(state: &PlayerState, style: VizStyle, width: usize,
+                                rows: usize, extras: bool) -> Vec<String> {
     const LOWER_BLOCKS: &[char] = &[' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇'];
     const BRAILLE_V: &[char] = &[' ', '⣀', '⣀', '⣤', '⣤', '⣶', '⣶', '⣿'];
     let spec_l = state.get_spectrum();
     let spec_r = state.get_spectrum_r();
     let spectrum: [f32; SPECTRUM_BANDS] = std::array::from_fn(|i| (spec_l[i] + spec_r[i]) / 2.0);
     let dots = state.get_dots();
-    let height = 8;
+    // No room reserved means draw nothing, not one row anyway.
+    if rows == 0 {
+        return Vec::new();
+    }
+    // The legend takes the bottom row, so the bars lose one.
+    let legend = extras && rows >= 2;
+    let height = rows - usize::from(legend);
+    let cw = spectrum_cell_w(width);
+    let groups = spectrum_columns(spectrum_col_count(width, cw));
+    let indent = " ".repeat(spectrum_indent(width, groups.len(), cw));
     let mut lines = vec![String::new(); height];
 
     let vp = viz_palette(state.theme_kind());
-    // Top rows are "hot" (loud), bottom rows are quiet — map onto hot→mid→low.
-    let row_colors = [
-        vp.hot, vp.hot, vp.mid, vp.mid,
-        vp.low, vp.low, vp.low, vp.low,
-    ];
+    // Top rows are "hot" (loud), bottom rows are quiet. Keyed off the row's
+    // position in the range rather than a fixed 8-entry table, so the ramp
+    // holds at any height: the top quarter is hot, the next quarter mid.
+    let row_color = |row: usize| -> &str {
+        let frac = row as f32 / height as f32;
+        if frac < 0.25 { vp.hot } else if frac < 0.5 { vp.mid } else { vp.low }
+    };
 
     let partials = match style {
         VizStyle::Bars => LOWER_BLOCKS,
@@ -854,24 +1111,27 @@ pub fn render_spectrum_vertical(state: &PlayerState, style: VizStyle) -> Vec<Str
     };
 
     for row in 0..height {
-        lines[row].push_str("  ");
+        lines[row].push_str(&indent);
         let row_bottom = (height - 1 - row) as f32 / height as f32;
         let row_top = (height - row) as f32 / height as f32;
-        let color = row_colors[row];
+        let color = row_color(row);
 
-        for (i, &level) in spectrum.iter().enumerate() {
-            let dot = dots[i];
+        for &g in &groups {
+            let (level, _) = spectrum_group(&spectrum, g);
+            let (dot, _) = spectrum_group(&dots, g);
             let dot_in_row = dot >= row_bottom && dot < row_top;
             let bar_partial = level > row_bottom && level < row_top;
             let bar_full = level >= row_top;
 
             if bar_full {
                 let ch = match style { VizStyle::Bars => '█', VizStyle::Dots => '⣿' };
-                lines[row].push_str(&format!("{C_RESET}{}{} ", color, ch));
+                lines[row].push_str(C_RESET);
+                lines[row].push_str(&spectrum_cell(color, ch, cw));
             } else if bar_partial && dot_in_row {
                 let frac = (dot - row_bottom) / (row_top - row_bottom);
                 let idx = (frac * 7.0).clamp(1.0, 7.0) as usize;
-                lines[row].push_str(&format!("{C_RESET}{}{} ", color, partials[idx]));
+                lines[row].push_str(C_RESET);
+                lines[row].push_str(&spectrum_cell(color, partials[idx], cw));
             } else if dot_in_row {
                 let dot_ch = match style {
                     VizStyle::Dots => '⣀',
@@ -881,37 +1141,208 @@ pub fn render_spectrum_vertical(state: &PlayerState, style: VizStyle) -> Vec<Str
                         LOWER_BLOCKS[idx.min(2)]
                     }
                 };
-                lines[row].push_str(&format!("{C_RESET}{}{} ", color, dot_ch));
+                lines[row].push_str(C_RESET);
+                lines[row].push_str(&spectrum_cell(color, dot_ch, cw));
             } else if bar_partial {
                 let frac = (level - row_bottom) / (row_top - row_bottom);
                 let idx = (frac * 7.0).max(1.0) as usize;
-                lines[row].push_str(&format!("{C_RESET}{}{} ", color, partials[idx]));
+                lines[row].push_str(C_RESET);
+                lines[row].push_str(&spectrum_cell(color, partials[idx], cw));
             } else {
-                lines[row].push_str(&format!("{}  ", vp.reset));
+                lines[row].push_str(vp.reset);
+                for _ in 0..cw { lines[row].push(' '); }
             }
         }
         lines[row].push_str(vp.reset);
     }
+    if legend {
+        lines.push(spectrum_legend_row(&groups, cw, indent.len(), &vp));
+    }
     lines
 }
 
-pub fn get_viz_line_count(mode: VizMode, style: VizStyle) -> usize {
+/// Glyphs per spectrum band. The band count is fixed at 31 by the atomics that
+/// carry it, so extra width goes into bar WEIGHT, in whole steps: one glyph,
+/// then two, then three, each with a one-column gap. Padding a single glyph out
+/// with spaces instead would make a wide window look sparser, not bigger.
+/// Deriving more than 31 bands from the FFT's 2048 bins is the real horizontal
+/// win and needs the state pipeline widened first.
+fn spectrum_bar_w(width: usize) -> usize {
+    (width.saturating_sub(2) / SPECTRUM_BANDS).saturating_sub(1).clamp(1, 3)
+}
+
+/// Columns one band occupies: its bars plus the gap after them.
+fn spectrum_cell_w(width: usize) -> usize {
+    spectrum_bar_w(width) + 1
+}
+
+/// Source band range for each display column when `SPECTRUM_BANDS` has to fit
+/// into `cols` columns.
+///
+/// A window too narrow for all 31 bands gets a coarser spectrum, never a
+/// truncated one: dropping the top columns would silently cut the treble off
+/// the display and misreport what is playing. Each column takes the peak of
+/// its group, the same way the character spectrogram folds bands into octaves.
+fn spectrum_columns(cols: usize) -> Vec<(usize, usize)> {
+    let cols = cols.clamp(1, SPECTRUM_BANDS);
+    (0..cols)
+        .map(|i| {
+            let lo = i * SPECTRUM_BANDS / cols;
+            let hi = ((i + 1) * SPECTRUM_BANDS / cols).max(lo + 1);
+            (lo, hi.min(SPECTRUM_BANDS))
+        })
+        .collect()
+}
+
+/// The band whose colour and centre frequency represent a group.
+fn spectrum_group_src(group: (usize, usize)) -> usize {
+    let (lo, hi) = group;
+    (lo + (hi - lo) / 2).min(SPECTRUM_BANDS - 1)
+}
+
+/// Peak of a band group, and the source band that represents it.
+fn spectrum_group(spec: &[f32; SPECTRUM_BANDS], group: (usize, usize)) -> (f32, usize) {
+    let (lo, hi) = group;
+    let peak = spec[lo..hi].iter().copied().fold(0.0f32, f32::max);
+    (peak, spectrum_group_src(group))
+}
+
+/// Short label for a band centre, in at most three columns and never
+/// ambiguous: `fmt_gutter_hz` rounds 1000, 1250 and 1600 all to "1k", which
+/// would print the same label over three different bins.
+fn fmt_band_hz(f: f32) -> String {
+    let hz = f.round() as i64;
+    if hz < 1000 {
+        return format!("{hz}");
+    }
+    if hz >= 10_000 {
+        return format!("{}k", hz / 1000);
+    }
+    let tenth = (hz % 1000) / 100;
+    if tenth == 0 { format!("{}k", hz / 1000) } else { format!("{}k{}", hz / 1000, tenth) }
+}
+
+/// How many spectrum columns fit in `width`, given the per-band cell width.
+fn spectrum_col_count(width: usize, cw: usize) -> usize {
+    (width.saturating_sub(2) / cw.max(1)).clamp(1, SPECTRUM_BANDS)
+}
+
+/// Left margin that centres the band block in the window.
+///
+/// Cell width moves in whole columns, so 31 bands rarely divide the window
+/// exactly — at 90 columns they occupy 64. Centring spends the remainder on
+/// both margins instead of leaving a ragged gap down the right-hand side.
+/// Never less than the frame's own two-column indent.
+fn spectrum_indent(width: usize, cols: usize, cw: usize) -> usize {
+    let used = cols * cw;
+    2 + width.saturating_sub(2 + used) / 2
+}
+
+/// A frequency legend row for the spectrum bins.
+///
+/// 31 labels never fit, so this walks the columns and keeps a label only when
+/// it clears the previous one — the same thinning the analysis spectrogram's
+/// octave ladder uses. Labels name the band actually under them, taken from the
+/// same `ISO_CENTERS` table that defines the bins, so they cannot drift.
+fn spectrum_legend_row(groups: &[(usize, usize)], cw: usize, indent: usize,
+                       vp: &VizPalette) -> String {
+    let width = groups.len() * cw;
+    let mut cells = vec![' '; width];
+    let mut next_free = 0usize;
+    for (i, &g) in groups.iter().enumerate() {
+        let text = fmt_band_hz(ISO_CENTERS[spectrum_group_src(g)]);
+        let col = i * cw;
+        if col < next_free || col + text.len() > width {
+            continue;
+        }
+        for (k, ch) in text.chars().enumerate() {
+            cells[col + k] = ch;
+        }
+        // One clear column between labels, or they read as one number.
+        next_free = col + text.len() + 1;
+    }
+    let mut line = " ".repeat(indent);
+    line.push_str(vp.dim);
+    line.extend(cells);
+    line.push_str(vp.reset);
+    line
+}
+
+/// One spectrum cell: `cw - 1` glyphs, then the gap column.
+fn spectrum_cell(color: &str, ch: char, cw: usize) -> String {
+    let mut s = String::with_capacity(color.len() + cw);
+    s.push_str(color);
+    for _ in 1..cw { s.push(ch); }
+    s.push(' ');
+    s
+}
+
+/// Rows the viz body occupies given the rows the frame can spare. Modes that
+/// scale clamp into their own range; the rest ignore the budget and keep their
+/// fixed height. Callers add one for the separator line above the block —
+/// `get_viz_line_count` is that total.
+pub fn viz_body_rows(mode: VizMode, avail: usize, fullscreen: bool, extras: bool) -> usize {
     match mode {
         VizMode::None => 0,
-        VizMode::VuMeter => if matches!(style, VizStyle::Bars) { 4 } else { 3 },
-        VizMode::SpectrumHorizontal => SPECTRUM_H_ROWS * 2 + 1,
-        VizMode::SpectrumVertical => 9,
-        VizMode::Oscilloscope => OSCILLOSCOPE_ROWS + 1,
-        VizMode::Lissajous => LISSAJOUS_ROWS + 1,
-        VizMode::Spectrogram => SPECTROGRAM_ROWS + 1,
-        VizMode::SpectrogramAnalysis => SPECTRO_ANALYSIS_ROWS + 1,
+        // No lower bound: `avail` is what the window actually has, and
+        // returning more than that reserves rows past the terminal's bottom.
+        // Zero means draw nothing.
+        _ => avail.min(viz_max_rows(mode, fullscreen, extras)),
     }
 }
 
+/// Ceiling for a scaled viz body.
+///
+/// A resize is responsive on its own: give a mode more room and it grows in
+/// steps, without any key press. Full window lifts the ceiling so the mode can
+/// take the screen; at normal size it stops well short, or a tall terminal
+/// would hand the whole frame to the visualization and push everything else
+/// out. The normal VU ceiling is deliberately enough for triple-height bars.
+fn viz_max_rows(mode: VizMode, fullscreen: bool, extras: bool) -> usize {
+    match mode {
+        // Without the history strip the meter has nothing to do with extra
+        // rows, so it stops asking for them rather than reserving blanks.
+        // The meter's own structure sets this: two bars at the odd thickness
+        // cap, the gap between them, and the scale. History on must never make
+        // the block SMALLER than history off, or the toggle shrinks the meter.
+        VizMode::VuMeter => match (extras, fullscreen) {
+            (false, _) => VU_BARS_ROWS,
+            (true, false) => VU_BARS_ROWS + 6,
+            (true, true) => VU_MAX_ROWS,
+        },
+        // Everything else follows one policy: a normal frame grows to about
+        // twice its natural height — visibly responsive without swallowing the
+        // window — and full window runs to whatever the DATA supports.
+        VizMode::SpectrumHorizontal => if fullscreen { SPECTRUM_MAX_ROWS } else { 12 },
+        VizMode::SpectrumVertical => if fullscreen { SPECTRUM_MAX_ROWS } else { 16 },
+        VizMode::Oscilloscope => if fullscreen { OSCILLOSCOPE_MAX_ROWS } else { 16 },
+        VizMode::Lissajous => if fullscreen { LISSAJOUS_MAX_ROWS } else { 16 },
+        // One row per band is the real ceiling: past 31 rows there are no more
+        // ⅓-octave bands left to separate.
+        VizMode::Spectrogram => if fullscreen { SPECTRUM_BANDS } else { 20 },
+        // The pixel image gains the most from height — more pixel rows per
+        // octave is what makes pitch readable off it — but each row is more
+        // Sixel to encode per hop, so its normal ceiling stays put.
+        VizMode::SpectrogramAnalysis =>
+            if fullscreen { SPECTRO_ANALYSIS_MAX_ROWS } else { SPECTRO_ANALYSIS_ROWS },
+        _ => 0,
+    }
+}
+
+
+
 // --- Oscilloscope -----------------------------------------------------------
 
-const OSCILLOSCOPE_ROWS: usize = 8;    // terminal cells tall (width is responsive)
-const OSCILLOSCOPE_DOTS_H: usize = OSCILLOSCOPE_ROWS * 4;
+const OSCILLOSCOPE_MAX_ROWS: usize = 40;
+/// Height at which the trace splits into one per channel. Below this there are
+/// too few braille sub-rows to tell two traces apart, so the mono sum is the
+/// honest display; above it the stereo difference is information the mono sum
+/// throws away.
+const OSCILLOSCOPE_DUAL_ROWS: usize = 10;
+/// Widest trace worth drawing: the renderer samples two sub-columns per cell,
+/// so this is exactly the waveform buffer's depth — past it the same sample
+/// would be plotted twice.
+const OSCILLOSCOPE_MAX_COLS: usize = WAVEFORM_BUF_SIZE / 2;
 
 // Bit offsets within a braille cell for dot (px, py) where px∈0..2, py∈0..4.
 const BRAILLE_BITS: [[u32; 4]; 2] = [
@@ -919,20 +1350,26 @@ const BRAILLE_BITS: [[u32; 4]; 2] = [
     [0x08, 0x10, 0x20, 0x80],
 ];
 
-pub fn render_oscilloscope(analyser: &VizAnalyser, style: VizStyle, width: usize) -> Vec<String> {
+pub fn render_oscilloscope(analyser: &VizAnalyser, style: VizStyle, width: usize, rows: usize) -> Vec<String> {
     // Fill the terminal width (2-space pad + 2-col safety margin), with a sane cap.
-    let cols = width.saturating_sub(4).clamp(8, 240);
+    let cols = width.saturating_sub(4).clamp(8, OSCILLOSCOPE_MAX_COLS);
+    if rows == 0 {
+        return Vec::new();
+    }
+    // Both axes are latent: braille packs 2x4 sub-cells and the waveform buffer
+    // holds far more samples than any width shows, so height is pure resolution
+    // — rows x 4 vertical steps in Dots, rows x 2 in Bars.
     match style {
-        VizStyle::Dots => render_oscilloscope_dots(analyser, cols),
-        VizStyle::Bars => render_oscilloscope_bars(analyser, cols),
+        VizStyle::Dots => render_oscilloscope_dots(analyser, cols, rows),
+        VizStyle::Bars => render_oscilloscope_bars(analyser, cols, rows),
     }
 }
 
-fn render_oscilloscope_bars(analyser: &VizAnalyser, cols: usize) -> Vec<String> {
+fn render_oscilloscope_bars(analyser: &VizAnalyser, cols: usize, rows: usize) -> Vec<String> {
     let buf = &analyser.waveform_buf;
     // 2× horizontal resolution via quadrant blocks: sample at 2× cell width.
     let sub_cols = cols * 2;
-    const SUB_ROWS: usize = OSCILLOSCOPE_ROWS * 2;
+    let sub_rows: usize = rows * 2;
     let mut col_values = vec![0.0f32; sub_cols];
     if !buf.is_empty() {
         let n = buf.len();
@@ -943,13 +1380,13 @@ fn render_oscilloscope_bars(analyser: &VizAnalyser, cols: usize) -> Vec<String> 
         }
     }
     // Mark filled sub-cells (2 sub-cols × 2 sub-rows per terminal cell).
-    let mid_sub = SUB_ROWS as f32 / 2.0;
-    let mut sub_grid = vec![false; SUB_ROWS * sub_cols];
+    let mid_sub = sub_rows as f32 / 2.0;
+    let mut sub_grid = vec![false; sub_rows * sub_cols];
     for (x, &v) in col_values.iter().enumerate() {
         let wave_sub = mid_sub - v * mid_sub;
         let (lo, hi) = if wave_sub < mid_sub { (wave_sub, mid_sub) } else { (mid_sub, wave_sub) };
         let lo_i = lo.floor() as usize;
-        let hi_i = (hi.ceil() as usize).min(SUB_ROWS);
+        let hi_i = (hi.ceil() as usize).min(sub_rows);
         for sy in lo_i..hi_i {
             sub_grid[sy * sub_cols + x] = true;
         }
@@ -961,9 +1398,9 @@ fn render_oscilloscope_bars(analyser: &VizAnalyser, cols: usize) -> Vec<String> 
         '▗', '▚', '▐', '▜',  // 1000 1001 1010 1011
         '▄', '▙', '▟', '█',  // 1100 1101 1110 1111
     ];
-    let mut lines = Vec::with_capacity(OSCILLOSCOPE_ROWS);
-    for cy in 0..OSCILLOSCOPE_ROWS {
-        let from_edge = cy.min(OSCILLOSCOPE_ROWS - 1 - cy);
+    let mut lines = Vec::with_capacity(rows);
+    for cy in 0..rows {
+        let from_edge = cy.min(rows - 1 - cy);
         let color = match from_edge {
             0 => C_RED,
             1 => C_YELLOW,
@@ -989,59 +1426,88 @@ fn render_oscilloscope_bars(analyser: &VizAnalyser, cols: usize) -> Vec<String> 
     lines
 }
 
-fn render_oscilloscope_dots(analyser: &VizAnalyser, cols: usize) -> Vec<String> {
+fn render_oscilloscope_dots(analyser: &VizAnalyser, cols: usize, rows: usize) -> Vec<String> {
     let buf = &analyser.waveform_buf;
     let dots_w = cols * 2; // braille 2 dots/cell
-    let mut grid = vec![0u32; dots_w * OSCILLOSCOPE_DOTS_H];
-    let set = |g: &mut [u32], x: usize, y: usize| {
-        if x < dots_w && y < OSCILLOSCOPE_DOTS_H {
-            g[y * dots_w + x] = 1;
-        }
-    };
+    let dots_h = rows * 4; // braille 4 dots/cell
+    // Two traces, one per channel. Below the dual-trace height there isn't the
+    // vertical resolution to tell them apart, so they collapse to the mono sum
+    // and the display is what it always was.
+    let dual = rows >= OSCILLOSCOPE_DUAL_ROWS;
+    let mut grid_l = vec![0u32; dots_w * dots_h];
+    let mut grid_r = vec![0u32; dots_w * dots_h];
 
     if !buf.is_empty() {
         let n = buf.len();
-        let mut prev_y: Option<i32> = None;
-        let mid = (OSCILLOSCOPE_DOTS_H / 2) as i32;
-        for x in 0..dots_w {
-            // Map column to sample index (newest on right).
-            let idx = x * (n - 1) / dots_w.max(1);
-            let (l, r) = buf[idx];
-            let mono = (l + r) * 0.5;
-            let y = mid - (mono.clamp(-1.0, 1.0) * mid as f32) as i32;
-            let y = y.clamp(0, (OSCILLOSCOPE_DOTS_H - 1) as i32);
-            // Connect previous sample's y to current y so the trace is continuous.
-            let y0 = prev_y.unwrap_or(y);
-            let (lo, hi) = if y0 < y { (y0, y) } else { (y, y0) };
-            for yi in lo..=hi {
-                set(&mut grid, x, yi as usize);
+        let mid = (dots_h / 2) as i32;
+        let trace = |grid: &mut [u32], pick: &dyn Fn(f32, f32) -> f32| {
+            let mut prev_y: Option<i32> = None;
+            for x in 0..dots_w {
+                // Map column to sample index (newest on right).
+                let idx = x * (n - 1) / dots_w.max(1);
+                let (l, r) = buf[idx];
+                let v = pick(l, r);
+                let y = mid - (v.clamp(-1.0, 1.0) * mid as f32) as i32;
+                let y = y.clamp(0, (dots_h - 1) as i32);
+                // Connect the previous sample's y so the trace is continuous.
+                let y0 = prev_y.unwrap_or(y);
+                let (lo, hi) = if y0 < y { (y0, y) } else { (y, y0) };
+                for yi in lo..=hi {
+                    let (gx, gy) = (x, yi as usize);
+                    if gx < dots_w && gy < dots_h {
+                        grid[gy * dots_w + gx] = 1;
+                    }
+                }
+                prev_y = Some(y);
             }
-            prev_y = Some(y);
+        };
+        if dual {
+            trace(&mut grid_l, &|l, _| l);
+            trace(&mut grid_r, &|_, r| r);
+        } else {
+            trace(&mut grid_l, &|l, r| (l + r) * 0.5);
         }
     }
 
     // Render grid row-by-row. Color by distance from center (green → yellow → red).
-    let mut lines = Vec::with_capacity(OSCILLOSCOPE_ROWS);
-    for cy in 0..OSCILLOSCOPE_ROWS {
+    let mut lines = Vec::with_capacity(rows);
+    for cy in 0..rows {
         let mut line = String::from("  ");
         let mut last_color = "";
         for cx in 0..cols {
-            let mut bits: u32 = 0;
+            let (mut bits, mut bits_l, mut bits_r) = (0u32, 0u32, 0u32);
             for py in 0..4 {
                 for px in 0..2 {
                     let gx = cx * 2 + px;
                     let gy = cy * 4 + py;
-                    if grid[gy * dots_w + gx] != 0 {
-                        bits |= BRAILLE_BITS[px][py];
+                    let bit = BRAILLE_BITS[px][py];
+                    if grid_l[gy * dots_w + gx] != 0 {
+                        bits |= bit;
+                        bits_l |= bit;
+                    }
+                    if grid_r[gy * dots_w + gx] != 0 {
+                        bits |= bit;
+                        bits_r |= bit;
                     }
                 }
             }
-            // Color by row — rows near the edges are louder, so redder.
-            let from_edge = cy.min(OSCILLOSCOPE_ROWS - 1 - cy);
-            let color = match from_edge {
-                0 => C_RED,
-                1 => C_YELLOW,
-                _ => C_GREEN,
+            let color = if dual {
+                // Stereo width read straight off the colour: cells where both
+                // traces pass are mono content, one-sided cells are the
+                // difference between the channels.
+                match (bits_l != 0, bits_r != 0) {
+                    (true, true) => C_GREEN,
+                    (true, false) => C_CYAN,
+                    (false, true) => C_MAGENTA,
+                    (false, false) => C_GREEN,
+                }
+            } else {
+                // Colour by row — rows near the edges are louder, so redder.
+                match cy.min(rows - 1 - cy) {
+                    0 => C_RED,
+                    1 => C_YELLOW,
+                    _ => C_GREEN,
+                }
             };
             if color != last_color {
                 line.push_str(color);
@@ -1058,45 +1524,107 @@ fn render_oscilloscope_dots(analyser: &VizAnalyser, cols: usize) -> Vec<String> 
 
 // --- Lissajous / Vectorscope ------------------------------------------------
 
-const LISSAJOUS_COLS: usize = 16;
-const LISSAJOUS_ROWS: usize = 8;
-const LISSAJOUS_DOTS_W: usize = LISSAJOUS_COLS * 2;
-const LISSAJOUS_DOTS_H: usize = LISSAJOUS_ROWS * 4;
+const LISSAJOUS_MAX_ROWS: usize = 40;
+/// Columns the side panel needs before it is worth drawing.
+const LISSAJOUS_PANEL_W: usize = 12;
 
-pub fn render_lissajous(analyser: &VizAnalyser, style: VizStyle, width: usize) -> Vec<String> {
-    // The vectorscope box must stay ~square (16 cols × 8 rows ≈ square at the
-    // typical 1:2 cell aspect), so unlike the other modes it can't stretch to
-    // the terminal width — center it instead.
-    let pad = (width.saturating_sub(LISSAJOUS_COLS) / 2).max(2);
-    match style {
-        VizStyle::Dots => render_lissajous_dots(analyser, pad),
-        VizStyle::Bars => render_lissajous_bars(analyser, pad),
+/// Inter-channel correlation and balance over the waveform buffer.
+///
+/// Correlation is the normalised dot product: +1 mono, 0 uncorrelated, -1 the
+/// channels cancelling — the number a vectorscope exists to show, and the one
+/// thing its picture makes you estimate by eye. Balance is the signed share of
+/// energy, negative to the left.
+fn lissajous_stats(buf: &std::collections::VecDeque<(f32, f32)>) -> (f32, f32) {
+    let (mut lr, mut ll, mut rr) = (0.0f64, 0.0f64, 0.0f64);
+    for &(l, r) in buf.iter() {
+        lr += (l * r) as f64;
+        ll += (l * l) as f64;
+        rr += (r * r) as f64;
     }
+    let denom = (ll * rr).sqrt();
+    let corr = if denom > 1e-12 { (lr / denom) as f32 } else { 0.0 };
+    let total = ll + rr;
+    let bal = if total > 1e-12 { ((rr - ll) / total) as f32 } else { 0.0 };
+    (corr.clamp(-1.0, 1.0), bal.clamp(-1.0, 1.0))
+}
+/// Terminal cells are roughly 1:2, so a square box needs twice as many columns
+/// as rows. A vectorscope that is not square lies about phase.
+const LISSAJOUS_ASPECT: usize = 2;
+
+pub fn render_lissajous(analyser: &VizAnalyser, style: VizStyle, width: usize, rows: usize) -> Vec<String> {
+    // Unlike every other mode the two axes are ONE knob: whichever of height or
+    // width runs out first sets the box, and the leftover width stays margin
+    // rather than being stretched into.
+    let avail_cols = width.saturating_sub(4);
+    let side = rows.min(avail_cols / LISSAJOUS_ASPECT);
+    if side == 0 {
+        return vec![String::new(); rows];
+    }
+    let cols = side * LISSAJOUS_ASPECT;
+    let pad = (width.saturating_sub(cols) / 2).max(2);
+    let mut lines = match style {
+        VizStyle::Dots => render_lissajous_dots(analyser, pad, side, cols),
+        VizStyle::Bars => render_lissajous_bars(analyser, pad, side, cols),
+    };
+    // A square box in a wide window leaves two margins that must not be
+    // stretched into. Spend the right-hand one on the numbers a vectorscope is
+    // read FOR — correlation and channel balance — which is the honest use of
+    // space that cannot hold more scatter.
+    let right = width.saturating_sub(pad + cols);
+    if right >= LISSAJOUS_PANEL_W && lines.len() >= 3 {
+        let (corr, bal) = lissajous_stats(&analyser.waveform_buf);
+        let panel = [
+            format!("corr {corr:+.2}"),
+            match bal {
+                b if b.abs() < 0.02 => "bal  ctr".to_string(),
+                b if b < 0.0 => format!("bal  L{:.0}%", -b * 100.0),
+                b => format!("bal  R{:.0}%", b * 100.0),
+            },
+            // Correlation near -1 means the channels cancel in mono.
+            if corr < -0.2 { "MONO RISK".to_string() } else { String::new() },
+        ];
+        let top = lines.len().saturating_sub(panel.len()) / 2;
+        for (i, text) in panel.iter().enumerate() {
+            if text.is_empty() {
+                continue;
+            }
+            if let Some(line) = lines.get_mut(top + i) {
+                line.push_str(&format!("  {C_DIM}{text}{C_RESET}"));
+            }
+        }
+    }
+    // The box is square, the budget may not be: pad the remainder so the frame
+    // still gets exactly the rows it accounted for.
+    while lines.len() < rows {
+        lines.push(String::new());
+    }
+    lines.truncate(rows);
+    lines
 }
 
-fn render_lissajous_bars(analyser: &VizAnalyser, pad: usize) -> Vec<String> {
+fn render_lissajous_bars(analyser: &VizAnalyser, pad: usize, rows: usize, cols: usize) -> Vec<String> {
     let buf = &analyser.waveform_buf;
-    let mut counts = vec![0u32; LISSAJOUS_COLS * LISSAJOUS_ROWS];
+    let mut counts = vec![0u32; cols * rows];
     let inv_sqrt2 = std::f32::consts::FRAC_1_SQRT_2;
-    let w_half = LISSAJOUS_COLS as f32 / 2.0;
-    let h_half = LISSAJOUS_ROWS as f32 / 2.0;
+    let w_half = cols as f32 / 2.0;
+    let h_half = rows as f32 / 2.0;
     for &(l, r) in buf.iter() {
         let side = (l - r) * inv_sqrt2;
         let mid = (l + r) * inv_sqrt2;
         let x = (w_half + side.clamp(-1.0, 1.0) * (w_half - 0.5)) as i32;
         let y = (h_half - mid.clamp(-1.0, 1.0) * (h_half - 0.5)) as i32;
-        if x >= 0 && (x as usize) < LISSAJOUS_COLS && y >= 0 && (y as usize) < LISSAJOUS_ROWS {
-            counts[y as usize * LISSAJOUS_COLS + x as usize] += 1;
+        if x >= 0 && (x as usize) < cols && y >= 0 && (y as usize) < rows {
+            counts[y as usize * cols + x as usize] += 1;
         }
     }
     let max = counts.iter().copied().max().unwrap_or(1).max(1) as f32;
 
-    let mut lines = Vec::with_capacity(LISSAJOUS_ROWS);
-    for cy in 0..LISSAJOUS_ROWS {
+    let mut lines = Vec::with_capacity(rows);
+    for cy in 0..rows {
         let mut line = " ".repeat(pad);
         line.push_str(C_CYAN);
-        for cx in 0..LISSAJOUS_COLS {
-            let f = counts[cy * LISSAJOUS_COLS + cx] as f32 / max;
+        for cx in 0..cols {
+            let f = counts[cy * cols + cx] as f32 / max;
             let ch = if f == 0.0 { ' ' }
                 else if f < 0.25 { '░' }
                 else if f < 0.5  { '▒' }
@@ -1110,36 +1638,37 @@ fn render_lissajous_bars(analyser: &VizAnalyser, pad: usize) -> Vec<String> {
     lines
 }
 
-fn render_lissajous_dots(analyser: &VizAnalyser, pad: usize) -> Vec<String> {
+fn render_lissajous_dots(analyser: &VizAnalyser, pad: usize, rows: usize, cols: usize) -> Vec<String> {
+    let (dots_w, dots_h) = (cols * 2, rows * 4);
     let buf = &analyser.waveform_buf;
-    let mut grid = vec![0u32; LISSAJOUS_DOTS_W * LISSAJOUS_DOTS_H];
+    let mut grid = vec![0u32; dots_w * dots_h];
 
     // Rotated 45° (mid/side): mono signals appear as a vertical line.
     // X = side = (L - R) / sqrt(2); Y = mid = (L + R) / sqrt(2). Terminal Y grows down.
     let inv_sqrt2 = std::f32::consts::FRAC_1_SQRT_2;
-    let w_half = (LISSAJOUS_DOTS_W / 2) as f32;
-    let h_half = (LISSAJOUS_DOTS_H / 2) as f32;
+    let w_half = (dots_w / 2) as f32;
+    let h_half = (dots_h / 2) as f32;
     for &(l, r) in buf.iter() {
         let side = (l - r) * inv_sqrt2;
         let mid = (l + r) * inv_sqrt2;
         let x = (w_half + side.clamp(-1.0, 1.0) * (w_half - 1.0)) as i32;
         let y = (h_half - mid.clamp(-1.0, 1.0) * (h_half - 1.0)) as i32;
-        if x >= 0 && (x as usize) < LISSAJOUS_DOTS_W && y >= 0 && (y as usize) < LISSAJOUS_DOTS_H {
-            grid[y as usize * LISSAJOUS_DOTS_W + x as usize] = 1;
+        if x >= 0 && (x as usize) < dots_w && y >= 0 && (y as usize) < dots_h {
+            grid[y as usize * dots_w + x as usize] = 1;
         }
     }
 
-    let mut lines = Vec::with_capacity(LISSAJOUS_ROWS);
-    for cy in 0..LISSAJOUS_ROWS {
+    let mut lines = Vec::with_capacity(rows);
+    for cy in 0..rows {
         let mut line = " ".repeat(pad);
         line.push_str(C_CYAN);
-        for cx in 0..LISSAJOUS_COLS {
+        for cx in 0..cols {
             let mut bits: u32 = 0;
             for py in 0..4 {
                 for px in 0..2 {
                     let gx = cx * 2 + px;
                     let gy = cy * 4 + py;
-                    if grid[gy * LISSAJOUS_DOTS_W + gx] != 0 {
+                    if grid[gy * dots_w + gx] != 0 {
                         bits |= BRAILLE_BITS[px][py];
                     }
                 }
@@ -1176,7 +1705,10 @@ const SPECTROGRAM_DOTS: &[char] = &[' ', '⡀', '⣀', '⣄', '⣤', '⣦', '⣶
 const SPECTROGRAM_FLOOR: f32 = 0.30; // raise to darken / drop weak bands
 const SPECTROGRAM_CEIL: f32 = 0.62;  // lower to make peaks reach full height sooner
 
-pub fn render_spectrogram(analyser: &VizAnalyser, style: VizStyle, width: usize) -> Vec<String> {
+pub fn render_spectrogram(analyser: &VizAnalyser, style: VizStyle, width: usize, rows: usize) -> Vec<String> {
+    if rows == 0 {
+        return Vec::new();
+    }
     let hist = &analyser.spectrogram_history;
     // Fill the terminal width (2-space pad + 2-col safety margin), capped at history.
     let cols = width.saturating_sub(4).clamp(8, SPECTROGRAM_COLS);
@@ -1190,23 +1722,25 @@ pub fn render_spectrogram(analyser: &VizAnalyser, style: VizStyle, width: usize)
     // Group 31 bands into 10 octave rows, top-to-bottom = highest-to-lowest freq.
     // One octave (3 ⅓-octave bands) per row; the top row absorbs the spare 20 kHz
     // band. Row i pulls the max over its group for snappier high-freq response.
-    let band_groups: [(usize, usize); SPECTROGRAM_ROWS] = [
-        (27, 31), // 10k-20k air
-        (24, 27), // 5k-8k brilliance
-        (21, 24), // 2.5k-4k presence
-        (18, 21), // 1.25k-2k upper-mid
-        (15, 18), // 630-1k mid
-        (12, 15), // 315-500 low-mid
-        (9, 12),  // 160-250 upper bass
-        (6, 9),   // 80-125 bass
-        (3, 6),   // 40-63 low bass
-        (0, 3),   // 20-31.5 sub
-    ];
+    // Rows are latent detail, not decoration: 31 ⅓-octave bands fold into
+    // whatever height there is, one octave per row at the natural 10 and
+    // approaching one BAND per row as the block grows. Top row = highest
+    // frequency, so the groups run backwards down the band list.
+    let band_groups: Vec<(usize, usize)> = (0..rows)
+        .map(|r| {
+            let from_bottom = rows - 1 - r;
+            let lo = from_bottom * SPECTRUM_BANDS / rows;
+            let hi = ((from_bottom + 1) * SPECTRUM_BANDS / rows).max(lo + 1);
+            (lo, hi.min(SPECTRUM_BANDS))
+        })
+        .collect();
 
-    let mut lines = Vec::with_capacity(SPECTROGRAM_ROWS);
+    let mut lines = Vec::with_capacity(rows);
     for (row, &(lo, hi)) in band_groups.iter().enumerate() {
         let mut line = String::from("  ");
-        let color = SPECTROGRAM_ROW_COLORS[row];
+        // The colour ramp is a fixed table read by position, not by index, so
+        // it stretches over any number of rows instead of running off its end.
+        let color = SPECTROGRAM_ROW_COLORS[row * SPECTROGRAM_ROW_COLORS.len() / rows];
         line.push_str(color);
         // Show the newest `cols` columns: oldest on the left, newest on the right.
         // Pad with spaces when history hasn't filled the visible width yet.
@@ -1490,26 +2024,27 @@ fn analysis_can_skip_emit(
     sixel && !force && key == last
 }
 
-/// Clamp the analysis-spectrogram row count so the whole frame fits the
-/// window. If the frame is even 1-2 rows taller than the terminal, every full
-/// repaint (viz switch, track skip) scrolls the banner's top rows into
-/// scrollback — on ConPTY that litters one UI fragment per song. `rows_above`
-/// = banner + status lines above the viz block; 3 more rows are reserved for
-/// the viz separator line, the transient status line, and one row of slack.
-pub fn analysis_rows_for_window(term_h: usize, rows_above: usize) -> usize {
-    analysis_rows_reserving(term_h, rows_above, 3)
+
+/// Blank rows to put ABOVE a viz block that stops short of its budget, so it
+/// sits centred in the space instead of pinned to the top.
+///
+/// Only meaningful in full window: a normal frame has chrome directly below the
+/// block, so there is no free space to centre within. Modes that stop short are
+/// the ones with a shape of their own — the VU meter with its history off, a
+/// square vectorscope in a tall window.
+pub fn viz_top_pad(avail: usize, body: usize, fullscreen: bool) -> usize {
+    if fullscreen { avail.saturating_sub(body) / 2 } else { 0 }
 }
 
-/// As [`analysis_rows_for_window`], but with the rows kept free BELOW the image
-/// stated explicitly.
+/// Rows the frame can spare for a viz body: what the window has left after the
+/// content above it and whatever must stay visible below.
 ///
-/// The default of 3 assumes a footer under the spectrogram. Minimal draws its
-/// command tray *above* it — those rows are already counted in `rows_above`, so
-/// reserving three more would shrink the image for no reason. One row of slack
-/// is still kept: an image ending on the very last line makes the terminal
-/// scroll on the next write.
-pub fn analysis_rows_reserving(term_h: usize, rows_above: usize, below: usize) -> usize {
-    SPECTRO_ANALYSIS_ROWS.min(4.max(term_h.saturating_sub(rows_above + below)))
+/// No floor. A minimum enforced when the window has no room for it reserves
+/// rows past the terminal's own bottom, and a Sixel image painted there
+/// auto-scrolls the status line away on every frame. Zero means no room, and
+/// the caller draws nothing.
+pub fn viz_rows_available(term_h: usize, rows_above: usize, below: usize) -> usize {
+    term_h.saturating_sub(rows_above + below)
 }
 
 /// Whether the analysis-spectrogram lines must be printed WITHOUT the usual
@@ -1934,6 +2469,259 @@ fn analysis_colormap(t: f32) -> (u8, u8, u8) {
 mod analysis_tests {
     use super::*;
 
+    /// Every scaled mode, both styles, swept across window sizes the way a drag
+    /// resizes one — one row and one column at a time. Two invariants hold at
+    /// every step: the renderer returns EXACTLY the rows it was given (the
+    /// frame's line accounting is derived from this, and a renderer that
+    /// returns a different count silently shifts everything below it), and no
+    /// line is wider than the window (a wrapped line costs a row the layout
+    /// never budgeted for, which is what scrolls the frame).
+    #[test]
+    fn scaled_viz_fill_their_row_budget_at_every_window_size() {
+        use crate::ansi::visible_len;
+        let state = PlayerState::new();
+        let analyser = VizAnalyser::new(48000);
+        let modes = [
+            VizMode::VuMeter,
+            VizMode::SpectrumHorizontal,
+            VizMode::SpectrumVertical,
+            VizMode::Oscilloscope,
+            VizMode::Lissajous,
+            VizMode::Spectrogram,
+        ];
+        for mode in modes {
+            for style in [VizStyle::Dots, VizStyle::Bars] {
+              for extras in [false, true] {
+                for term_w in [20usize, 40, 62, 80, 100, 140, 200, 320] {
+                    // Step through every height a drag would pass through.
+                    for term_h in 0..48usize {
+                        let rows = viz_body_rows(mode, term_h, true, extras);
+                        let lines = match mode {
+                            VizMode::VuMeter => render_vu_meter(&state, style, term_w, rows, extras),
+                            VizMode::SpectrumHorizontal =>
+                                render_spectrum_horizontal(&state, style, term_w, rows, extras),
+                            VizMode::SpectrumVertical =>
+                                render_spectrum_vertical(&state, style, term_w, rows, extras),
+                            VizMode::Oscilloscope =>
+                                render_oscilloscope(&analyser, style, term_w, rows),
+                            VizMode::Lissajous =>
+                                render_lissajous(&analyser, style, term_w, rows),
+                            VizMode::Spectrogram =>
+                                render_spectrogram(&analyser, style, term_w, rows),
+                            _ => unreachable!(),
+                        };
+                        assert_eq!(
+                            lines.len(), rows,
+                            "{mode:?}/{style:?} extras={extras} w={term_w} budget={term_h}: \
+                             got {} lines for {rows} rows",
+                            lines.len()
+                        );
+                        for (i, line) in lines.iter().enumerate() {
+                            assert!(
+                                visible_len(line) <= term_w,
+                                "{mode:?}/{style:?} extras={extras} w={term_w} rows={rows} \
+                                 line {i} is {} wide",
+                                visible_len(line)
+                            );
+                        }
+                    }
+                }
+              }
+            }
+        }
+    }
+
+    #[test]
+    fn a_scaled_viz_never_claims_rows_the_window_does_not_have() {
+        // The same trap as the analysis block's old 4-row floor: a minimum
+        // applied to a window with no room reserves lines off-screen, and the
+        // frame scrolls on every repaint.
+        for term_h in 0..60usize {
+            for above in 0..40usize {
+                let avail = viz_rows_available(term_h, above, 3);
+                for mode in [VizMode::VuMeter, VizMode::SpectrumHorizontal,
+                             VizMode::SpectrumVertical, VizMode::Oscilloscope,
+                             VizMode::Lissajous, VizMode::Spectrogram,
+                             VizMode::SpectrogramAnalysis] {
+                    {
+                        let body = viz_body_rows(mode, avail, true, true);
+                        assert!(body <= avail, "{mode:?} claimed {body} of {avail}");
+                        assert!(
+                            body + above + 3 <= term_h || body == 0,
+                            "{mode:?} term_h={term_h} above={above} body={body} overflows"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn analysis_block_fills_its_row_budget_across_window_sizes() {
+        // Same contract as the cell-based modes, on a coarser grid: this one
+        // encodes an image per call, so sweeping every size costs half a minute.
+        let analyser = VizAnalyser::new(48000);
+        for term_w in [24usize, 60, 120, 240] {
+            for rows in [0usize, 1, 2, 5, 9, 16, 24, 32] {
+                let budget = viz_body_rows(VizMode::SpectrogramAnalysis, rows, true, false);
+                for log in [true, false] {
+                    let lines = render_spectrogram_analysis(
+                        &analyser, term_w, log, false, budget, true,
+                    );
+                    assert_eq!(
+                        lines.len(), budget,
+                        "w={term_w} budget={budget}: got {} lines", lines.len()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_band_gets_its_own_label_in_three_columns() {
+        // A legend that prints "1k" over 1000, 1250 and 1600 is worse than no
+        // legend: it names the wrong bin and looks deliberate.
+        let mut seen = std::collections::HashSet::new();
+        for &f in ISO_CENTERS.iter() {
+            let text = fmt_band_hz(f);
+            assert!(text.len() <= 3, "{f}Hz -> {text:?} is too wide");
+            assert!(seen.insert(text.clone()), "duplicate label {text:?}");
+        }
+        assert_eq!(fmt_band_hz(20.0), "20");
+        assert_eq!(fmt_band_hz(1000.0), "1k");
+        assert_eq!(fmt_band_hz(1250.0), "1k2");
+        assert_eq!(fmt_band_hz(6300.0), "6k3");
+        assert_eq!(fmt_band_hz(16000.0), "16k");
+    }
+
+    #[test]
+    fn the_db_scale_runs_loud_to_quiet_and_ends_at_full_scale() {
+        for bar in [12usize, 24, 54, 120, 300] {
+            let marks = vu_scale_marks(bar);
+            assert!(!marks.is_empty(), "bar={bar} got no scale");
+            // 0 dB is full scale, so it always survives the thinning and sits
+            // hard against the right-hand end.
+            let (col, text) = *marks.last().unwrap();
+            assert_eq!(text, "0");
+            assert_eq!(col, bar - 1, "bar={bar}: 0 dB must end the scale");
+            // Quieter marks sit further left, and none overlap.
+            for pair in marks.windows(2) {
+                assert!(pair[0].0 + pair[0].1.len() < pair[1].0,
+                        "bar={bar}: {:?} collides with {:?}", pair[0], pair[1]);
+            }
+            for (c, t) in &marks {
+                assert!(c + t.len() <= bar, "bar={bar}: {t:?} runs off the end");
+            }
+        }
+    }
+
+    #[test]
+    fn vectorscope_stats_name_what_the_picture_only_implies() {
+        use std::collections::VecDeque;
+        let mk = |f: &dyn Fn(usize) -> (f32, f32)| -> VecDeque<(f32, f32)> {
+            (0..512).map(f).collect()
+        };
+        let sine = |i: usize| (i as f32 * 0.1).sin();
+        // Identical channels: perfectly correlated, dead centre.
+        let (c, b) = lissajous_stats(&mk(&|i| (sine(i), sine(i))));
+        assert!((c - 1.0).abs() < 1e-3, "mono corr {c}");
+        assert!(b.abs() < 1e-3, "mono bal {b}");
+        // Inverted: cancels in mono, which is the thing worth warning about.
+        let (c, _) = lissajous_stats(&mk(&|i| (sine(i), -sine(i))));
+        assert!((c + 1.0).abs() < 1e-3, "out-of-phase corr {c}");
+        // One channel only: hard to that side.
+        let (_, b) = lissajous_stats(&mk(&|i| (sine(i), 0.0)));
+        assert!((b + 1.0).abs() < 1e-3, "left-only bal {b}");
+        let (_, b) = lissajous_stats(&mk(&|i| (0.0, sine(i))));
+        assert!((b - 1.0).abs() < 1e-3, "right-only bal {b}");
+        // Silence must not divide by zero.
+        assert_eq!(lissajous_stats(&mk(&|_| (0.0, 0.0))), (0.0, 0.0));
+        assert_eq!(lissajous_stats(&VecDeque::new()), (0.0, 0.0));
+    }
+
+    #[test]
+    fn full_window_centres_a_block_that_stops_short() {
+        for avail in 0..60usize {
+            for mode in [VizMode::VuMeter, VizMode::Lissajous, VizMode::SpectrumVertical] {
+                for extras in [false, true] {
+                    let body = viz_body_rows(mode, avail, true, extras);
+                    let pad = viz_top_pad(avail, body, true);
+                    // Never claims more than the window has, and the leftover
+                    // is split so the block sits in the middle of it.
+                    assert!(pad + body <= avail, "{mode:?} avail={avail}");
+                    let below = avail - pad - body;
+                    assert!(below >= pad && below - pad <= 1,
+                            "{mode:?} avail={avail}: {pad} above, {below} below");
+                    // A normal frame has chrome under the block; nothing to centre.
+                    assert_eq!(viz_top_pad(avail, body, false), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_resize_grows_the_viz_and_full_window_lifts_the_ceiling() {
+        for mode in [VizMode::VuMeter, VizMode::SpectrumHorizontal,
+                     VizMode::SpectrumVertical, VizMode::Oscilloscope,
+                     VizMode::Lissajous, VizMode::Spectrogram,
+                     VizMode::SpectrogramAnalysis] {
+            // Growth is responsive on its own: more room, more rows, no key.
+            let mut prev = 0;
+            for avail in 0..30usize {
+                let rows = viz_body_rows(mode, avail, false, true);
+                assert!(rows >= prev, "{mode:?} shrank as the window grew");
+                assert!(rows <= avail, "{mode:?} claimed rows it wasn't given");
+                prev = rows;
+            }
+            // A normal frame stops short so the rest of the UI survives a tall
+            // terminal; full window lifts that ceiling.
+            let normal = viz_body_rows(mode, 200, false, true);
+            let full = viz_body_rows(mode, 200, true, true);
+            assert_eq!(normal, viz_max_rows(mode, false, true));
+            assert!(full > normal, "{mode:?}: full window must exceed normal");
+            assert_eq!(viz_body_rows(mode, 0, true, true), 0);
+        }
+        assert_eq!(viz_body_rows(VizMode::None, 40, true, true), 0);
+        assert_eq!(viz_body_rows(VizMode::VuMeter, 9999, true, true), VU_MAX_ROWS);
+    }
+
+    #[test]
+    fn vu_spends_height_on_information_not_on_thicker_bars() {
+        for style in [VizStyle::Dots, VizStyle::Bars] {
+            for rows in 0..40usize {
+                let lay = vu_layout(rows, style, true);
+                assert_eq!(lay.total(), rows, "layout must account for every row (rows={rows})");
+                assert!(lay.thickness <= VU_MAX_THICKNESS, "rows={rows}");
+            }
+            // Odd at every height, so `thickness / 2` is always a real middle.
+            for rows in 0..40usize {
+                let t = vu_layout(rows, style, true).thickness;
+                assert!(t == 0 || !t.is_multiple_of(2), "rows={rows}: even thickness {t}");
+            }
+            // Past the thickness cap the extra rows go to the history strip,
+            // which is the only part carrying information a single row cannot.
+            let tall = vu_layout(24, style, true);
+            assert_eq!(tall.thickness, VU_MAX_THICKNESS);
+            assert!(tall.history > 0, "tall meter must show level history");
+        }
+    }
+
+    #[test]
+    fn spectrum_bands_widen_to_use_the_window() {
+        // 31 bands is fixed by the state pipeline, so width goes into cell
+        // width — but never below 2 (unreadable) or above 6 (a bar chart).
+        // Bar weight steps in whole glyphs: 1, then 2, then 3.
+        assert_eq!(spectrum_bar_w(0), 1);
+        assert_eq!(spectrum_bar_w(64), 1);
+        assert_eq!(spectrum_bar_w(120), 2);
+        assert_eq!(spectrum_bar_w(200), 3);
+        assert_eq!(spectrum_bar_w(4000), 3);
+        for w in 0..400usize {
+            assert!((1..=3).contains(&spectrum_bar_w(w)), "w={w}");
+            assert_eq!(spectrum_cell_w(w), spectrum_bar_w(w) + 1, "w={w}");
+        }
+    }
+
     #[test]
     fn pixel_row_for_a_frequency_inverts_the_rows_own_mapping() {
         // The legend and the image must agree exactly; this is the property
@@ -2085,10 +2873,10 @@ mod analysis_tests {
         // Window chosen so the SPECTRO_ANALYSIS_ROWS cap doesn't bind and the
         // reserve is what's actually being measured.
         // Default (3 rows reserved) is for a footer under the image.
-        let with_footer = analysis_rows_for_window(24, 10);
+        let with_footer = viz_body_rows(VizMode::SpectrogramAnalysis, viz_rows_available(24, 10, 3), false, false);
         // Minimal draws its tray above, so only the bottom-slack row is kept —
         // same window, same content above, but two more rows of image.
-        let tray_above = analysis_rows_reserving(24, 10, 1);
+        let tray_above = viz_body_rows(VizMode::SpectrogramAnalysis, viz_rows_available(24, 10, 1), false, false);
         assert_eq!(with_footer, 24 - 10 - 3);
         assert_eq!(tray_above, 24 - 10 - 1);
         assert!(tray_above > with_footer);
@@ -2096,15 +2884,17 @@ mod analysis_tests {
         // The frame must still fit: rows_above + image + reserve <= term_h.
         for term_h in [12usize, 20, 24, 40, 60] {
             for rows_above in [5usize, 10, 18] {
-                let r = analysis_rows_reserving(term_h, rows_above, 1);
+                let r = viz_body_rows(VizMode::SpectrogramAnalysis,
+                                      viz_rows_available(term_h, rows_above, 1), false, false);
                 assert!(
-                    rows_above + r < term_h || r == 4,
+                    rows_above + r < term_h || r == 0,
                     "term_h={term_h} above={rows_above} rows={r} overflows"
                 );
             }
         }
         // Never grows past the cap however tall the window is.
-        assert_eq!(analysis_rows_reserving(200, 0, 1), analysis_rows_for_window(200, 0));
+        assert_eq!(viz_body_rows(VizMode::SpectrogramAnalysis, viz_rows_available(200, 0, 1), false, false),
+                   viz_body_rows(VizMode::SpectrogramAnalysis, viz_rows_available(200, 0, 3), false, false));
     }
 
     #[test]
@@ -2136,19 +2926,29 @@ mod analysis_tests {
 
     #[test]
     fn analysis_rows_keep_full_height_in_tall_windows() {
-        assert_eq!(analysis_rows_for_window(50, 15), SPECTRO_ANALYSIS_ROWS);
+        assert_eq!(viz_body_rows(VizMode::SpectrogramAnalysis, viz_rows_available(50, 15, 3), false, false), SPECTRO_ANALYSIS_ROWS);
     }
 
     #[test]
     fn analysis_rows_shed_to_fit_short_windows() {
         // 32-row window, 15 rows above the viz block, 3 reserved (separator +
         // transient status + slack) → only 14 spectrogram rows fit.
-        assert_eq!(analysis_rows_for_window(32, 15), 14);
+        assert_eq!(viz_body_rows(VizMode::SpectrogramAnalysis, viz_rows_available(32, 15, 3), false, false), 14);
     }
 
     #[test]
-    fn analysis_rows_floor_at_four_for_tiny_windows() {
-        assert_eq!(analysis_rows_for_window(12, 15), 4);
+    fn analysis_rows_yield_nothing_when_the_window_has_no_room() {
+        // 15 rows of content above a 12-row window: there is no space at all,
+        // and reserving a minimum anyway put the block past the screen bottom,
+        // which on Sixel is the auto-scroll storm.
+        assert_eq!(viz_body_rows(VizMode::SpectrogramAnalysis, viz_rows_available(12, 15, 3), false, false), 0);
+        for term_h in 0..40usize {
+            for above in 0..40usize {
+                let r = viz_body_rows(VizMode::SpectrogramAnalysis,
+                                      viz_rows_available(term_h, above, 3), false, false);
+                assert!(r + above + 3 <= term_h || r == 0, "term_h={term_h} above={above} r={r}");
+            }
+        }
     }
 
     #[test]

@@ -121,6 +121,8 @@ keet ~/Music/favorites.m3u
 | `T` | Cycle UI theme (Classic → Minimal → Hi-Fi) |
 | `V` | Cycle visualization modes |
 | `B` | Toggle visualization style (bars/dots) |
+| `Shift+F` | Toggle full-window visualization (drops the banner, gives the viz every spare row) |
+| `Shift+L` | Toggle per-visualization detail: level history on the VU meter, frequency legend on either spectrum |
 | `E` | Open the EQ + FX editor screen |
 | `X` | Cycle effects presets |
 | `Shift+R` | Cycle repeat mode (Off → All → One) |

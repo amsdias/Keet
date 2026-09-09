@@ -16,7 +16,7 @@ use crate::ansi::{truncate_ansi, truncate_plain, visible_len};
 use crate::state::{InputMode, PlayerState, UiState, VizMode, VizStyle};
 use crate::theme::{palette, ThemeKind};
 use crate::viz::{
-    StatsMonitor, VizAnalyser, analysis_needs_raw_lines, analysis_rows_reserving,
+    StatsMonitor, VizAnalyser, analysis_needs_raw_lines,
     render_lissajous, render_oscilloscope, render_spectrogram,
     render_spectrogram_analysis, render_spectrum_horizontal,
     render_spectrum_vertical, render_vu_meter,
@@ -53,7 +53,7 @@ pub fn print_status_minimal(
     state: &PlayerState,
     ui: &mut UiState,
     name: &str,
-    _track_info: &str,
+    track_info: &str,
     eq_preset: &crate::eq::EqPreset,
     fx_name: &str,
     cf_name: &str,
@@ -90,16 +90,30 @@ pub fn print_status_minimal(
     stats.update_buf(buf as f32 / ring_cap as f32 * 100.0);
     let buf_pct = stats.smoothed_buf_pct as u32;
 
-    // === Anchor (line 1): wordmark ===
+    // === Anchor (line 1) ===
+    // Full window keeps exactly one line of chrome, so the anchor carries the
+    // song and transport instead of the wordmark, and everything between it
+    // and the visualization is suppressed.
+    let fullscreen = state.viz_fullscreen();
+    let extras = state.viz_extras();
     let mut w = crate::ui::FrameWriter::new();
-    w.first_line(&wordmark_anchor(p));
+    if fullscreen {
+        w.first_line(&crate::ansi::truncate_ansi(&format!(
+            "  {bold}{name}{rst} {dim}{info}  {cur}/{tot}  {{⇧F}} exit{rst}",
+            bold = p.accent, dim = p.dim, rst = p.reset,
+            name = name, info = track_info,
+            cur = format_time(state.time_secs()), tot = format_time(state.total_secs()),
+        ), term_w));
+    } else {
+        w.first_line(&wordmark_anchor(p));
 
-    // === Line 2: dim rule separating the wordmark from the song info ===
-    let rule_w = term_w.saturating_sub(4);
-    w.line(&format!(
-        "  {rule}{rl}{rst}",
-        rule = p.rule, rst = p.reset, rl = "─".repeat(rule_w),
-    ));
+        // === Line 2: dim rule separating the wordmark from the song info ===
+        let rule_w = term_w.saturating_sub(4);
+        w.line(&format!(
+            "  {rule}{rl}{rst}",
+            rule = p.rule, rst = p.reset, rl = "─".repeat(rule_w),
+        ));
+    }
 
     // === Width budget, decided before anything is emitted ===
     // The identity block wins: `ident_w` depends on the terminal alone, so the
@@ -214,7 +228,7 @@ pub fn print_status_minimal(
         right_col.push(render_signal_row(p, k, v, *good, signal_w));
     }
 
-    if show_signal {
+    if show_signal && !fullscreen {
         // The cover is vertically aligned with SIGNAL: its top row sits on the
         // SIGNAL label and its bottom on `balance`, so the two right-hand
         // blocks read as one group rather than two staggered ones.
@@ -277,25 +291,29 @@ pub fn print_status_minimal(
                 w.line(&line);
             }
         }
-    } else {
+    } else if !fullscreen {
         ui.cover_block_intact = false;
         for (content, vis) in ident.iter() {
             w.line(&format!("  {}", ident_cell(content, *vis, ident_w)));
         }
+    } else {
+        ui.cover_block_intact = false;
     }
 
     // === Command tray ===
     // Above the visualisation, not below it: the viz block changes height with
     // the mode (VU is a few rows, the analysis spectrogram many), which dragged
     // the tray up and down the screen every time it changed.
-    w.line("");
-
     if let Some(msg) = ui.active_status() {
+        if !fullscreen {
+            w.line("");
+        }
         w.line(&format!(
             "  {accent}{msg}{rst}",
             accent = p.accent, rst = p.reset, msg = msg,
         ));
-    } else {
+    } else if !fullscreen {
+        w.line("");
         for line in slim_cmd_box(p, term_w) {
             w.line(&line);
         }
@@ -303,12 +321,24 @@ pub fn print_status_minimal(
 
     // === SPECTRUM section ===
     if viz_mode != VizMode::None {
-        w.line("");
-        w.line(&format!(
-            "  {dim}{label}{rst}",
-            dim = p.dim, rst = p.reset, label = viz_section_label(viz_mode),
-        ));
+        if !fullscreen {
+            w.line("");
+            w.line(&format!(
+                "  {dim}{label}{rst}",
+                dim = p.dim, rst = p.reset, label = viz_section_label(viz_mode),
+            ));
+        }
 
+        // One budget for every mode: what the frame has spare, capped by the
+        // mode's own ceiling. A resize grows the block on its own; full window
+        // only lifts the ceiling.
+        let viz_avail = crate::viz::viz_rows_available(term_h, 1 + w.count(), 1);
+        let viz_body = crate::viz::viz_body_rows(viz_mode, viz_avail, fullscreen, extras);
+        // Full window centres the block in the space it chose not to fill.
+        let viz_pad = crate::viz::viz_top_pad(viz_avail, viz_body, fullscreen);
+        for _ in 0..viz_pad {
+            w.line("");
+        }
         if viz_mode == VizMode::SpectrogramAnalysis {
             // Real analysis spectrogram: a pixel image (Kitty on Ghostty/Kitty,
             // fixed-palette Sixel on Windows Terminal) or a half-block fallback.
@@ -320,12 +350,18 @@ pub fn print_status_minimal(
             // Rows above = anchor (1) + everything already emitted, which now
             // includes the command tray. Nothing follows the image, so only one
             // row of bottom slack is reserved rather than a footer's worth.
-            let ana_rows = analysis_rows_reserving(term_h, 1 + w.count(), 1);
             let raw = analysis_needs_raw_lines();
-            let force = prev_viz_lines == usize::MAX || !block_was_intact;
+            // Height change means the block moved: full window toggling, or a
+            // resize. Classic catches this by comparing its predicted frame
+            // height against the previous derived one; Minimal builds its
+            // layout as it goes, so it tracks the body height directly.
+            let force = prev_viz_lines == usize::MAX
+                || !block_was_intact
+                || (viz_pad, viz_body) != ui.last_viz_block;
+            ui.last_viz_block = (viz_pad, viz_body);
             ui.spectro_block_intact = true;
             for line in render_spectrogram_analysis(
-                analyser, term_w, log_axis, state.is_paused(), ana_rows, force,
+                analyser, term_w, log_axis, state.is_paused(), viz_body, force,
             ) {
                 if raw {
                     w.line_raw(&line);
@@ -337,12 +373,12 @@ pub fn print_status_minimal(
             // Character-cell viz modes: erase-to-EOL is fine.
             let viz_lines: Vec<String> = match viz_mode {
                 VizMode::None => Vec::new(),
-                VizMode::VuMeter => render_vu_meter(state, viz_style, term_w),
-                VizMode::SpectrumHorizontal => render_spectrum_horizontal(state, viz_style),
-                VizMode::SpectrumVertical => render_spectrum_vertical(state, viz_style),
-                VizMode::Oscilloscope => render_oscilloscope(analyser, viz_style, term_w),
-                VizMode::Lissajous => render_lissajous(analyser, viz_style, term_w),
-                VizMode::Spectrogram => render_spectrogram(analyser, viz_style, term_w),
+                VizMode::VuMeter => render_vu_meter(state, viz_style, term_w, viz_body, extras),
+                VizMode::SpectrumHorizontal => render_spectrum_horizontal(state, viz_style, term_w, viz_body, extras),
+                VizMode::SpectrumVertical => render_spectrum_vertical(state, viz_style, term_w, viz_body, extras),
+                VizMode::Oscilloscope => render_oscilloscope(analyser, viz_style, term_w, viz_body),
+                VizMode::Lissajous => render_lissajous(analyser, viz_style, term_w, viz_body),
+                VizMode::Spectrogram => render_spectrogram(analyser, viz_style, term_w, viz_body),
                 VizMode::SpectrogramAnalysis => unreachable!("handled above"),
             };
             for line in &viz_lines {

@@ -1650,7 +1650,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // once content exceeds terminal height. For non-Classic
                     // themes, skip compose_banner entirely so no placeholder
                     // black box is reserved in the cover slot.
-                    let (composed, lines) = if state.theme_kind() == theme::ThemeKind::Classic {
+                    // Full window means exactly that: the banner (and the cover
+                    // it carries) is dropped so the visualization gets those
+                    // rows. banner_lines going to 0 is what tells print_status
+                    // the space is now the viz's.
+                    let (composed, lines) = if state.viz_fullscreen() {
+                        (String::new(), 0)
+                    } else if state.theme_kind() == theme::ThemeKind::Classic {
                         compose_banner(&ui.banner_text, ui.cover.as_ref(), term_w)
                     } else {
                         let count = ui.banner_text.lines().count();
