@@ -16,14 +16,31 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install Linux deps
         run: |
-          sudo apt-get update
+          # The runner image ships third-party apt repos (Chrome, Microsoft)
+          # that we never use. `apt-get update` exits 100 if ANY index fails,
+          # so a hash-sum mismatch mid-publish on Google's CDN fails the whole
+          # job — which is exactly what happened. Drop those lists first: the
+          # three dev packages below all come from Ubuntu's own repos. Ubuntu's
+          # own sources live in sources.list.d too (deb822 on 24.04), so remove
+          # the specific vendor files rather than the directory.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
+                     /etc/apt/sources.list.d/microsoft-prod.list
+          # Still retry: a mirror can be mid-sync for genuinely transient
+          # reasons. Fail loudly if all attempts fail — `|| sleep` would leave
+          # the loop exiting 0 and hide a real outage behind a later error.
+          ok=
+          for _ in 1 2 3; do
+            if sudo apt-get update; then ok=1; break; fi
+            sleep 5
+          done
+          [ -n "$ok" ] || { echo "apt-get update failed after 3 attempts"; exit 1; }
           sudo apt-get install -y libasound2-dev libdbus-1-dev pkg-config
 
       - name: Test
@@ -36,7 +53,7 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -45,7 +62,24 @@ jobs:
 
       - name: Install Linux deps
         run: |
-          sudo apt-get update
+          # The runner image ships third-party apt repos (Chrome, Microsoft)
+          # that we never use. `apt-get update` exits 100 if ANY index fails,
+          # so a hash-sum mismatch mid-publish on Google's CDN fails the whole
+          # job — which is exactly what happened. Drop those lists first: the
+          # three dev packages below all come from Ubuntu's own repos. Ubuntu's
+          # own sources live in sources.list.d too (deb822 on 24.04), so remove
+          # the specific vendor files rather than the directory.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
+                     /etc/apt/sources.list.d/microsoft-prod.list
+          # Still retry: a mirror can be mid-sync for genuinely transient
+          # reasons. Fail loudly if all attempts fail — `|| sleep` would leave
+          # the loop exiting 0 and hide a real outage behind a later error.
+          ok=
+          for _ in 1 2 3; do
+            if sudo apt-get update; then ok=1; break; fi
+            sleep 5
+          done
+          [ -n "$ok" ] || { echo "apt-get update failed after 3 attempts"; exit 1; }
           sudo apt-get install -y libasound2-dev libdbus-1-dev pkg-config
 
       - name: Clippy
@@ -78,7 +112,7 @@ jobs:
             out: keet-windows-x86_64.exe
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -89,14 +123,31 @@ jobs:
       - name: Install Linux deps
         if: matrix.os == 'ubuntu-latest'
         run: |
-          sudo apt-get update
+          # The runner image ships third-party apt repos (Chrome, Microsoft)
+          # that we never use. `apt-get update` exits 100 if ANY index fails,
+          # so a hash-sum mismatch mid-publish on Google's CDN fails the whole
+          # job — which is exactly what happened. Drop those lists first: the
+          # three dev packages below all come from Ubuntu's own repos. Ubuntu's
+          # own sources live in sources.list.d too (deb822 on 24.04), so remove
+          # the specific vendor files rather than the directory.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
+                     /etc/apt/sources.list.d/microsoft-prod.list
+          # Still retry: a mirror can be mid-sync for genuinely transient
+          # reasons. Fail loudly if all attempts fail — `|| sleep` would leave
+          # the loop exiting 0 and hide a real outage behind a later error.
+          ok=
+          for _ in 1 2 3; do
+            if sudo apt-get update; then ok=1; break; fi
+            sleep 5
+          done
+          [ -n "$ok" ] || { echo "apt-get update failed after 3 attempts"; exit 1; }
           sudo apt-get install -y libasound2-dev libdbus-1-dev pkg-config
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.out }}
           path: target/${{ matrix.target }}/release/${{ matrix.bin }}
