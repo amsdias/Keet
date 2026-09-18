@@ -19,7 +19,7 @@ audioadapter-buffers = "5.1"
 crossterm = "0.29"
 
 # rtrb - Lock-free ring buffer for audio
-rtrb = "0.3"
+rtrb = "0.4"
 
 # realfft - FFT for real signals (audio spectrum analysis)
 realfft = "3.4"
@@ -38,7 +38,7 @@ ureq = { version = "3", default-features = false, features = ["native-tls", "gzi
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 
 # Pure-Rust Sixel encoder for terminals that don't speak Kitty/iTerm2 (Windows Terminal, foot, mlterm).
-icy_sixel = "0.5"
+icy_sixel = "0.7"
 
 # macOS CoreAudio bindings for sample rate switching
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -51,3 +51,51 @@ winresource = "0.1"
 [profile.release]
 strip = true
 lto = true
+
+# One codegen unit: LLVM optimises the whole crate as a single module, so
+# inlining and dead-code elimination reach across module boundaries instead of
+# stopping at a unit edge. Measured on this repo (M4, cold builds, n=3 each):
+#   binary  4,369,904 B -> 4,071,472 B   -6.8%, byte-identical every run
+#   build   45-55 s     -> 51-63 s       modestly slower, but noisy
+# Binary size is deterministic; build time is NOT -- the ranges overlap and one
+# sample pair even came out faster with this enabled, so treat the build cost as
+# "roughly comparable", not a fixed percentage. It stays that cheap only because
+# `lto = true` already serialises the heavy optimisation pass.
+# Other values: drop the key for the default (16 for non-incremental builds), or
+# raise it to trade code quality for build parallelism. Must be >= 1.
+codegen-units = 1
+
+# --- target-cpu (NOT settable here) -----------------------------------------
+# `target-cpu` is a rustc codegen flag, not a Cargo profile key, so it cannot
+# live in this file (`[profile] rustflags` is still unstable). Released binaries
+# are deliberately built generic so each one runs on every CPU of its target.
+#
+# To build tuned for your own machine, either:
+#     RUSTFLAGS="-C target-cpu=native" cargo build --release
+# or create .cargo/config.toml (untracked):
+#     [build]
+#     rustflags = ["-C", "target-cpu=native"]
+#
+# Defaults the shipped binaries use today (feature counts, measured):
+#     x86_64-unknown-linux-gnu    3   fxsr,sse,sse2 -- the 2003 baseline
+#     x86_64-pc-windows-msvc      5   + cmpxchg16b,sse3
+#     x86_64-apple-darwin         7   + ssse3,sse4.1 -- ~Core 2 Penryn
+#     aarch64-apple-darwin       28   identical to apple-m1
+#
+# Options, with the oldest CPU each still runs on:
+#     x86-64-v2    9 features  adds sse4.1/4.2,ssse3,popcnt   Nehalem '08 / Bulldozer
+#     x86-64-v3   18 features  adds AVX,AVX2,FMA,BMI1/2       Haswell '13 / Zen
+#     x86-64-v4   23 features  adds AVX-512                   Skylake-X / Zen 4 (narrow)
+#     native      host CPU -- fastest locally, NOT redistributable
+#
+# WARNING: on Apple Silicon `native` is not portable across M-series chips. It
+# resolves to the host part (apple-m4 here), adding bf16/i8mm/bti, which M1 does
+# not implement -- such a build dies with SIGILL on an M1/M2/M3.
+#
+# MEASURED, before reaching for any of this: x86-64-v3 did NOT vectorise the DSP
+# chain. Vector FP ops went eq 40 -> 33, crossfeed 2 -> 1, viz 222 -> 150, i.e.
+# slightly DOWN, and zero bf16/i8mm instructions were emitted on ARM. Biquads are
+# serially dependent (each output feeds the next input), so there is no
+# independent work to pack into a vector lane and no ISA can create any. The AVX
+# already present in the shipped binaries comes from symphonia and rustfft, which
+# dispatch on SIMD at runtime and need no build flags at all.
