@@ -50,6 +50,81 @@ use playlist::{build_playlist, shuffle_list};
 use ui::{print_status, poll_input, poll_auto_sort, poll_library_tree, arm_auto_sort, format_time};
 use resume::{ResumeState, save_state, load_state};
 
+/// Name of the producer (decode) thread. The panic hook uses it to tell a
+/// caught decoder panic apart from one that is really taking Keet down.
+const PRODUCER_THREAD: &str = "keet-producer";
+
+/// Apply a pending banner rebuild and full-screen repaint (resize, theme or
+/// viz-layout change). Returns true when the screen was repainted from scratch,
+/// so the caller resets its frame bookkeeping (`prev_frame_lines = usize::MAX`,
+/// any Kitty viz image gone). Must run after the DEC 2026 sync-begin.
+///
+/// Every loop that draws frames calls this — the steady-state loop, the
+/// start-of-track buffering wait and the exclusive-mode rate-change wait. The
+/// buffering wait used to render without it, so a Shift+F or resize pressed in
+/// the ~1 s after a track change drew the new layout under the old banner.
+fn repaint_if_needed(
+    state: &PlayerState,
+    ui: &mut state::UiState,
+    build_banner_box: &dyn Fn(bool, state::RepeatMode, &PlayerState) -> String,
+) -> bool {
+    if ui.banner_dirty {
+        ui.banner_dirty = false;
+        let new_box = build_banner_box(ui.shuffle, ui.repeat_mode, state);
+        // banner_tail (device info + verbose key help) is Classic-only.
+        // It was built once at startup, so if the user starts in
+        // Classic and presses T to switch themes, the cached tail
+        // would otherwise bleed into the new theme's banner.
+        ui.banner_text = if state.theme_kind() == theme::ThemeKind::Classic {
+            format!("{}{}", new_box, ui.banner_tail)
+        } else {
+            new_box
+        };
+        ui.terminal_resized = true;
+    }
+
+    if !ui.terminal_resized {
+        return false;
+    }
+    ui.terminal_resized = false;
+        // Clear entire screen and reprint banner (old lines may
+        // have wrapped at the previous terminal width).
+        // In raw mode \n doesn't imply \r, so use \r\n.
+        let term_w = terminal::size().map(|(w, _)| w as usize).unwrap_or(120);
+        // Cover overlay is Classic-only — variant-b/c mocks are
+        // text-first and the kitty image scrolls out of its slot
+        // once content exceeds terminal height. For non-Classic
+        // themes, skip compose_banner entirely so no placeholder
+        // black box is reserved in the cover slot.
+        // Full window means exactly that: the banner (and the cover
+        // it carries) is dropped so the visualization gets those
+        // rows. banner_lines going to 0 is what tells print_status
+        // the space is now the viz's.
+        let (composed, lines) = if state.viz_fullscreen() {
+            (String::new(), 0)
+        } else if state.theme_kind() == theme::ThemeKind::Classic {
+            compose_banner(&ui.banner_text, ui.cover.as_ref(), term_w)
+        } else {
+            let count = ui.banner_text.lines().count();
+            (ui.banner_text.clone(), count)
+        };
+        ui.banner_lines = lines;
+        // Remove any previously-placed kitty graphic before redrawing.
+        // No-op on terminals that don't speak the protocol.
+        let kitty_clear = if matches!(cover::detect_protocol(), cover::GraphicsProtocol::Kitty) {
+            format!("{}{}", cover::kitty_clear_escape(), cover::viz_image_clear_escape())
+        } else {
+            String::new()
+        };
+        // Home + erase-down (NOT \x1B[2J): ConPTY implements ED2 by
+        // scrolling the viewport into scrollback, so on Windows
+        // Terminal a 2J repaint shoves the whole UI out of sight
+        // instead of refreshing in place. ED0 from home erases the
+        // same cells without the scroll.
+        print!("{}\x1B[0m\x1B[H\x1B[J{}", kitty_clear, composed.replace('\n', "\r\n"));
+    true
+}
+
 /// Kick off the lyrics loader on a background thread and install its receiver on `ui`.
 /// Reads embedded tags from the file if not already cached, then falls back to LRCLIB.
 /// The main thread never blocks on disk or HTTP.
@@ -273,8 +348,12 @@ fn build_resume_state(
 /// and for every stream rebuild (exclusive rate switch, stream-error device swap)
 /// so those paths can't drift apart. Returns the audio producer, viz consumer, and
 /// stream; the caller calls `stream.play()`.
-/// Audio producer, viz consumer, and output stream returned by `rebuild_stream`.
-type StreamParts = (rtrb::Producer<f32>, rtrb::Consumer<f32>, cpal::Stream);
+/// Audio producer, viz consumer, output stream, and the rate the stream
+/// ACTUALLY runs at, returned by `rebuild_stream`. The rate is part of the
+/// result because the fallback path can land on a different rate than the one
+/// requested — a caller that kept its own copy then spawned the producer
+/// resampling for the rejected rate, playing everything off-speed.
+type StreamParts = (rtrb::Producer<f32>, rtrb::Consumer<f32>, cpal::Stream, u32);
 
 fn rebuild_stream(
     device: &cpal::Device,
@@ -337,10 +416,10 @@ fn rebuild_stream(
                 buffer_size: cpal::BufferSize::Default,
             };
             let s = build_stream(device, &cfg, c, vp, Arc::clone(state))?;
-            return Ok((p, vc, s));
+            return Ok((p, vc, s, rate));
         }
     };
-    Ok((prod, viz_cons, stream))
+    Ok((prod, viz_cons, stream, stream_rate))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -361,8 +440,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Restore terminal on panic so it doesn't stay in raw mode
     let default_panic = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = terminal::disable_raw_mode();
-        restore_cursor(&mut io::stdout());
+        // A panic on the producer thread is caught there (the bad file is
+        // skipped and playback goes on), so it must NOT tear the terminal
+        // down: restoring cooked mode here left the still-running UI with a
+        // broken terminal. It is still logged below.
+        let caught = thread::current().name() == Some(PRODUCER_THREAD);
+        if !caught {
+            let _ = terminal::disable_raw_mode();
+            restore_cursor(&mut io::stdout());
+        }
 
         // Write crash log to ~/.config/keet/crash.log
         let info_str = info.to_string();
@@ -383,7 +469,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        default_panic(info);
+        if !caught {
+            default_panic(info);
+        }
     }));
 
     let args: Vec<String> = env::args().collect();
@@ -849,7 +937,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Fix stale sample rate on Bluetooth devices (CoreAudio can get stuck at wrong rate)
-        let bt_rate = fix_bluetooth_sample_rate();
+        let bt_rate = fix_bluetooth_sample_rate(&device);
         if let Some(rate) = bt_rate {
             if classic {
                 writeln!(banner_tail, "Bluetooth device detected, using native {}Hz", rate).ok();
@@ -975,13 +1063,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let saved_buffer_size = buffer_size;
 
-    let (mut prod, mut viz_cons, mut stream) =
+    let (mut prod, mut viz_cons, mut stream, built_rate) =
         rebuild_stream(&device, stream_rate, out_channels, saved_buffer_size, &state)?;
+    stream_rate = built_rate;
     stream.play()?;
 
     // Set exclusive mode if requested (macOS only: hog mode + per-track rate switching)
     let mut hog_device_id: Option<u32> = None;
     if exclusive {
+        if let Ok(mut caps) = state.exclusive_caps.lock() {
+            *caps = Some(audio::probe_rate_caps(&device));
+        }
         match audio::set_exclusive_mode(&device) {
             Ok(id) => {
                 hog_device_id = Some(id);
@@ -1084,6 +1176,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Reset state for new producer
         state.current_track.store(ui.current, Ordering::Relaxed);
         state.producer_done.store(false, Ordering::Relaxed);
+        // A seek still pending here was aimed at audio a finished producer no
+        // longer plays (pressed during a rate-change drain, or just before a
+        // skip/jump). Left in place, the new producer would apply it to a
+        // different track. A resume position is re-issued below, after this.
+        state.take_seek();
         state.track_info_ready.store(false, Ordering::Relaxed);
         state.skip_next.store(false, Ordering::Relaxed);
         state.skip_prev.store(false, Ordering::Relaxed);
@@ -1108,7 +1205,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let xfade = crossfade_secs;
         let mut prod_for_thread = prod;
 
-        let producer_handle = thread::spawn(move || {
+        let producer_handle = thread::Builder::new().name(PRODUCER_THREAD.into()).spawn(move || {
             let mut eq_chain = eq::EqChain::new();
             if state_clone.is_eq_custom() {
                 eq_chain.load_bands(&state_clone.eq_bands_array(), state_clone.eq_preamp_db(), sr as f32);
@@ -1120,16 +1217,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut cf_filter = crossfeed::CrossfeedFilter::new();
             cf_filter.load_preset(&cf_presets_clone[state_clone.crossfeed_index()], sr as f32);
 
-            decode_playlist(
-                &playlist_snapshot, start_idx,
-                &mut prod_for_thread, &state_clone, sr, hq,
-                &mut eq_chain, &eq_presets_clone,
-                &mut fx_chain, &fx_presets_clone,
-                xfade,
-                &mut cf_filter, &cf_presets_clone,
-            );
+            // A malformed file can panic inside symphonia. Uncaught, the thread
+            // died without setting producer_done and main sat in silence
+            // forever. Caught, the file is reported and playback moves on to
+            // the next track (main's jump handler respawns the producer there).
+            let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                decode_playlist(
+                    &playlist_snapshot, start_idx,
+                    &mut prod_for_thread, &state_clone, sr, hq,
+                    &mut eq_chain, &eq_presets_clone,
+                    &mut fx_chain, &fx_presets_clone,
+                    xfade,
+                    &mut cf_filter, &cf_presets_clone,
+                );
+            }));
+            if run.is_err() {
+                let idx = state_clone.producer_decoding.load(Ordering::Relaxed);
+                let name = playlist_snapshot
+                    .get(idx)
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if let Ok(mut err) = state_clone.decode_error.lock() {
+                    *err = Some(format!("{name}: decoder crashed, skipped"));
+                }
+                if idx + 1 < playlist_snapshot.len() {
+                    state_clone.jump_to(idx + 1);
+                } else {
+                    state_clone.producer_done.store(true, Ordering::Relaxed);
+                }
+            }
             prod_for_thread // Return producer ownership
-        });
+        }).expect("spawn producer thread");
 
         // Stage 1: wait for the producer to open the file and publish track info
         // (fast, usually < 50ms). Once this is set, sample rate / bits / duration
@@ -1211,16 +1330,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // fraction of the raw ring size) keeps the cushion consistent
             // across output rates.
             let startup_threshold = stream_rate as usize * 2;
+            // Also stop on a rate-change request: that exit does not set
+            // producer_done, so a track shorter than the 1 s threshold followed
+            // by one at another rate never filled the ring and stalled here —
+            // the loop that acts on the request is the one this wait gates.
             while state.buffer_level.load(Ordering::Relaxed) < startup_threshold
                   && !state.producer_done.load(Ordering::Relaxed)
+                  && !state.rate_change_needed.load(Ordering::Relaxed)
                   && !state.should_quit()
             {
                 poll_input(&state, &mut ui, &mut playlist);
+                // A theme switch here must re-decode the cover for the new slot
+                // (Minimal drew the 20x10 Classic cover into its 18-col slot).
+                if ui.cover_resize_pending {
+                    ui.cover_resize_pending = false;
+                    if let Some(path) = playlist.get(ui.current).cloned() {
+                        spawn_cover_worker(&mut ui, path, cover::CoverSize::for_theme(state.theme_kind()));
+                    }
+                }
                 // Begin/end synchronized update (DEC mode 2026): present each frame
                 // atomically so terminals (notably Windows Terminal) don't show the
                 // mid-redraw erase-then-repaint as flickering black lines. Ignored by
                 // terminals that don't support it.
                 print!("\x1B[?2026h");
+                if repaint_if_needed(&state, &mut ui, &build_banner_box) {
+                    prev_frame_lines = usize::MAX;
+                    prev_viz_image_shown = false;
+                }
                 prev_frame_lines = print_status(&state, &mut ui, &filename, &track_info, &track_ext, current_eq, current_fx, current_cf, &mut stats, prev_frame_lines, &playlist, &viz_analyser);
                 print!("\x1B[?2026l");
                 io::stdout().flush().ok();
@@ -1374,8 +1510,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // push — otherwise the drain may fire late and discard the new
                 // track's first samples.
                 if state.ring_capacity.load(Ordering::Relaxed) - prod.slots() > 0 {
-                    state.reset_consumer_counter.store(true, Ordering::Relaxed);
+                    state.reset_consumer_counter.store(true, Ordering::Release);
                     await_consumer_drain(&state);
+                }
+                // The respawn below clears decode_error, so show it first — a
+                // producer that caught a decoder crash jumps here to skip.
+                if let Some(msg) = state.decode_error.lock().ok().and_then(|mut e| e.take()) {
+                    ui.set_status(format!("Skip: {msg}"));
                 }
                 if let Some(target) = state.take_jump() {
                     ui.current = target;
@@ -1392,41 +1533,68 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // tear the stream down. A paused stream never drains, so wait out the
                 // pause instead of bailing — bailing here would truncate the buffered
                 // tail and click. The rate switch simply defers until playback resumes.
+                //
+                // The wait keeps the UI alive: it polls input (so pause/unpause
+                // and quit work — a paused wait used to be unbreakable from the
+                // keyboard, and raw mode swallows Ctrl+C) and keeps painting.
+                // It also bails on a stream error: a dead callback never drains
+                // the ring, so an unplug during the tail used to hang here
+                // forever. Either bail falls through WITHOUT the rate switch —
+                // quit is handled at the top of the next pass, and the stream
+                // error by the recovery block just below, which restarts the
+                // current track where it was.
                 while !state.should_quit()
+                    && !state.stream_error.load(Ordering::Relaxed)
                     && (state.is_paused() || state.buffer_level.load(Ordering::Relaxed) > 0)
                 {
-                    thread::sleep(Duration::from_millis(10));
+                    poll_input(&state, &mut ui, &mut playlist);
+                    let current_eq = &eq_presets[state.eq_index()];
+                    let current_fx = &fx_presets[state.effects_index()].name;
+                    let current_cf = &cf_presets[state.crossfeed_index()].name;
+                    print!("\x1B[?2026h");
+                    if repaint_if_needed(&state, &mut ui, &build_banner_box) {
+                        prev_frame_lines = usize::MAX;
+                        prev_viz_image_shown = false;
+                    }
+                    prev_frame_lines = print_status(&state, &mut ui, &filename, &track_info, &track_ext, current_eq, current_fx, current_cf, &mut stats, prev_frame_lines, &playlist, &viz_analyser);
+                    print!("\x1B[?2026l");
+                    io::stdout().flush().ok();
+                    thread::sleep(Duration::from_millis(20));
                 }
+                if !state.should_quit() && !state.stream_error.load(Ordering::Relaxed) {
+                    match producer_handle.join() {
+                        Ok(_) => {} // Old producer dropped; new ring buffer below
+                        Err(_) => break 'playlist,
+                    }
 
-                match producer_handle.join() {
-                    Ok(_) => {} // Old producer dropped; new ring buffer below
-                    Err(_) => break 'playlist,
+                    let new_rate = state.next_track_rate.load(Ordering::Relaxed);
+                    let max_rate = audio::max_supported_rate(&device);
+                    let target_rate = new_rate.min(max_rate);
+                    let actual_rate = set_output_sample_rate(target_rate, stream_rate, &device);
+                    stream_rate = actual_rate;
+                    state.output_rate.store(stream_rate as u64, Ordering::Relaxed);
+
+                    // Drop old stream before creating the new ring buffer, and
+                    // forget any error it reported on its way out.
+                    drop(stream);
+                    state.stream_error.store(false, Ordering::Relaxed);
+
+                    let (new_prod, new_viz_cons, new_stream, built_rate) =
+                        rebuild_stream(&device, stream_rate, out_channels, saved_buffer_size, &state)?;
+                    stream_rate = built_rate;
+                    prod = new_prod;
+                    viz_cons = new_viz_cons;
+                    stream = new_stream;
+                    stream.play()?;
+
+                    // Continue playlist from the track that needs the new rate
+                    // (viz_analyser is re-created at the top of each 'playlist iteration)
+                    let new_idx = state.producer_track_index.load(Ordering::Relaxed);
+                    if new_idx < playlist.len() {
+                        ui.current = new_idx;
+                    }
+                    continue 'playlist;
                 }
-
-                let new_rate = state.next_track_rate.load(Ordering::Relaxed);
-                let max_rate = audio::max_supported_rate(&device);
-                let target_rate = new_rate.min(max_rate);
-                let actual_rate = set_output_sample_rate(target_rate, stream_rate, &device);
-                stream_rate = actual_rate;
-                state.output_rate.store(stream_rate as u64, Ordering::Relaxed);
-
-                // Drop old stream before creating the new ring buffer.
-                drop(stream);
-
-                let (new_prod, new_viz_cons, new_stream) =
-                    rebuild_stream(&device, stream_rate, out_channels, saved_buffer_size, &state)?;
-                prod = new_prod;
-                viz_cons = new_viz_cons;
-                stream = new_stream;
-                stream.play()?;
-
-                // Continue playlist from the track that needs the new rate
-                // (viz_analyser is re-created at the top of each 'playlist iteration)
-                let new_idx = state.producer_track_index.load(Ordering::Relaxed);
-                if new_idx < playlist.len() {
-                    ui.current = new_idx;
-                }
-                continue 'playlist;
             }
 
             // Stream error recovery (device disconnected, AirPods removed, etc.)
@@ -1453,6 +1621,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // immediately, wasting a spawn/join cycle before playback resumes.
                     state.take_jump();
                     drop(stream);
+                    // The dying stream's error callback can fire once more
+                    // after the swap that brought us here; anything set so far
+                    // is about the stream just dropped, not the one built below.
+                    state.stream_error.store(false, Ordering::Relaxed);
 
                     device = new_device;
 
@@ -1477,6 +1649,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if let Ok(id) = audio::set_exclusive_mode(&device) {
                             hog_device_id = Some(id);
                         }
+                        // A new device means new reachable rates.
+                        if let Ok(mut caps) = state.exclusive_caps.lock() {
+                            *caps = Some(audio::probe_rate_caps(&device));
+                        }
                     }
 
                     let new_rate = device.default_output_config()
@@ -1486,7 +1662,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     state.output_rate.store(stream_rate as u64, Ordering::Relaxed);
 
                     match rebuild_stream(&device, stream_rate, out_channels, saved_buffer_size, &state) {
-                        Ok((new_prod, new_viz_cons, new_stream)) => {
+                        Ok((new_prod, new_viz_cons, new_stream, built_rate)) => {
+                            stream_rate = built_rate;
                             prod = new_prod;
                             viz_cons = new_viz_cons;
                             stream = new_stream;
@@ -1617,21 +1794,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                if ui.banner_dirty {
-                    ui.banner_dirty = false;
-                    let new_box = build_banner_box(ui.shuffle, ui.repeat_mode, &state);
-                    // banner_tail (device info + verbose key help) is Classic-only.
-                    // It was built once at startup, so if the user starts in
-                    // Classic and presses T to switch themes, the cached tail
-                    // would otherwise bleed into the new theme's banner.
-                    ui.banner_text = if state.theme_kind() == theme::ThemeKind::Classic {
-                        format!("{}{}", new_box, ui.banner_tail)
-                    } else {
-                        new_box
-                    };
-                    ui.terminal_resized = true;
-                }
-
                 // Begin synchronized update (DEC mode 2026) before any frame
                 // output — including the full repaint below, which now also runs
                 // on every viz mode/style key — so the erase-then-repaint is
@@ -1639,45 +1801,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // terminals that don't support it.
                 print!("\x1B[?2026h");
 
-                if ui.terminal_resized {
-                    ui.terminal_resized = false;
-                    // Clear entire screen and reprint banner (old lines may
-                    // have wrapped at the previous terminal width).
-                    // In raw mode \n doesn't imply \r, so use \r\n.
-                    let term_w = terminal::size().map(|(w, _)| w as usize).unwrap_or(120);
-                    // Cover overlay is Classic-only — variant-b/c mocks are
-                    // text-first and the kitty image scrolls out of its slot
-                    // once content exceeds terminal height. For non-Classic
-                    // themes, skip compose_banner entirely so no placeholder
-                    // black box is reserved in the cover slot.
-                    // Full window means exactly that: the banner (and the cover
-                    // it carries) is dropped so the visualization gets those
-                    // rows. banner_lines going to 0 is what tells print_status
-                    // the space is now the viz's.
-                    let (composed, lines) = if state.viz_fullscreen() {
-                        (String::new(), 0)
-                    } else if state.theme_kind() == theme::ThemeKind::Classic {
-                        compose_banner(&ui.banner_text, ui.cover.as_ref(), term_w)
-                    } else {
-                        let count = ui.banner_text.lines().count();
-                        (ui.banner_text.clone(), count)
-                    };
-                    ui.banner_lines = lines;
-                    // Remove any previously-placed kitty graphic before redrawing.
-                    // No-op on terminals that don't speak the protocol.
-                    let kitty_clear = if matches!(cover::detect_protocol(), cover::GraphicsProtocol::Kitty) {
-                        format!("{}{}", cover::kitty_clear_escape(), cover::viz_image_clear_escape())
-                    } else {
-                        String::new()
-                    };
-                    // Home + erase-down (NOT \x1B[2J): ConPTY implements ED2 by
-                    // scrolling the viewport into scrollback, so on Windows
-                    // Terminal a 2J repaint shoves the whole UI out of sight
-                    // instead of refreshing in place. ED0 from home erases the
-                    // same cells without the scroll.
-                    print!("{}\x1B[0m\x1B[H\x1B[J{}", kitty_clear, composed.replace('\n', "\r\n"));
+                if repaint_if_needed(&state, &mut ui, &build_banner_box) {
                     prev_frame_lines = usize::MAX;
-                    prev_viz_image_shown = false; // resize already cleared any viz image
+                    prev_viz_image_shown = false; // the repaint cleared any viz image
                 }
 
                 // Refresh filename from the metadata cache once the background

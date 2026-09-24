@@ -205,6 +205,10 @@ fn print_status_eq_view(
     if pre_db.abs() >= 0.05 {
         readouts.insert(0, ("PRE", pre_str.as_str()));
     }
+    // The screen starts at the anchor row, BELOW the banner and its gap row:
+    // budgeting it as `term_h - 2` ignored the banner (13 rows in Classic), so
+    // a default-size window scrolled the banner off for good.
+    let avail = term_h.saturating_sub(ui.banner_lines + 1);
     let bands = state.eq_bands_array();
     let body = crate::eq_ui::render_eq_screen(
         &bands,
@@ -214,29 +218,59 @@ fn print_status_eq_view(
         knob,
         p,
         term_w,
-        term_h.saturating_sub(2),
+        avail.saturating_sub(1),
     );
-
-    // First body line is the anchor; the rest and the footer sit below it.
-    if let Some(first) = body.first() {
-        print!("\r\x1B[K{}", first);
-    }
-    let mut below = 0usize;
-    for line in body.iter().skip(1) {
-        print!("\n\r\x1B[K{}", line);
-        below += 1;
-    }
-    print!(
-        "\n\r\x1B[K  {dim}[←→] band  [↑↓] gain (⇧ fine)  [t] type  [,.] Q  [<>] freq  [[]] preset  [0] reset  [E/Esc] close{rst}",
+    let footer_full = format!(
+        "  {dim}[←→] band  [↑↓] gain (⇧ fine)  [t] type  [,.] Q  [<>] freq  [[]] preset  [0] reset  [E/Esc] close{rst}",
         dim = p.dim, rst = p.reset,
     );
-    below += 1;
+    let footer_short = format!(
+        "  {dim}←→ band ↑↓ gain t type ,. Q <> freq E close{rst}",
+        dim = p.dim, rst = p.reset,
+    );
+    let lines = fit_eq_screen(body, &footer_full, &footer_short, term_w, avail);
+
+    // First line is the anchor; the rest sit below it.
+    let mut below = 0usize;
+    for (i, line) in lines.iter().enumerate() {
+        if i == 0 {
+            print!("\r\x1B[K{}", line);
+        } else {
+            print!("\n\r\x1B[K{}", line);
+            below += 1;
+        }
+    }
 
     print!("\x1B[J");
     io::stdout().flush().ok();
     below
 }
 
+
+/// Fit the EQ editor into `avail` rows of `term_w` columns: every line cut to
+/// the width (the 99-column footer wrapped on an 80-column terminal, the frame
+/// landed a row low every frame and then scrolled the screen at 20 fps), the
+/// body cut to leave room for the footer, and the short footer used when the
+/// full one would not fit.
+fn fit_eq_screen(
+    body: Vec<String>,
+    footer_full: &str,
+    footer_short: &str,
+    term_w: usize,
+    avail: usize,
+) -> Vec<String> {
+    if avail == 0 {
+        return Vec::new();
+    }
+    let footer = if visible_len(footer_full) <= term_w { footer_full } else { footer_short };
+    let mut out: Vec<String> = body
+        .into_iter()
+        .take(avail - 1)
+        .map(|l| truncate_ansi(&l, term_w))
+        .collect();
+    out.push(truncate_ansi(footer, term_w));
+    out
+}
 #[allow(clippy::too_many_arguments)] // cohesive render context; bundling into a struct adds no clarity
 fn print_status_classic(state: &PlayerState, ui: &mut UiState, name: &str, track_info: &str, ext: &str, eq_preset: &crate::eq::EqPreset, fx_name: &str, cf_name: &str, stats: &mut StatsMonitor, prev_frame_lines: usize, playlist: &[PathBuf], analyser: &VizAnalyser) -> usize {
     let viz_mode = state.viz_mode();
@@ -280,14 +314,6 @@ fn print_status_classic(state: &PlayerState, ui: &mut UiState, name: &str, track
     // that stops short of the ceiling — the VU meter with history off, a square
     // vectorscope — otherwise sits pinned to the top with the rest blank.
     let viz_pad = viz_top_pad(viz_avail, viz_body, fullscreen);
-    let sep = if viz_mode == VizMode::None || fullscreen { 0 } else { 1 };
-    let viz_lines = if viz_mode == VizMode::None { 0 } else { viz_body + sep + viz_pad }
-        + if eq_line { 1 } else { 0 };
-    // Lines this frame emits below the anchor row: the transport line (gone in
-    // full window), then everything viz_lines covers. Compared against the
-    // previous frame's DERIVED count to decide whether the sixel block moved —
-    // a prediction that drifts from reality forces a re-emit on every frame.
-    let predicted_lines = if fullscreen { 0 } else { 1 } + viz_lines;
     // Sixel emit-on-change bookkeeping: cleared every frame, re-asserted only
     // by the analysis branch below. Any frame that doesn't reach that branch
     // (playlist/lyrics view, another viz) may paint over the block, so the
@@ -412,7 +438,8 @@ fn print_status_classic(state: &PlayerState, ui: &mut UiState, name: &str, track
 
     // EQ curve visualization (when non-Flat preset is active)
     if eq_line {
-        w.line(&eq_curve);
+        // The curve is a fixed 26 columns; a narrower window would wrap it.
+        w.line(&truncate_ansi(&eq_curve, term_w));
     }
 
 
@@ -681,14 +708,18 @@ fn print_status_classic(state: &PlayerState, ui: &mut UiState, name: &str, track
             let raw = analysis_needs_raw_lines();
             // Force a full re-emit when the screen was repainted from scratch
             // this frame (resize/viz-switch/skip path), when the block wasn't
-            // ours last frame, or when the layout height changed (EQ curve
-            // line toggling, transient status row) — the block moves rows
-            // then, and a skipped emit would leave the image stranded at the
-            // old position. Predicted height below the anchor = line2 (1) +
-            // viz_lines; compared against the previous frame's derived count.
+            // ours last frame, or when the block itself moved or resized (EQ
+            // curve line toggling, full window) — a skipped emit would leave
+            // the image stranded at the old position. Keyed on the block's own
+            // first row and height, as Minimal does: comparing the whole
+            // frame's height also counted the status line printed BELOW the
+            // block, so every frame with a status message re-sent the image
+            // (~20x/s through ConPTY while paused) though nothing had moved.
+            let block = (w.count(), viz_body);
             let force = prev_frame_lines == usize::MAX
                 || !block_was_intact
-                || predicted_lines != prev_frame_lines;
+                || block != ui.last_viz_block;
+            ui.last_viz_block = block;
             ui.spectro_block_intact = true;
             for line in render_spectrogram_analysis(analyser, term_w, log_axis, state.is_paused(), viz_body, force) {
                 if raw { w.line_raw(&line); } else { w.line(&line); }
@@ -707,6 +738,13 @@ fn print_status_classic(state: &PlayerState, ui: &mut UiState, name: &str, track
     print!("\x1B[J");
     io::stdout().flush().ok();
     w.count()
+}
+
+/// Whether the event right behind a bare Esc means the Esc was the first
+/// byte of an escape sequence (macOS Cmd+Arrow arrives as ESC + another key
+/// press), rather than a real Esc tap.
+fn esc_starts_sequence(next: &Event) -> bool {
+    matches!(next, Event::Key(k) if k.kind == KeyEventKind::Press)
 }
 
 pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<PathBuf>) -> bool {
@@ -733,12 +771,21 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
         // the pair as an unrecognized escape sequence and drop both. Human typing
         // rarely produces 0ms gaps, so a zero-duration poll returning true here
         // is a reliable signal.
+        //
+        // Only another key PRESS makes it a sequence. Windows (crossterm on
+        // ConPTY) reports a Release for every key, so a quick Esc tap arrives
+        // as Press+Release inside one 50 ms tick — treating that Release as
+        // "the second half" threw most Esc taps away (leaving views, cancelling
+        // search, quitting). A waiting resize is recorded, not swallowed.
         if k.code == KeyCode::Esc
             && k.modifiers.is_empty()
             && event::poll(Duration::ZERO).unwrap_or(false)
         {
-            let _ = event::read();
-            continue;
+            match event::read() {
+                Ok(next) if esc_starts_sequence(&next) => continue,
+                Ok(Event::Resize(_, _)) => ui.terminal_resized = true,
+                _ => {}
+            }
         }
 
             // In text input mode, route to text handler
@@ -990,7 +1037,11 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
                         } else {
                             ui.filtered_indices.get(ui.cursor).copied().unwrap_or(ui.cursor)
                         };
-                        state.jump_to(target);
+                        // A jump past the end made the playlist loop see
+                        // current >= len — with repeat off, Keet exited.
+                        if target < playlist.len() {
+                            state.jump_to(target);
+                        }
                         return false;
                     }
                     KeyEvent { code: KeyCode::Char('/'), .. } => {
@@ -1836,8 +1887,15 @@ fn sort_playlist_by_tags(state: &PlayerState, ui: &mut UiState, playlist: &mut V
 
     reindex_and_restart_scan(ui, playlist, &old_playlist);
     state.current_track.store(ui.current, Ordering::Relaxed);
-    ui.cursor = ui.current;
-    ensure_cursor_visible(ui, playlist);
+    if matches!(ui.input_mode, InputMode::Search(_)) {
+        // A live search's hits are playlist indices into the OLD order, and
+        // its cursor is a position in that hit list — re-run the query. (The
+        // one-shot auto-sort fires in the background, so it can land mid-search.)
+        rebuild_filter(ui, playlist);
+    } else {
+        ui.cursor = ui.current;
+        ensure_cursor_visible(ui, playlist);
+    }
     ui.playlist_dirty = true;
     ui.banner_dirty = true;
     let was_shuffled = ui.shuffle;
@@ -2053,6 +2111,16 @@ fn rescan(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<PathBuf>) {
 
     reindex_and_restart_scan(ui, playlist, &old_playlist);
     arm_auto_sort(ui); // re-settle newly-added tracks into artist→album order
+
+    // Removed tracks can leave the list cursor past the end; Enter then asked
+    // for a track that no longer exists. A live search re-runs its query (its
+    // hits are indices into the old list).
+    if matches!(ui.input_mode, InputMode::Search(_)) {
+        rebuild_filter(ui, playlist);
+    } else {
+        ui.cursor = ui.cursor.min(playlist.len().saturating_sub(1));
+        ui.scroll_offset = ui.scroll_offset.min(ui.cursor);
+    }
 
     if playlist.is_empty() || (playlist.len() == 1 && total_removed > 0 && current_track_path.is_some()) {
         ui.set_status("All files removed, finishing current track".to_string());
@@ -2406,5 +2474,96 @@ mod ui_tests {
         );
         assert!(quit && state.should_quit());
         assert!(ui.tree_filter.is_empty(), "Ctrl+C must not type into the tree filter");
+    }
+
+    #[test]
+    fn eq_editor_fits_every_window_it_is_drawn_in() {
+        // The editor printed its 99-column footer and every body line raw and
+        // budgeted height as `term_h - 2` from below the banner: narrower than
+        // 99 columns it wrapped (frame drifts a row per frame, then scrolls),
+        // and in a default-size window it scrolled the banner away.
+        let st = PlayerState::new();
+        let bands = st.eq_bands_array();
+        let p = crate::theme::palette(crate::theme::ThemeKind::Classic);
+        let readouts = [("FX", "None"), ("XFEED", "Off"), ("BAL", "centred"), ("RG", "off")];
+        let full = "  [←→] band  [↑↓] gain (⇧ fine)  [t] type  [,.] Q  [<>] freq  [[]] preset  [0] reset  [E/Esc] close";
+        let short = "  ←→ band ↑↓ gain t type ,. Q <> freq E close";
+        for term_w in 10usize..130 {
+            for avail in 0usize..45 {
+                let body = crate::eq_ui::render_eq_screen(
+                    &bands, 0, "Flat", &readouts, '█', p, term_w, avail.saturating_sub(1),
+                );
+                let lines = fit_eq_screen(body, full, short, term_w, avail);
+                assert!(lines.len() <= avail, "{} rows in a {avail}-row budget at width {term_w}", lines.len());
+                for l in &lines {
+                    assert!(visible_len(l) <= term_w, "{}-col line at width {term_w}: {l:?}", visible_len(l));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn esc_tap_survives_its_own_release_event() {
+        use crossterm::event::{KeyEventState, KeyModifiers};
+        let key = |code, kind| Event::Key(KeyEvent { code, modifiers: KeyModifiers::NONE, kind, state: KeyEventState::NONE });
+        // Windows: Press + Release of the same Esc — a real tap.
+        assert!(!esc_starts_sequence(&key(KeyCode::Esc, KeyEventKind::Release)));
+        // macOS Cmd+Arrow: ESC then another key press — a sequence.
+        assert!(esc_starts_sequence(&key(KeyCode::Char('b'), KeyEventKind::Press)));
+        // A resize behind the Esc is not a sequence either.
+        assert!(!esc_starts_sequence(&Event::Resize(80, 24)));
+    }
+
+    #[test]
+    fn a_sort_during_search_refilters_instead_of_leaving_stale_hits() {
+        // The one-shot artist->album auto-sort can fire mid-search. It reordered
+        // the playlist but kept `filtered_indices` (and set the cursor to a
+        // playlist index), so the results showed other tracks and Enter played
+        // the wrong one.
+        let mut playlist: Vec<PathBuf> =
+            ["c-song.flac", "a-song.flac", "b-other.flac"].iter().map(PathBuf::from).collect();
+        let cache = crate::metadata::MetadataCache::new(playlist.len());
+        let mut ui = UiState::new(Vec::new(), cache);
+        let st = PlayerState::new();
+        ui.input_mode = InputMode::Search("song".to_string());
+        rebuild_filter(&mut ui, &playlist);
+        assert_eq!(ui.filtered_indices, vec![0, 1]);
+        sort_playlist_by_tags(&st, &mut ui, &mut playlist);
+        let hits: Vec<&str> = ui
+            .filtered_indices
+            .iter()
+            .map(|&i| playlist[i].to_str().unwrap())
+            .collect();
+        assert_eq!(hits, vec!["a-song.flac", "c-song.flac"], "results must follow the new order");
+        assert!(ui.cursor < ui.filtered_indices.len(), "cursor is a list position, not a playlist index");
+    }
+
+    #[test]
+    fn rescan_that_removes_tracks_keeps_the_cursor_on_the_list() {
+        // Cursor at the end of a list, files deleted on disk, `r`: the cursor
+        // was left past the end, and Enter then jumped to a missing index —
+        // the playlist loop saw current >= len and (repeat off) Keet exited.
+        let dir = std::env::temp_dir().join(format!("keet_rescan_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..5 {
+            std::fs::write(dir.join(format!("t{i}.flac")), b"").unwrap();
+        }
+        let mut playlist = crate::playlist::build_playlist(&dir, false).unwrap();
+        assert_eq!(playlist.len(), 5);
+        let cache = crate::metadata::MetadataCache::new(playlist.len());
+        let mut ui = UiState::new(vec![dir.clone()], cache);
+        let st = PlayerState::new();
+        ui.current = 0;
+        ui.cursor = 4;
+        ui.scroll_offset = 3;
+        for i in 2..5 {
+            std::fs::remove_file(dir.join(format!("t{i}.flac"))).unwrap();
+        }
+        rescan(&st, &mut ui, &mut playlist);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(playlist.len(), 2);
+        assert!(ui.cursor < playlist.len(), "cursor {} on a {}-track list", ui.cursor, playlist.len());
+        assert!(ui.scroll_offset <= ui.cursor);
     }
 }

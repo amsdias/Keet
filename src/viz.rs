@@ -860,7 +860,35 @@ fn vu_history_lines(hist: &[(f32, f32)], w: usize, rows: usize, style: VizStyle,
     lines
 }
 
-pub fn render_vu_meter(state: &PlayerState, style: VizStyle, width: usize, rows: usize,
+/// The width half of the renderer contract ("exactly `rows` lines, none wider
+/// than the window"), enforced in one place per renderer instead of inside
+/// each layout. Several layouts have a floor — the VU label column plus a
+/// 10-cell bar, an 8-column scope grid — and below it they drew past the
+/// window edge (a 14-column VU line in a 1-column window). An over-wide line
+/// wraps into a row nobody budgeted for and drifts the frame, so a too-small
+/// window gets a clipped picture rather than a broken frame.
+fn fit_width(lines: Vec<String>, width: usize) -> Vec<String> {
+    lines
+        .into_iter()
+        .map(|l| {
+            if crate::ansi::visible_len(&l) <= width {
+                l
+            } else {
+                // The cut drops the line's trailing SGR reset with the text
+                // after it; restore one so the colour can't bleed on.
+                format!("{}\x1B[0m", crate::ansi::truncate_ansi(&l, width))
+            }
+        })
+        .collect()
+}
+
+/// See `render_vu_meter_body`; this enforces the width half of the renderer contract
+/// (`fit_width`).
+pub fn render_vu_meter(state: &PlayerState, style: VizStyle, width: usize, rows: usize, extras: bool) -> Vec<String> {
+    fit_width(render_vu_meter_body(state, style, width, rows, extras), width)
+}
+
+fn render_vu_meter_body(state: &PlayerState, style: VizStyle, width: usize, rows: usize,
                        extras: bool) -> Vec<String> {
     let (left, right) = state.get_peaks();
     let (dot_l, dot_r) = state.get_vu_dots();
@@ -978,7 +1006,13 @@ const BAND_COLORS: [&str; 31] = [
     C_MAGENTA,
 ];
 
-pub fn render_spectrum_horizontal(state: &PlayerState, style: VizStyle, width: usize,
+/// See `render_spectrum_horizontal_body`; this enforces the width half of the renderer contract
+/// (`fit_width`).
+pub fn render_spectrum_horizontal(state: &PlayerState, style: VizStyle, width: usize, rows: usize, extras: bool) -> Vec<String> {
+    fit_width(render_spectrum_horizontal_body(state, style, width, rows, extras), width)
+}
+
+fn render_spectrum_horizontal_body(state: &PlayerState, style: VizStyle, width: usize,
                                   rows: usize, extras: bool) -> Vec<String> {
     let spec_l = state.get_spectrum();
     let spec_r = state.get_spectrum_r();
@@ -1076,7 +1110,13 @@ fn h_cell(level: f32, lo: f32, hi: f32, style: VizStyle, color: &str, up: bool, 
     }
 }
 
-pub fn render_spectrum_vertical(state: &PlayerState, style: VizStyle, width: usize,
+/// See `render_spectrum_vertical_body`; this enforces the width half of the renderer contract
+/// (`fit_width`).
+pub fn render_spectrum_vertical(state: &PlayerState, style: VizStyle, width: usize, rows: usize, extras: bool) -> Vec<String> {
+    fit_width(render_spectrum_vertical_body(state, style, width, rows, extras), width)
+}
+
+fn render_spectrum_vertical_body(state: &PlayerState, style: VizStyle, width: usize,
                                 rows: usize, extras: bool) -> Vec<String> {
     const LOWER_BLOCKS: &[char] = &[' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇'];
     const BRAILLE_V: &[char] = &[' ', '⣀', '⣀', '⣤', '⣤', '⣶', '⣶', '⣿'];
@@ -1350,7 +1390,13 @@ const BRAILLE_BITS: [[u32; 4]; 2] = [
     [0x08, 0x10, 0x20, 0x80],
 ];
 
+/// See `render_oscilloscope_body`; this enforces the width half of the renderer contract
+/// (`fit_width`).
 pub fn render_oscilloscope(analyser: &VizAnalyser, style: VizStyle, width: usize, rows: usize) -> Vec<String> {
+    fit_width(render_oscilloscope_body(analyser, style, width, rows), width)
+}
+
+fn render_oscilloscope_body(analyser: &VizAnalyser, style: VizStyle, width: usize, rows: usize) -> Vec<String> {
     // Fill the terminal width (2-space pad + 2-col safety margin), with a sane cap.
     let cols = width.saturating_sub(4).clamp(8, OSCILLOSCOPE_MAX_COLS);
     if rows == 0 {
@@ -1551,7 +1597,13 @@ fn lissajous_stats(buf: &std::collections::VecDeque<(f32, f32)>) -> (f32, f32) {
 /// as rows. A vectorscope that is not square lies about phase.
 const LISSAJOUS_ASPECT: usize = 2;
 
+/// See `render_lissajous_body`; this enforces the width half of the renderer contract
+/// (`fit_width`).
 pub fn render_lissajous(analyser: &VizAnalyser, style: VizStyle, width: usize, rows: usize) -> Vec<String> {
+    fit_width(render_lissajous_body(analyser, style, width, rows), width)
+}
+
+fn render_lissajous_body(analyser: &VizAnalyser, style: VizStyle, width: usize, rows: usize) -> Vec<String> {
     // Unlike every other mode the two axes are ONE knob: whichever of height or
     // width runs out first sets the box, and the leftover width stays margin
     // rather than being stretched into.
@@ -1705,7 +1757,13 @@ const SPECTROGRAM_DOTS: &[char] = &[' ', '⡀', '⣀', '⣄', '⣤', '⣦', '⣶
 const SPECTROGRAM_FLOOR: f32 = 0.30; // raise to darken / drop weak bands
 const SPECTROGRAM_CEIL: f32 = 0.62;  // lower to make peaks reach full height sooner
 
+/// See `render_spectrogram_body`; this enforces the width half of the renderer contract
+/// (`fit_width`).
 pub fn render_spectrogram(analyser: &VizAnalyser, style: VizStyle, width: usize, rows: usize) -> Vec<String> {
+    fit_width(render_spectrogram_body(analyser, style, width, rows), width)
+}
+
+fn render_spectrogram_body(analyser: &VizAnalyser, style: VizStyle, width: usize, rows: usize) -> Vec<String> {
     if rows == 0 {
         return Vec::new();
     }
@@ -1846,7 +1904,19 @@ fn analysis_sixel_palette() -> &'static [(u8, u8, u8)] {
     })
 }
 
+/// See `render_spectrogram_analysis_body`. A window too narrow to hold the
+/// image (or the half-block grid) gets blank rows: a picture cannot be cut to
+/// width the way text can — a Kitty/Sixel image placed wider than the window
+/// overflows it whatever the text around it says.
 pub fn render_spectrogram_analysis(analyser: &VizAnalyser, width: usize, log_axis: bool, paused: bool, rows: usize, force: bool) -> Vec<String> {
+    let lines = render_spectrogram_analysis_body(analyser, width, log_axis, paused, rows, force);
+    if lines.iter().any(|l| crate::ansi::visible_len(l) > width) {
+        return vec![String::new(); rows];
+    }
+    lines
+}
+
+fn render_spectrogram_analysis_body(analyser: &VizAnalyser, width: usize, log_axis: bool, paused: bool, rows: usize, force: bool) -> Vec<String> {
     use std::cell::RefCell;
     thread_local! {
         // Reused across frames so the per-frame image buffers aren't reallocated each tick.
@@ -2074,7 +2144,7 @@ fn protocol_draws_image_legend(protocol: crate::cover::GraphicsProtocol) -> bool
 
 /// Assumed terminal cell size in px for Sixel sizing: small enough that the
 /// image cannot spill past its reserved rows on any real terminal.
-const SIXEL_CELL_FLOOR: (usize, usize) = (8, 16);
+pub(crate) const SIXEL_CELL_FLOOR: (usize, usize) = (8, 16);
 
 fn analysis_image_geometry(
     protocol: crate::cover::GraphicsProtocol,
@@ -2492,7 +2562,10 @@ mod analysis_tests {
         for mode in modes {
             for style in [VizStyle::Dots, VizStyle::Bars] {
               for extras in [false, true] {
-                for term_w in [20usize, 40, 62, 80, 100, 140, 200, 320] {
+                // Every width from 1 up to 20 (a drag through a tiny window —
+                // the sweep used to start at 20, which hid renderers with a
+                // hard minimum width), then a spread of wider ones.
+                for term_w in (1usize..=20).chain([40, 62, 80, 100, 140, 200, 320]) {
                     // Step through every height a drag would pass through.
                     for term_h in 0..48usize {
                         let rows = viz_body_rows(mode, term_h, true, extras);
@@ -2560,8 +2633,9 @@ mod analysis_tests {
     fn analysis_block_fills_its_row_budget_across_window_sizes() {
         // Same contract as the cell-based modes, on a coarser grid: this one
         // encodes an image per call, so sweeping every size costs half a minute.
+        use crate::ansi::visible_len;
         let analyser = VizAnalyser::new(48000);
-        for term_w in [24usize, 60, 120, 240] {
+        for term_w in [1usize, 4, 8, 11, 24, 60, 120, 240] {
             for rows in [0usize, 1, 2, 5, 9, 16, 24, 32] {
                 let budget = viz_body_rows(VizMode::SpectrogramAnalysis, rows, true, false);
                 for log in [true, false] {
@@ -2572,6 +2646,12 @@ mod analysis_tests {
                         lines.len(), budget,
                         "w={term_w} budget={budget}: got {} lines", lines.len()
                     );
+                    for (i, l) in lines.iter().enumerate() {
+                        assert!(
+                            visible_len(l) <= term_w,
+                            "w={term_w} budget={budget} line {i} is {} wide", visible_len(l)
+                        );
+                    }
                 }
             }
         }

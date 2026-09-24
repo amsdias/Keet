@@ -98,7 +98,7 @@ pub(crate) fn producer_should_unstick(state: &PlayerState) -> bool {
 /// (device error) can't hang the producer; 250 ms is many callback periods.
 pub(crate) fn await_consumer_drain(state: &PlayerState) {
     for _ in 0..50 {
-        if !state.reset_consumer_counter.load(Ordering::Relaxed) || producer_should_unstick(state) {
+        if !state.reset_consumer_counter.load(Ordering::Acquire) || producer_should_unstick(state) {
             return;
         }
         thread::sleep(Duration::from_millis(5));
@@ -258,28 +258,238 @@ fn apply_chain_and_push(
         }
     }
 
-    let out: &[f32] = if using_final_buf { &bufs.final_buf } else { bal_output };
-
-    // Clipping detection only — flag for the UI when peak * volume would
-    // exceed 0dBFS at the DAC. Hard prevention happens in the audio callback
-    // (clamp post-gain), since volume can change between this scan and
-    // consumption (~ring-buffer-depth latency).
+    // Clipping detection — flag for the UI when the DSP output (before the
+    // limiter below) times volume would exceed 0 dBFS. That is the useful
+    // signal: "the limiter is working, lower the EQ preamp". The audio
+    // callback still clamps post-gain, since volume can change between this
+    // scan and consumption (~ring-buffer-depth latency).
     let vol = state.volume.load(Ordering::Relaxed) as f32 / 100.0;
-    let peak = out.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+    let peak = {
+        let out: &[f32] = if using_final_buf { &bufs.final_buf } else { bal_output };
+        out.iter().fold(0.0f32, |m, &s| m.max(s.abs()))
+    };
     if peak * vol > 1.0 {
         state.clipping.store(true, Ordering::Relaxed);
     }
 
-    // Push to ring buffer, then capture the tail for the crossfade into the
-    // next track.
-    push_all(producer, state, out);
-    if let Some(tb) = tail_buf {
-        tb.extend(out.iter().copied());
-        if tb.len() > crossfade_samples {
-            let excess = tb.len() - crossfade_samples;
-            tb.drain(..excess);
+    // Output limiter: the LAST DSP stage, so EQ, effects, ReplayGain,
+    // crossfeed and crossfade boosts are all caught. It used to live inside
+    // the effects chain — running only with an effect on, and before
+    // ReplayGain, so a hot master was squashed and then turned down anyway
+    // while every other boost went straight to the callback's hard clamp.
+    // Zero-copy while idle: it only touches samples when engaged.
+    if effects.limiter_engaged(peak) {
+        if !using_final_buf {
+            bufs.final_buf.clear();
+            bufs.final_buf.extend_from_slice(bal_output);
+            using_final_buf = true;
+        }
+        effects.limit_output(&mut bufs.final_buf);
+    }
+
+    let out: &[f32] = if using_final_buf { &bufs.final_buf } else { bal_output };
+
+    // With crossfade on, the newest `crossfade_samples` are HELD BACK in
+    // `tail_buf` instead of being pushed: they are the part of this track that
+    // will play underneath the next one. Only what falls off the front of the
+    // hold is pushed. Pushing everything and keeping a copy (the old code)
+    // played the tail twice — once in full, then again faded under the next
+    // track — so there was never a real overlap. Whoever ends the track and
+    // does NOT hand the tail on must push it (`push_held_tail`).
+    match tail_buf {
+        Some(tb) => {
+            tb.extend(out.iter().copied());
+            if tb.len() > crossfade_samples {
+                let excess = tb.len() - crossfade_samples;
+                push_deque_front(producer, state, tb, excess);
+            }
+        }
+        None => push_all(producer, state, out),
+    }
+}
+
+/// Push the first `n` samples of `dq` to the ring and remove them. `n` is even
+/// (the deque only ever grows by whole stereo frames), so the ring's L/R
+/// alignment survives.
+fn push_deque_front(
+    producer: &mut Producer<f32>,
+    state: &PlayerState,
+    dq: &mut std::collections::VecDeque<f32>,
+    n: usize,
+) {
+    let (a, b) = dq.as_slices();
+    let from_a = n.min(a.len());
+    push_all(producer, state, &a[..from_a]);
+    push_all(producer, state, &b[..n - from_a]);
+    dq.drain(..n);
+}
+
+/// Play a held-back crossfade tail unmixed: the track ended and nothing is
+/// going to fade in over it (last track, repeat-one, a rate-change rebuild).
+fn push_held_tail(
+    producer: &mut Producer<f32>,
+    state: &PlayerState,
+    tail: &mut std::collections::VecDeque<f32>,
+) {
+    let n = tail.len();
+    push_deque_front(producer, state, tail, n);
+}
+
+/// Take a pending seek that targets a track whose decode has already finished
+/// (its audio still draining from the ring). `None` = no seek pending.
+/// `Some(Some(t))` = reopen that track at `t` seconds; `Some(None)` = the target
+/// lies past its end, so just drop the rest of it.
+fn take_seek_for_finished_track(state: &PlayerState) -> Option<Option<f64>> {
+    let rel = state.take_seek();
+    if rel == 0 {
+        return None;
+    }
+    let target = (state.time_secs() + rel as f64).max(0.0);
+    let len = state.total_secs();
+    Some((len <= 0.0 || target < len).then_some(target))
+}
+
+/// Wait for the final track's audio to finish playing. Returns a seek target
+/// if one arrives meanwhile and lands inside the track (it is then reopened);
+/// a seek past the end drops the remaining audio and returns `None`.
+fn wait_out_final_tail(
+    producer: &mut Producer<f32>,
+    state: &PlayerState,
+    ring_capacity: usize,
+) -> Option<f64> {
+    loop {
+        if producer_should_unstick(state) || ring_capacity - producer.slots() == 0 {
+            return None;
+        }
+        if let Some(target) = take_seek_for_finished_track(state) {
+            state.reset_consumer_counter.store(true, Ordering::Release);
+            await_consumer_drain(state);
+            return target;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// A resampler handed from one track to the next so a gapless join stays
+/// continuous. A fresh resampler per track starts from an empty delay line, so
+/// every boundary of a resampled album (44.1 kHz on a 48 kHz device — the most
+/// common setup) got the filter's start-up latency as a burst of near-silence
+/// and a discontinuity. Carrying the resampler AND its unconsumed input across
+/// the boundary makes a split file play back identical to the unsplit one.
+struct ResamplerCarry {
+    resampler: Async<f32>,
+    /// Source rate the resampler was built for; the next track reuses it only
+    /// at the same rate.
+    src_rate: u32,
+    /// Input frames not yet consumed (less than one chunk).
+    pending: Vec<f32>,
+    /// ReplayGain of the track `pending` came from. Gain commutes with the
+    /// (linear) resampler and EQ, so the next track rescales `pending` by
+    /// old/new to keep these frames at their own track's gain.
+    rg_linear: f32,
+}
+
+/// Drain a resampler at the end of its input: feed the final partial chunk
+/// with `partial_len` (rubato pads internally), pump zeros to empty the sinc
+/// delay line, and emit exactly ceil(ratio·pending) + output_delay frames.
+/// Zero-padding `pending` to a full chunk and pushing everything instead
+/// appended ~23 ms of resampled silence per track — a gap in gapless albums.
+/// Runs even when `pending` is empty: the delay line still holds the real
+/// last few ms of the track (skipping it dropped them whenever a track's
+/// length was an exact multiple of the chunk size).
+#[allow(clippy::too_many_arguments)] // producer-thread chain context, as apply_chain_and_push
+fn flush_resampler(
+    resampler: &mut Async<f32>,
+    pending: &[f32],
+    src_rate: u32,
+    output_rate: u32,
+    resamp_out: &mut Vec<f32>,
+    flush_planes: &mut Vec<Vec<f32>>,
+    producer: &mut Producer<f32>,
+    state: &PlayerState,
+    eq: &mut crate::eq::EqChain,
+    effects: &mut crate::effects::EffectsChain,
+    crossfeed: &mut crate::crossfeed::CrossfeedFilter,
+    rg_linear: f32,
+    xfade_in: Option<&std::collections::VecDeque<f32>>,
+    crossfade_pos: &mut usize,
+    crossfade_samples: usize,
+    mut tail_buf: Option<&mut std::collections::VecDeque<f32>>,
+    chain_bufs: &mut ChainBufs,
+) {
+    let channels = 2usize;
+    let chunk_size = resampler.input_frames_next();
+    let pending_frames = pending.len() / channels;
+    let ratio = output_rate as f64 / src_rate as f64;
+    let mut frames_wanted =
+        (pending_frames as f64 * ratio).ceil() as usize + resampler.output_delay();
+    if resamp_out.len() < resampler.output_frames_max() * channels {
+        resamp_out.resize(resampler.output_frames_max() * channels, 0.0);
+    }
+    deinterleave_into(pending, channels, flush_planes);
+    // The adapter needs full chunk geometry; rubato only reads the first
+    // `partial_len` frames of it.
+    for plane in flush_planes.iter_mut() {
+        plane.resize(chunk_size, 0.0);
+    }
+    let mut partial = Some(pending_frames);
+    while frames_wanted > 0 {
+        let Ok(adapter_in) = SequentialSliceOfVecs::new(&*flush_planes, channels, chunk_size) else {
+            break;
+        };
+        let indexing = Indexing {
+            input_offset: 0,
+            output_offset: 0,
+            partial_len: Some(partial.take().unwrap_or(0)),
+            active_channels_mask: None,
+        };
+        let out_frames = resampler.output_frames_next();
+        let Ok(mut out_buf) = InterleavedSlice::new_mut(&mut resamp_out[..], channels, out_frames) else {
+            break;
+        };
+        match resampler.process_into_buffer(&adapter_in, &mut out_buf, Some(&indexing)) {
+            Ok((_, nbr_out)) => {
+                if nbr_out == 0 {
+                    break;
+                }
+                let take = frames_wanted.min(nbr_out);
+                // Through the full DSP chain, same as the packet loop — pushing
+                // raw here skipped EQ/RG/etc. for the final ~20 ms of every
+                // resampled track.
+                apply_chain_and_push(
+                    &resamp_out[..take * channels], producer, state,
+                    eq, effects, crossfeed, rg_linear,
+                    xfade_in, crossfade_pos, crossfade_samples,
+                    tail_buf.as_deref_mut(),
+                    chain_bufs,
+                );
+                frames_wanted -= take;
+            }
+            Err(_) => break,
         }
     }
+}
+
+/// Flush a carried resampler that no track is going to continue (the next
+/// track is at another rate, the playlist ended, or the stream is about to be
+/// rebuilt). Rare path, so it allocates its own scratch.
+fn flush_carry(
+    mut c: ResamplerCarry,
+    output_rate: u32,
+    producer: &mut Producer<f32>,
+    state: &PlayerState,
+    eq: &mut crate::eq::EqChain,
+    effects: &mut crate::effects::EffectsChain,
+    crossfeed: &mut crate::crossfeed::CrossfeedFilter,
+) {
+    let mut out = Vec::new();
+    let mut planes = Vec::with_capacity(2);
+    let mut bufs = ChainBufs::with_capacity(c.resampler.output_frames_max() * 2);
+    let mut pos = 0;
+    flush_resampler(
+        &mut c.resampler, &c.pending, c.src_rate, output_rate, &mut out, &mut planes,
+        producer, state, eq, effects, crossfeed, c.rg_linear, None, &mut pos, 0, None, &mut bufs,
+    );
 }
 
 /// ReplayGain tag values parsed from a single track.
@@ -390,6 +600,16 @@ pub fn decode_playlist(
     // True until the first track this producer decodes is set up. Distinct from
     // `track_index == start_index`, which wrongly matches again on repeat-one.
     let mut first_iteration = true;
+    // Resampler handed from the previous track across a gapless join.
+    let mut carry: Option<ResamplerCarry> = None;
+    // The previous track ended by a user skip rather than running out. Only a
+    // jump in the audio (skip, seek, a new producer) should reset the DSP
+    // filters; a natural track change is continuous audio and must not.
+    let mut prev_track_skipped = false;
+    // The last track whose audio reached the ring, and an absolute seek target
+    // to apply when a track is reopened (see `drain_or_seek`).
+    let mut last_track: Option<usize> = None;
+    let mut initial_seek: Option<f64> = None;
     // Ring capacity is sized per output rate in main.rs and stored on state before
     // the producer is spawned, so it's stable for the lifetime of this call.
     let ring_capacity = state.ring_capacity.load(Ordering::Relaxed);
@@ -406,6 +626,7 @@ pub fn decode_playlist(
         }
 
         let path = &playlist[track_index];
+        state.producer_decoding.store(track_index, Ordering::Relaxed);
 
         // --- Open file and probe format ---
         let file = match File::open(path) {
@@ -446,7 +667,7 @@ pub fn decode_playlist(
             }
         };
 
-        let track = match format.default_track(TrackType::Audio) {
+        let mut track = match format.default_track(TrackType::Audio) {
             Some(t) => t.clone(),
             None => {
                 if let Ok(mut err) = state.decode_error.lock() {
@@ -458,7 +679,7 @@ pub fn decode_playlist(
             }
         };
 
-        let track_id = track.id;
+        let mut track_id = track.id;
         // 0.6: codec_params is Option and splits per media type, so the audio
         // parameters come out of .audio(); track length moved onto Track.
         let audio_params = match track.codec_params.as_ref().and_then(|c| c.audio()) {
@@ -511,7 +732,28 @@ pub fn decode_playlist(
         // Created before the drain wait so a failure skips the track like the
         // decoder-creation failures above. Falling back to "no resampler" here
         // would silently play the track at the wrong pitch.
-        let mut resampler: Option<Async<f32>> = if sample_rate != output_rate {
+        // A carried resampler at this track's rate continues the stream; one
+        // at any other rate is flushed here, before this track pushes anything.
+        let mut carried_pending: Option<Vec<f32>> = None;
+        let reuse = match carry.take() {
+            Some(c) if sample_rate != output_rate && c.src_rate == sample_rate => Some(c),
+            Some(c) => {
+                flush_carry(c, output_rate, producer, state, eq, effects, crossfeed);
+                None
+            }
+            None => None,
+        };
+        let mut resampler: Option<Async<f32>> = if let Some(c) = reuse {
+            let mut p = c.pending;
+            if rg_linear > 0.0 && c.rg_linear != rg_linear {
+                let k = c.rg_linear / rg_linear;
+                for x in p.iter_mut() {
+                    *x *= k;
+                }
+            }
+            carried_pending = Some(p);
+            Some(c.resampler)
+        } else if sample_rate != output_rate {
             let params = if hq_resampler {
                 SincInterpolationParameters {
                     sinc_len: 256,
@@ -553,6 +795,8 @@ pub fn decode_playlist(
 
         let mut broke_for_skip = false;
         let mut skipped = false;
+        // Set when a seek aimed at the previous track needs it reopened.
+        let mut reopen: Option<(usize, f64)> = None;
 
         // Wait for buffer to drain so display update matches audio playback.
         // Gated on "not the first decoded track of this producer" rather than
@@ -569,8 +813,35 @@ pub fn decode_playlist(
                     break;
                 }
                 if state.take_skip_next() {
-                    state.reset_consumer_counter.store(true, Ordering::Relaxed);
+                    state.reset_consumer_counter.store(true, Ordering::Release);
                     await_consumer_drain(state);
+                    // The held tail and any carried resampler input belong to
+                    // the track being skipped; neither may reach the next one.
+                    crossfade_tail = None;
+                    if carried_pending.take().is_some() {
+                        if let Some(ref mut r) = resampler {
+                            r.reset();
+                        }
+                    }
+                    prev_track_skipped = true;
+                    break;
+                }
+                // A seek here is aimed at the PREVIOUS track: its decode has
+                // finished, but its last seconds are still playing and it is
+                // still the track on screen. Applying it to this track's clock
+                // (which is about to be zeroed) jumped the next track ahead or
+                // silently dropped a backward seek.
+                if let Some(target) = take_seek_for_finished_track(state) {
+                    state.reset_consumer_counter.store(true, Ordering::Release);
+                    await_consumer_drain(state);
+                    crossfade_tail = None;
+                    if carried_pending.take().is_some() {
+                        if let Some(ref mut r) = resampler {
+                            r.reset();
+                        }
+                    }
+                    prev_track_skipped = true;
+                    reopen = last_track.zip(target);
                     break;
                 }
                 if state.is_paused() {
@@ -580,6 +851,11 @@ pub fn decode_playlist(
                 }
             }
             if broke_for_skip { break; }
+            if let Some((a, t)) = reopen {
+                track_index = a;
+                initial_seek = Some(t);
+                continue;
+            }
         }
 
         // --- Update track info ---
@@ -587,6 +863,13 @@ pub fn decode_playlist(
         state.sample_rate.store(sample_rate as u64, Ordering::Relaxed);
         state.total_samples.store(total, Ordering::Relaxed);
         state.samples_played.store(0, Ordering::Relaxed);
+        // Whatever is still queued belongs to the previous track; the clock
+        // starts counting this one only once that has played (see state.rs).
+        state.clock_preroll.store(
+            ((ring_capacity - producer.slots()) / 2) as u64,
+            Ordering::Relaxed,
+        );
+        last_track = Some(track_index);
         state.channels.store(src_channels, Ordering::Relaxed);
         state.bits_per_sample.store(bits_per_sample as usize, Ordering::Relaxed);
         state.track_info_ready.store(true, Ordering::Relaxed);
@@ -597,12 +880,17 @@ pub fn decode_playlist(
         if !first_iteration {
             state.signal_next_track(track_index);
         }
+        // Reset the DSP filters only where the audio actually jumps: the first
+        // track of a producer (it follows a skip-back, a jump, a respawn) or
+        // after a skip. A natural track change is continuous audio — resetting
+        // there restarted the biquads from zero state (a step right at the
+        // join, audible on bass-heavy EQ) and cut reverb/delay tails dead.
+        if first_iteration || prev_track_skipped {
+            eq.reset();
+            effects.reset();
+            crossfeed.reset();
+        }
         first_iteration = false;
-
-        // Reset filter states for new track
-        eq.reset();
-        effects.reset();
-        crossfeed.reset();
 
         // --- Crossfade setup for this track ---
         let xfade_in = crossfade_tail.take();
@@ -611,7 +899,13 @@ pub fn decode_playlist(
         let mut tail_buf: std::collections::VecDeque<f32> = if capture_tail { std::collections::VecDeque::with_capacity(crossfade_samples) } else { std::collections::VecDeque::new() };
 
         let chunk_size = resampler.as_ref().map(|r| r.input_frames_next()).unwrap_or(1024);
+        // Start time of the last decoded packet — where decoding resumes if a
+        // seek fails after the ring has been drained.
+        let mut decode_pos_secs = 0.0f64;
         let mut pending: Vec<f32> = Vec::with_capacity(chunk_size * channels * 2);
+        if let Some(p) = carried_pending.take() {
+            pending.extend_from_slice(&p);
+        }
 
         // Persistent resampler output, sized once to the worst case. Both the
         // packet loop and the EOF flush process into this via InterleavedSlice —
@@ -647,36 +941,76 @@ pub fn decode_playlist(
             // Check skip-next — flush buffer and advance to next track
             if state.take_skip_next() {
                 if ring_capacity - producer.slots() > 0 {
-                    state.reset_consumer_counter.store(true, Ordering::Relaxed);
+                    state.reset_consumer_counter.store(true, Ordering::Release);
                     await_consumer_drain(state);
                 }
                 skipped = true;
                 break;
             }
 
-            // Handle seek
-            let seek_secs = state.take_seek();
-            if seek_secs != 0 {
-                let new_time = (state.time_secs() + seek_secs as f64).max(0.0);
+            // Handle seek. `initial_seek` is an absolute target carried in by a
+            // reopen; relative requests made meanwhile stack on top of it.
+            let rel = state.take_seek();
+            let seek_to = match initial_seek.take() {
+                Some(t) => Some((t + rel as f64).max(0.0)),
+                None if rel != 0 => Some((state.time_secs() + rel as f64).max(0.0)),
+                None => None,
+            };
+            if let Some(new_time) = seek_to {
+                let track_len = state.total_secs();
+                if track_len > 0.0 && new_time >= track_len {
+                    // Past the end: move on to the next track. Draining first
+                    // and letting the seek fail (OutOfRange) dropped a ring's
+                    // worth of audio and left the clock that far behind.
+                    if ring_capacity - producer.slots() > 0 {
+                        state.reset_consumer_counter.store(true, Ordering::Release);
+                        await_consumer_drain(state);
+                    }
+                    skipped = true;
+                    break;
+                }
                 pending.clear();
+                // Held-back crossfade audio is pre-seek audio: drop it, and
+                // stop fading the previous track's tail into the new position.
+                tail_buf.clear();
+                crossfade_pos = crossfade_samples;
                 if let Some(ref mut r) = resampler { r.reset(); }
                 eq.reset();
                 effects.reset();
                 crossfeed.reset();
 
-                state.reset_consumer_counter.store(true, Ordering::Relaxed);
+                state.reset_consumer_counter.store(true, Ordering::Release);
                 await_consumer_drain(state);
+                state.clock_preroll.store(0, Ordering::Relaxed);
 
                 // 0.6 replaced the infallible From<f64> with a checked
                 // constructor; an unrepresentable target just skips the seek.
-                if let Some(time) = Time::try_from_secs_f64(new_time) {
-                    if format.seek(SeekMode::Coarse, SeekTo::Time {
-                        time,
-                        track_id: Some(track_id),
-                    }).is_ok() {
-                        state.samples_played.store((new_time * output_rate as f64) as u64, Ordering::Relaxed);
+                let landed = Time::try_from_secs_f64(new_time).and_then(|time| {
+                    format.seek(SeekMode::Coarse, SeekTo::Time { time, track_id: Some(track_id) }).ok()
+                });
+                let clock_at = match landed {
+                    Some(seeked) => {
+                        // Codec state (MP3 bit reservoir, AAC/Vorbis overlap)
+                        // belongs to the old position; symphonia requires a
+                        // reset after a seek.
+                        decoder.reset();
+                        // A coarse seek lands at or before the target; clock
+                        // the position actually reached (FLAC lands up to
+                        // ~80 ms early), not the one asked for.
+                        track
+                            .time_base
+                            .and_then(|tb| tb.calc_time(seeked.actual_ts))
+                            .map(|t| t.as_secs_f64())
+                            .unwrap_or(new_time)
                     }
-                }
+                    // The seek failed after the ring was already drained: the
+                    // decoder carries on from where it was, so the clock must
+                    // too — it had been left a ring's depth behind the audio.
+                    None => decode_pos_secs,
+                };
+                state
+                    .samples_played
+                    .store((clock_at * output_rate as f64) as u64, Ordering::Relaxed);
             }
 
             // Throttle when buffer is full
@@ -726,10 +1060,37 @@ pub fn decode_playlist(
             let packet = match format.next_packet() {
                 Ok(Some(p)) => p,
                 Ok(None) => break,  // end of stream
+                // A chained stream (concatenated Ogg files, many internet-radio
+                // rips) began a new logical stream: the track list changed.
+                // Re-select the audio track and rebuild the decoder, then carry
+                // on — this used to end the track after the first link. A link
+                // at a different sample rate would need a new resampler, so
+                // that case still ends the track.
+                Err(symphonia::core::errors::Error::ResetRequired) => {
+                    let Some(next) = format.default_track(TrackType::Audio).cloned() else { break };
+                    let Some(params) = next.codec_params.as_ref().and_then(|c| c.audio()).cloned() else { break };
+                    if params.sample_rate.unwrap_or(sample_rate) != sample_rate {
+                        break;
+                    }
+                    match symphonia::default::get_codecs()
+                        .make_audio_decoder(&params, &AudioDecoderOptions::default())
+                    {
+                        Ok(d) => {
+                            decoder = d;
+                            track_id = next.id;
+                            track = next;
+                            continue;
+                        }
+                        Err(_) => break,
+                    }
+                }
                 Err(_) => break,    // read error
             };
 
             if packet.track_id != track_id { continue; }
+            if let Some(t) = track.time_base.and_then(|tb| tb.calc_time(packet.pts)) {
+                decode_pos_secs = t.as_secs_f64();
+            }
 
             let decoded = match decoder.decode(&packet) {
                 Ok(d) => d,
@@ -744,7 +1105,12 @@ pub fn decode_playlist(
             if raw_buf.is_empty() { continue; }
 
             // Convert the source layout to interleaved stereo (appends to pending).
-            interleaved_to_stereo(&raw_buf, src_channels, &mut pending);
+            // The layout comes from THIS buffer, not the codec parameters: a
+            // stream can change channel count mid-file (concatenated MP3s going
+            // mono -> stereo), and reading it with the old count misreads the
+            // interleave — half- or double-speed playback.
+            let buf_channels = decoded.spec().channels().count().max(1);
+            interleaved_to_stereo(&raw_buf, buf_channels, &mut pending);
 
             // Resample if needed
             decoded_buf.clear();
@@ -798,69 +1164,41 @@ pub fn decode_playlist(
             );
         }
 
-        // Flush the resampler tail. Zero-padding `pending` to a full chunk and
-        // pushing everything the resampler produced appended up to ~23 ms of
-        // resampled silence to every track — an audible gap in gapless albums.
-        // Instead: feed the real frames with `partial_len` (rubato pads
-        // internally), pump zeros to drain the sinc delay line, and emit
-        // exactly ceil(ratio·pending) + delay frames.
-        if let Some(ref mut resampler) = resampler {
-            if !pending.is_empty() && !skipped && !broke_for_skip {
-                let pending_frames = pending.len() / channels;
-                let ratio = output_rate as f64 / sample_rate as f64;
-                let mut frames_wanted =
-                    (pending_frames as f64 * ratio).ceil() as usize + resampler.output_delay();
-                deinterleave_into(&pending, channels, &mut flush_planes);
-                // The adapter needs full chunk geometry; rubato only reads the
-                // first `partial_len` frames of it.
-                for plane in flush_planes.iter_mut() {
-                    plane.resize(chunk_size, 0.0);
-                }
-                let mut partial = Some(pending_frames);
-                while frames_wanted > 0 {
-                    let adapter_in =
-                        match SequentialSliceOfVecs::new(&flush_planes, channels, chunk_size) {
-                            Ok(a) => a,
-                            Err(_) => break,
-                        };
-                    let indexing = Indexing {
-                        input_offset: 0,
-                        output_offset: 0,
-                        partial_len: Some(partial.take().unwrap_or(0)),
-                        active_channels_mask: None,
-                    };
-                    let out_frames = resampler.output_frames_next();
-                    let Ok(mut out_buf) =
-                        InterleavedSlice::new_mut(&mut resamp_out, channels, out_frames)
-                    else {
-                        break;
-                    };
-                    match resampler.process_into_buffer(&adapter_in, &mut out_buf, Some(&indexing)) {
-                        Ok((_, nbr_out)) => {
-                            if nbr_out == 0 {
-                                break;
-                            }
-                            let take = frames_wanted.min(nbr_out);
-                            // Through the full DSP chain, same as the packet
-                            // loop — pushing raw here skipped EQ/RG/etc. for
-                            // the final ~20 ms of every resampled track.
-                            apply_chain_and_push(
-                                &resamp_out[..take * channels], producer, state,
-                                eq, effects, crossfeed, rg_linear,
-                                xfade_in.as_ref(), &mut crossfade_pos, crossfade_samples,
-                                if capture_tail { Some(&mut tail_buf) } else { None },
-                                &mut chain_bufs,
-                            );
-                            frames_wanted -= take;
-                        }
-                        Err(_) => break,
-                    }
+        // End of the track's input. If the next thing to play continues this
+        // audio gaplessly (no crossfade, a next track exists), hand the
+        // resampler and its unconsumed input across instead of flushing — the
+        // next track reuses them at the same source rate, or flushes them first
+        // at any other. Otherwise drain it now. A skip or producer exit
+        // discards it: that audio is being thrown away.
+        if let Some(mut r) = resampler.take() {
+            if !skipped && !broke_for_skip {
+                let repeats = state.repeat_mode() == crate::state::RepeatMode::One;
+                let next_exists = repeats || track_index + 1 < playlist.len();
+                if crossfade_samples == 0 && next_exists {
+                    carry = Some(ResamplerCarry {
+                        resampler: r,
+                        src_rate: sample_rate,
+                        pending: std::mem::take(&mut pending),
+                        rg_linear,
+                    });
+                } else {
+                    flush_resampler(
+                        &mut r, &pending, sample_rate, output_rate,
+                        &mut resamp_out, &mut flush_planes, producer, state,
+                        eq, effects, crossfeed, rg_linear,
+                        xfade_in.as_ref(), &mut crossfade_pos, crossfade_samples,
+                        if capture_tail { Some(&mut tail_buf) } else { None },
+                        &mut chain_bufs,
+                    );
                 }
             }
         }
+        prev_track_skipped = skipped;
 
-        // Save crossfade tail for next track (skip if user explicitly skipped)
-        if capture_tail && !tail_buf.is_empty() && !skipped {
+        // Hand the held-back tail to the next track to fade under it. A skip
+        // or a producer exit discards it: the user asked for this audio to
+        // stop, and the ring has been (or is about to be) drained anyway.
+        if capture_tail && !tail_buf.is_empty() && !skipped && !broke_for_skip {
             crossfade_tail = Some(tail_buf);
         }
 
@@ -868,16 +1206,30 @@ pub fn decode_playlist(
             break; // Exit entire function
         }
 
-        // Repeat-one: replay same track, no crossfade tail
+        // Repeat-one: replay the same track without a crossfade — so the tail
+        // that was held back for one is played out plain instead of lost.
         if state.repeat_mode() == crate::state::RepeatMode::One && !skipped {
-            crossfade_tail = None;
+            if let Some(mut t) = crossfade_tail.take() {
+                push_held_tail(producer, state, &mut t);
+            }
             continue;
         }
 
         // Exclusive mode: check if next track needs a different sample rate
         if state.exclusive.load(Ordering::Relaxed) && track_index + 1 < playlist.len() {
             if let Some(next_rate) = crate::audio::probe_sample_rate(&playlist[track_index + 1]) {
-                if next_rate != output_rate {
+                // Compare against the rate a switch would actually reach, not
+                // the file's rate: when the device cannot follow, the rebuild
+                // lands on the current rate and only costs a drain and a gap.
+                if state.exclusive_target_rate(next_rate, output_rate) != output_rate {
+                    // The stream is rebuilt at another rate, so nothing can
+                    // fade across the rebuild: play the held tail out now.
+                    if let Some(mut t) = crossfade_tail.take() {
+                        push_held_tail(producer, state, &mut t);
+                    }
+                    if let Some(c) = carry.take() {
+                        flush_carry(c, output_rate, producer, state, eq, effects, crossfeed);
+                    }
                     state.next_track_rate.store(next_rate, Ordering::Relaxed);
                     state.rate_change_needed.store(true, Ordering::Relaxed);
                     track_index += 1;
@@ -887,7 +1239,37 @@ pub fn decode_playlist(
             }
         }
 
+        // Last track: its decode is done but its audio is still playing. Stay
+        // until it has, so a seek in those seconds reaches this track instead
+        // of lingering until a respawned producer applies it to another one.
+        if track_index + 1 >= playlist.len() && !producer_should_unstick(state) {
+            if let Some(mut t) = crossfade_tail.take() {
+                push_held_tail(producer, state, &mut t);
+            }
+            if let Some(target) = wait_out_final_tail(producer, state, ring_capacity) {
+                track_index = last_track.unwrap_or(track_index);
+                initial_seek = Some(target);
+                prev_track_skipped = true;
+                continue;
+            }
+        }
+
         track_index += 1;
+    }
+
+    // The playlist ran out with a tail still held for a next track that never
+    // came: play it, or the last N seconds of the final track vanish. Not on
+    // a quit/skip exit — that audio is being thrown away on purpose.
+    if let Some(mut t) = crossfade_tail.take() {
+        if !producer_should_unstick(state) {
+            push_held_tail(producer, state, &mut t);
+        }
+    }
+    // Same for a resampler carried toward a next track that failed to open.
+    if let Some(c) = carry.take() {
+        if !producer_should_unstick(state) {
+            flush_carry(c, output_rate, producer, state, eq, effects, crossfeed);
+        }
     }
 
     if !state.rate_change_needed.load(Ordering::Relaxed) {
@@ -1028,7 +1410,7 @@ mod tests {
         // at 250 ms — but a pending join (jump set) must end it promptly, not
         // ride out the full bound.
         let state = std::sync::Arc::new(PlayerState::new());
-        state.reset_consumer_counter.store(true, Ordering::Relaxed);
+        state.reset_consumer_counter.store(true, Ordering::Release);
         state.jump_to(0);
         let handle = thread::spawn(move || await_consumer_drain(&state));
         for _ in 0..24 {
@@ -1158,6 +1540,15 @@ mod chain_tests {
     /// Run files through the real producer chain with the test acting as the
     /// audio callback: drain the ring, collect every output sample.
     fn run_chain(paths: &[PathBuf], output_rate: u32, rg: RgMode) -> Vec<f32> {
+        run_chain_with(paths, output_rate, rg, 0, false, None)
+    }
+
+    /// `run_chain` with the crossfade length (seconds) and resampler quality
+    /// exposed, for the tests that exercise track boundaries.
+    fn run_chain_with(
+        paths: &[PathBuf], output_rate: u32, rg: RgMode, crossfade_secs: u32, hq: bool,
+        eq_preset: Option<usize>,
+    ) -> Vec<f32> {
         let state = Arc::new(PlayerState::new());
         let cap = 1 << 16;
         state.ring_capacity.store(cap, Ordering::Relaxed);
@@ -1168,14 +1559,17 @@ mod chain_tests {
         let handle = thread::spawn(move || {
             let mut eq_chain = crate::eq::EqChain::new();
             let eq_presets = crate::eq::builtin_presets();
+            if let Some(i) = eq_preset {
+                eq_chain.load_preset(&eq_presets[i], output_rate as f32);
+            }
             let mut fx_chain = crate::effects::EffectsChain::new(output_rate as f32);
             let fx_presets = crate::effects::builtin_presets();
             let mut cf_filter = crate::crossfeed::CrossfeedFilter::new();
             let cf_presets = crate::crossfeed::builtin_presets();
             decode_playlist(
-                &list, 0, &mut producer, &st, output_rate, false,
+                &list, 0, &mut producer, &st, output_rate, hq,
                 &mut eq_chain, &eq_presets, &mut fx_chain, &fx_presets,
-                0, &mut cf_filter, &cf_presets,
+                crossfade_secs, &mut cf_filter, &cf_presets,
             );
         });
         let mut out = Vec::new();
@@ -1390,5 +1784,262 @@ mod chain_tests {
             peak < 0.35,
             "flush tail must be ReplayGain-attenuated (~0.25 peak), got {peak}"
         );
+    }
+
+    #[test]
+    fn crossfade_overlaps_the_tail_instead_of_replaying_it() {
+        // A (440 Hz) and B (1 kHz), 2 s each, 1 s crossfade. A true overlap is
+        // 3 s long: A alone, then A fading under B, then B alone. The old code
+        // pushed A in full and then mixed A's last second under B again — 4 s,
+        // with A audible a second time inside B.
+        let (a, b) = (tmp_wav("xfade_a"), tmp_wav("xfade_b"));
+        let sa = sine(44100, 2.0, 440.0, 0.5);
+        let sb = sine(44100, 2.0, 1000.0, 0.5);
+        write_wav(&a, 44100, 2, WavFmt::Pcm16, &interleave(&[sa.clone(), sa]));
+        write_wav(&b, 44100, 2, WavFmt::Pcm16, &interleave(&[sb.clone(), sb]));
+        let out = run_chain_with(&[a, b], 44100, RgMode::Off, 1, false, None);
+        let (l, _) = channels(&out);
+        assert_eq!(l.len(), 132_300, "3 s of output for 2 s + 2 s with a 1 s overlap");
+        // After the overlap only B remains: A must not come back.
+        let after = &l[88_200..132_300];
+        assert!(tone_amplitude(after, 44100.0, 440.0) < 0.01, "A replayed after the crossfade");
+        assert!(tone_amplitude(after, 44100.0, 1000.0) > 0.4, "B missing after the crossfade");
+        // Before the overlap only A plays.
+        let before = &l[..44_100];
+        assert!(tone_amplitude(before, 44100.0, 1000.0) < 0.01, "B leaked before the crossfade");
+    }
+
+    #[test]
+    fn crossfade_tail_is_played_when_no_track_follows() {
+        // With crossfade on, the last N seconds are held back to be mixed into
+        // the next track. On the last track nothing follows, and the held tail
+        // must still reach the output rather than being dropped.
+        let a = tmp_wav("xfade_last");
+        let sa = sine(44100, 2.0, 440.0, 0.5);
+        write_wav(&a, 44100, 2, WavFmt::Pcm16, &interleave(&[sa.clone(), sa]));
+        let out = run_chain_with(&[a], 44100, RgMode::Off, 1, false, None);
+        assert_eq!(out.len() / 2, 88_200, "the whole track, tail included");
+    }
+
+    /// Split one continuous signal into two files at `split` frames, run both
+    /// and the unsplit original through the chain, and return (split, whole).
+    fn split_vs_whole(
+        tag: &str, full: &[f32], split: usize, src_rate: u32, out_rate: u32, hq: bool,
+        eq_preset: Option<usize>,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let (h1, h2) = full.split_at(split);
+        let (a, b, w) = (
+            tmp_wav(&format!("{tag}_a")), tmp_wav(&format!("{tag}_b")), tmp_wav(&format!("{tag}_w")),
+        );
+        write_wav(&a, src_rate, 2, WavFmt::F32, &interleave(&[h1.to_vec(), h1.to_vec()]));
+        write_wav(&b, src_rate, 2, WavFmt::F32, &interleave(&[h2.to_vec(), h2.to_vec()]));
+        write_wav(&w, src_rate, 2, WavFmt::F32, &interleave(&[full.to_vec(), full.to_vec()]));
+        let split_out = run_chain_with(&[a, b], out_rate, RgMode::Off, 0, hq, eq_preset);
+        let whole_out = run_chain_with(&[w], out_rate, RgMode::Off, 0, hq, eq_preset);
+        (split_out, whole_out)
+    }
+
+    fn max_abs_diff(x: &[f32], y: &[f32]) -> f32 {
+        x.iter().zip(y).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()))
+    }
+
+    fn assert_gapless_resampled(hq: bool) {
+        // A continuous sine cut mid-cycle, 44.1 kHz source on a 48 kHz output.
+        // Gapless means the join is inaudible: the split playback must match
+        // the unsplit file sample for sample. A fresh resampler per track put
+        // its start-up delay (tens to a hundred-odd frames of near-silence) at
+        // every boundary.
+        let full = sine(44100, 2.0, 441.0, 0.5);
+        let (split, whole) =
+            split_vs_whole(&format!("gapless_{hq}"), &full, 44100 + 123, 44100, 48000, hq, None);
+        assert_eq!(split.len(), whole.len(), "hq={hq}: split playback is a different length");
+        let err = max_abs_diff(&split, &whole);
+        assert!(err < 1e-4, "hq={hq}: split differs from whole by {err} at the join");
+    }
+
+    #[test]
+    fn gapless_join_survives_resampling() {
+        assert_gapless_resampled(false);
+    }
+
+    #[test]
+    fn gapless_join_survives_hq_resampling() {
+        assert_gapless_resampled(true);
+    }
+
+    #[test]
+    fn eq_state_carries_across_a_gapless_boundary() {
+        // Same rate (no resampler), bass-boost EQ on a 60 Hz tone. Resetting
+        // the biquads at the track change restarted them from zero state — a
+        // step in the output exactly at the join.
+        let full = sine(44100, 2.0, 60.0, 0.4);
+        let (split, whole) = split_vs_whole("eq_join", &full, 44100 + 300, 44100, 44100, false, Some(1));
+        assert_eq!(split.len(), whole.len());
+        let err = max_abs_diff(&split, &whole);
+        assert!(err < 1e-4, "EQ output steps by {err} at the track change");
+    }
+
+    #[test]
+    fn resampler_tail_is_flushed_when_no_input_is_left_over() {
+        // A track whose length is an exact multiple of the 1024-frame chunk
+        // leaves nothing in `pending` at EOF. The flush was skipped then, so
+        // the resampler's delay line — the real last few ms — was dropped.
+        // One frame longer must yield roughly one output frame more, not one
+        // plus the whole delay line.
+        let n = 43 * 1024;
+        let run = |frames: usize, tag: &str| {
+            let p = tmp_wav(tag);
+            let s = sine(44100, frames as f32 / 44100.0, 441.0, 0.5);
+            let s = s[..frames].to_vec();
+            write_wav(&p, 44100, 2, WavFmt::F32, &interleave(&[s.clone(), s]));
+            run_chain_with(&[p], 48000, RgMode::Off, 0, false, None).len() / 2
+        };
+        let exact = run(n, "flush_exact");
+        let plus_one = run(n + 1, "flush_plus1");
+        let d = plus_one as i64 - exact as i64;
+        assert!((0..=2).contains(&d), "one extra input frame changed the output by {d} frames");
+    }
+
+    /// A harness closer to the real callback than `run_chain`: it consumes at a
+    /// fixed multiple of real time (so the producer runs a full ring ahead, as
+    /// in playback), advances `samples_played`, honours drain requests, and
+    /// fires `seeks` — (seconds of audio consumed, relative seek) — on cue.
+    fn run_chain_paced(paths: &[PathBuf], rate: u32, seeks: &[(f64, i64)]) -> Vec<f32> {
+        const SPEEDUP: f64 = 10.0;
+        let state = Arc::new(PlayerState::new());
+        let cap = crate::state::ring_capacity_for(rate);
+        state.ring_capacity.store(cap, Ordering::Relaxed);
+        state.output_rate.store(rate as u64, Ordering::Relaxed);
+        state.rg_mode.store(RgMode::Off as u8, Ordering::Relaxed);
+        let (mut producer, mut consumer) = rtrb::RingBuffer::<f32>::new(cap);
+        let st = Arc::clone(&state);
+        let list = paths.to_vec();
+        let handle = thread::spawn(move || {
+            let mut eq_chain = crate::eq::EqChain::new();
+            let eq_presets = crate::eq::builtin_presets();
+            let mut fx_chain = crate::effects::EffectsChain::new(rate as f32);
+            let fx_presets = crate::effects::builtin_presets();
+            let mut cf_filter = crate::crossfeed::CrossfeedFilter::new();
+            let cf_presets = crate::crossfeed::builtin_presets();
+            decode_playlist(
+                &list, 0, &mut producer, &st, rate, false,
+                &mut eq_chain, &eq_presets, &mut fx_chain, &fx_presets,
+                0, &mut cf_filter, &cf_presets,
+            );
+        });
+        let mut out = Vec::new();
+        let mut next_seek = 0;
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(30);
+        loop {
+            if state.reset_consumer_counter.swap(false, Ordering::AcqRel) {
+                while consumer.pop().is_ok() {}
+            }
+            let played_frames = out.len() / 2;
+            if next_seek < seeks.len() && played_frames as f64 >= seeks[next_seek].0 * rate as f64 {
+                state.seek(seeks[next_seek].1);
+                next_seek += 1;
+            }
+            let due = (start.elapsed().as_secs_f64() * rate as f64 * SPEEDUP) as usize;
+            let mut frames = due.saturating_sub(played_frames);
+            state.buffer_level.store(consumer.slots(), Ordering::Relaxed);
+            while frames > 0 {
+                let (Ok(l), Ok(r)) = (consumer.pop(), consumer.pop()) else { break };
+                out.push(l);
+                out.push(r);
+                state.samples_played.fetch_add(1, Ordering::Relaxed);
+                frames -= 1;
+            }
+            if state.producer_done.load(Ordering::Relaxed) && consumer.slots() == 0 {
+                break;
+            }
+            if Instant::now() > deadline {
+                state.quit();
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        let _ = handle.join();
+        out
+    }
+
+    fn secs(out: &[f32], rate: u32) -> f64 {
+        out.len() as f64 / 2.0 / rate as f64
+    }
+
+    #[test]
+    fn seeking_past_the_end_moves_on_to_the_next_track() {
+        // 1 s into an 8 s track, seek +10 s: that lands past the end, so the
+        // player should move on to B. It used to drain the ring, have the seek
+        // fail (OutOfRange), and carry on decoding A from wherever the producer
+        // was — dropping ~4 s and leaving the clock ~4 s wrong.
+        let (a, b) = (tmp_wav("seekend_a"), tmp_wav("seekend_b"));
+        let sa = sine(44100, 8.0, 440.0, 0.5);
+        let sb = sine(44100, 2.0, 1000.0, 0.5);
+        write_wav(&a, 44100, 2, WavFmt::Pcm16, &interleave(&[sa.clone(), sa]));
+        write_wav(&b, 44100, 2, WavFmt::Pcm16, &interleave(&[sb.clone(), sb]));
+        let out = run_chain_paced(&[a, b], 44100, &[(1.0, 10)]);
+        let t = secs(&out, 44100);
+        // Upper bound is the regression check (unfixed: ~7.2 s). The lower
+        // bound is loose on purpose: under a loaded parallel test run the
+        // harness thread can miss the 250 ms drain window, and the late drain
+        // then eats some of B — a harness artifact the real-time callback
+        // does not share.
+        assert!((2.0..3.6).contains(&t), "expected ~1 s of A then 2 s of B, got {t:.2} s");
+        let (l, _) = channels(&out);
+        // Only the final 0.3 s: B's end is always the last audio out, while a
+        // late (starved-harness) drain can shorten B enough that a wider
+        // window reaches back into A's first second.
+        let tail = &l[l.len() - 13_230..];
+        assert!(tone_amplitude(tail, 44100.0, 440.0) < 0.01, "A still playing after the seek");
+    }
+
+    #[test]
+    fn seeking_in_the_last_seconds_seeks_the_track_you_hear() {
+        // The producer finishes decoding A seconds before A finishes playing.
+        // A seek pressed in that window belongs to A (A is what is on screen
+        // and in your ears); it used to wait for B and be applied to B's clock.
+        // Here: at 2.0 s of a 3 s track, seek back 1 s -> A again from ~1 s.
+        let (a, b) = (tmp_wav("seektail_a"), tmp_wav("seektail_b"));
+        let sa = sine(44100, 3.0, 440.0, 0.5);
+        let sb = sine(44100, 3.0, 1000.0, 0.5);
+        write_wav(&a, 44100, 2, WavFmt::Pcm16, &interleave(&[sa.clone(), sa]));
+        write_wav(&b, 44100, 2, WavFmt::Pcm16, &interleave(&[sb.clone(), sb]));
+        let out = run_chain_paced(&[a, b], 44100, &[(2.0, -1)]);
+        let t = secs(&out, 44100);
+        // Unfixed: ~5.6 s (the seek was spent on B). Lower bound loose for the
+        // same harness-starvation reason as the test above.
+        assert!((6.2..7.3).contains(&t), "expected 2 s + A from 1 s (2 s) + B (3 s) = 7 s, got {t:.2} s");
+        let (l, _) = channels(&out);
+        let replay = &l[(2.2 * 44100.0) as usize..(3.8 * 44100.0) as usize];
+        assert!(tone_amplitude(replay, 44100.0, 440.0) > 0.4, "A was not replayed after the seek");
+    }
+
+    #[test]
+    fn dsp_boosts_are_limited_not_left_to_clip() {
+        // Bass-boost EQ on a hot 60 Hz tone pushes peaks past full scale. The
+        // only limiter lived inside the effects chain (so it ran only with an
+        // effect on, and before ReplayGain/crossfeed); everything else reached
+        // the callback's hard clamp — i.e. clipped. The chain's own output must
+        // stay within 0 dBFS.
+        let a = tmp_wav("hot_eq");
+        let t = sine(44100, 1.5, 60.0, 0.95);
+        write_wav(&a, 44100, 2, WavFmt::F32, &interleave(&[t.clone(), t]));
+        let out = run_chain_with(&[a], 44100, RgMode::Off, 0, false, Some(1));
+        let peak = out.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(peak <= 1.0 + 1e-6, "chain output peaks at {peak}, past 0 dBFS");
+    }
+
+    #[test]
+    fn chained_ogg_plays_every_link() {
+        // Two Ogg Vorbis streams concatenated in one file. At the join the
+        // demuxer returns ResetRequired (new logical stream); that used to be
+        // treated as end of track, so only the first link ever played.
+        let out = run_chain(&[fixture("chained.ogg")], 44100, RgMode::Off);
+        let (l, _) = channels(&out);
+        let t = l.len() as f64 / 44100.0;
+        assert!(t > 1.8, "only {t:.2} s played of a 2 s chained file");
+        let second = &l[l.len() - 30_000..];
+        assert!(tone_amplitude(second, 44100.0, 1000.0) > 0.3, "second link's 1 kHz missing");
     }
 }

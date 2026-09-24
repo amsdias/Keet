@@ -70,14 +70,16 @@ pub fn parse_lyrics(raw: &str) -> Lyrics {
             // A line may carry several timestamps sharing the same text.
             // Non-timestamped lines (metadata like [ar:Artist]) yield nothing.
             for (time, text) in parse_lrc_line(line) {
-                lines.push(LrcLine { time, text });
+                // Lyrics are drawn straight into frame lines, and LRCLIB text
+                // is user-submitted: strip control characters (ESC, CR, ...).
+                lines.push(LrcLine { time, text: crate::ansi::sanitize_display(&text) });
             }
         }
         lines.sort_by(|a, b| a.time.partial_cmp(&b.time).unwrap_or(std::cmp::Ordering::Equal));
         Lyrics::Synced(lines)
     } else {
         let lines: Vec<String> = raw.lines()
-            .map(|l| l.to_string())
+            .map(crate::ansi::sanitize_display)
             .collect();
         Lyrics::Plain(lines)
     }
@@ -222,6 +224,20 @@ fn urlencod(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lyric_lines_are_stripped_of_control_characters() {
+        let synced = parse_lyrics("[00:01.00]hi\x1B]52;c;cGF3bmVk\x07there");
+        assert!(!synced.line_text(0).contains('\x1B'), "{:?}", synced.line_text(0));
+        let plain = parse_lyrics("verse\x1B[2J one\nverse two");
+        assert!(!plain.line_text(0).contains('\x1B'));
+        assert_eq!(plain.line_text(1), "verse two");
+    }
 }
 
 #[cfg(test)]

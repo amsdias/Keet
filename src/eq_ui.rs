@@ -3,6 +3,7 @@
 //! it takes the band set + selection + readout strings and returns the screen
 //! lines.
 
+use crate::ansi::visible_len;
 use crate::eq::{format_freq, BandSettings, BandType, EQ_BANDS, EQ_GAIN_LIMIT};
 use crate::theme::Palette;
 
@@ -62,8 +63,12 @@ pub fn render_eq_screen(
 ) -> Vec<String> {
     let rst = p.reset;
     let band_w = 6;
-    // Odd slider height so there's a true centre (0 dB) row.
-    let slider_h = (height.saturating_sub(9).clamp(5, 15)) | 1;
+    // Odd slider height so there's a true centre (0 dB) row — rounded DOWN:
+    // `| 1` rounded an even budget up, one row past what the caller had.
+    let slider_h = {
+        let h = height.saturating_sub(9).clamp(5, 15);
+        if h.is_multiple_of(2) { h - 1 } else { h }
+    };
     let center = slider_h / 2;
 
     // gain (dB) → grid row (0 = top = +limit … slider_h-1 = bottom = -limit).
@@ -128,7 +133,7 @@ pub fn render_eq_screen(
         } else {
             format!("{}{}{}", p.dim, label, rst)
         };
-        freq_line.push_str(&center_cell(&colored, label.chars().count(), band_w));
+        freq_line.push_str(&center_cell(&colored, visible_len(&label), band_w));
     }
     out.push(freq_line);
 
@@ -146,7 +151,7 @@ pub fn render_eq_screen(
         };
         type_line.push_str(&center_cell(
             &format!("{col}{label}{rst}"),
-            label.chars().count(),
+            visible_len(label),
             band_w,
         ));
     }
@@ -174,7 +179,7 @@ pub fn render_eq_screen(
         } else {
             p.dim
         };
-        db_line.push_str(&center_cell(&format!("{col}{val}{rst}"), val.chars().count(), band_w));
+        db_line.push_str(&center_cell(&format!("{col}{val}{rst}"), visible_len(&val), band_w));
     }
     out.push(db_line);
 

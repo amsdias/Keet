@@ -169,7 +169,7 @@ pub fn print_status_hifi(
     ));
 
     // Row 3: seg_bot  +  progress + " / TOTAL"
-    let bar_w = right_w.saturating_sub(tot.chars().count() + 4).max(20);
+    let bar_w = right_w.saturating_sub(visible_len(&tot) + 4).max(20);
     let bar = render_solid_bar(progress, bar_w);
     w.line(&format!(
         "  {fg}{seg}{rst}{gap}{accent}{bar}{rst}  {dim}/ {tot}{rst}",
@@ -281,7 +281,7 @@ pub fn print_status_hifi(
         ));
         let cell_inner = cell_w.saturating_sub(2);
         // Label row: dim, centered.
-        let pl = label.chars().count();
+        let pl = visible_len(label);
         let lpad = (cell_inner.saturating_sub(pl)) / 2;
         let rpad = cell_inner.saturating_sub(pl + lpad);
         label_row.push_str(&format!(
@@ -292,7 +292,7 @@ pub fn print_status_hifi(
         // Value row: bold accent, with optional dim unit suffix.
         let unit = knob_unit[i];
         let val_color = if *good { p.good } else { p.accent };
-        let val_visible = value.chars().count() + if unit.is_empty() { 0 } else { 1 + unit.chars().count() };
+        let val_visible = visible_len(value) + if unit.is_empty() { 0 } else { 1 + visible_len(unit) };
         let v_lpad = (cell_inner.saturating_sub(val_visible)) / 2;
         let v_rpad = cell_inner.saturating_sub(val_visible + v_lpad);
         let val_styled = if unit.is_empty() {
@@ -364,7 +364,7 @@ fn render_db_scale(meter_w: usize, p: &crate::theme::Palette) -> String {
         let target = (frac * meter_w as f32) as usize;
         // For first label, place at column 0; for last, anchor flush to meter_w end.
         let col = if i == labels.len() - 1 {
-            meter_w.saturating_sub(label.chars().count())
+            meter_w.saturating_sub(visible_len(label))
         } else {
             target
         };
@@ -376,7 +376,7 @@ fn render_db_scale(meter_w: usize, p: &crate::theme::Palette) -> String {
         out.push_str(color);
         out.push_str(label);
         out.push_str(p.reset);
-        placed += label.chars().count();
+        placed += visible_len(label);
     }
     out
 }
@@ -512,22 +512,13 @@ fn format_time(secs: f64) -> String {
     format!("{:02}:{:02}", m, s)
 }
 
-/// Pad with spaces to `width` (or truncate with ellipsis if too long).
+/// Pad with spaces to `width` columns (or truncate with ellipsis if too long).
+/// Measured in display columns: a wide (CJK) title padded by char count
+/// overflowed its column and wrapped the row.
 fn pad_or_truncate(s: &str, width: usize) -> String {
-    let visible = s.chars().count();
-    if visible == width {
-        s.to_string()
-    } else if visible < width {
-        let mut out = String::from(s);
-        out.push_str(&" ".repeat(width - visible));
-        out
-    } else if width > 1 {
-        let mut out: String = s.chars().take(width - 1).collect();
-        out.push('…');
-        out
-    } else {
-        s.chars().take(width).collect()
-    }
+    let cut = crate::ansi::truncate_plain(s, width);
+    let visible = visible_len(&cut);
+    format!("{cut}{}", " ".repeat(width.saturating_sub(visible)))
 }
 
 

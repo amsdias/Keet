@@ -63,7 +63,28 @@ pub fn detect_protocol() -> GraphicsProtocol {
 }
 
 /// Pure decision core of `detect_protocol`, parameterized for testability.
+///
+/// Kitty is NEVER returned on Windows, whatever the environment claims. ConPTY
+/// drops the APC sequences the protocol rides on, and the Kitty hints all
+/// survive into a Windows session: `TERM=xterm-kitty` and `KITTY_WINDOW_ID` are
+/// forwarded by `ssh` into Windows OpenSSH, and Ghostty sets TERM_PROGRAM. The
+/// rule is applied once, here, rather than per hint (only WezTerm was guarded).
 fn protocol_from_env(
+    term_program: Option<&str>,
+    term: Option<&str>,
+    has_kitty_window_id: bool,
+    lc_terminal: Option<&str>,
+    has_wt_session: bool,
+    is_windows: bool,
+) -> GraphicsProtocol {
+    let p = protocol_from_env_hints(term_program, term, has_kitty_window_id, lc_terminal, has_wt_session, is_windows);
+    if is_windows && p == GraphicsProtocol::Kitty {
+        return if has_wt_session { GraphicsProtocol::Sixel } else { GraphicsProtocol::HalfBlock };
+    }
+    p
+}
+
+fn protocol_from_env_hints(
     term_program: Option<&str>,
     term: Option<&str>,
     has_kitty_window_id: bool,
@@ -140,10 +161,19 @@ impl CoverSize {
         }
     }
 
-    /// Sixel is pixel-exact, so its target is derived from the cell box at a
-    /// conservative 10×20 px per cell (the Windows Terminal default font).
+    /// Sixel is pixel-exact, so its target is derived from the cell box at
+    /// the SMALLEST plausible cell (`viz::SIXEL_CELL_FLOOR`, 8×16 px) — the
+    /// same floor the analysis spectrogram uses. Sizing for 10×20 cells (the
+    /// old choice) is the opposite of conservative: on any terminal with
+    /// smaller cells (foot, a smaller Windows Terminal font) the cover spilled
+    /// out of its slot, got overwritten by the text beside it, and could scroll
+    /// the screen near the bottom. Underfilling a big-cell terminal is only
+    /// cosmetic. Height is trimmed to whole 6-px sixel bands: a partial band
+    /// still advances a full six pixels.
     fn sixel_px(&self) -> (u32, u32) {
-        (self.cols * 10, self.rows * 20)
+        let (cw, ch) = crate::viz::SIXEL_CELL_FLOOR;
+        let h = (self.rows * ch as u32) / 6 * 6;
+        (self.cols * cw as u32, h.max(6))
     }
 }
 
@@ -675,6 +705,12 @@ pub(crate) fn render_viz_sixel_indexed(
 }
 
 fn viz_sixel_lines(data: &str, cols: u32, rows: u32, gutter: Gutter<'_>) -> Vec<String> {
+    // Every renderer returns EXACTLY `rows` lines. A zero-row budget (a window
+    // too short for any viz) used to get one line anyway, so the block
+    // alternated between 0 lines (skip-emit frames) and 1 (emit frames).
+    if rows == 0 {
+        return Vec::new();
+    }
     // Sixel pixels are ordinary cell content — no Kitty-style image layer or
     // id-replacement. Two consequences: (1) the block must clear ITSELF (one
     // erase pass over all rows here, before painting) because stale cells are
@@ -1084,5 +1120,44 @@ mod viz_sixel_tests {
         for line in &lines[1..] {
             assert_eq!(line, "\x1B[80C");
         }
+    }
+
+    #[test]
+    fn sixel_cover_never_outgrows_its_slot() {
+        // The cover must fit the slot even on the smallest plausible cell, and
+        // end on a whole sixel band so the cursor lands inside the slot.
+        let (cw, ch) = crate::viz::SIXEL_CELL_FLOOR;
+        for size in [CoverSize::CLASSIC, CoverSize::MINIMAL] {
+            let (w, h) = size.sixel_px();
+            assert!(w as usize <= size.cols as usize * cw, "width {w} overflows {} cols", size.cols);
+            assert!(h as usize <= size.rows as usize * ch, "height {h} overflows {} rows", size.rows);
+            assert_eq!(h % 6, 0, "height {h} ends on a partial sixel band");
+        }
+    }
+
+    #[test]
+    fn kitty_is_never_chosen_on_windows_whatever_the_env_says() {
+        // ssh from kitty into Windows OpenSSH forwards TERM; KITTY_WINDOW_ID
+        // and TERM_PROGRAM=ghostty can leak the same way. ConPTY eats the APCs.
+        let kitty_term = protocol_from_env(None, Some("xterm-kitty"), false, None, false, true);
+        assert_eq!(kitty_term, GraphicsProtocol::HalfBlock);
+        let window_id = protocol_from_env(None, None, true, None, false, true);
+        assert_eq!(window_id, GraphicsProtocol::HalfBlock);
+        let ghostty = protocol_from_env(Some("ghostty"), None, false, None, false, true);
+        assert_eq!(ghostty, GraphicsProtocol::HalfBlock);
+        // Inside Windows Terminal the fallback is its native sixel.
+        let in_wt = protocol_from_env(None, Some("xterm-kitty"), false, None, true, true);
+        assert_eq!(in_wt, GraphicsProtocol::Sixel);
+        // Off Windows the same hints still mean Kitty.
+        assert_eq!(protocol_from_env(None, Some("xterm-kitty"), false, None, false, false), GraphicsProtocol::Kitty);
+    }
+
+    #[test]
+    fn a_zero_row_sixel_block_emits_nothing() {
+        let palette = [(0u8, 0u8, 0u8)];
+        let lines = render_viz_sixel_indexed(&[0; 36], &palette, 6, 6, 4, 0, Gutter::NONE);
+        assert!(lines.is_empty(), "0-row budget produced {} lines", lines.len());
+        let one = render_viz_sixel_indexed(&[0; 36], &palette, 6, 6, 4, 1, Gutter::NONE);
+        assert_eq!(one.len(), 1);
     }
 }

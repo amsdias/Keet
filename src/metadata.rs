@@ -55,10 +55,7 @@ impl MetadataCache {
         if let Some(Some(meta)) = entries.get(index) {
             meta.display.clone()
         } else {
-            path.file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned()
+            crate::ansi::sanitize_display(&path.file_name().unwrap_or_default().to_string_lossy())
         }
     }
 
@@ -309,10 +306,14 @@ fn read_metadata_full(path: &Path) -> Option<CachedMeta> {
         title, artist, album, lyrics, track_number, disc_number,
         rg_track_gain, rg_track_peak, rg_album_gain, rg_album_peak,
     } = fields;
+    // Everything here ends up in frame lines: no control characters (a tag
+    // can carry a newline or an ESC).
+    let clean = |t: Option<String>| t.map(|s| crate::ansi::sanitize_display(&s));
+    let (title, artist, album) = (clean(title), clean(artist), clean(album));
 
-    let filename = path.file_name()
-        .unwrap_or_default()
-        .to_string_lossy();
+    let filename = crate::ansi::sanitize_display(
+        &path.file_name().unwrap_or_default().to_string_lossy(),
+    );
     let display = match (&artist, &title) {
         (Some(a), Some(t)) => format!("{} - {}", a, t),
         (None, Some(t)) => t.clone(),

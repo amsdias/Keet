@@ -212,6 +212,35 @@ impl VizMode {
 
 }
 
+/// What an exclusive-mode sample-rate switch can actually reach on an output
+/// device, captured on the main thread so the producer can predict a switch.
+/// Mirrors main's `min(max_supported_rate)` cap and `set_output_sample_rate`.
+#[derive(Clone, Debug, Default)]
+pub struct RateCaps {
+    /// Supported sample-rate ranges, inclusive.
+    pub ranges: Vec<(u32, u32)>,
+    /// Highest supported rate; requests above it are capped to it. 0 = unknown.
+    pub max: u32,
+    /// The device never switches (Bluetooth, or a platform that does not).
+    pub fixed: bool,
+    /// The platform switches to whatever is requested (PipeWire).
+    pub any: bool,
+}
+
+impl RateCaps {
+    pub fn resolve(&self, desired: u32, current: u32) -> u32 {
+        let target = if self.max > 0 { desired.min(self.max) } else { desired };
+        if target == current || self.fixed {
+            return current;
+        }
+        if self.any || self.ranges.iter().any(|&(lo, hi)| lo <= target && target <= hi) {
+            target
+        } else {
+            current
+        }
+    }
+}
+
 pub struct PlayerState {
     // Control flags
     pub(crate) paused: AtomicBool,
@@ -228,6 +257,11 @@ pub struct PlayerState {
     pub(crate) output_rate: AtomicU64,      // Output stream sample rate
     pub(crate) total_samples: AtomicU64,    // Total samples in source file
     pub(crate) samples_played: AtomicU64,   // Samples played (at output rate)
+    /// Frames of the PREVIOUS track still queued in the ring when this track's
+    /// clock was zeroed. The callback counts them into `samples_played` as they
+    /// play, so the clock subtracts them: the track's time starts at 0 when its
+    /// own first sample plays, not up to ~0.5 s early.
+    pub(crate) clock_preroll: AtomicU64,
     pub(crate) channels: AtomicUsize,
     pub(crate) bits_per_sample: AtomicUsize,
 
@@ -244,6 +278,10 @@ pub struct PlayerState {
 
     // Signal consumer to drain the ring buffer (for seek/skip).
     // Triggers an immediate full drain in the audio callback.
+    // Release on set / AcqRel on the callback's swap / Acquire on the wait:
+    // the samples pushed before the request must be visible to the drain that
+    // answers it, or a sliver of pre-seek audio can survive it (weakly ordered
+    // CPUs — ARM, i.e. Apple Silicon — can reorder Relaxed accesses).
     pub(crate) reset_consumer_counter: AtomicBool,
 
     // Visualization state
@@ -326,6 +364,14 @@ pub struct PlayerState {
 
     // Exclusive mode
     pub(crate) exclusive: AtomicBool,
+    /// What an exclusive-mode rate switch can reach on the current device.
+    /// Set by main (which owns the device); read by the producer at a track
+    /// boundary to decide whether a stream rebuild would change anything.
+    pub(crate) exclusive_caps: Mutex<Option<RateCaps>>,
+    /// Index of the track the producer is opening/decoding right now. Unlike
+    /// producer_track_index (updated once a track's audio is about to play),
+    /// this is current the moment decoding starts — what a crash report needs.
+    pub(crate) producer_decoding: AtomicUsize,
     pub(crate) rate_change_needed: AtomicBool,
     pub(crate) next_track_rate: AtomicU32,
 
@@ -355,6 +401,7 @@ impl PlayerState {
             output_rate: AtomicU64::new(44100),
             total_samples: AtomicU64::new(0),
             samples_played: AtomicU64::new(0),
+            clock_preroll: AtomicU64::new(0),
             channels: AtomicUsize::new(2),
             bits_per_sample: AtomicUsize::new(16),
             producer_done: AtomicBool::new(false),
@@ -399,6 +446,8 @@ impl PlayerState {
             crossfeed_changed: AtomicBool::new(false),
             balance: AtomicI32::new(0),
             exclusive: AtomicBool::new(false),
+            exclusive_caps: Mutex::new(None),
+            producer_decoding: AtomicUsize::new(0),
             rate_change_needed: AtomicBool::new(false),
             next_track_rate: AtomicU32::new(0),
             stream_error: AtomicBool::new(false),
@@ -465,8 +514,22 @@ impl PlayerState {
         self.volume.load(Ordering::Relaxed) as f32 / 100.0
     }
 
+    /// The rate an exclusive-mode switch toward `desired` would actually land
+    /// on, starting from `current`. Without captured caps, assume the switch
+    /// succeeds (the old behaviour).
+    pub fn exclusive_target_rate(&self, desired: u32, current: u32) -> u32 {
+        self.exclusive_caps
+            .lock()
+            .ok()
+            .and_then(|c| c.as_ref().map(|c| c.resolve(desired, current)))
+            .unwrap_or(desired)
+    }
+
     pub fn time_secs(&self) -> f64 {
-        let s = self.samples_played.load(Ordering::Relaxed) as f64;
+        let s = self
+            .samples_played
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.clock_preroll.load(Ordering::Relaxed)) as f64;
         let r = self.output_rate.load(Ordering::Relaxed) as f64;
         if r > 0.0 { s / r } else { 0.0 }
     }
@@ -860,9 +923,13 @@ pub struct UiState {
     /// view, another viz mode) leaves it false, forcing a full re-emit when
     /// the spectrogram next renders over whatever that frame painted.
     pub spectro_block_intact: bool,
-    /// (top padding, body height) of the viz block the last frame drew. A
-    /// change in EITHER means the block moved or resized, so a Sixel image must
-    /// be re-emitted rather than left where it was.
+    /// (first row, body height) of the viz block the last frame drew, the row
+    /// counted in frame lines below the anchor (so it includes the top padding
+    /// AND everything above the block). A change in EITHER means the block
+    /// moved or resized, so a Sixel image must be re-emitted. Keying on the
+    /// padding alone missed moves caused by rows above it — a status line
+    /// replacing the 4-row command tray moved the block up 2 rows and left the
+    /// old image stranded (clipped by the trailing erase).
     pub last_viz_block: (usize, usize),
     pub lyrics: Option<crate::lyrics::Lyrics>,
     pub lyrics_receiver: Option<std::sync::mpsc::Receiver<Option<crate::lyrics::Lyrics>>>,
@@ -970,7 +1037,35 @@ mod state_tests {
     use super::*;
 
     #[test]
-    fn seek_requests_accumulate_until_taken() {
+    fn rate_caps_predict_what_a_switch_can_reach() {
+        let dac = RateCaps { ranges: vec![(44_100, 44_100), (48_000, 192_000)], max: 192_000, ..Default::default() };
+        assert_eq!(dac.resolve(96_000, 44_100), 96_000, "supported rate switches");
+        assert_eq!(dac.resolve(352_800, 48_000), 192_000, "capped to the device max");
+        let only48 = RateCaps { ranges: vec![(48_000, 48_000)], max: 48_000, ..Default::default() };
+        assert_eq!(only48.resolve(44_100, 48_000), 48_000, "unsupported rate: no switch");
+        let bt = RateCaps { fixed: true, max: 48_000, ..Default::default() };
+        assert_eq!(bt.resolve(44_100, 48_000), 48_000, "Bluetooth never switches");
+        let pw = RateCaps { any: true, ..Default::default() };
+        assert_eq!(pw.resolve(88_200, 48_000), 88_200);
+    }
+
+    #[test]
+    fn clock_starts_when_the_tracks_own_audio_does() {
+        // 0.5 s of the previous track is still queued when this track's clock
+        // is zeroed; the clock must hold at 0 until those frames have played.
+        let st = PlayerState::new();
+        st.output_rate.store(48_000, Ordering::Relaxed);
+        st.samples_played.store(0, Ordering::Relaxed);
+        st.clock_preroll.store(24_000, Ordering::Relaxed);
+        assert_eq!(st.time_secs(), 0.0);
+        st.samples_played.store(24_000, Ordering::Relaxed);
+        assert_eq!(st.time_secs(), 0.0);
+        st.samples_played.store(72_000, Ordering::Relaxed);
+        assert_eq!(st.time_secs(), 1.0);
+    }
+
+    #[test]
+        fn seek_requests_accumulate_until_taken() {
         // Two quick ←/→ presses inside one producer-loop iteration (~20 ms when
         // the ring is full) must both apply. A plain store made the second
         // press overwrite the first: +10 then +10 seeked only 10 s.

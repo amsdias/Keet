@@ -112,8 +112,13 @@ impl Freeverb {
         Self { combs_l, combs_r, allpasses_l, allpasses_r, wet: 0.0, dry: 1.0, width: 1.0 }
     }
 
+    // Every parameter is clamped: presets are user-editable JSON, and an
+    // out-of-range value (room_size > ~1.07 puts comb feedback at >= 1) makes
+    // the filters run away to inf and then NaN (see the test at the bottom).
     fn set_params(&mut self, room_size: f32, damping: f32, wet: f32, dry: f32, width: f32) {
-        let feedback = room_size * 0.28 + 0.7; // scale to 0.7-0.98 range
+        let feedback = room_size.clamp(0.0, 1.0) * 0.28 + 0.7; // scale to 0.7-0.98 range
+        let damping = damping.clamp(0.0, 1.0);
+        let (wet, dry, width) = (wet.clamp(0.0, 1.0), dry.clamp(0.0, 1.0), width.clamp(0.0, 1.0));
         for comb in self.combs_l.iter_mut().chain(self.combs_r.iter_mut()) {
             comb.set_feedback(feedback);
             comb.set_damp(damping);
@@ -187,9 +192,12 @@ impl Chorus {
     }
 
     fn set_params(&mut self, rate: f32, depth: f32, wet: f32) {
-        self.rate = rate;
-        self.depth = depth * self.sample_rate * 0.001; // convert ms to samples
-        self.wet = wet;
+        self.rate = rate.clamp(0.0, 20.0);
+        // Depth must keep the modulated read inside the delay line, which is
+        // centred on half its length.
+        let max_depth = (self.delay_l.len() as f32 / 2.0 - 1.0).max(0.0);
+        self.depth = (depth.max(0.0) * self.sample_rate * 0.001).min(max_depth); // ms -> samples
+        self.wet = wet.clamp(0.0, 1.0);
     }
 
     fn reset(&mut self) {
@@ -268,9 +276,10 @@ impl Delay {
     }
 
     fn set_params(&mut self, delay_ms: f32, feedback: f32, wet: f32, sample_rate: f32) {
-        self.delay_samples = ((delay_ms * sample_rate / 1000.0) as usize).min(self.buffer_l.len() - 1);
-        self.feedback = feedback.min(0.95);
-        self.wet = wet;
+        self.delay_samples = ((delay_ms.max(0.0) * sample_rate / 1000.0) as usize).min(self.buffer_l.len() - 1);
+        // Both signs: feedback below -1 grows just as surely as above +1.
+        self.feedback = feedback.clamp(-0.95, 0.95);
+        self.wet = wet.clamp(0.0, 1.0);
     }
 
     fn reset(&mut self) {
@@ -419,14 +428,30 @@ impl EffectsChain {
         if let Some(c) = self.chorus.as_mut() { c.process_stereo(samples); }
         if let Some(d) = self.delay.as_mut() { d.process_stereo(samples); }
         if let Some(r) = self.reverb.as_mut() { r.process_stereo(samples); }
+    }
 
-        // Safety limiter: keep effect output below 0 dBFS without the per-buffer
-        // gain jumps a brickwall causes (audible zipper/pumping when reverb/delay
-        // push past full scale). Instant attack guarantees no sample exceeds 0 dBFS;
-        // slow per-sample release lets the gain recover smoothly across buffers, so
-        // the reduction is continuous rather than recomputed independently per call.
+    /// Whether the output limiter has work to do for a block peaking at
+    /// `peak`: something is over full scale, or the gain is still recovering.
+    pub fn limiter_engaged(&self, peak: f32) -> bool {
+        peak > 1.0 || self.limiter_gain < 1.0 || !peak.is_finite()
+    }
+
+    /// Output safety limiter, run by the producer as the LAST stage of the DSP
+    /// chain (the state lives here because the chain already persists across
+    /// buffers and tracks). Keeps output at or below 0 dBFS without the
+    /// per-buffer gain jumps a brickwall causes (audible zipper/pumping).
+    /// Instant attack guarantees no sample exceeds 0 dBFS; slow per-sample
+    /// release lets the gain recover smoothly across buffers. A non-finite
+    /// sample is replaced with silence — NaN passes straight through `.clamp`
+    /// and must never reach the DAC.
+    pub fn limit_output(&mut self, samples: &mut [f32]) {
         const LIMITER_RELEASE: f32 = 0.0005;
         for frame in samples.chunks_mut(2) {
+            for s in frame.iter_mut() {
+                if !s.is_finite() {
+                    *s = 0.0;
+                }
+            }
             let peak = frame.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
             let target = if peak > 1.0 { 1.0 / peak } else { 1.0 };
             if target < self.limiter_gain {
@@ -437,6 +462,11 @@ impl EffectsChain {
             for s in frame.iter_mut() {
                 *s *= self.limiter_gain;
             }
+        }
+        // The release approaches 1.0 asymptotically; snap once inaudibly close
+        // so the limiter disengages and the chain goes back to zero-copy.
+        if self.limiter_gain > 0.9999 {
+            self.limiter_gain = 1.0;
         }
     }
 }
@@ -517,4 +547,39 @@ pub fn load_custom_presets() -> Vec<EffectsPreset> {
     }
     presets.sort_by(|a, b| a.name.cmp(&b.name));
     presets
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn preset(json: &str) -> EffectsPreset {
+        serde_json::from_str(json).expect("preset json")
+    }
+
+    #[test]
+    fn out_of_range_custom_presets_cannot_blow_up() {
+        // A hand-edited preset with room_size > ~1.07 pushed comb feedback to
+        // >= 1, and a delay feedback below -1 was never clamped: the filters
+        // ran away to inf, the limiter's inf * 0 made NaN, and NaN reached the
+        // DAC (it sails through `.clamp`). Every parameter must be bounded.
+        let p = preset(
+            r#"{"name":"broken",
+                "reverb":{"room_size":5.0,"damping":-2.0,"wet":3.0,"dry":4.0,"width":9.0},
+                "chorus":{"rate":-50.0,"depth":400.0,"wet":7.0},
+                "delay":{"delay_ms":300.0,"feedback":-3.0,"wet":5.0}}"#,
+        );
+        let mut fx = EffectsChain::new(48_000.0);
+        fx.load_preset(&p, 48_000.0);
+        let mut buf = vec![0.0f32; 4_096];
+        for block in 0..600 {
+            for (i, s) in buf.iter_mut().enumerate() {
+                *s = if block == 0 && i < 2 { 1.0 } else { 0.25 * ((i as f32) * 0.05).sin() };
+            }
+            fx.process_stereo(&mut buf);
+            assert!(buf.iter().all(|s| s.is_finite()), "non-finite output at block {block}");
+            fx.limit_output(&mut buf);
+            assert!(buf.iter().all(|s| s.abs() <= 1.0 + 1e-6), "limiter let a sample past 0 dBFS");
+        }
+    }
 }

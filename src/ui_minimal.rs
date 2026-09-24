@@ -152,7 +152,7 @@ pub fn print_status_minimal(
     let title_truncated = truncate_plain(&title, ident_w);
     ident.push((
         format!("{bold}{fg}{t}{rst}", bold = p.bold, fg = p.fg, rst = p.reset, t = title_truncated),
-        title_truncated.chars().count(),
+        visible_len(&title_truncated),
     ));
 
     let mut sub = String::new();
@@ -164,7 +164,7 @@ pub fn print_status_minimal(
     let sub_truncated = truncate_plain(&sub, ident_w);
     ident.push((
         format!("{dim}{s}{rst}", dim = p.dim, rst = p.reset, s = sub_truncated),
-        sub_truncated.chars().count(),
+        visible_len(&sub_truncated),
     ));
 
     ident.push((String::new(), 0));
@@ -172,7 +172,7 @@ pub fn print_status_minimal(
     let np_label = if state.is_paused() { "PAUSED" } else { "NOW PLAYING" };
     ident.push((
         format!("{dim}{l}{rst}", dim = p.dim, rst = p.reset, l = np_label),
-        np_label.chars().count(),
+        visible_len(np_label),
     ));
 
     let progress = if state.total_secs() > 0.0 {
@@ -187,7 +187,7 @@ pub fn print_status_minimal(
             "{accent}{cur}{rst}   {bar}   {dim}{tot}{rst}",
             accent = p.accent, rst = p.reset, dim = p.dim, cur = cur, bar = bar, tot = tot,
         ),
-        cur.chars().count() + 3 + bar_w + 3 + tot.chars().count(),
+        visible_len(&cur) + 3 + bar_w + 3 + visible_len(&tot),
     ));
 
     let track_n = state.current_track.load(Ordering::Relaxed) + 1;
@@ -351,14 +351,18 @@ pub fn print_status_minimal(
             // includes the command tray. Nothing follows the image, so only one
             // row of bottom slack is reserved rather than a footer's worth.
             let raw = analysis_needs_raw_lines();
-            // Height change means the block moved: full window toggling, or a
-            // resize. Classic catches this by comparing its predicted frame
-            // height against the previous derived one; Minimal builds its
-            // layout as it goes, so it tracks the body height directly.
+            // A block that moved or resized must re-emit: full window
+            // toggling, a resize, or a row appearing/vanishing above it (a
+            // status line swapping in for the command tray). Classic catches
+            // this by comparing its predicted frame height against the previous
+            // derived one; Minimal builds its layout as it goes, so it keys on
+            // the block's actual first row (everything emitted so far, padding
+            // included) and its height.
+            let block = (w.count(), viz_body);
             let force = prev_viz_lines == usize::MAX
                 || !block_was_intact
-                || (viz_pad, viz_body) != ui.last_viz_block;
-            ui.last_viz_block = (viz_pad, viz_body);
+                || block != ui.last_viz_block;
+            ui.last_viz_block = block;
             ui.spectro_block_intact = true;
             for line in render_spectrogram_analysis(
                 analyser, term_w, log_axis, state.is_paused(), viz_body, force,
@@ -431,7 +435,7 @@ fn ident_cell(content: &str, visible: usize, width: usize) -> String {
 /// imposed a *minimum* of 20, so the row stayed ~36 columns wide however
 /// narrow the column became, and overflowed while the window was dragged in.
 fn progress_bar_width(ident_w: usize, cur: &str, tot: &str) -> usize {
-    let fixed = cur.chars().count() + 3 + 3 + tot.chars().count();
+    let fixed = visible_len(cur) + 3 + 3 + visible_len(tot);
     ident_w.saturating_sub(fixed).min(60)
 }
 
@@ -482,7 +486,7 @@ fn render_signal_row(
     good: bool,
     width: usize,
 ) -> String {
-    let visible = key.chars().count() + value.chars().count();
+    let visible = visible_len(key) + visible_len(value);
     let gap = width.saturating_sub(visible).max(1);
     let value_color = if good { p.accent } else { p.fg };
     format!(
@@ -774,7 +778,7 @@ pub fn print_status_minimal_library(
             let album_pad = album_w.saturating_sub(visible_len(&album_truncated));
 
             // Time cell: dim, right-aligned, fixed width.
-            let time_pad = time_w.saturating_sub(dur_str.chars().count());
+            let time_pad = time_w.saturating_sub(visible_len(&dur_str));
 
             let row_color = if is_playing { p.accent } else { p.fg };
             let num_color = if is_playing { p.accent } else { p.dim };
@@ -940,9 +944,9 @@ pub fn print_status_minimal_lyrics(
     let time_str = format!("{}  /  {}", cur_t, tot_t);
 
     // Composition: budget the title to leave room for meta + spacing + time on right.
-    let right_visible = time_str.chars().count();
+    let right_visible = visible_len(&time_str);
     let title_budget = term_w
-        .saturating_sub(2 + meta.chars().count() + 4 + right_visible + 2)
+        .saturating_sub(2 + visible_len(&meta) + 4 + right_visible + 2)
         .max(8);
     let title_truncated = truncate_plain(&title, title_budget);
     let left_str = format!(
@@ -1002,7 +1006,7 @@ pub fn print_status_minimal_lyrics(
                 let text = lyrics.line_text(line_idx);
                 let is_current = current_line == Some(line_idx);
                 // Center the text horizontally.
-                let text_visible = text.chars().count().min(term_w.saturating_sub(4));
+                let text_visible = visible_len(text).min(term_w.saturating_sub(4));
                 let leading = term_w.saturating_sub(text_visible) / 2;
                 // Single-line highlight: current line in bold accent (the
                 // warm-cyan accent makes the colour difference do the work,
@@ -1030,7 +1034,7 @@ pub fn print_status_minimal_lyrics(
         }
     } else {
         let msg = "(no lyrics available)";
-        let leading = term_w.saturating_sub(msg.chars().count()) / 2;
+        let leading = term_w.saturating_sub(visible_len(msg)) / 2;
         w.line(&format!(
             "{lead}{dim}{msg}{rst}",
             lead = " ".repeat(leading),

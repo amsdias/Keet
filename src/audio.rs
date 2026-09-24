@@ -20,15 +20,45 @@ use crate::state::PlayerState;
 /// to 48kHz (the actual hardware rate). CoreAudio can get stuck at a wrong rate
 /// from a previous run that attempted to switch it. Returns the corrected rate
 /// if a fix was applied, or None if no correction was needed.
-pub fn fix_bluetooth_sample_rate() -> Option<u32> {
+pub fn fix_bluetooth_sample_rate(device: &cpal::Device) -> Option<u32> {
     #[cfg(target_os = "macos")]
     {
-        if macos_audio::is_bluetooth_device() {
-            let _ = macos_audio::set_device_sample_rate(48000);
-            return Some(48000);
+        if let Some(id) = coreaudio_device_id(device) {
+            if macos_audio::is_bluetooth_device_by_id(id) {
+                let _ = macos_audio::set_device_sample_rate_for_id(id, 48000);
+                return Some(48000);
+            }
         }
     }
+    #[cfg(not(target_os = "macos"))]
+    let _ = device;
     None
+}
+
+/// The CoreAudio id of a cpal output device, found by name (cpal does not
+/// expose it). Falls back to the system default output when the name matches
+/// nothing, which is also what the device resolves to when none was chosen.
+#[cfg(target_os = "macos")]
+fn coreaudio_device_id(device: &cpal::Device) -> Option<u32> {
+    let name = device.description().map(|d| d.name().to_string()).unwrap_or_default();
+    macos_audio::find_device_id_by_name(&name).or_else(macos_audio::get_default_device_id)
+}
+
+/// Pick the device whose name matches `wanted`: an exact (case-insensitive)
+/// match beats a substring one. Substring-only matching took the FIRST hit,
+/// so asking for "Speakers" could land on "External Speakers" when
+/// "MacBook Pro Speakers" was meant, or vice versa.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn pick_device_id(devices: &[(u32, String)], wanted: &str) -> Option<u32> {
+    let want = wanted.to_lowercase();
+    if want.is_empty() {
+        return None;
+    }
+    devices
+        .iter()
+        .find(|(_, n)| n.to_lowercase() == want)
+        .or_else(|| devices.iter().find(|(_, n)| n.to_lowercase().contains(&want)))
+        .map(|&(id, _)| id)
 }
 
 pub fn probe_sample_rate(path: &Path) -> Option<u32> {
@@ -197,164 +227,6 @@ mod macos_audio {
     const kAudioDevicePropertyHogMode: u32 = 0x686F676D; // 'hogm'
     const kAudioHardwarePropertyDevices: u32 = 0x64657623; // 'dev#'
 
-    pub fn is_bluetooth_device() -> bool {
-        unsafe {
-            // Get default output device
-            let address = AudioObjectPropertyAddress {
-                mSelector: kAudioHardwarePropertyDefaultOutputDevice,
-                mScope: kAudioObjectPropertyScopeGlobal,
-                mElement: kAudioObjectPropertyElementMain,
-            };
-
-            let mut device_id: u32 = 0;
-            let mut size: u32 = std::mem::size_of::<u32>() as u32;
-
-            let status = AudioObjectGetPropertyData(
-                kAudioObjectSystemObject,
-                &address,
-                0,
-                std::ptr::null(),
-                &mut size,
-                &mut device_id as *mut u32 as *mut c_void,
-            );
-
-            if status != 0 {
-                return false;
-            }
-
-            // Get transport type
-            let transport_address = AudioObjectPropertyAddress {
-                mSelector: kAudioDevicePropertyTransportType,
-                mScope: kAudioObjectPropertyScopeGlobal,
-                mElement: kAudioObjectPropertyElementMain,
-            };
-
-            let mut transport_type: u32 = 0;
-            let mut size: u32 = std::mem::size_of::<u32>() as u32;
-
-            let status = AudioObjectGetPropertyData(
-                device_id,
-                &transport_address,
-                0,
-                std::ptr::null(),
-                &mut size,
-                &mut transport_type as *mut u32 as *mut c_void,
-            );
-
-            if status != 0 {
-                return false;
-            }
-
-            transport_type == kAudioDeviceTransportTypeBluetooth
-                || transport_type == kAudioDeviceTransportTypeBluetoothLE
-        }
-    }
-
-    pub fn set_device_sample_rate(rate: u32) -> Result<(), String> {
-        unsafe {
-            // Get default output device
-            let address = AudioObjectPropertyAddress {
-                mSelector: kAudioHardwarePropertyDefaultOutputDevice,
-                mScope: kAudioObjectPropertyScopeGlobal,
-                mElement: kAudioObjectPropertyElementMain,
-            };
-
-            let mut device_id: u32 = 0;
-            let mut size: u32 = std::mem::size_of::<u32>() as u32;
-
-            let status = AudioObjectGetPropertyData(
-                kAudioObjectSystemObject,
-                &address,
-                0,
-                std::ptr::null(),
-                &mut size,
-                &mut device_id as *mut u32 as *mut c_void,
-            );
-
-            if status != 0 {
-                return Err(format!("Failed to get default output device: {}", status));
-            }
-
-            // Set sample rate
-            let rate_address = AudioObjectPropertyAddress {
-                mSelector: kAudioDevicePropertyNominalSampleRate,
-                mScope: kAudioObjectPropertyScopeGlobal,
-                mElement: kAudioObjectPropertyElementMain,
-            };
-
-            let rate_f64 = rate as f64;
-            let status = AudioObjectSetPropertyData(
-                device_id,
-                &rate_address,
-                0,
-                std::ptr::null(),
-                std::mem::size_of::<f64>() as u32,
-                &rate_f64 as *const f64 as *const c_void,
-            );
-
-            if status != 0 {
-                return Err(format!("Failed to set sample rate to {}: {}", rate, status));
-            }
-
-            // Brief delay for hardware to switch
-            std::thread::sleep(std::time::Duration::from_millis(50));
-
-            Ok(())
-        }
-    }
-
-    pub fn get_device_sample_rate() -> Result<u32, String> {
-        unsafe {
-            // Get default output device
-            let address = AudioObjectPropertyAddress {
-                mSelector: kAudioHardwarePropertyDefaultOutputDevice,
-                mScope: kAudioObjectPropertyScopeGlobal,
-                mElement: kAudioObjectPropertyElementMain,
-            };
-
-            let mut device_id: u32 = 0;
-            let mut size: u32 = std::mem::size_of::<u32>() as u32;
-
-            let status = AudioObjectGetPropertyData(
-                kAudioObjectSystemObject,
-                &address,
-                0,
-                std::ptr::null(),
-                &mut size,
-                &mut device_id as *mut u32 as *mut c_void,
-            );
-
-            if status != 0 {
-                return Err(format!("Failed to get default output device: {}", status));
-            }
-
-            // Get sample rate
-            let rate_address = AudioObjectPropertyAddress {
-                mSelector: kAudioDevicePropertyNominalSampleRate,
-                mScope: kAudioObjectPropertyScopeGlobal,
-                mElement: kAudioObjectPropertyElementMain,
-            };
-
-            let mut rate_f64: f64 = 0.0;
-            let mut size: u32 = std::mem::size_of::<f64>() as u32;
-
-            let status = AudioObjectGetPropertyData(
-                device_id,
-                &rate_address,
-                0,
-                std::ptr::null(),
-                &mut size,
-                &mut rate_f64 as *mut f64 as *mut c_void,
-            );
-
-            if status != 0 {
-                return Err(format!("Failed to get sample rate: {}", status));
-            }
-
-            Ok(rate_f64 as u32)
-        }
-    }
-
     pub fn get_default_device_id() -> Option<u32> {
         unsafe {
             let address = AudioObjectPropertyAddress {
@@ -434,15 +306,31 @@ mod macos_audio {
                 &mut size, device_ids.as_mut_ptr() as *mut c_void,
             );
             if status != 0 { return None; }
-            let name_lower = name.to_lowercase();
-            for &did in &device_ids {
-                if let Some(device_name) = get_device_name_by_id(did) {
-                    if device_name.to_lowercase().contains(&name_lower) {
-                        return Some(did);
-                    }
-                }
+            let named: Vec<(u32, String)> = device_ids
+                .iter()
+                .filter_map(|&did| get_device_name_by_id(did).map(|n| (did, n)))
+                .collect();
+            super::pick_device_id(&named, name)
+        }
+    }
+
+    pub fn get_device_sample_rate_for_id(device_id: u32) -> Result<u32, String> {
+        unsafe {
+            let rate_address = AudioObjectPropertyAddress {
+                mSelector: kAudioDevicePropertyNominalSampleRate,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain,
+            };
+            let mut rate_f64: f64 = 0.0;
+            let mut size: u32 = std::mem::size_of::<f64>() as u32;
+            let status = AudioObjectGetPropertyData(
+                device_id, &rate_address, 0, std::ptr::null(),
+                &mut size, &mut rate_f64 as *mut f64 as *mut c_void,
+            );
+            if status != 0 {
+                return Err(format!("Failed to get sample rate: {}", status));
             }
-            None
+            Ok(rate_f64 as u32)
         }
     }
 
@@ -496,7 +384,6 @@ mod macos_audio {
         }
     }
 
-    #[allow(dead_code)]
     pub fn set_device_sample_rate_for_id(device_id: u32, rate: u32) -> Result<(), String> {
         unsafe {
             let rate_address = AudioObjectPropertyAddress {
@@ -518,7 +405,6 @@ mod macos_audio {
         }
     }
 
-    #[allow(dead_code)]
     pub fn is_bluetooth_device_by_id(device_id: u32) -> bool {
         unsafe {
             let transport_address = AudioObjectPropertyAddress {
@@ -539,7 +425,35 @@ mod macos_audio {
     }
 }
 
-/// Try to set the system audio output sample rate to match the source.
+/// Capture what `set_output_sample_rate` (plus main's max-rate cap) can reach
+/// on `device`, so the producer can tell in advance whether a track boundary
+/// would actually change the output rate. Without this it compared the raw
+/// file rate against the output rate and tore the stream down and rebuilt it
+/// at the SAME rate on every boundary a device could not follow (44.1 kHz
+/// albums on a 48 kHz-only DAC, Bluetooth, 352.8 kHz files on a 192 kHz DAC).
+pub fn probe_rate_caps(device: &cpal::Device) -> crate::state::RateCaps {
+    let ranges: Vec<(u32, u32)> = device
+        .supported_output_configs()
+        .map(|configs| configs.map(|c| (c.min_sample_rate(), c.max_sample_rate())).collect())
+        .unwrap_or_default();
+    let max = max_supported_rate(device);
+    #[cfg(target_os = "macos")]
+    let caps = crate::state::RateCaps {
+        ranges,
+        max,
+        fixed: coreaudio_device_id(device).is_some_and(macos_audio::is_bluetooth_device_by_id),
+        any: false,
+    };
+    #[cfg(target_os = "windows")]
+    let caps = crate::state::RateCaps { ranges, max, fixed: true, any: false };
+    #[cfg(target_os = "linux")]
+    let caps = crate::state::RateCaps { ranges, max, fixed: false, any: true };
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    let caps = crate::state::RateCaps { ranges, max, fixed: false, any: false };
+    caps
+}
+
+/// Try to set the output device's sample rate to match the source.
 /// Returns the actual rate to use (may differ if switching failed).
 pub fn set_output_sample_rate(desired_rate: u32, current_rate: u32, device: &cpal::Device) -> u32 {
     if desired_rate == current_rate {
@@ -551,7 +465,14 @@ pub fn set_output_sample_rate(desired_rate: u32, current_rate: u32, device: &cpa
         // Bluetooth devices (like AirPods) operate at a fixed rate (typically 48kHz).
         // CoreAudio lies about rate changes succeeding, causing sped-up audio and
         // buffer underruns. Skip rate switching entirely for Bluetooth.
-        if macos_audio::is_bluetooth_device() {
+        // Everything below acts on THIS device's CoreAudio id. The helpers
+        // used to target the system default output, so with `--device DAC`
+        // while the default was the built-in speakers, the speakers' rate was
+        // changed and then "verified" — the DAC never moved.
+        let Some(device_id) = coreaudio_device_id(device) else {
+            return current_rate;
+        };
+        if macos_audio::is_bluetooth_device_by_id(device_id) {
             return current_rate;
         }
 
@@ -568,10 +489,10 @@ pub fn set_output_sample_rate(desired_rate: u32, current_rate: u32, device: &cpa
             return current_rate;
         }
 
-        match macos_audio::set_device_sample_rate(desired_rate) {
+        match macos_audio::set_device_sample_rate_for_id(device_id, desired_rate) {
             Ok(()) => {
                 // Verify it actually changed
-                if let Ok(actual) = macos_audio::get_device_sample_rate() {
+                if let Ok(actual) = macos_audio::get_device_sample_rate_for_id(device_id) {
                     if actual == desired_rate {
                         return desired_rate;
                     }
@@ -612,11 +533,7 @@ pub fn set_output_sample_rate(desired_rate: u32, current_rate: u32, device: &cpa
 pub fn set_exclusive_mode(device: &cpal::Device) -> Result<u32, String> {
     #[cfg(target_os = "macos")]
     {
-        let device_name = device.description()
-            .map(|d| d.name().to_string())
-            .unwrap_or_default();
-        let device_id = macos_audio::find_device_id_by_name(&device_name)
-            .or_else(macos_audio::get_default_device_id)
+        let device_id = coreaudio_device_id(device)
             .ok_or_else(|| "Could not find CoreAudio device ID".to_string())?;
 
         macos_audio::set_hog_mode(device_id)?;
@@ -657,7 +574,7 @@ pub fn build_stream(
             let paused = state.is_paused();
 
             // Check if seek happened - drain buffer immediately for instant response
-            if state.reset_consumer_counter.swap(false, Ordering::Relaxed) {
+            if state.reset_consumer_counter.swap(false, Ordering::AcqRel) {
                 // Drain all buffered samples instantly
                 let to_drain = consumer.slots();
                 if to_drain > 0 {
@@ -798,4 +715,45 @@ pub fn build_stream(
     )?;
 
     Ok(stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_name_prefers_an_exact_match_over_a_substring() {
+        let devs = vec![
+            (10, "External Speakers".to_string()),
+            (20, "Speakers".to_string()),
+            (30, "USB DAC Pro".to_string()),
+        ];
+        assert_eq!(pick_device_id(&devs, "speakers"), Some(20), "exact beats first substring hit");
+        assert_eq!(pick_device_id(&devs, "dac"), Some(30), "substring still works");
+        assert_eq!(pick_device_id(&devs, "headphones"), None);
+        assert_eq!(pick_device_id(&devs, ""), None, "empty name matches nothing");
+    }
+
+    /// Real hardware: every output device cpal lists must resolve to its own
+    /// CoreAudio id by name — the lookup every rate switch now depends on.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires audio hardware"]
+    fn every_output_device_resolves_to_a_coreaudio_id() {
+        use cpal::traits::HostTrait;
+        let host = cpal::default_host();
+        let mut ids = Vec::new();
+        for dev in host.output_devices().expect("output devices") {
+            let name = dev.description().map(|d| d.name().to_string()).unwrap_or_default();
+            let id = coreaudio_device_id(&dev);
+            let rate = id.and_then(|i| macos_audio::get_device_sample_rate_for_id(i).ok());
+            eprintln!("{name:40} id={id:?} rate={rate:?}");
+            assert!(id.is_some(), "{name} did not resolve");
+            ids.push(id);
+        }
+        let mut uniq = ids.clone();
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(uniq.len(), ids.len(), "two devices resolved to the same id");
+    }
 }

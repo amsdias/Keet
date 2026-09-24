@@ -37,6 +37,11 @@ ureq = { version = "3", default-features = false, features = ["native-tls", "gzi
 # Album cover decoding + resizing. Default-features off to skip formats we don't need.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 
+# Terminal display width of text (CJK and most emoji take two columns). Layout
+# math must count COLUMNS: counting chars wrapped wide titles/lyrics and drifted
+# the frame's line count.
+unicode-width = "0.2"
+
 # Pure-Rust Sixel encoder for terminals that don't speak Kitty/iTerm2 (Windows Terminal, foot, mlterm).
 icy_sixel = "0.7"
 
