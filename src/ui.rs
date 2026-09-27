@@ -427,7 +427,12 @@ fn print_status_classic(state: &PlayerState, ui: &mut UiState, name: &str, track
         match viz_style { VizStyle::Dots => "Bars", VizStyle::Bars => "Dots" }
     };
     let stats_display = if state.show_stats() {
-        format!(" cpu:{:.1}% mem:{:.0}M", stats.cpu_usage, stats.memory_mb)
+        // Dropouts (cpal xruns) appear once there are any: the number to
+        // watch when deciding whether HQ resampling or the buffer is too
+        // much for the machine.
+        let xruns = state.xrun_count.load(Ordering::Relaxed);
+        let xrun_str = if xruns > 0 { format!(" xrun:{xruns}") } else { String::new() };
+        format!(" cpu:{:.1}% mem:{:.0}M{xrun_str}", stats.cpu_usage, stats.memory_mb)
     } else {
         String::new()
     };

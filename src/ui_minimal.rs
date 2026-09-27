@@ -133,9 +133,17 @@ pub fn print_status_minimal(
                   else { format!("R{}%", bal) };
     let fader = if state.is_pre_fader() { "pre" } else { "post" };
     let signal_rows: Vec<(&'static str, String, bool /*good*/)> = vec![
-        ("output",  format!("{:.1}k", out_rate as f32 / 1000.0), false),
+        // Exclusive mode also shows the DAC's format ("96.0k · 24-bit").
+        ("output",  match state.output_bits.load(Ordering::Relaxed) {
+                        0 => format!("{:.1}k", out_rate as f32 / 1000.0),
+                        b => format!("{:.1}k · {b}-bit", out_rate as f32 / 1000.0),
+                    }, false),
         ("volume",  format!("{}%", vol), false),
-        ("buffer",  format!("{}%", buf_pct), buf_pct >= 60),
+        // Dropouts (cpal xruns) ride on the buffer row once there are any —
+        // they are buffer events, and a new row would break the 8-row
+        // alignment with the cover. Longest value "100% · 999 xruns" fits.
+        ("buffer",  buffer_value(buf_pct, state.xrun_count.load(Ordering::Relaxed)),
+                    buf_pct >= 60 && state.xrun_count.load(Ordering::Relaxed) == 0),
         ("fader",   fader.to_string(), false),
         ("balance", bal_str, false),
         // cpu/mem live here permanently rather than on the meta line, where the
@@ -200,6 +208,15 @@ pub fn print_status_minimal(
         format!("{:.1}k", src_rate as f32 / 1000.0)
     } else {
         format!("{:.1}k → {:.1}k", src_rate as f32 / 1000.0, out_rate as f32 / 1000.0)
+    };
+    // Exclusive mode: the DAC's format, as on Classic's track info line. It
+    // lives here, on the always-visible meta line, because the SIGNAL column
+    // (whose `output` row also shows it) is only drawn from 100 columns up —
+    // narrower, the bit depth was shown nowhere. Right after the rate, ahead
+    // of eq/fx/cf, so it is the last thing truncation removes.
+    let rate_label = match state.output_bits.load(Ordering::Relaxed) {
+        0 => rate_label,
+        b => format!("{rate_label}  ·  out {b}-bit"),
     };
     let mut meta = format!(
         "track {n} of {tot}  ·  {bits}-bit {ch}  ·  {rate}",
@@ -441,6 +458,15 @@ fn progress_bar_width(ident_w: usize, cur: &str, tot: &str) -> usize {
 
 /// Width of the reserved SIGNAL column.
 const SIGNAL_W: usize = 30;
+
+/// The SIGNAL block's buffer value, with the dropout count once there is one.
+fn buffer_value(buf_pct: u32, xruns: u64) -> String {
+    match xruns {
+        0 => format!("{buf_pct}%"),
+        1 => format!("{buf_pct}% · 1 xrun"),
+        n => format!("{buf_pct}% · {n} xruns"),
+    }
+}
 /// Widest the identity block is allowed to get.
 ///
 /// The identity column has absolute priority: its width depends on the terminal
@@ -1249,5 +1275,16 @@ mod minimal_tests {
             crate::cover::CoverSize::MINIMAL.rows as usize, SIGNAL_ROWS,
             "cover must span exactly the SIGNAL block"
         );
+    }
+
+    #[test]
+    fn the_xrun_count_fits_the_signal_column() {
+        assert_eq!(buffer_value(62, 0), "62%");
+        assert_eq!(buffer_value(62, 1), "62% · 1 xrun");
+        for (pct, n) in [(100u32, 999u64), (100, 99_999)] {
+            let v = buffer_value(pct, n);
+            let row = render_signal_row(crate::theme::palette(crate::theme::ThemeKind::Minimal), "buffer", &v, false, SIGNAL_W);
+            assert!(visible_len(&row) <= SIGNAL_W, "{v:?} makes a {}-col row", visible_len(&row));
+        }
     }
 }

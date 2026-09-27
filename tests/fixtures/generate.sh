@@ -34,5 +34,13 @@ ffmpeg -y -v error -f lavfi -i "sine=frequency=1000:duration=1:sample_rate=44100
 cat chain_part1.ogg chain_part2.ogg > chained.ogg
 rm chain_part1.ogg chain_part2.ogg
 
+# Hi-res FLAC for the bit-perfect test: 24-bit / 96 kHz, 0.25 s, L = 997 Hz,
+# R = 3001 Hz (co-prime with the rate, so every code path sees varied samples),
+# near full scale (volume 7.9 x lavfi's 1/8 = 0.9875).
+ffmpeg -y -v error -f lavfi -i "sine=frequency=997:duration=0.25:sample_rate=96000" \
+    -f lavfi -i "sine=frequency=3001:duration=0.25:sample_rate=96000" \
+    -filter_complex "[0:a][1:a]join=inputs=2:channel_layout=stereo[j];[j]volume=7.9[a]" \
+    -map "[a]" -sample_fmt s32 -bits_per_raw_sample 24 -c:a flac hires_24_96.flac
+
 echo "fixtures regenerated:"
-ls -la sine_lr.flac sine_lr.mp3 sine_lr_rg.flac chained.ogg
+ls -la sine_lr.flac sine_lr.mp3 sine_lr_rg.flac chained.ogg hires_24_96.flac

@@ -50,6 +50,31 @@ use playlist::{build_playlist, shuffle_list};
 use ui::{print_status, poll_input, poll_auto_sort, poll_library_tree, arm_auto_sort, format_time};
 use resume::{ResumeState, save_state, load_state};
 
+/// Exclusive mode: put the DAC at its most precise physical format for `rate`
+/// (Keet otherwise set only the rate, so a DAC left at 16-bit in Audio MIDI
+/// Setup truncated 24-bit files) and record the result for display. Must run
+/// with no stream open, like the rate change it follows.
+fn apply_exclusive_bit_depth(state: &PlayerState, device: &cpal::Device, rate: u32) {
+    if state.exclusive.load(Ordering::Relaxed) {
+        let bits = audio::set_max_bit_depth(device, rate).unwrap_or(0);
+        state.output_bits.store(bits, Ordering::Relaxed);
+    }
+}
+
+/// "44100Hz", "44100→48000Hz" when resampling, plus the DAC's format in
+/// exclusive mode once known ("96000Hz • out 24-bit").
+fn rate_label(src_rate: u32, stream_rate: u32, state: &PlayerState) -> String {
+    let rate = if src_rate != stream_rate {
+        format!("{}→{}Hz", src_rate, stream_rate)
+    } else {
+        format!("{}Hz", src_rate)
+    };
+    match state.output_bits.load(Ordering::Relaxed) {
+        0 => rate,
+        bits => format!("{rate} • out {bits}-bit"),
+    }
+}
+
 /// Name of the producer (decode) thread. The panic hook uses it to tell a
 /// caught decoder panic apart from one that is really taking Keet down.
 const PRODUCER_THREAD: &str = "keet-producer";
@@ -843,6 +868,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    // The resumed value must reach state too: it was stored earlier from the
+    // command-line flag only, so a bare `keet` resuming an exclusive session
+    // took hog mode (the local) while rate switching, the bit depth and error
+    // handling (all reading state) ran as non-exclusive — and the next save
+    // wrote exclusive: false, dropping it from the resume for good.
+    state.exclusive.store(exclusive, Ordering::Relaxed);
 
     let eq_presets = Arc::new(eq_presets);
     let fx_presets = Arc::new(fx_presets);
@@ -1017,10 +1048,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         host.default_output_device().ok_or("No output device")?
     };
+    // Exclusive mode binds to ONE device: the stream, hog mode and every rate
+    // switch must all be the same hardware. The default device's stream
+    // follows the system default, and hogging the default makes macOS move
+    // the default away — so pin it (see audio::pin_device).
+    if exclusive {
+        if let Some(pinned) = audio::pin_device(&host, &device) {
+            device = pinned;
+        }
+    }
 
     // Probe first track's sample rate to set output rate
     let source_rate = probe_sample_rate(&playlist[ui.current]).unwrap_or(44100);
-    let persistent_output_rate = set_output_sample_rate(source_rate, current_output_rate, &device);
+    // Exclusive mode changes the DAC's rate and bit depth; remember how it was
+    // so quitting can put it back (before the first change, below).
+    let mut original_format = if exclusive { audio::capture_format(&device) } else { None };
+    // Only exclusive mode may change the device. Normal mode used to switch the
+    // DAC's system-wide rate to the first track's here (macOS; the other
+    // platforms' set_output_sample_rate never touches the device): that spared
+    // one track from resampling, resampled every other app on the DAC, never
+    // switched again, and was never put back. Normal mode now plays at whatever
+    // rate the device is set to and resamples every track the same way.
+    let persistent_output_rate = if exclusive {
+        set_output_sample_rate(source_rate, current_output_rate, &device)
+    } else {
+        current_output_rate
+    };
+    apply_exclusive_bit_depth(&state, &device, persistent_output_rate);
     let actual_device_rate = match device.default_output_config() {
         Ok(config) => config.sample_rate(),
         Err(_) => persistent_output_rate,
@@ -1187,6 +1241,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         state.buffer_level.store(0, Ordering::Relaxed);
         if let Ok(mut err) = state.decode_error.lock() { *err = None; }
 
+        // Exclusive mode: match the device to the track about to start. The
+        // producer only checks the rate at a NATURAL track change, so a skip
+        // back, a playlist jump or a restart after recovery began the new
+        // producer at the previous track's rate — resampled, e.g. song B
+        // played at song C's rate after skipping back. The ring is empty here
+        // (every respawn path drains it first), so the stream can be rebuilt.
+        if state.exclusive.load(Ordering::Relaxed) {
+            if let Some(track_rate) = probe_sample_rate(&playlist[ui.current]) {
+                let target = state.exclusive_target_rate(track_rate, stream_rate);
+                if target != stream_rate {
+                    // Stream first, then the rate (see the rate-change handler
+                    // below): no stream may be alive while the rate changes.
+                    drop(stream);
+                    let actual = set_output_sample_rate(target, stream_rate, &device);
+                    apply_exclusive_bit_depth(&state, &device, actual);
+                    state.stream_error.store(false, Ordering::Relaxed);
+                    let (new_prod, new_viz_cons, new_stream, built_rate) =
+                        rebuild_stream(&device, actual, out_channels, saved_buffer_size, &state)?;
+                    prod = new_prod;
+                    viz_cons = new_viz_cons;
+                    stream = new_stream;
+                    stream_rate = built_rate;
+                    state.output_rate.store(stream_rate as u64, Ordering::Relaxed);
+                    stream.play()?;
+                }
+            }
+        }
+
         let track_path = &playlist[ui.current];
         let mut filename = ui.metadata_cache.display_name(ui.current, track_path);
         let mut track_ext = track_path.extension()
@@ -1297,11 +1379,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             2 => "stereo".to_string(),
             n => format!("{}ch", n),
         };
-        let rate_str = if src_rate != stream_rate {
-            format!("{}→{}Hz", src_rate, stream_rate)
-        } else {
-            format!("{}Hz", src_rate)
-        };
+        let rate_str = rate_label(src_rate, stream_rate, &state);
         let mut track_info = format!("{} • {}bit {} • {}", format_time(state.total_secs()), bits, ch_str, rate_str);
 
         // Load lyrics off the main thread so skip stays responsive.
@@ -1395,8 +1473,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 print!("\x1B[J");
                 io::stdout().flush().ok();
                 let _ = save_tx.send(build_resume_state(&ui, &playlist, &state, &eq_presets, &fx_presets, &cf_presets, &device_arg));
-                if let Some(id) = hog_device_id {
-                    audio::release_exclusive_mode(id);
+                // Stop the stream BEFORE giving the device back. Releasing hog
+                // mode while our IO was still running reconfigured the device
+                // mid-stream, and the process then exited with the stream never
+                // stopped — heard as a buzz on quit. `take()` so the release at
+                // the end of main does not run a second time.
+                // Exclusive mode: give the DAC back as it was found. Silence
+                // and close the stream first — releasing hog mode under
+                // running IO buzzed, and a format change under a live stream is
+                // what StreamInvalidated reports — then restore the format
+                // while hog mode is still ours (no other app sees the
+                // in-between state), then release it. Also taken when hog mode
+                // was refused but the rate/bit depth were still changed.
+                let hog = hog_device_id.take();
+                if hog.is_some() || original_format.is_some() {
+                    let _ = stream.pause();
+                    drop(stream);
+                    if let Some(saved) = original_format.take() {
+                        let _ = audio::restore_format(&saved);
+                    }
+                    if let Some(id) = hog {
+                        audio::release_exclusive_mode(id);
+                    }
+                    let _ = producer_handle.join();
+                    break 'playlist;
                 }
                 // Producer will exit when state.should_quit() is true
                 let _ = producer_handle.join();
@@ -1477,11 +1577,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         2 => "stereo".to_string(),
                         n => format!("{}ch", n),
                     };
-                    let rate_str = if src_rate != stream_rate {
-                        format!("{}→{}Hz", src_rate, stream_rate)
-                    } else {
-                        format!("{}Hz", src_rate)
-                    };
+                    let rate_str = rate_label(src_rate, stream_rate, &state);
                     track_info = format!("{} • {}bit {} • {}", format_time(state.total_secs()), bits, ch_str, rate_str);
 
                     if let Some(ref mut mc) = media_controls {
@@ -1567,16 +1663,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Err(_) => break 'playlist,
                     }
 
+                    // Drop the old stream BEFORE changing the device rate: a
+                    // stream alive during the change gets StreamInvalidated from
+                    // cpal's rate listener, which ran a full recovery ("output
+                    // moved", restart at the last whole second) on every switch.
+                    drop(stream);
                     let new_rate = state.next_track_rate.load(Ordering::Relaxed);
                     let max_rate = audio::max_supported_rate(&device);
                     let target_rate = new_rate.min(max_rate);
                     let actual_rate = set_output_sample_rate(target_rate, stream_rate, &device);
+                    apply_exclusive_bit_depth(&state, &device, actual_rate);
                     stream_rate = actual_rate;
                     state.output_rate.store(stream_rate as u64, Ordering::Relaxed);
-
-                    // Drop old stream before creating the new ring buffer, and
-                    // forget any error it reported on its way out.
-                    drop(stream);
+                    // Forget anything the old stream reported on its way out.
                     state.stream_error.store(false, Ordering::Relaxed);
 
                     let (new_prod, new_viz_cons, new_stream, built_rate) =
@@ -1599,8 +1698,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Stream error recovery (device disconnected, AirPods removed, etc.)
             if state.stream_error.swap(false, Ordering::Relaxed) {
-                // Try to switch to the current default output device
-                if let Some(new_device) = host.default_output_device() {
+                // Normal mode follows the current default output device.
+                // Exclusive mode stays on ITS device while that device exists
+                // (chasing the default is what split the stream from the hogged
+                // device); only if it is gone does it move to the new default,
+                // pinned again.
+                let replacement = if state.exclusive.load(Ordering::Relaxed) {
+                    audio::pin_device(&host, &device).or_else(|| {
+                        host.default_output_device().and_then(|d| audio::pin_device(&host, &d))
+                    })
+                } else {
+                    host.default_output_device()
+                };
+                if let Some(new_device) = replacement {
                     // Recovery tears down the producer and re-enters the
                     // playlist loop, which starts the track from 0:00. Capture
                     // where we were so it can seek back: changing output device
@@ -1658,6 +1768,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let new_rate = device.default_output_config()
                         .map(|c| c.sample_rate())
                         .unwrap_or(48000);
+                    // New device (or the same one back): its format is set
+                    // again, before the stream is built.
+                    apply_exclusive_bit_depth(&state, &device, new_rate);
                     stream_rate = new_rate;
                     state.output_rate.store(stream_rate as u64, Ordering::Relaxed);
 
@@ -1750,7 +1863,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // that is no longer producing sound. Only meaningful when we
                 // follow the default (an explicit --device stays put), and
                 // polled at ~1 Hz because enumerating endpoints is a COM call.
-                if device_arg.is_none() && last_device_poll.elapsed() >= Duration::from_secs(1) {
+                // The OS rerouted our default-device stream (cpal DeviceChanged,
+                // e.g. AirPods connecting). The stream is STILL PLAYING on the
+                // new output — rebuilding it (the old behaviour) restarted the
+                // track at the last whole second. Only our device handle and the
+                // banner label follow; the poll below runs now rather than
+                // after its 1 s throttle. Exclusive mode never gets here: its
+                // reroutes are classified as a rebuild (see classify_stream_error).
+                let rerouted = state.device_rerouted.swap(false, Ordering::Relaxed);
+                if rerouted {
+                    if let Some(d) = host.default_output_device() {
+                        device = d;
+                    }
+                }
+                // Exclusive mode is pinned to its device, so the system default
+                // moving (which Keet's own hog mode causes) is not our output
+                // moving — relabelling to it announced "output now on MacBook
+                // speakers" while playback stayed on the DAC.
+                if device_arg.is_none()
+                    && !state.exclusive.load(Ordering::Relaxed)
+                    && (rerouted || last_device_poll.elapsed() >= Duration::from_secs(1))
+                {
                     last_device_poll = Instant::now();
                     let current = host
                         .default_output_device()
@@ -1878,7 +2011,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("✓ Done");
     io::stdout().flush().ok();
 
-    // Release exclusive mode
+    // Release exclusive mode and restore the DAC's format. Normally already
+    // done (and taken) by the quit key, which silences the stream first; this
+    // covers the rarer exits, most of which have already dropped the stream.
+    if let Some(saved) = original_format.take() {
+        let _ = audio::restore_format(&saved);
+    }
     if let Some(id) = hog_device_id {
         audio::release_exclusive_mode(id);
     }

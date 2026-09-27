@@ -372,6 +372,18 @@ pub struct PlayerState {
     /// producer_track_index (updated once a track's audio is about to play),
     /// this is current the moment decoding starts — what a crash report needs.
     pub(crate) producer_decoding: AtomicUsize,
+    /// Buffer underruns/overruns the output stream reported (cpal ErrorKind::Xrun),
+    /// cumulative for the session. Shown in the stats so real dropouts are
+    /// visible; they are glitches, never a reason to rebuild the stream.
+    pub(crate) xrun_count: AtomicU64,
+    /// The OS rerouted a default-device stream to a new output (cpal
+    /// ErrorKind::DeviceChanged). The stream is still playing; main only
+    /// refreshes its device handle and label.
+    pub(crate) device_rerouted: AtomicBool,
+    /// Exclusive mode: the bits per sample the DAC's physical format carries
+    /// exactly (set by `audio::set_max_bit_depth`), for display. 0 = unknown
+    /// or not in exclusive mode.
+    pub(crate) output_bits: AtomicU32,
     pub(crate) rate_change_needed: AtomicBool,
     pub(crate) next_track_rate: AtomicU32,
 
@@ -448,6 +460,9 @@ impl PlayerState {
             exclusive: AtomicBool::new(false),
             exclusive_caps: Mutex::new(None),
             producer_decoding: AtomicUsize::new(0),
+            xrun_count: AtomicU64::new(0),
+            device_rerouted: AtomicBool::new(false),
+            output_bits: AtomicU32::new(0),
             rate_change_needed: AtomicBool::new(false),
             next_track_rate: AtomicU32::new(0),
             stream_error: AtomicBool::new(false),

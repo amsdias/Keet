@@ -2042,4 +2042,141 @@ mod chain_tests {
         let second = &l[l.len() - 30_000..];
         assert!(tone_amplitude(second, 44100.0, 1000.0) > 0.3, "second link's 1 kHz missing");
     }
+
+    // ---- bit-perfect ------------------------------------------------------
+    //
+    // With every DSP stage off, no resampling (output rate = file rate) and
+    // volume at 100%, Keet must hand the device the file's samples UNCHANGED:
+    // each f32 equal to `integer / 2^(bits-1)`, which a DAC's float->int
+    // conversion maps straight back to the original integer. These tests pin
+    // Keet's side of the bit-perfect claim, file on disk to the samples the
+    // audio callback writes; CoreAudio's own conversion is outside them.
+
+    /// A WAV written from exact integers (the float writer above rounds).
+    fn write_wav_int(path: &PathBuf, rate: u32, channels: u16, bits: u16, samples: &[i32]) {
+        let bytes_per = (bits / 8) as usize;
+        let mut data = Vec::with_capacity(samples.len() * bytes_per);
+        for &v in samples {
+            data.extend_from_slice(&v.to_le_bytes()[..bytes_per]);
+        }
+        let block_align = channels as u32 * bytes_per as u32;
+        let mut out = Vec::with_capacity(data.len() + 44);
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+        out.extend_from_slice(b"WAVEfmt ");
+        out.extend_from_slice(&16u32.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        out.extend_from_slice(&channels.to_le_bytes());
+        out.extend_from_slice(&rate.to_le_bytes());
+        out.extend_from_slice(&(rate * block_align).to_le_bytes());
+        out.extend_from_slice(&(block_align as u16).to_le_bytes());
+        out.extend_from_slice(&bits.to_le_bytes());
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&data);
+        std::fs::write(path, out).expect("write int wav");
+    }
+
+    /// Full-range integers at `bits`: both extremes, zero, +-1 and their
+    /// neighbours first, then a deterministic spread over the whole range.
+    fn full_range_ints(n: usize, bits: u32) -> Vec<i32> {
+        let max = (1i64 << (bits - 1)) - 1;
+        let min = -(1i64 << (bits - 1));
+        let mut v: Vec<i32> = [min, max, 0, 1, -1, min + 1, max - 1]
+            .iter().map(|&x| x as i32).collect();
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        while v.len() < n {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let span = (max - min + 1) as u64;
+            v.push((min + ((x >> 11) % span) as i64) as i32);
+        }
+        v
+    }
+
+    fn assert_output_stage_is_identity(out: &[f32]) {
+        let st = PlayerState::new();
+        st.volume.store(100, Ordering::Relaxed);
+        let gain = st.volume_gain();
+        assert_eq!(gain.to_bits(), 1.0f32.to_bits(), "100% volume must be a gain of exactly 1.0");
+        for &o in out {
+            let played = crate::audio::output_sample(o, gain);
+            assert_eq!(played.to_bits(), o.to_bits(), "callback changed {o} at 100% volume");
+        }
+    }
+
+    #[test]
+    fn bit_perfect_pcm_reaches_the_callback_unchanged() {
+        for (bits, rate) in [(16u16, 44_100u32), (24, 96_000)] {
+            let scale = (1u64 << (bits - 1)) as f64;
+            for channels in [1u16, 2] {
+                let frames = 12_000;
+                let src = full_range_ints(frames * channels as usize, bits as u32);
+                let path = tmp_wav(&format!("bitperfect_{bits}_{channels}"));
+                write_wav_int(&path, rate, channels, bits, &src);
+                // Output rate = file rate: no resampler; RG off; DSP at defaults (off).
+                let out = run_chain(&[path], rate, RgMode::Off);
+                assert_eq!(out.len(), frames * 2, "{bits}-bit/{channels}ch: sample count changed");
+                for (frame, pair) in out.as_chunks::<2>().0.iter().enumerate() {
+                    for (ch, &o) in pair.iter().enumerate() {
+                        // Mono is duplicated into both channels.
+                        let v = src[frame * channels as usize + if channels == 1 { 0 } else { ch }];
+                        let back = o as f64 * scale;
+                        assert!(
+                            back == v as f64,
+                            "{bits}-bit/{channels}ch frame {frame} ch {ch}: source {v}, delivered {o} (= {back} at {bits} bits)"
+                        );
+                    }
+                    if channels == 1 {
+                        // A mono device folds the frame back: must be exact too.
+                        assert_eq!(crate::audio::mono_fold(pair[0], pair[1]).to_bits(), pair[0].to_bits());
+                    }
+                }
+                assert_output_stage_is_identity(&out);
+            }
+        }
+    }
+
+    #[test]
+    fn bit_perfect_24_bit_flac_matches_a_direct_decode() {
+        // The hi-res format people actually play: the chain's output must be
+        // exactly the decoder's output, and sit on the 24-bit integer grid.
+        let path = fixture("hires_24_96.flac");
+        let out = run_chain(std::slice::from_ref(&path), 96_000, RgMode::Off);
+
+        let file = File::open(&path).unwrap();
+        let mss = MediaSourceStream::new(Box::new(file), Default::default());
+        let mut hint = Hint::new();
+        hint.with_extension("flac");
+        let mut format = symphonia::default::get_probe()
+            .probe(&hint, mss, FormatOptions::default(), MetadataOptions::default())
+            .unwrap();
+        let track = format.default_track(TrackType::Audio).unwrap().clone();
+        let params = track.codec_params.as_ref().and_then(|c| c.audio()).unwrap().clone();
+        assert_eq!(params.bits_per_sample, Some(24));
+        let mut dec = symphonia::default::get_codecs()
+            .make_audio_decoder(&params, &AudioDecoderOptions::default())
+            .unwrap();
+        let mut direct: Vec<f32> = Vec::new();
+        while let Ok(Some(pkt)) = format.next_packet() {
+            let buf = dec.decode(&pkt).unwrap();
+            let mut tmp = vec![0.0f32; buf.samples_interleaved()];
+            buf.copy_to_slice_interleaved(&mut tmp);
+            direct.extend_from_slice(&tmp);
+        }
+        assert_eq!(out.len(), direct.len(), "sample count changed");
+        for (i, (&o, &d)) in out.iter().zip(&direct).enumerate() {
+            assert_eq!(o.to_bits(), d.to_bits(), "sample {i}: decoded {d}, delivered {o}");
+            let back = o as f64 * 8_388_608.0;
+            assert!(back == back.round(), "sample {i} ({o}) is off the 24-bit grid");
+        }
+        assert_output_stage_is_identity(&out);
+    }
+
+    #[test]
+    fn the_bit_perfect_checks_notice_a_change() {
+        // Negative control: the identity check must fail for any real change.
+        let x = 12_345.0f32 / 8_388_608.0;
+        assert_ne!(crate::audio::output_sample(x, 0.99).to_bits(), x.to_bits(), "99% volume");
+        assert_ne!(crate::audio::output_sample(x, 1.0 + f32::EPSILON).to_bits(), x.to_bits());
+    }
 }
