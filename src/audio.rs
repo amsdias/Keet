@@ -669,6 +669,9 @@ pub fn release_exclusive_mode(device_id: u32) {
 
 /// One physical (hardware) format a device's output stream offers, reduced to
 /// what choosing a bit depth needs. Plain data so the choice is testable.
+// Only the macOS half of `set_max_bit_depth` uses this (and the chooser below);
+// elsewhere it is test-only, and Linux CI's `-D warnings` rejects dead code.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct PhysFormat {
     pub lpcm: bool,
@@ -683,6 +686,7 @@ pub(crate) struct PhysFormat {
 
 /// Bits a format carries EXACTLY: an integer format its width; a float its
 /// significand (24 for 32-bit float, 53 for 64-bit).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn usable_bits(f: &PhysFormat) -> u32 {
     match (f.float, f.bits) {
         (false, b) => b,
@@ -700,6 +704,7 @@ fn usable_bits(f: &PhysFormat) -> u32 {
 /// MIXABLE variant: devices like the FiiO KA17 list each integer format twice,
 /// and the non-mixable one can be refused before hog mode is held.
 /// Formats at other rates or channel counts are never candidates.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn pick_max_bit_format(avail: &[PhysFormat], rate: u32, channels: u32) -> Option<usize> {
     let r = rate as f64;
     avail
