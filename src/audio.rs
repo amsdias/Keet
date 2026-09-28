@@ -5,6 +5,7 @@ use std::sync::atomic::Ordering;
 
 use cpal::traits::DeviceTrait;
 use cpal::traits::HostTrait;
+use cpal::traits::StreamTrait;
 use cpal::{Stream, StreamConfig};
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
@@ -99,7 +100,91 @@ pub fn probe_sample_rate(path: &Path) -> Option<u32> {
 }
 
 /// Print numbered list of output devices to stdout
-pub fn list_output_devices(host: &cpal::Host) {
+/// One device as the compact listing sees it (no device is opened for it).
+pub(crate) struct ListedDevice {
+    pub id: String,
+    pub name: String,
+    pub default: bool,
+}
+
+/// Sound-server routes worth showing on Linux; other card-less ALSA PCMs are
+/// plugins (null, samplerate, upmix, …) that no one picks by hand.
+const ALSA_ROUTES: [&str; 5] = ["default", "sysdefault", "pipewire", "pulse", "jack"];
+
+/// The `--list-devices` lines. Linux (`alsa`): every ALSA name of a card —
+/// hw:, plughw:, front:, surround51:, iec958:, dmix: … — is its own "device",
+/// so a laptop with a USB DAC listed 40+ entries. Instead: the sound-server
+/// routes (normal mode), then one line per card output by its raw hw: id (what
+/// --exclusive needs); cpal's numeric duplicates (hw:CARD=1 for hw:CARD=KA17)
+/// are merged, keeping the named form. Elsewhere: one line per device.
+pub(crate) fn compact_device_list(devs: &[ListedDevice], alsa: bool) -> Vec<String> {
+    let mark = |d: &ListedDevice| if d.default { "  (default)" } else { "" };
+    let mut out = Vec::new();
+    if alsa {
+        let routes: Vec<&ListedDevice> = devs.iter().filter(|d| ALSA_ROUTES.contains(&d.id.as_str())).collect();
+        // hw: outputs, one per (card name, device), named CARD preferred.
+        let mut hw: Vec<&ListedDevice> = Vec::new();
+        for d in devs.iter().filter(|d| d.id.starts_with("hw:")) {
+            let dev_of = |x: &ListedDevice| hw_pcm_id_for(&x.id).and_then(|h| h.rsplit_once("DEV=").map(|(_, v)| v.to_string()));
+            let numeric = |x: &ListedDevice| {
+                hw_pcm_id_for(&x.id).is_some_and(|h| h.trim_start_matches("hw:CARD=").split(',').next().is_some_and(|c| c.chars().all(|ch| ch.is_ascii_digit())))
+            };
+            match hw.iter().position(|e| e.name == d.name && dev_of(e) == dev_of(d)) {
+                Some(i) if numeric(hw[i]) && !numeric(d) => hw[i] = d,
+                Some(_) => {}
+                None => hw.push(d),
+            }
+        }
+        if !routes.is_empty() || !hw.is_empty() {
+            out.push("Output devices (--list-devices --verbose shows every device and its formats)".to_string());
+            if !routes.is_empty() {
+                out.push(String::new());
+                out.push("  Normal mode:".to_string());
+                let w = routes.iter().map(|d| d.id.len()).max().unwrap_or(0);
+                for d in routes {
+                    out.push(format!("    {:<w$}   {}{}", d.id, d.name, mark(d)));
+                }
+            }
+            if !hw.is_empty() {
+                out.push(String::new());
+                out.push("  --exclusive (pass the id to --device):".to_string());
+                let w = hw.iter().map(|d| d.id.len()).max().unwrap_or(0);
+                for d in hw {
+                    out.push(format!("    {:<w$}   {}{}", d.id, d.name, mark(d)));
+                }
+            }
+            return out;
+        }
+    }
+    out.push("Output devices (--list-devices --verbose shows each device's formats):".to_string());
+    for (i, d) in devs.iter().enumerate() {
+        out.push(format!("  {}. {}{}", i + 1, d.name, mark(d)));
+    }
+    out
+}
+
+/// `--list-devices`: the compact list, or with `verbose` every device with
+/// its id, default format and supported formats (for troubleshooting).
+pub fn list_output_devices(host: &cpal::Host, verbose: bool) {
+    if !verbose {
+        let default_id = host.default_output_device().and_then(|d| d.id().ok()).map(|i| i.id().to_string());
+        match host.output_devices() {
+            Ok(devices) => {
+                let listed: Vec<ListedDevice> = devices
+                    .map(|d| {
+                        let id = d.id().map(|i| i.id().to_string()).unwrap_or_default();
+                        let name = d.description().map(|x| x.name().trim().to_string()).unwrap_or_else(|_| "Unknown".into());
+                        ListedDevice { default: default_id.as_deref() == Some(id.as_str()), id, name }
+                    })
+                    .collect();
+                for line in compact_device_list(&listed, cfg!(target_os = "linux")) {
+                    println!("{line}");
+                }
+            }
+            Err(e) => eprintln!("Cannot enumerate devices: {}", e),
+        }
+        return;
+    }
     match host.output_devices() {
         Ok(devices) => {
             let default_name = host.default_output_device()
@@ -113,6 +198,11 @@ pub fn list_output_devices(host: &cpal::Host) {
                     .unwrap_or_else(|_| "Unknown".to_string());
                 let suffix = if default_name.as_ref() == Some(&name) { " (default)" } else { "" };
                 println!("  {}. {}{}", i + 1, name, suffix);
+                // The id is what --device matches exactly; on Linux it is the
+                // ALSA PCM (hw:CARD=…,DEV=… is the one for exclusive mode).
+                if let Ok(id) = device.id() {
+                    println!("       id: {}", id.id());
+                }
                 // The shared-mode mixer format. On Windows this is the ONLY
                 // format WASAPI accepts without conversion, so it's the first
                 // thing to check when a stream fails to build.
@@ -152,24 +242,40 @@ pub fn list_output_devices(host: &cpal::Host) {
                         println!("       supports: {} ch, {:?}, rates: {}", ch, fmt, list.join(", "));
                     }
                 }
+                // cpal lists only the shared-mode format; what exclusive mode
+                // (and so per-track rate switching) can do comes from WASAPI.
+                #[cfg(target_os = "windows")]
+                if let (Ok(id), Ok(c)) = (device.id(), device.default_output_config()) {
+                    for line in crate::wasapi_out::exclusive_report(id.id(), c.channels()) {
+                        println!("       {line}");
+                    }
+                }
             }
         }
         Err(e) => eprintln!("Cannot enumerate devices: {}", e),
     }
 }
 
-/// Find an output device by substring match (case-insensitive)
+/// Find an output device: an exact device id first (on Linux the ALSA PCM
+/// name, e.g. `hw:CARD=0,DEV=0` — several PCMs of one card share its friendly
+/// name, so the id is the unambiguous handle), then a case-insensitive
+/// substring of the name.
 pub fn find_device_by_name(host: &cpal::Host, name: &str) -> Option<cpal::Device> {
+    let devices: Vec<cpal::Device> = host.output_devices().ok()?.collect();
+    if let Some(d) = devices.iter().find(|d| d.id().is_ok_and(|i| i.id() == name)) {
+        return Some(d.clone());
+    }
     let name_lower = name.to_lowercase();
-    host.output_devices().ok()?
-        .find(|d| {
-            d.description()
-                .map(|desc| desc.name().to_lowercase().contains(&name_lower))
-                .unwrap_or(false)
-        })
+    devices.into_iter().find(|d| {
+        d.description()
+            .map(|desc| desc.name().to_lowercase().contains(&name_lower))
+            .unwrap_or(false)
+    })
 }
 
 /// Query the maximum sample rate supported by a device
+// Unused on Windows, where exclusive-mode rates come from WASAPI (probe_rate_caps).
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 pub fn max_supported_rate(device: &cpal::Device) -> u32 {
     device.supported_output_configs()
         .map(|configs| {
@@ -541,11 +647,33 @@ mod macos_audio {
 /// file rate against the output rate and tore the stream down and rebuilt it
 /// at the SAME rate on every boundary a device could not follow (44.1 kHz
 /// albums on a 48 kHz-only DAC, Bluetooth, 352.8 kHz files on a 192 kHz DAC).
-pub fn probe_rate_caps(device: &cpal::Device) -> crate::state::RateCaps {
+///
+/// None when the device's rates could not be read (e.g. a Linux hw: device
+/// already open — it admits one client): unknown capabilities must not read
+/// as "only 48 kHz". Without caps, `exclusive_target_rate` falls back to the
+/// requested rate, and the switch itself (made with no stream open) checks
+/// the device lists it.
+pub fn probe_rate_caps(device: &cpal::Device) -> Option<crate::state::RateCaps> {
+    // Windows exclusive mode opens the device itself: its rates are the ones
+    // WASAPI exclusive accepts, not the shared-mode mixer's single format
+    // that cpal reports.
+    #[cfg(target_os = "windows")]
+    {
+        let id = device.id().ok()?.id().to_string();
+        let ch = device.default_output_config().map(|c| c.channels()).unwrap_or(2);
+        let rates = crate::wasapi_out::supported_rates(&id, ch);
+        let max = rates.iter().copied().max()?;
+        Some(crate::state::RateCaps { ranges: rates.iter().map(|&r| (r, r)).collect(), max, fixed: false, any: false })
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
     let ranges: Vec<(u32, u32)> = device
         .supported_output_configs()
         .map(|configs| configs.map(|c| (c.min_sample_rate(), c.max_sample_rate())).collect())
         .unwrap_or_default();
+    if ranges.is_empty() {
+        return None;
+    }
     let max = max_supported_rate(device);
     #[cfg(target_os = "macos")]
     let caps = crate::state::RateCaps {
@@ -554,13 +682,14 @@ pub fn probe_rate_caps(device: &cpal::Device) -> crate::state::RateCaps {
         fixed: coreaudio_device_id(device).is_some_and(macos_audio::is_bluetooth_device_by_id),
         any: false,
     };
-    #[cfg(target_os = "windows")]
-    let caps = crate::state::RateCaps { ranges, max, fixed: true, any: false };
+    // Linux exclusive mode opens a raw hw: device, which takes exactly the
+    // rates it lists (reopening at one IS the switch).
     #[cfg(target_os = "linux")]
-    let caps = crate::state::RateCaps { ranges, max, fixed: false, any: true };
-    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     let caps = crate::state::RateCaps { ranges, max, fixed: false, any: false };
-    caps
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let caps = crate::state::RateCaps { ranges, max, fixed: false, any: false };
+    Some(caps)
+    }
 }
 
 /// Try to set the output device's sample rate to match the source.
@@ -615,18 +744,30 @@ pub fn set_output_sample_rate(desired_rate: u32, current_rate: u32, device: &cpa
 
     #[cfg(target_os = "windows")]
     {
-        // On Windows, virtual audio devices (like SteelSeries Sonar) don't support rate switching
-        // and may report incorrect capabilities. Always use the current device rate and let
-        // our resampler handle conversion if needed. This prevents pitch shifting issues.
-        let _ = (desired_rate, device);
-        return current_rate;
+        // Only exclusive mode calls this. WASAPI exclusive opens the device at
+        // the stream's rate itself — reopening IS the switch — so the answer
+        // is whether the device accepts `desired_rate` exclusively. (Shared
+        // mode never switches: virtual devices like SteelSeries Sonar report
+        // capabilities they do not have.)
+        let id = device.id().map(|i| i.id().to_string()).unwrap_or_default();
+        let ch = device.default_output_config().map(|c| c.channels()).unwrap_or(2);
+        return if crate::wasapi_out::best_layout(&id, desired_rate, ch).is_some() {
+            desired_rate
+        } else {
+            current_rate
+        };
     }
 
     #[cfg(target_os = "linux")]
     {
-        // On Linux with PipeWire, just request the rate - PipeWire handles switching
-        let _ = device;
-        return desired_rate;
+        // Only exclusive mode calls this, on a raw hw: device: there is no
+        // device-wide rate to set — the stream is reopened at the new rate —
+        // so the answer is simply whether the device lists it.
+        let supported = device
+            .supported_output_configs()
+            .map(|mut cs| cs.any(|c| c.min_sample_rate() <= desired_rate && desired_rate <= c.max_sample_rate()))
+            .unwrap_or(false);
+        return if supported { desired_rate } else { current_rate };
     }
 
     // Fallback: keep current rate (will resample)
@@ -639,19 +780,196 @@ pub fn set_output_sample_rate(desired_rate: u32, current_rate: u32, device: &cpa
 
 /// Set exclusive (hog) mode on the output device. macOS only.
 /// Returns the CoreAudio device ID if successful, for later release.
-pub fn set_exclusive_mode(device: &cpal::Device) -> Result<u32, String> {
+/// ALSA: the raw `hw:` PCM behind any PCM that names a card — `front:`,
+/// `plughw:`, `sysdefault:`, `dmix:` … of the same card and device. Raw `hw:`
+/// is the one ALSA PCM that plays exactly what it is sent (no plug
+/// conversion, no mixing). None for PCMs that name no card: `default`,
+/// `pipewire`, `pulse` route through a sound server, so there is nothing to
+/// own. Plain string logic, compiled and tested on every platform.
+pub(crate) fn hw_pcm_id_for(pcm_id: &str) -> Option<String> {
+    let (_, rest) = pcm_id.split_once(':')?;
+    let mut card = None;
+    let mut dev = "0".to_string();
+    let parts: Vec<&str> = rest.split(',').map(str::trim).collect();
+    for (i, part) in parts.iter().enumerate() {
+        match part.split_once('=') {
+            Some(("CARD", v)) => card = Some(v.to_string()),
+            Some(("DEV", v)) => dev = v.to_string(),
+            Some(_) => {}
+            // Positional form: hw:1,0 (card, device).
+            None if i == 0 => card = Some(part.to_string()),
+            None if i == 1 => dev = part.to_string(),
+            None => {}
+        }
+    }
+    Some(format!("hw:CARD={},DEV={}", card?, dev))
+}
+
+/// One sample format a device lists, for choosing an output format.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FormatRange {
+    pub format: cpal::SampleFormat,
+    pub channels: u16,
+    pub min: u32,
+    pub max: u32,
+}
+
+/// The format a raw device should be opened with at `rate` and `channels`:
+/// the one carrying the most bits exactly (the same ranking as macOS's
+/// physical formats — see `pick_max_bit_format`). Returns it with its exact
+/// bit count. None when the device lists nothing at that rate/channels.
+pub(crate) fn choose_output_format(
+    configs: &[FormatRange],
+    rate: u32,
+    channels: u16,
+) -> Option<(cpal::SampleFormat, u32)> {
+    use cpal::SampleFormat as F;
+    let candidates: Vec<(F, PhysFormat)> = configs
+        .iter()
+        .filter_map(|c| {
+            let (float, bits) = match c.format {
+                F::I16 => (false, 16),
+                F::I24 => (false, 24),
+                F::I32 => (false, 32),
+                F::F32 => (true, 32),
+                F::F64 => (true, 64),
+                _ => return None,
+            };
+            Some((c.format, PhysFormat {
+                lpcm: true, float, nonmixable: false, bits,
+                channels: c.channels as u32,
+                rate_min: c.min as f64, rate_max: c.max as f64,
+            }))
+        })
+        .collect();
+    let phys: Vec<PhysFormat> = candidates.iter().map(|(_, p)| *p).collect();
+    let i = pick_max_bit_format(&phys, rate, channels as u32)?;
+    Some((candidates[i].0, usable_bits(&phys[i])))
+}
+
+/// The device exclusive mode should actually use, or why it cannot run.
+/// macOS: the same device, pinned (see `pin_device`). Linux: the card's raw
+/// `hw:` device (a `default`/`pipewire` route has no card to own). Elsewhere
+/// exclusive mode is not available yet.
+pub fn prepare_exclusive_device(host: &cpal::Host, device: &cpal::Device) -> Result<cpal::Device, String> {
+    if cfg!(target_os = "macos") {
+        return Ok(pin_device(host, device).unwrap_or_else(|| device.clone()));
+    }
+    if cfg!(target_os = "linux") {
+        let id = device.id().map_err(|e| e.to_string())?;
+        let hw = hw_pcm_id_for(id.id()).ok_or_else(|| {
+            format!(
+                "exclusive mode needs a hardware device, and '{}' is a sound-server route. \
+                 Pass --device with a card's hw: id (see --list-devices), e.g. --device hw:CARD=0,DEV=0",
+                id.id()
+            )
+        })?;
+        return host
+            .output_devices()
+            .map_err(|e| e.to_string())?
+            .find(|d| d.id().ok().is_some_and(|i| i.id() == hw))
+            .ok_or_else(|| format!("no raw hardware device {hw} to open exclusively"));
+    }
+    if cfg!(target_os = "windows") {
+        // WASAPI exclusive binds to this endpoint by id: already pinned.
+        return Ok(device.clone());
+    }
+    Err("exclusive mode is not available on this platform yet".into())
+}
+
+/// Sample format (and the bits it carries exactly) to open the stream with.
+/// Float everywhere, except Linux exclusive mode, where a raw `hw:` device
+/// takes an integer format as-is. (bits 0 = not applicable / unknown.)
+pub fn output_format(device: &cpal::Device, rate: u32, channels: u16, exclusive: bool) -> (cpal::SampleFormat, u32) {
+    if !(exclusive && cfg!(target_os = "linux")) {
+        return (cpal::SampleFormat::F32, 0);
+    }
+    let ranges: Vec<FormatRange> = device
+        .supported_output_configs()
+        .map(|cs| {
+            cs.map(|c| FormatRange {
+                format: c.sample_format(),
+                channels: c.channels(),
+                min: c.min_sample_rate(),
+                max: c.max_sample_rate(),
+            })
+            .collect()
+        })
+        .unwrap_or_default();
+    choose_output_format(&ranges, rate, channels).unwrap_or((cpal::SampleFormat::F32, 0))
+}
+
+/// A device held by another program, reported by an output Keet opens itself
+/// (WASAPI exclusive: AUDCLNT_E_DEVICE_IN_USE).
+#[derive(Debug)]
+pub struct DeviceBusyError(pub String);
+
+impl std::fmt::Display for DeviceBusyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for DeviceBusyError {}
+
+/// Whether a stream-build failure means the device is held by another
+/// program: cpal's DeviceBusy (ALSA EBUSY/EAGAIN — `build_stream` boxes
+/// cpal's own error, which keeps the kind recoverable) or `DeviceBusyError`.
+pub fn is_device_busy(e: &(dyn std::error::Error + 'static)) -> bool {
+    e.downcast_ref::<cpal::Error>().is_some_and(|c| c.kind() == cpal::ErrorKind::DeviceBusy)
+        || e.downcast_ref::<DeviceBusyError>().is_some()
+}
+
+/// The output stream, whichever backend drives it: a cpal stream, or on
+/// Windows in exclusive mode Keet's own WASAPI exclusive stream. main only
+/// plays, pauses and drops it.
+pub enum Output {
+    Cpal(Stream),
+    #[cfg(target_os = "windows")]
+    Wasapi(crate::wasapi_out::WasapiOutput),
+}
+
+impl Output {
+    pub fn play(&self) -> Result<(), Box<dyn std::error::Error>> {
+        match self {
+            Output::Cpal(s) => Ok(s.play()?),
+            // Plays from the moment it opens.
+            #[cfg(target_os = "windows")]
+            Output::Wasapi(_) => Ok(()),
+        }
+    }
+
+    pub fn pause(&self) -> Result<(), Box<dyn std::error::Error>> {
+        match self {
+            Output::Cpal(s) => Ok(s.pause()?),
+            #[cfg(target_os = "windows")]
+            Output::Wasapi(w) => {
+                w.stop();
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Take exclusive ownership of the output device. `Ok(Some(id))`: macOS hog
+/// mode, held until `release_exclusive_mode(id)`. `Ok(None)`: exclusive by
+/// nature — a Linux raw `hw:` device admits one client while open.
+pub fn set_exclusive_mode(device: &cpal::Device) -> Result<Option<u32>, String> {
     #[cfg(target_os = "macos")]
     {
         let device_id = coreaudio_device_id(device)
             .ok_or_else(|| "Could not find CoreAudio device ID".to_string())?;
 
         macos_audio::set_hog_mode(device_id)?;
-        Ok(device_id)
+        Ok(Some(device_id))
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = device;
-        Err("Exclusive mode not supported on this platform".to_string())
+        let is_hw = device.id().is_ok_and(|i| i.id().starts_with("hw:"));
+        if (cfg!(target_os = "linux") && is_hw) || cfg!(target_os = "windows") {
+            return Ok(None);
+        }
+        Err("exclusive mode is not available on this device or platform".to_string())
     }
 }
 
@@ -968,173 +1286,308 @@ pub(crate) fn classify_stream_error(kind: cpal::ErrorKind, exclusive: bool) -> S
     }
 }
 
+/// Sample types the audio output can deliver. `from_f32` is EXACT for any
+/// source at most the target's depth: decode hands over `v / 2^(bits-1)`, and
+/// multiplying back by the target's full scale lands on `v` (shifted into the
+/// wider format) with nothing to round. That is what lets an integer device —
+/// an ALSA `hw:` device, WASAPI exclusive — receive the file's own samples.
+pub(crate) trait OutputSample: cpal::SizedSample + Send + 'static {
+    fn from_f32(x: f32) -> Self;
+}
+
+impl OutputSample for f32 {
+    fn from_f32(x: f32) -> f32 {
+        x
+    }
+}
+
+/// Scale to a `bits`-wide signed integer: round (exact for sources no deeper
+/// than `bits`), clamp (+1.0 is full scale's one step past the top), NaN -> 0.
+fn scale_to_int(x: f32, bits: u32) -> i64 {
+    let full = (1i64 << (bits - 1)) as f64;
+    (x as f64 * full).round().clamp(-full, full - 1.0) as i64
+}
+
+impl OutputSample for i16 {
+    fn from_f32(x: f32) -> i16 {
+        scale_to_int(x, 16) as i16
+    }
+}
+
+impl OutputSample for cpal::I24 {
+    fn from_f32(x: f32) -> cpal::I24 {
+        cpal::I24::new_unchecked(scale_to_int(x, 24) as i32)
+    }
+}
+
+impl OutputSample for i32 {
+    fn from_f32(x: f32) -> i32 {
+        scale_to_int(x, 32) as i32
+    }
+}
+
+/// Pack full-scale i32 samples (from `OutputRenderer::render::<i32>`) into a
+/// device buffer laid out as `store` bits per sample, `valid` of them used —
+/// the WASAPI exclusive layouts: 32/32, 24-in-32 (left-justified, unused low
+/// byte zero), packed 24 (three bytes), 16. Exact for any source no deeper
+/// than `valid`: a 24-bit sample arrives as `v << 8` and every layout of 24+
+/// bits carries it unchanged. `out` holds `samples.len() * store / 8` bytes.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn pack_samples(samples: &[i32], store: u16, valid: u16, out: &mut [u8]) {
+    match (store, valid) {
+        (32, 32) => {
+            for (s, o) in samples.iter().zip(out.as_chunks_mut::<4>().0) {
+                *o = s.to_le_bytes();
+            }
+        }
+        (32, _) => {
+            for (s, o) in samples.iter().zip(out.as_chunks_mut::<4>().0) {
+                *o = (s & !0xFF).to_le_bytes();
+            }
+        }
+        (24, _) => {
+            for (s, o) in samples.iter().zip(out.as_chunks_mut::<3>().0) {
+                o.copy_from_slice(&s.to_le_bytes()[1..4]);
+            }
+        }
+        _ => {
+            // 16-bit: round (exact for 16-bit sources, whose low 16 bits are 0).
+            for (s, o) in samples.iter().zip(out.as_chunks_mut::<2>().0) {
+                let v = ((*s as i64 + 0x8000) >> 16).clamp(i16::MIN as i64, i16::MAX as i64) as i16;
+                *o = v.to_le_bytes();
+            }
+        }
+    }
+}
+
+/// Scratch size for integer rendering, in samples: a WASAPI period of 2048
+/// frames at 8 channels. A larger callback is rendered in pieces.
+const RENDER_SCRATCH: usize = 16_384;
+
+/// Everything the audio callback does, independent of the backend and sample
+/// format: drain requests, reading the stereo ring, volume and clamp, fanning
+/// out to the device's channel count, position counting and the viz tap.
+/// cpal's float callback calls `render_f32` directly; integer outputs call
+/// `render`. Lock-free and allocation-free once built.
+pub(crate) struct OutputRenderer {
+    consumer: Consumer<f32>,
+    viz_producer: Producer<f32>,
+    state: Arc<PlayerState>,
+    channels: usize,
+    scratch: Vec<f32>,
+}
+
+impl OutputRenderer {
+    pub(crate) fn new(
+        consumer: Consumer<f32>,
+        viz_producer: Producer<f32>,
+        state: Arc<PlayerState>,
+        channels: usize,
+    ) -> Self {
+        Self { consumer, viz_producer, state, channels, scratch: vec![0.0; RENDER_SCRATCH] }
+    }
+
+    pub(crate) fn render_f32(&mut self, data: &mut [f32]) {
+        let channels = self.channels;
+        let paused = self.state.is_paused();
+
+        // Check if seek happened - drain buffer immediately for instant response
+        if self.state.reset_consumer_counter.swap(false, Ordering::AcqRel) {
+            // Drain all buffered samples instantly
+            let to_drain = self.consumer.slots();
+            if to_drain > 0 {
+                if let Ok(chunk) = self.consumer.read_chunk(to_drain) {
+                    chunk.commit_all(); // Discard without processing
+                }
+            }
+            data.fill(0.0);
+            return;
+        }
+
+        // Use chunk reads for efficiency
+        let available = self.consumer.slots();
+
+        // Update buffer level so main thread can detect track end
+        self.state.buffer_level.store(available, Ordering::Relaxed);
+
+        if paused || available == 0 {
+            // Output silence
+            data.fill(0.0);
+            return;
+        }
+
+        // Ring buffer always contains stereo (2ch) samples
+        // Guard: channels must be >= 1 to avoid division by zero
+        if channels == 0 {
+            data.fill(0.0);
+            return;
+        }
+
+        let source_channels = 2usize; // Our ring buffer is always stereo
+        let frames_needed = data.len() / channels;
+        let samples_to_read = (frames_needed * source_channels).min(available);
+
+        if let Ok(chunk) = self.consumer.read_chunk(samples_to_read) {
+            let (first, second) = chunk.as_slices();
+            let gain = self.state.volume_gain();
+
+            // Process both ring buffer slices sequentially (no heap allocation)
+            // out_step: always need at least 2 free slots (L+R) even for mono downmix
+            let mut out_idx = 0;
+            let slices: [&[f32]; 2] = [first, second];
+            let mut src_idx = 0;
+            let mut current_slice = 0;
+
+            while current_slice < 2 && out_idx < data.len() {
+                let slice = slices[current_slice];
+                if src_idx + 1 >= slice.len() {
+                    current_slice += 1;
+                    src_idx = 0;
+                    continue;
+                }
+
+                // Clamp post-gain to prevent DAC clipping. Producer only
+                // flags clipping (self.state.clipping) — can't scale there since
+                // volume may change between scan and this callback.
+                let left = output_sample(slice[src_idx], gain);
+                let right = output_sample(slice[src_idx + 1], gain);
+
+                if channels == 1 {
+                    data[out_idx] = mono_fold(left, right);
+                } else if out_idx + 1 < data.len() {
+                    data[out_idx] = left;
+                    data[out_idx + 1] = right;
+                    for ch in 2..channels {
+                        if out_idx + ch < data.len() {
+                            data[out_idx + ch] = 0.0;
+                        }
+                    }
+                } else {
+                    break; // Not enough space for a full frame
+                }
+
+                out_idx += channels;
+                src_idx += source_channels;
+            }
+
+            chunk.commit_all();
+
+            // Track playback position (frames consumed from ring buffer)
+            let consumed_frames = samples_to_read / source_channels;
+            self.state.samples_played.fetch_add(consumed_frames as u64, Ordering::Relaxed);
+
+            // Tap played stereo samples into viz buffer (best-effort, drop if full)
+            // Pre-fader mode: undo volume gain so viz shows raw signal levels
+            let frames_written = out_idx.checked_div(channels).unwrap_or(0);
+            let viz_samples = frames_written * 2; // stereo
+            let pre_fader = self.state.is_pre_fader();
+            let viz_scale = if pre_fader && gain > 0.0 { 1.0 / gain } else { 1.0 };
+            if viz_samples > 0 {
+                if channels == 2 && viz_scale == 1.0 && viz_samples <= data.len() {
+                    // Fast path: post-fader stereo bulk copy
+                    let _ = self.viz_producer.push_partial_slice(&data[..viz_samples]);
+                } else if self.viz_producer.slots() >= viz_samples {
+                    if let Ok(mut vchunk) = self.viz_producer.write_chunk(viz_samples) {
+                        let (vfirst, vsecond) = vchunk.as_mut_slices();
+                        let viz_total = vfirst.len() + vsecond.len();
+
+                        // Scaled path: extract L/R, apply viz_scale
+                        let mut vi = 0;
+                        for f in 0..frames_written {
+                            let di = f * channels;
+                            if di >= data.len() { break; }
+                            let l = data[di] * viz_scale;
+                            let r = if channels >= 2 && di + 1 < data.len() {
+                                data[di + 1] * viz_scale
+                            } else {
+                                l
+                            };
+                            for &val in &[l, r] {
+                                if vi >= viz_total { break; }
+                                if vi < vfirst.len() {
+                                    vfirst[vi] = val;
+                                } else {
+                                    vsecond[vi - vfirst.len()] = val;
+                                }
+                                vi += 1;
+                            }
+                        }
+                        vchunk.commit_all();
+                    }
+                }
+            }
+
+            // Fill remainder with silence
+            data[out_idx..].fill(0.0);
+        } else {
+            data.fill(0.0);
+        }
+    }
+
+    /// Render into any output sample type: through `render_f32` into the
+    /// preallocated scratch, then an exact conversion per sample.
+    pub(crate) fn render<T: OutputSample>(&mut self, data: &mut [T]) {
+        let ch = self.channels.max(1);
+        let step = (RENDER_SCRATCH / ch).max(1) * ch; // whole frames only
+        // Swap the scratch out so render_f32 can borrow self; Vec::new() does
+        // not allocate, and the buffer is put back below.
+        let mut scratch = std::mem::take(&mut self.scratch);
+        if scratch.len() < step {
+            scratch.resize(step, 0.0); // only for a device wider than the scratch
+        }
+        for out in data.chunks_mut(step) {
+            let buf = &mut scratch[..out.len()];
+            self.render_f32(buf);
+            for (o, &x) in out.iter_mut().zip(buf.iter()) {
+                *o = T::from_f32(x);
+            }
+        }
+        self.scratch = scratch;
+    }
+}
+
+/// Build the output stream. `format` is the sample format handed to the device:
+/// F32 everywhere today (CoreAudio and shared-mode mixers convert themselves);
+/// the integer formats are for outputs that talk to hardware directly.
 pub fn build_stream(
     device: &cpal::Device,
     config: &StreamConfig,
-    mut consumer: Consumer<f32>,
-    mut viz_producer: Producer<f32>,
+    format: cpal::SampleFormat,
+    consumer: Consumer<f32>,
+    viz_producer: Producer<f32>,
     state: Arc<PlayerState>,
 ) -> Result<Stream, Box<dyn std::error::Error>> {
     let channels = config.channels as usize;
     let err_state = Arc::clone(&state);
-
-    let stream = device.build_output_stream(
-        *config,
-        move |data: &mut [f32], _| {
-            let paused = state.is_paused();
-
-            // Check if seek happened - drain buffer immediately for instant response
-            if state.reset_consumer_counter.swap(false, Ordering::AcqRel) {
-                // Drain all buffered samples instantly
-                let to_drain = consumer.slots();
-                if to_drain > 0 {
-                    if let Ok(chunk) = consumer.read_chunk(to_drain) {
-                        chunk.commit_all(); // Discard without processing
+    let mut r = OutputRenderer::new(consumer, viz_producer, state, channels);
+    let on_error = move |e: cpal::Error| {
+                // cpal's error callback can run on audio-thread adjacent paths; avoid
+                // I/O here — only atomics. The main loop acts on them.
+                use std::sync::atomic::Ordering;
+                let exclusive = err_state.exclusive.load(Ordering::Relaxed);
+                match classify_stream_error(e.kind(), exclusive) {
+                    StreamErrorAction::Glitch => {
+                        err_state.xrun_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    StreamErrorAction::Rerouted => {
+                        err_state.device_rerouted.store(true, Ordering::Relaxed);
+                    }
+                    StreamErrorAction::Rebuild => {
+                        err_state.stream_error.store(true, Ordering::Relaxed);
                     }
                 }
-                data.fill(0.0);
-                return;
-            }
-
-            // Use chunk reads for efficiency
-            let available = consumer.slots();
-
-            // Update buffer level so main thread can detect track end
-            state.buffer_level.store(available, Ordering::Relaxed);
-
-            if paused || available == 0 {
-                // Output silence
-                data.fill(0.0);
-                return;
-            }
-
-            // Ring buffer always contains stereo (2ch) samples
-            // Guard: channels must be >= 1 to avoid division by zero
-            if channels == 0 {
-                data.fill(0.0);
-                return;
-            }
-
-            let source_channels = 2usize; // Our ring buffer is always stereo
-            let frames_needed = data.len() / channels;
-            let samples_to_read = (frames_needed * source_channels).min(available);
-
-            if let Ok(chunk) = consumer.read_chunk(samples_to_read) {
-                let (first, second) = chunk.as_slices();
-                let gain = state.volume_gain();
-
-                // Process both ring buffer slices sequentially (no heap allocation)
-                // out_step: always need at least 2 free slots (L+R) even for mono downmix
-                let mut out_idx = 0;
-                let slices: [&[f32]; 2] = [first, second];
-                let mut src_idx = 0;
-                let mut current_slice = 0;
-
-                while current_slice < 2 && out_idx < data.len() {
-                    let slice = slices[current_slice];
-                    if src_idx + 1 >= slice.len() {
-                        current_slice += 1;
-                        src_idx = 0;
-                        continue;
-                    }
-
-                    // Clamp post-gain to prevent DAC clipping. Producer only
-                    // flags clipping (state.clipping) — can't scale there since
-                    // volume may change between scan and this callback.
-                    let left = output_sample(slice[src_idx], gain);
-                    let right = output_sample(slice[src_idx + 1], gain);
-
-                    if channels == 1 {
-                        data[out_idx] = mono_fold(left, right);
-                    } else if out_idx + 1 < data.len() {
-                        data[out_idx] = left;
-                        data[out_idx + 1] = right;
-                        for ch in 2..channels {
-                            if out_idx + ch < data.len() {
-                                data[out_idx + ch] = 0.0;
-                            }
-                        }
-                    } else {
-                        break; // Not enough space for a full frame
-                    }
-
-                    out_idx += channels;
-                    src_idx += source_channels;
-                }
-
-                chunk.commit_all();
-
-                // Track playback position (frames consumed from ring buffer)
-                let consumed_frames = samples_to_read / source_channels;
-                state.samples_played.fetch_add(consumed_frames as u64, Ordering::Relaxed);
-
-                // Tap played stereo samples into viz buffer (best-effort, drop if full)
-                // Pre-fader mode: undo volume gain so viz shows raw signal levels
-                let frames_written = out_idx.checked_div(channels).unwrap_or(0);
-                let viz_samples = frames_written * 2; // stereo
-                let pre_fader = state.is_pre_fader();
-                let viz_scale = if pre_fader && gain > 0.0 { 1.0 / gain } else { 1.0 };
-                if viz_samples > 0 {
-                    if channels == 2 && viz_scale == 1.0 && viz_samples <= data.len() {
-                        // Fast path: post-fader stereo bulk copy
-                        let _ = viz_producer.push_partial_slice(&data[..viz_samples]);
-                    } else if viz_producer.slots() >= viz_samples {
-                        if let Ok(mut vchunk) = viz_producer.write_chunk(viz_samples) {
-                            let (vfirst, vsecond) = vchunk.as_mut_slices();
-                            let viz_total = vfirst.len() + vsecond.len();
-
-                            // Scaled path: extract L/R, apply viz_scale
-                            let mut vi = 0;
-                            for f in 0..frames_written {
-                                let di = f * channels;
-                                if di >= data.len() { break; }
-                                let l = data[di] * viz_scale;
-                                let r = if channels >= 2 && di + 1 < data.len() {
-                                    data[di + 1] * viz_scale
-                                } else {
-                                    l
-                                };
-                                for &val in &[l, r] {
-                                    if vi >= viz_total { break; }
-                                    if vi < vfirst.len() {
-                                        vfirst[vi] = val;
-                                    } else {
-                                        vsecond[vi - vfirst.len()] = val;
-                                    }
-                                    vi += 1;
-                                }
-                            }
-                            vchunk.commit_all();
-                        }
-                    }
-                }
-
-                // Fill remainder with silence
-                data[out_idx..].fill(0.0);
-            } else {
-                data.fill(0.0);
-            }
-
-        },
-        move |e: cpal::Error| {
-            // cpal's error callback can run on audio-thread adjacent paths; avoid
-            // I/O here — only atomics. The main loop acts on them.
-            use std::sync::atomic::Ordering;
-            let exclusive = err_state.exclusive.load(Ordering::Relaxed);
-            match classify_stream_error(e.kind(), exclusive) {
-                StreamErrorAction::Glitch => {
-                    err_state.xrun_count.fetch_add(1, Ordering::Relaxed);
-                }
-                StreamErrorAction::Rerouted => {
-                    err_state.device_rerouted.store(true, Ordering::Relaxed);
-                }
-                StreamErrorAction::Rebuild => {
-                    err_state.stream_error.store(true, Ordering::Relaxed);
-                }
-            }
-        },
-        None,
-    )?;
+            };
+    let stream = match format {
+        cpal::SampleFormat::F32 => device.build_output_stream(
+            *config, move |d: &mut [f32], _| r.render_f32(d), on_error, None)?,
+        cpal::SampleFormat::I32 => device.build_output_stream(
+            *config, move |d: &mut [i32], _| r.render(d), on_error, None)?,
+        cpal::SampleFormat::I24 => device.build_output_stream(
+            *config, move |d: &mut [cpal::I24], _| r.render(d), on_error, None)?,
+        cpal::SampleFormat::I16 => device.build_output_stream(
+            *config, move |d: &mut [i16], _| r.render(d), on_error, None)?,
+        other => return Err(format!("unsupported output sample format {other:?}").into()),
+    };
 
     Ok(stream)
 }
@@ -1352,5 +1805,220 @@ mod tests {
         assert_eq!(after.mSampleRate, before.mSampleRate, "rate restored");
         assert_eq!(after.mBitsPerChannel, before.mBitsPerChannel, "bit depth restored");
         assert_eq!(after.mFormatFlags, before.mFormatFlags, "format flags restored");
+    }
+
+    #[test]
+    fn integer_output_is_exact_for_every_source_depth() {
+        // x = v / 2^(src-1) is what decode delivers for a src-bit integer v.
+        // Into any integer format at least as deep, the conversion must land
+        // on v exactly (shifted to the wider format) — bit-perfect needs it.
+        let ints16 = [i16::MIN as i32, -12_345, -1, 0, 1, 12_345, i16::MAX as i32];
+        for v in ints16 {
+            let x = v as f32 / 32_768.0;
+            assert_eq!(<i16 as OutputSample>::from_f32(x) as i32, v, "16 -> i16");
+            assert_eq!(<cpal::I24 as OutputSample>::from_f32(x).inner(), v << 8, "16 -> i24");
+            assert_eq!(<i32 as OutputSample>::from_f32(x), v << 16, "16 -> i32");
+        }
+        let ints24 = [-8_388_608, -5_000_001, -1, 0, 1, 5_000_001, 8_388_607];
+        for v in ints24 {
+            let x = v as f32 / 8_388_608.0;
+            assert_eq!(<cpal::I24 as OutputSample>::from_f32(x).inner(), v, "24 -> i24");
+            assert_eq!(<i32 as OutputSample>::from_f32(x), v << 8, "24 -> i32");
+        }
+        // Full scale (+1.0, reachable from float sources / DSP) clamps to max.
+        assert_eq!(<i16 as OutputSample>::from_f32(1.0), i16::MAX);
+        assert_eq!(<i32 as OutputSample>::from_f32(1.0), i32::MAX);
+        assert_eq!(<cpal::I24 as OutputSample>::from_f32(1.0).inner(), 8_388_607);
+        assert_eq!(<i16 as OutputSample>::from_f32(-1.0), i16::MIN);
+    }
+
+    #[test]
+    fn integer_render_is_the_float_render_converted() {
+        // The integer path must deliver exactly what the float path does —
+        // same ring handling, same gain — only converted.
+        let make = |chans: usize| {
+            let st = Arc::new(PlayerState::new());
+            st.volume.store(100, Ordering::Relaxed);
+            let (mut p, c) = rtrb::RingBuffer::<f32>::new(4096);
+            let (vp, _vc) = rtrb::RingBuffer::<f32>::new(4096);
+            let src: Vec<f32> = (0i32..1024).map(|i| ((i * 7919 % 16_384) - 8_192) as f32 / 8_192.0 * 0.9).collect();
+            p.push_entire_slice(&src).unwrap();
+            OutputRenderer::new(c, vp, st, chans)
+        };
+        for chans in [1usize, 2, 4] {
+            let mut a = make(chans);
+            let mut b = make(chans);
+            let mut f = vec![0.0f32; 300 * chans];
+            let mut n = vec![0i32; 300 * chans];
+            a.render_f32(&mut f);
+            b.render(&mut n);
+            for (i, (&x, &y)) in f.iter().zip(&n).enumerate() {
+                assert_eq!(y, <i32 as OutputSample>::from_f32(x), "{chans}ch sample {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_output_callback_keeps_its_contract() {
+        let setup = |chans: usize| {
+            let st = Arc::new(PlayerState::new());
+            st.volume.store(100, Ordering::Relaxed);
+            let (mut p, c) = rtrb::RingBuffer::<f32>::new(64);
+            let (vp, _vc) = rtrb::RingBuffer::<f32>::new(64);
+            p.push_entire_slice(&[0.5, -0.25, 0.125, -0.0625]).unwrap(); // 2 stereo frames
+            (Arc::clone(&st), OutputRenderer::new(c, vp, st, chans))
+        };
+        // Paused: silence, and nothing consumed.
+        let (st, mut r) = setup(2);
+        st.paused.store(true, Ordering::Relaxed);
+        let mut out = [9.0f32; 4];
+        r.render_f32(&mut out);
+        assert_eq!(out, [0.0; 4]);
+        assert_eq!(st.samples_played.load(Ordering::Relaxed), 0);
+        // Unpaused: the frames play, the clock advances by 2 frames.
+        st.paused.store(false, Ordering::Relaxed);
+        r.render_f32(&mut out);
+        assert_eq!(out, [0.5, -0.25, 0.125, -0.0625]);
+        assert_eq!(st.samples_played.load(Ordering::Relaxed), 2);
+        // A drain request discards the ring and outputs silence.
+        let (st, mut r) = setup(2);
+        st.reset_consumer_counter.store(true, Ordering::Release);
+        let mut out = [9.0f32; 4];
+        r.render_f32(&mut out);
+        assert_eq!(out, [0.0; 4]);
+        assert!(!st.reset_consumer_counter.load(Ordering::Acquire), "drain acknowledged");
+        r.render_f32(&mut out);
+        assert_eq!(out, [0.0; 4], "ring was emptied");
+        // 4-channel device: L/R in the first two, the rest silent.
+        let (_st, mut r) = setup(4);
+        let mut out = [9.0f32; 8];
+        r.render_f32(&mut out);
+        assert_eq!(out, [0.5, -0.25, 0.0, 0.0, 0.125, -0.0625, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn any_card_pcm_maps_to_its_raw_hw_device() {
+        // Exclusive mode on Linux needs the raw hw: PCM — the one that plays
+        // exactly what it is sent. The friendly name is shared by hw:, plughw:,
+        // front:, sysdefault: ... of the same card.
+        assert_eq!(hw_pcm_id_for("hw:CARD=KA17,DEV=0").as_deref(), Some("hw:CARD=KA17,DEV=0"));
+        assert_eq!(hw_pcm_id_for("front:CARD=KA17,DEV=0").as_deref(), Some("hw:CARD=KA17,DEV=0"));
+        assert_eq!(hw_pcm_id_for("plughw:CARD=0,DEV=1").as_deref(), Some("hw:CARD=0,DEV=1"));
+        assert_eq!(hw_pcm_id_for("sysdefault:CARD=KA17").as_deref(), Some("hw:CARD=KA17,DEV=0"));
+        assert_eq!(hw_pcm_id_for("hw:1,0").as_deref(), Some("hw:CARD=1,DEV=0"));
+        // Sound servers and the default route name no card: nothing to own.
+        for id in ["default", "pipewire", "pulse", "sysdefault"] {
+            assert_eq!(hw_pcm_id_for(id), None, "{id}");
+        }
+    }
+
+    #[test]
+    fn a_hw_device_gets_its_deepest_format_at_the_rate() {
+        use cpal::SampleFormat as F;
+        let r = |format, min, max| FormatRange { format, channels: 2, min, max };
+        let dac = [r(F::I16, 44_100, 192_000), r(F::I32, 44_100, 192_000), r(F::I24, 44_100, 96_000)];
+        assert_eq!(choose_output_format(&dac, 96_000, 2), Some((F::I32, 32)));
+        // Only packed 24 would beat 16 here, and cpal cannot open S24_3LE: 16
+        // is what is left (the caller warns about it).
+        let only16 = [r(F::I16, 44_100, 48_000)];
+        assert_eq!(choose_output_format(&only16, 44_100, 2), Some((F::I16, 16)));
+        // 32-bit float carries 24 exact bits: better than 16, ties 24 integer.
+        let f_or_16 = [r(F::I16, 48_000, 48_000), r(F::F32, 48_000, 48_000)];
+        assert_eq!(choose_output_format(&f_or_16, 48_000, 2), Some((F::F32, 24)));
+        let f_or_24 = [r(F::F32, 48_000, 48_000), r(F::I24, 48_000, 48_000)];
+        assert_eq!(choose_output_format(&f_or_24, 48_000, 2), Some((F::I24, 24)));
+        // A rate or channel count the device does not list: no format.
+        assert_eq!(choose_output_format(&dac, 352_800, 2), None);
+        assert_eq!(choose_output_format(&dac, 44_100, 6), None);
+    }
+
+    #[test]
+    fn a_busy_device_is_recognised_through_the_boxed_error() {
+        let busy: Box<dyn std::error::Error> = Box::new(cpal::Error::new(cpal::ErrorKind::DeviceBusy));
+        assert!(is_device_busy(busy.as_ref()));
+        let other: Box<dyn std::error::Error> = Box::new(cpal::Error::new(cpal::ErrorKind::UnsupportedConfig));
+        assert!(!is_device_busy(other.as_ref()));
+        let text: Box<dyn std::error::Error> = "some other failure".into();
+        assert!(!is_device_busy(text.as_ref()));
+    }
+
+    #[test]
+    fn the_linux_device_list_shows_routes_and_one_line_per_card_output() {
+        // A typical PipeWire laptop with a USB DAC: 20+ ALSA PCMs for two cards.
+        let d = |id: &str, name: &str| ListedDevice { id: id.into(), name: name.into(), default: id == "default" };
+        let devs = vec![
+            d("default", "Default ALSA Output (currently PipeWire Media Server)"),
+            d("pipewire", "PipeWire Sound Server"),
+            d("pulse", "PulseAudio Sound Server"),
+            d("null", "Discard all samples (playback) or generate zero samples (capture)"),
+            d("samplerate", "Rate Converter Plugin Using Samplerate Library"),
+            d("sysdefault:CARD=KA17", "FIIO KA17, USB Audio"),
+            d("front:CARD=KA17,DEV=0", "FIIO KA17, USB Audio"),
+            d("surround51:CARD=KA17,DEV=0", "FIIO KA17, USB Audio"),
+            d("iec958:CARD=KA17,DEV=0", "FIIO KA17, USB Audio"),
+            d("dmix:CARD=KA17,DEV=0", "FIIO KA17, USB Audio"),
+            d("hw:CARD=KA17,DEV=0", "FIIO KA17, USB Audio"),
+            d("plughw:CARD=KA17,DEV=0", "FIIO KA17, USB Audio"),
+            d("hw:CARD=PCH,DEV=0", "HDA Intel PCH, ALC3246 Analog"),
+            d("hw:CARD=PCH,DEV=3", "HDA Intel PCH, HDMI 0"),
+            d("hdmi:CARD=PCH,DEV=0", "HDA Intel PCH, HDMI 0"),
+            // Physical enumeration repeats the same hardware under numeric names.
+            d("hw:CARD=1,DEV=0", "FIIO KA17, USB Audio"),
+            d("plughw:CARD=1,DEV=0", "FIIO KA17, USB Audio"),
+            d("hw:CARD=0,DEV=0", "HDA Intel PCH, ALC3246 Analog"),
+        ];
+        let lines = compact_device_list(&devs, true);
+        let text = lines.join("\n");
+        // Routes for normal mode, marked default; internal plugins hidden.
+        assert!(text.contains("default") && text.contains("(default)") && text.contains("pipewire"));
+        assert!(!text.contains("samplerate") && !text.contains("Discard all samples"));
+        // One line per card output, by its hw: id; everything else of a card hidden.
+        for id in ["hw:CARD=KA17,DEV=0", "hw:CARD=PCH,DEV=0", "hw:CARD=PCH,DEV=3"] {
+            assert_eq!(lines.iter().filter(|l| l.contains(id)).count(), 1, "{id} once:\n{text}");
+        }
+        for hidden in ["front:", "surround51", "iec958", "dmix", "plughw", "sysdefault:CARD", "hdmi:CARD", "CARD=1,", "CARD=0,"] {
+            assert!(!text.contains(hidden), "{hidden} should be hidden:\n{text}");
+        }
+        assert!(lines.len() <= 12, "compact list is {} lines:\n{text}", lines.len());
+    }
+
+    #[test]
+    fn other_platforms_list_one_line_per_device() {
+        let devs = vec![
+            ListedDevice { id: "AppleUSBAudioEngine:FiiO:1".into(), name: "FIIO KA17".into(), default: true },
+            ListedDevice { id: "BuiltInSpeakerDevice".into(), name: "MacBook Air Speakers".into(), default: false },
+        ];
+        let lines = compact_device_list(&devs, false);
+        let text = lines.join("\n");
+        assert!(text.contains("FIIO KA17") && text.contains("(default)") && text.contains("MacBook Air Speakers"));
+        assert_eq!(lines.iter().filter(|l| l.contains("FIIO KA17")).count(), 1);
+    }
+
+    #[test]
+    fn exclusive_output_packs_each_wasapi_layout_exactly() {
+        // A 24-bit sample v arrives from the renderer as i32 v << 8. Each
+        // layout must carry it exactly: 32/32 as-is, 24-in-32 with the unused
+        // low byte zero, packed 24 as three bytes, and 16-bit rounded.
+        let v24: i32 = -5_000_001;
+        let full = [v24 << 8];
+        let mut out = [0u8; 4];
+        pack_samples(&full, 32, 32, &mut out);
+        assert_eq!(i32::from_le_bytes(out), v24 << 8);
+        pack_samples(&[(v24 << 8) | 0x7F], 32, 24, &mut out);
+        assert_eq!(i32::from_le_bytes(out), v24 << 8, "low byte cleared for 24-in-32");
+        let mut p3 = [0u8; 3];
+        pack_samples(&full, 24, 24, &mut p3);
+        let back = i32::from_le_bytes([0, p3[0], p3[1], p3[2]]) >> 8;
+        assert_eq!(back, v24, "packed 24-bit");
+        let v16: i32 = -12_345;
+        let mut p2 = [0u8; 2];
+        pack_samples(&[v16 << 16], 16, 16, &mut p2);
+        assert_eq!(i16::from_le_bytes(p2) as i32, v16, "16-bit source exact");
+        pack_samples(&[i32::MAX], 16, 16, &mut p2);
+        assert_eq!(i16::from_le_bytes(p2), i16::MAX, "no wrap at full scale");
+        // Several samples: byte stride follows the store width.
+        let mut many = [0u8; 9];
+        pack_samples(&[1 << 8, 2 << 8, 3 << 8], 24, 24, &mut many);
+        assert_eq!(many, [1, 0, 0, 2, 0, 0, 3, 0, 0]);
     }
 }

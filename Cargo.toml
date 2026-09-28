@@ -49,6 +49,12 @@ icy_sixel = "0.7"
 [target.'cfg(target_os = "macos")'.dependencies]
 coreaudio-sys = "0.2"
 
+# WASAPI exclusive mode (Windows). cpal only opens SHARED mode, which always goes
+# through the Windows audio engine (mixed and resampled), so bit-perfect output
+# needs its own exclusive-mode path. By rubato's author; MIT.
+[target.'cfg(target_os = "windows")'.dependencies]
+wasapi = "0.24"
+
 # Windows icon embedding
 [target.'cfg(target_os = "windows")'.build-dependencies]
 winresource = "0.1"

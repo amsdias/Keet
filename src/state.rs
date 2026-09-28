@@ -228,16 +228,58 @@ pub struct RateCaps {
 }
 
 impl RateCaps {
+    /// The one rate the device offers, when it offers exactly one — a driver
+    /// that locks its clock to its control panel's setting (Focusrite and
+    /// NVIDIA HDMI under WASAPI exclusive), so every other rate is resampled.
+    /// None for several rates, unknown caps, PipeWire (`any`) and forced
+    /// devices (`fixed`: Bluetooth).
+    pub fn locked_rate(&self) -> Option<u32> {
+        if self.fixed || self.any {
+            return None;
+        }
+        match self.ranges.as_slice() {
+            [(lo, hi)] if lo == hi => Some(*lo),
+            _ => None,
+        }
+    }
+
+    /// The rate a track at `desired` should play at on this device. Chosen from
+    /// the device's rates alone — never from what played before: keeping the
+    /// current rate whenever the file's was not offered made the result depend
+    /// on history (an HDA played 44.1 kHz at 48 until a 96 kHz track came
+    /// along, then at 96 for good).
     pub fn resolve(&self, desired: u32, current: u32) -> u32 {
-        let target = if self.max > 0 { desired.min(self.max) } else { desired };
-        if target == current || self.fixed {
+        if self.fixed {
             return current;
         }
-        if self.any || self.ranges.iter().any(|&(lo, hi)| lo <= target && target <= hi) {
-            target
-        } else {
-            current
+        if self.any {
+            return if self.max > 0 { desired.min(self.max) } else { desired };
         }
+        self.best_rate(desired).unwrap_or(current)
+    }
+
+    fn supports(&self, rate: u32) -> bool {
+        self.ranges.iter().any(|&(lo, hi)| lo <= rate && rate <= hi)
+    }
+
+    /// In order: the file's own rate; a whole-number ratio of it (x2, /2, x4,
+    /// /4, x8, /8) — resampling 352.8k to 176.4k is a clean 2:1 where capping
+    /// to 192k was not; the lowest offered rate above the file's; the highest
+    /// offered at all.
+    fn best_rate(&self, desired: u32) -> Option<u32> {
+        if self.supports(desired) {
+            return Some(desired);
+        }
+        for k in [2u32, 4, 8] {
+            if let Some(up) = desired.checked_mul(k).filter(|r| self.supports(*r)) {
+                return Some(up);
+            }
+            if desired.is_multiple_of(k) && self.supports(desired / k) {
+                return Some(desired / k);
+            }
+        }
+        let offered = self.ranges.iter().flat_map(|&(lo, hi)| [lo, hi]);
+        offered.clone().filter(|&r| r > desired).min().or_else(|| offered.max())
     }
 }
 
@@ -887,6 +929,8 @@ pub struct UiState {
     pub repeat_mode: RepeatMode,
     pub enqueue_count: usize,
     pub status_message: Option<(String, Instant)>,
+    /// How long `status_message` stays up (2 s unless set_status_for).
+    pub status_hold: std::time::Duration,
     pub metadata_cache: std::sync::Arc<crate::metadata::MetadataCache>,
     pub scan_handle: Option<JoinHandle<()>>,
     /// One-shot flag: when the background scan finishes and we're not shuffling,
@@ -989,6 +1033,7 @@ impl UiState {
             repeat_mode: RepeatMode::Off,
             enqueue_count: 0,
             status_message: None,
+            status_hold: std::time::Duration::from_secs(2),
             metadata_cache,
             scan_handle: None,
             auto_sort_pending: false,
@@ -1034,12 +1079,26 @@ impl UiState {
 
     pub fn set_status(&mut self, msg: String) {
         self.status_message = Some((msg, Instant::now()));
+        self.status_hold = std::time::Duration::from_secs(2);
     }
 
+    /// A status message that stays up for `hold` — for notices that matter
+    /// more than a key's confirmation (e.g. exclusive mode falling back).
+    pub fn set_status_for(&mut self, msg: String, hold: std::time::Duration) {
+        self.status_message = Some((msg, Instant::now()));
+        self.status_hold = hold;
+    }
+
+    /// The status message, cut to fit the window. Every theme prints it after
+    /// a 2-column indent on a single frame line; a longer one (a device name
+    /// plus an explanation) wrapped into a row the frame never counted.
     pub fn active_status(&mut self) -> Option<String> {
         if let Some((ref msg, when)) = self.status_message {
-            if when.elapsed() < std::time::Duration::from_secs(2) {
-                return Some(msg.clone());
+            if when.elapsed() < self.status_hold {
+                return Some(match crossterm::terminal::size() {
+                    Ok((cols, _)) => crate::ansi::truncate_plain(msg, (cols as usize).saturating_sub(3).max(1)),
+                    Err(_) => msg.clone(),
+                });
             }
             self.status_message = None;
         }
@@ -1055,7 +1114,8 @@ mod state_tests {
     fn rate_caps_predict_what_a_switch_can_reach() {
         let dac = RateCaps { ranges: vec![(44_100, 44_100), (48_000, 192_000)], max: 192_000, ..Default::default() };
         assert_eq!(dac.resolve(96_000, 44_100), 96_000, "supported rate switches");
-        assert_eq!(dac.resolve(352_800, 48_000), 192_000, "capped to the device max");
+        // Too high for the device: the whole-number ratio (2:1), not the max.
+        assert_eq!(dac.resolve(352_800, 48_000), 176_400, "352.8k -> 176.4k, not 192k");
         let only48 = RateCaps { ranges: vec![(48_000, 48_000)], max: 48_000, ..Default::default() };
         assert_eq!(only48.resolve(44_100, 48_000), 48_000, "unsupported rate: no switch");
         let bt = RateCaps { fixed: true, max: 48_000, ..Default::default() };
@@ -1065,7 +1125,59 @@ mod state_tests {
     }
 
     #[test]
-    fn clock_starts_when_the_tracks_own_audio_does() {
+    fn an_unsupported_rate_resolves_the_same_way_whatever_played_before() {
+        // Intel HDA as ALSA lists it: 48/96/192 only. A 44.1 kHz track used to
+        // stay at whatever rate the device last had — 48 until a 96 kHz track
+        // came along, then 96 for good. The answer must not depend on history.
+        let hda = RateCaps {
+            ranges: vec![(48_000, 48_000), (96_000, 96_000), (192_000, 192_000)],
+            max: 192_000,
+            ..Default::default()
+        };
+        for current in [48_000, 96_000, 192_000] {
+            assert_eq!(hda.resolve(44_100, current), 48_000, "44.1k from {current}");
+            assert_eq!(hda.resolve(88_200, current), 96_000, "88.2k from {current}");
+            assert_eq!(hda.resolve(48_000, current), 48_000);
+        }
+        // A family multiple beats the next rate up: 22.05k -> 44.1k (2:1).
+        let dac = RateCaps { ranges: vec![(44_100, 44_100), (48_000, 48_000)], max: 48_000, ..Default::default() };
+        assert_eq!(dac.resolve(22_050, 48_000), 44_100);
+        // Nothing at or above: the highest the device has.
+        assert_eq!(dac.resolve(384_000, 44_100), 48_000);
+    }
+
+    #[test]
+    fn unknown_rate_caps_do_not_block_a_switch() {
+        // A failed capability probe must not read as "only the current rate":
+        // with no caps, the requested rate goes through (the switch itself
+        // then verifies it with the device).
+        let st = PlayerState::new();
+        assert_eq!(st.exclusive_target_rate(96_000, 48_000), 96_000);
+        *st.exclusive_caps.lock().unwrap() =
+            Some(RateCaps { ranges: vec![(44_100, 192_000)], max: 192_000, ..Default::default() });
+        assert_eq!(st.exclusive_target_rate(96_000, 48_000), 96_000);
+    }
+
+    #[test]
+    fn a_driver_offering_one_rate_is_reported_as_locked() {
+        // Focusrite's WASAPI driver (and NVIDIA HDMI) accept exclusive mode
+        // only at the rate set in their control panel: say so, since every
+        // other rate is resampled.
+        let one = RateCaps { ranges: vec![(96_000, 96_000)], max: 96_000, ..Default::default() };
+        assert_eq!(one.locked_rate(), Some(96_000));
+        let many = RateCaps { ranges: vec![(44_100, 44_100), (96_000, 96_000)], max: 96_000, ..Default::default() };
+        assert_eq!(many.locked_rate(), None);
+        let span = RateCaps { ranges: vec![(44_100, 192_000)], max: 192_000, ..Default::default() };
+        assert_eq!(span.locked_rate(), None);
+        // Unknown, "anything goes" (PipeWire) and forced (Bluetooth) are not a
+        // driver lock worth a message.
+        assert_eq!(RateCaps::default().locked_rate(), None);
+        assert_eq!(RateCaps { any: true, ..one.clone() }.locked_rate(), None);
+        assert_eq!(RateCaps { fixed: true, ..one }.locked_rate(), None);
+    }
+
+    #[test]
+        fn clock_starts_when_the_tracks_own_audio_does() {
         // 0.5 s of the previous track is still queued when this track's clock
         // is zeroed; the clock must hold at 0 until those frames have played.
         let st = PlayerState::new();

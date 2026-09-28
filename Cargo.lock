@@ -797,6 +797,7 @@ dependencies = [
  "symphonia",
  "unicode-width",
  "ureq",
+ "wasapi",
  "winresource",
 ]
 
@@ -2185,6 +2186,19 @@ checksum = "29790946404f91d9c5d06f9874efddea1dc06c5efe94541a7d6863108e3a5e4b"
 dependencies = [
  "same-file",
  "winapi-util",
+]
+
+[[package]]
+name = "wasapi"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee144c215d8d31e94c1a599fbaf540ca82a7017e4f1786816b179f334fac751d"
+dependencies = [
+ "log",
+ "num-integer",
+ "thiserror 2.0.20",
+ "windows 0.62.2",
+ "windows-core",
 ]
 
 [[package]]

@@ -2093,6 +2093,20 @@ mod chain_tests {
         v
     }
 
+    /// Push samples through the REAL output callback (`OutputRenderer`) at
+    /// 100% volume on a stereo device, rendering to sample type T.
+    fn through_callback<T: crate::audio::OutputSample>(samples: &[f32]) -> Vec<T> {
+        let st = Arc::new(PlayerState::new());
+        st.volume.store(100, Ordering::Relaxed);
+        let (mut p, c) = rtrb::RingBuffer::<f32>::new(samples.len().max(2));
+        let (vp, _vc) = rtrb::RingBuffer::<f32>::new(samples.len().max(2));
+        p.push_entire_slice(samples).unwrap();
+        let mut r = crate::audio::OutputRenderer::new(c, vp, st, 2);
+        let mut out = vec![T::EQUILIBRIUM; samples.len()];
+        r.render(&mut out);
+        out
+    }
+
     fn assert_output_stage_is_identity(out: &[f32]) {
         let st = PlayerState::new();
         st.volume.store(100, Ordering::Relaxed);
@@ -2132,6 +2146,19 @@ mod chain_tests {
                     }
                 }
                 assert_output_stage_is_identity(&out);
+
+                // Through the real callback: the float output is untouched, and
+                // a 32-bit integer output (an ALSA hw: / WASAPI exclusive
+                // device) receives the source integers exactly, shifted up.
+                let delivered: Vec<f32> = through_callback(&out);
+                assert!(delivered.iter().zip(&out).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "{bits}-bit/{channels}ch: the callback changed float samples");
+                let as_i32: Vec<i32> = through_callback(&out);
+                for (i, &o) in out.iter().enumerate() {
+                    let v = (o as f64 * scale) as i32;
+                    assert_eq!(as_i32[i], v << (32 - bits as u32),
+                        "{bits}-bit/{channels}ch sample {i}: integer output is not the source value");
+                }
             }
         }
     }

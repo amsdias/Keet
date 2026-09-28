@@ -191,6 +191,7 @@ fn process_stats() -> (u64, u64) {
 fn process_stats() -> (u64, u64) {
     use std::ffi::c_void;
     #[repr(C)]
+    #[allow(clippy::upper_case_acronyms)] // mirrors the Win32 type name
     struct FILETIME { low: u32, high: u32 }
     // Extended version includes PrivateUsage (matches Task Manager's "Memory" column)
     #[repr(C)]

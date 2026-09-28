@@ -28,6 +28,8 @@ mod crossfeed;
 mod metadata;
 mod lyrics;
 mod cover;
+#[cfg(target_os = "windows")]
+mod wasapi_out;
 
 use std::env;
 use std::io::{self, Write};
@@ -37,7 +39,7 @@ use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::traits::{DeviceTrait, HostTrait};
 use cpal::StreamConfig;
 use crossterm::terminal;
 use rtrb::RingBuffer;
@@ -49,6 +51,22 @@ use decode::{decode_playlist, await_consumer_drain};
 use playlist::{build_playlist, shuffle_list};
 use ui::{print_status, poll_input, poll_auto_sort, poll_library_tree, arm_auto_sort, format_time};
 use resume::{ResumeState, save_state, load_state};
+
+/// Exclusive mode on a device whose driver offers a single rate (Focusrite and
+/// NVIDIA HDMI under WASAPI lock their clock to the control panel's setting):
+/// say so, or every other rate is resampled with no hint why.
+fn locked_rate_note(state: &PlayerState, device: &cpal::Device) -> Option<String> {
+    let rate = state.exclusive_caps.lock().ok()?.as_ref()?.locked_rate()?;
+    let name = device
+        .description()
+        .map(|d| d.name().trim().to_string())
+        .unwrap_or_else(|_| "the device".into());
+    let khz = format!("{:.1}", rate as f64 / 1000.0);
+    let khz = khz.trim_end_matches(".0");
+    Some(format!(
+        "{name}: rate locked at {khz} kHz by its driver — other rates are resampled (set it in the device's control panel)"
+    ))
+}
 
 /// Exclusive mode: put the DAC at its most precise physical format for `rate`
 /// (Keet otherwise set only the rate, so a DAC left at 16-bit in Audio MIDI
@@ -378,7 +396,7 @@ fn build_resume_state(
 /// result because the fallback path can land on a different rate than the one
 /// requested — a caller that kept its own copy then spawned the producer
 /// resampling for the rejected rate, playing everything off-speed.
-type StreamParts = (rtrb::Producer<f32>, rtrb::Consumer<f32>, cpal::Stream, u32);
+type StreamParts = (rtrb::Producer<f32>, rtrb::Consumer<f32>, audio::Output, u32);
 
 fn rebuild_stream(
     device: &cpal::Device,
@@ -391,6 +409,35 @@ fn rebuild_stream(
     state.ring_capacity.store(ring_cap, Ordering::Relaxed);
     let (prod, cons) = RingBuffer::<f32>::new(ring_cap);
     let (viz_prod, viz_cons) = RingBuffer::<f32>::new(VIZ_BUFFER_SIZE);
+
+    // Windows exclusive mode: Keet's own WASAPI exclusive stream (cpal only
+    // opens shared mode), in the most precise layout the device accepts at
+    // this rate. A device in use comes back as DeviceBusyError.
+    #[cfg(target_os = "windows")]
+    if state.exclusive.load(Ordering::Relaxed) {
+        let id = device.id().map(|i| i.id().to_string())?;
+        // No layout found usually means another program holds the device (the
+        // probe cannot tell); opening anyway reports THAT, or the device's own
+        // reason if the rate really is unsupported.
+        let layout = crate::wasapi_out::best_layout(&id, stream_rate, channels).unwrap_or((32, 24));
+        let out = crate::wasapi_out::WasapiOutput::start(
+            &id, stream_rate, channels, layout, cons, viz_prod, Arc::clone(state),
+        )
+        .map_err(|e| -> Box<dyn std::error::Error> {
+            if audio::is_device_busy(e.as_ref()) {
+                format!(
+                    "the output device is busy: another program is using it exclusively. \
+                     Close it (or turn off \"Allow applications to take exclusive control\" for it), \
+                     then try again ({e})"
+                ).into()
+            } else {
+                e
+            }
+        })?;
+        state.output_bits.store(layout.1 as u32, Ordering::Relaxed);
+        return Ok((prod, viz_cons, audio::Output::Wasapi(out), stream_rate));
+    }
+
     // `channels` is the DEVICE's channel count, not the ring's. The ring is
     // always stereo; the audio callback fans it out to however many channels
     // the device wants (mono duplicates, >2 leaves the extras silent).
@@ -405,8 +452,33 @@ fn rebuild_stream(
         sample_rate: stream_rate,
         buffer_size,
     };
-    let stream = match build_stream(device, &config, cons, viz_prod, Arc::clone(state)) {
+    // Float everywhere except Linux exclusive mode, where a raw hw: device is
+    // opened in the integer format that carries the most bits exactly.
+    let exclusive = state.exclusive.load(Ordering::Relaxed);
+    let (format, bits) = audio::output_format(device, stream_rate, channels, exclusive);
+    if exclusive && cfg!(target_os = "linux") {
+        state.output_bits.store(bits, Ordering::Relaxed);
+        if bits == 16 {
+            // cpal cannot open packed 24-bit (S24_3LE), so a DAC offering only
+            // that and 16-bit is left with 16: say so rather than truncate
+            // 24-bit files in silence.
+            if let Ok(mut err) = state.decode_error.lock() {
+                *err = Some("device accepts only 16-bit here — 24-bit files are rounded to 16".to_string());
+            }
+        }
+    }
+    let stream = match build_stream(device, &config, format, cons, viz_prod, Arc::clone(state)) {
         Ok(s) => s,
+        // A busy device (another program — usually PipeWire or PulseAudio —
+        // holds the ALSA hw: device) cannot be fixed by a fallback config: say
+        // what is wrong and what to do instead.
+        Err(e) if audio::is_device_busy(e.as_ref()) => {
+            return Err(format!(
+                "the output device is busy: another program is using it (on Linux usually \
+                 PipeWire or PulseAudio holding the card). Exclusive mode needs the card to \
+                 itself — use a card no sound server is using, or free it first ({e})"
+            ).into());
+        }
         Err(e) => {
             // Last resort: take the device's default config verbatim. Rebuilds
             // the rings because the rate may differ from what we asked for.
@@ -440,11 +512,11 @@ fn rebuild_stream(
                 sample_rate: rate,
                 buffer_size: cpal::BufferSize::Default,
             };
-            let s = build_stream(device, &cfg, c, vp, Arc::clone(state))?;
-            return Ok((p, vc, s, rate));
+            let s = build_stream(device, &cfg, cpal::SampleFormat::F32, c, vp, Arc::clone(state))?;
+            return Ok((p, vc, audio::Output::Cpal(s), rate));
         }
     };
-    Ok((prod, viz_cons, stream, stream_rate))
+    Ok((prod, viz_cons, audio::Output::Cpal(stream), stream_rate))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -518,10 +590,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  -x, --crossfade <secs> Crossfade duration between tracks (0 = disabled)");
         println!("      --rg-mode <mode>   ReplayGain: track (default), album, or off");
         println!("      --device <name>    Output device (substring match)");
-        println!("      --exclusive        Exclusive mode: per-track sample rate, device lock (macOS)");
+        println!("      --exclusive        Exclusive mode: bit-perfect, per-track sample rate, device lock");
+        println!("                         (macOS: any device; Linux: a card's hw: device, see --list-devices)");
         println!("      --no-cover         Disable album cover display");
         println!("      --theme <name>     UI theme: classic (default), minimal, hifi");
         println!("      --list-devices     List available output devices and exit");
+        println!("      --verbose          With --list-devices: every device, with its formats");
         println!("  -h, --help             Show this help");
         println!();
         println!("\x1B[1mFORMATS\x1B[0m  MP3, FLAC, WAV, OGG, AAC/M4A, ALAC, AIFF");
@@ -579,7 +653,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Handle --list-devices (print and exit)
     if args.iter().any(|a| a == "--list-devices") {
         let host = cpal::default_host();
-        audio::list_output_devices(&host);
+        audio::list_output_devices(&host, args.iter().any(|a| a == "--verbose"));
         return Ok(());
     }
 
@@ -590,7 +664,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     print!("\x1Bc");
     io::stdout().flush().ok();
 
-    let flags = ["--shuffle", "-s", "--repeat", "-r", "--quality", "-q", "--eq", "-e", "--fx", "--crossfade", "-x", "--rg-mode", "--list-devices", "--device", "--exclusive", "--no-cover", "--theme", "--help", "-h"];
+    let flags = ["--shuffle", "-s", "--repeat", "-r", "--quality", "-q", "--eq", "-e", "--fx", "--crossfade", "-x", "--rg-mode", "--list-devices", "--verbose", "--device", "--exclusive", "--no-cover", "--theme", "--help", "-h"];
     // Loaded once and reused for the volume/EQ/device restore further down.
     let resume_state_loaded = if args.len() < 2 { load_state() } else { None };
     let (source_paths, shuffle, repeat_mode) = if args.len() < 2 {
@@ -1049,12 +1123,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         host.default_output_device().ok_or("No output device")?
     };
     // Exclusive mode binds to ONE device: the stream, hog mode and every rate
-    // switch must all be the same hardware. The default device's stream
-    // follows the system default, and hogging the default makes macOS move
-    // the default away — so pin it (see audio::pin_device).
+    // switch must all be the same hardware. macOS pins the device (hogging the
+    // default makes macOS move the default away); Linux resolves the card's raw
+    // hw: device. If that is impossible — a sound-server route on Linux, an
+    // unsupported platform — say why and continue in normal mode, with state
+    // agreeing (everything downstream reads state.exclusive).
+    let mut startup_note: Option<String> = None;
     if exclusive {
-        if let Some(pinned) = audio::pin_device(&host, &device) {
-            device = pinned;
+        match audio::prepare_exclusive_device(&host, &device) {
+            Ok(d) => device = d,
+            Err(e) => {
+                eprintln!("Note: {e}. Playing in normal mode.");
+                // The stderr note is wiped when the UI takes the screen; show
+                // it where it can be read (set just before playback starts).
+                startup_note = Some(format!("exclusive mode off: {e}"));
+                exclusive = false;
+                state.exclusive.store(false, Ordering::Relaxed);
+            }
         }
     }
 
@@ -1069,15 +1154,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // one track from resampling, resampled every other app on the DAC, never
     // switched again, and was never put back. Normal mode now plays at whatever
     // rate the device is set to and resamples every track the same way.
+    // Exclusive mode's rate capabilities are read first — before the startup
+    // rate is chosen (it goes through the same rule as every later switch)
+    // and BEFORE any stream opens: a Linux raw hw: device admits a single
+    // client, and listing its rates opens it — probed while our own stream had
+    // it, the query failed with EBUSY and read as "only 48 kHz", so no track
+    // ever switched rate.
+    if exclusive {
+        if let Ok(mut caps) = state.exclusive_caps.lock() {
+            *caps = audio::probe_rate_caps(&device);
+        }
+        if startup_note.is_none() {
+            startup_note = locked_rate_note(&state, &device);
+        }
+    }
     let persistent_output_rate = if exclusive {
-        set_output_sample_rate(source_rate, current_output_rate, &device)
+        let target = state.exclusive_target_rate(source_rate, current_output_rate);
+        set_output_sample_rate(target, current_output_rate, &device)
     } else {
         current_output_rate
     };
     apply_exclusive_bit_depth(&state, &device, persistent_output_rate);
-    let actual_device_rate = match device.default_output_config() {
-        Ok(config) => config.sample_rate(),
-        Err(_) => persistent_output_rate,
+    // Exclusive mode opens at the rate it chose. On macOS the device's default
+    // config reflects that rate (Keet set it); a Linux raw hw: device has no
+    // device-wide rate, and its default config is a fixed one (48 kHz) — so
+    // reading the rate back from there opened every session at 48 kHz.
+    let actual_device_rate = if exclusive {
+        persistent_output_rate
+    } else {
+        match device.default_output_config() {
+            Ok(config) => config.sample_rate(),
+            Err(_) => persistent_output_rate,
+        }
     };
     // Output channel count comes from the device, not an assumption. WASAPI
     // shared mode only accepts the mixer's own format, so a non-stereo device
@@ -1098,7 +1206,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })
             })
             .unwrap_or(false);
-        if rate_supported { actual_device_rate } else {
+        // Exclusive mode already checked the rate against the device itself.
+        // cpal's list is the SHARED-mode one — on Windows just the mixer's
+        // format — and would send a 44.1 kHz file back to 48 kHz here.
+        if exclusive || rate_supported { actual_device_rate } else {
             device.default_output_config()
                 .map(|c| c.sample_rate())
                 .unwrap_or(48000)
@@ -1125,13 +1236,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Set exclusive mode if requested (macOS only: hog mode + per-track rate switching)
     let mut hog_device_id: Option<u32> = None;
     if exclusive {
-        if let Ok(mut caps) = state.exclusive_caps.lock() {
-            *caps = Some(audio::probe_rate_caps(&device));
-        }
         match audio::set_exclusive_mode(&device) {
-            Ok(id) => {
+            Ok(Some(id)) => {
                 hog_device_id = Some(id);
                 println!("Exclusive mode: hog + per-track rate switching");
+            }
+            Ok(None) => {
+                if cfg!(target_os = "windows") {
+                    println!("Exclusive mode: WASAPI exclusive + per-track rate switching");
+                } else {
+                    println!("Exclusive mode: raw hardware device + per-track rate switching");
+                }
             }
             Err(e) => {
                 if cfg!(target_os = "macos") {
@@ -1163,6 +1278,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             save_state(&rs);
         }
     });
+
+    if let Some(note) = startup_note.take() {
+        ui.set_status_for(note, Duration::from_secs(10));
+    }
 
     'playlist: loop {
         if state.should_quit() { break; }
@@ -1668,9 +1787,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // cpal's rate listener, which ran a full recovery ("output
                     // moved", restart at the last whole second) on every switch.
                     drop(stream);
+                    // The same rule the producer used to predict this switch
+                    // (state::RateCaps::resolve): the file's rate, else a
+                    // whole-number ratio of it, else the next rate up — never
+                    // just capped to the device maximum (352.8k -> 192k).
                     let new_rate = state.next_track_rate.load(Ordering::Relaxed);
-                    let max_rate = audio::max_supported_rate(&device);
-                    let target_rate = new_rate.min(max_rate);
+                    let target_rate = state.exclusive_target_rate(new_rate, stream_rate);
                     let actual_rate = set_output_sample_rate(target_rate, stream_rate, &device);
                     apply_exclusive_bit_depth(&state, &device, actual_rate);
                     stream_rate = actual_rate;
@@ -1705,7 +1827,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // pinned again.
                 let replacement = if state.exclusive.load(Ordering::Relaxed) {
                     audio::pin_device(&host, &device).or_else(|| {
-                        host.default_output_device().and_then(|d| audio::pin_device(&host, &d))
+                        host.default_output_device()
+                            .and_then(|d| audio::prepare_exclusive_device(&host, &d).ok())
                     })
                 } else {
                     host.default_output_device()
@@ -1756,12 +1879,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(old_id) = hog_device_id.take() {
                             audio::release_exclusive_mode(old_id);
                         }
-                        if let Ok(id) = audio::set_exclusive_mode(&device) {
+                        if let Ok(Some(id)) = audio::set_exclusive_mode(&device) {
                             hog_device_id = Some(id);
                         }
                         // A new device means new reachable rates.
                         if let Ok(mut caps) = state.exclusive_caps.lock() {
-                            *caps = Some(audio::probe_rate_caps(&device));
+                            *caps = audio::probe_rate_caps(&device);
+                        }
+                        if let Some(note) = locked_rate_note(&state, &device) {
+                            ui.set_status_for(note, Duration::from_secs(10));
                         }
                     }
 

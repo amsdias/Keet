@@ -106,6 +106,7 @@ pub fn poll() {
 pub fn poll() {
     use std::ffi::c_void;
     #[repr(C)]
+    #[allow(clippy::upper_case_acronyms)] // mirrors the Win32 type name
     struct MSG {
         hwnd: *mut c_void,
         message: u32,
