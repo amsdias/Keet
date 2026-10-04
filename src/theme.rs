@@ -74,8 +74,10 @@ pub struct Palette {
     pub danger: &'static str,
     pub bold: &'static str,
     pub reset: &'static str,
-    /// Background tint for the cursor row in lists. Empty string = no tint.
-    pub cursor_bg: &'static str,
+    /// Highlight for the cursor row in lists: the accent as a background with
+    /// dark text over it. Empty = reverse video (Classic). Apply it through
+    /// [`cursor_row`], never by prefixing a coloured row.
+    pub cursor_hl: &'static str,
 }
 
 /// Box-drawing glyph set. Currently unused — both renderers emit literal
@@ -108,7 +110,7 @@ const CLASSIC_PAL: Palette = Palette {
     danger: "\x1B[31m",
     bold: "\x1B[1m",
     reset: "\x1B[0m",
-    cursor_bg: "",
+    cursor_hl: "",
 };
 
 // Minimal: warm cyan accent on the terminal default background. Truecolor for
@@ -124,7 +126,7 @@ const MINIMAL_PAL: Palette = Palette {
     danger: "\x1B[38;2;224;122;122m",
     bold: "\x1B[1m",
     reset: "\x1B[0m",
-    cursor_bg: "\x1B[48;2;24;27;28m",
+    cursor_hl: "\x1B[48;2;154;220;208m\x1B[38;2;16;20;22m",
 };
 
 // HiFi: amber palette per the design handoff. Truecolor throughout because
@@ -140,8 +142,23 @@ const HIFI_PAL: Palette = Palette {
     danger: "\x1B[1;38;2;224;122;74m",
     bold: "\x1B[1m",
     reset: "\x1B[0m",
-    cursor_bg: "\x1B[48;2;31;20;8m",
+    cursor_hl: "\x1B[48;2;255;179;71m\x1B[38;2;31;20;8m",
 };
+
+/// A list's cursor row: `row` as plain text on the theme's highlight, cut or
+/// padded to exactly `width` columns. The colours inside `row` are dropped on
+/// purpose — every cell of a coloured row ends in a reset, and a reset also
+/// clears the background, so prefixing one tinted only the first cell (the
+/// track number) and left the rest of the row looking unselected.
+pub fn cursor_row(p: &Palette, row: &str, width: usize) -> String {
+    let plain = crate::ansi::truncate_plain(&crate::ansi::strip_ansi(row), width);
+    let pad = " ".repeat(width.saturating_sub(crate::ansi::visible_len(&plain)));
+    if p.cursor_hl.is_empty() {
+        format!("\x1B[7m{plain}{pad}\x1B[27m")
+    } else {
+        format!("{}{plain}{pad}{}", p.cursor_hl, p.reset)
+    }
+}
 
 pub fn palette(kind: ThemeKind) -> &'static Palette {
     match kind {
@@ -177,6 +194,26 @@ mod theme_tests {
         assert_eq!(resolve_theme(None, None, Some(h())), ThemeKind::HiFi);
         // Nothing set → Classic.
         assert_eq!(resolve_theme(None, None, None), ThemeKind::Classic);
+    }
+
+    #[test]
+    fn cursor_row_highlights_the_whole_width_in_the_accent() {
+        for kind in [ThemeKind::Classic, ThemeKind::Minimal, ThemeKind::HiFi] {
+            let p = palette(kind);
+            // Coloured input: an inner reset used to end the highlight after
+            // the first cell, leaving only the number tinted.
+            let row = cursor_row(p, "\x1B[2m07\x1B[0m  Title  \x1B[2mArtist\x1B[0m", 30);
+            assert_eq!(crate::ansi::visible_len(&row), 30, "{kind:?}: {row:?}");
+            let body = row.trim_end_matches("\x1B[27m").trim_end_matches(p.reset);
+            assert!(!body.contains("\x1B[0m"), "{kind:?}: reset inside the highlight: {row:?}");
+            assert!(row.contains("07  Title  Artist"), "{kind:?}: {row:?}");
+            // Too long: cut, never wider than the row.
+            let long = cursor_row(p, &"x".repeat(50), 30);
+            assert_eq!(crate::ansi::visible_len(&long), 30);
+        }
+        // Minimal and HiFi highlight in their accent colour as a background.
+        assert!(palette(ThemeKind::Minimal).cursor_hl.contains("48;2;154;220;208"));
+        assert!(palette(ThemeKind::HiFi).cursor_hl.contains("48;2;255;179;71"));
     }
 
     #[test]

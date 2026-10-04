@@ -696,10 +696,10 @@ pub fn print_status_hifi_library(
                 dur = dur_padded,
             );
 
-            let line = if is_cursor && !p.cursor_bg.is_empty() {
+            let line = if is_cursor {
                 format!(
-                    "  {fg}│{rst}{bg}{body}{rst}{fg}│{rst}",
-                    fg = p.fg, rst = p.reset, bg = p.cursor_bg, body = body,
+                    "  {fg}│{rst}{hl}{fg}│{rst}",
+                    fg = p.fg, rst = p.reset, hl = crate::theme::cursor_row(p, &body, inner_w),
                 )
             } else {
                 format!(

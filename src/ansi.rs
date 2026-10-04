@@ -132,6 +132,23 @@ pub(crate) fn truncate_visible(s: &str, max: usize) -> String {
     out
 }
 
+/// The text with every ANSI escape sequence removed (all families, see
+/// [`escape_len`]).
+pub(crate) fn strip_ansi(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\x1B' {
+            i += escape_len(&chars, i);
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Make untrusted text (tags, filenames, LRCLIB lyrics) safe to put in a frame
 /// line: every control character — C0 (including ESC, `\n`, `\r`, tab), DEL
 /// and C1 (including the 8-bit CSI U+009B) — becomes a space. Printed raw, a

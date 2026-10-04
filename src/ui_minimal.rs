@@ -822,16 +822,9 @@ pub fn print_status_minimal_library(
                 time = dur_str,
             );
 
-            // Cursor row: bg-tint extending full width.
-            let line = if is_cursor && !p.cursor_bg.is_empty() {
-                let inner_visible = num_w + inter_gap + title_w + inter_gap
-                    + album_w + if album_w > 0 { inter_gap } else { 0 } + time_w;
-                let trail_pad = term_w.saturating_sub(2 + inner_visible);
-                format!(
-                    "{bg}  {body}{trail}{rst}",
-                    bg = p.cursor_bg, body = body,
-                    trail = " ".repeat(trail_pad), rst = p.reset,
-                )
+            // Cursor row: the accent highlight across the full width.
+            let line = if is_cursor {
+                crate::theme::cursor_row(p, &format!("  {body}"), term_w)
             } else {
                 format!("  {}", body)
             };

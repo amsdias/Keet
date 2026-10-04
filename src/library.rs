@@ -248,7 +248,7 @@ pub fn visible_rows_filtered(tree: &LibraryTree, query: &str) -> Vec<VisibleRow>
     rows
 }
 
-use crate::ansi::{truncate_visible, visible_len};
+use crate::ansi::truncate_visible;
 
 /// Render the tree body as indented lines using the active theme palette. Shared
 /// across all themes — a tree is structurally identical everywhere; only colors
@@ -306,16 +306,9 @@ pub fn render_library_tree(
             }
         };
         let line = if vi == cursor {
-            // Highlight the whole row. Use the theme's cursor tint when it has
-            // one; otherwise (e.g. Classic) reverse-video, matching the flat
-            // list. Plain text so no inner reset cancels the highlight.
-            let plain = truncate_visible(&plain, width);
-            let pad = " ".repeat(width.saturating_sub(visible_len(&plain)));
-            if p.cursor_bg.is_empty() {
-                format!("\x1B[7m{plain}{pad}\x1B[27m")
-            } else {
-                format!("{}{plain}{pad}{}", p.cursor_bg, p.reset)
-            }
+            // Highlight the whole row (the theme's accent, or reverse video on
+            // Classic), matching the flat list.
+            crate::theme::cursor_row(p, &plain, width)
         } else {
             truncate_visible(&colored, width)
         };
@@ -575,7 +568,7 @@ mod tests {
             // Row 0 is the cursor: it must carry a highlight — reverse-video when
             // the theme has no cursor tint (Classic), or the tint otherwise.
             let highlighted = lines[0].contains("\x1B[7m")
-                || (!p.cursor_bg.is_empty() && lines[0].contains(p.cursor_bg));
+                || (!p.cursor_hl.is_empty() && lines[0].contains(p.cursor_hl));
             assert!(highlighted, "{kind:?}: cursor row not highlighted: {:?}", lines[0]);
             // A non-cursor row must not be reverse-video highlighted.
             assert!(!lines[1].contains("\x1B[7m"), "{kind:?}: non-cursor row highlighted");
