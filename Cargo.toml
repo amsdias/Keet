@@ -53,7 +53,7 @@ coreaudio-sys = "0.2"
 # through the Windows audio engine (mixed and resampled), so bit-perfect output
 # needs its own exclusive-mode path. By rubato's author; MIT.
 [target.'cfg(target_os = "windows")'.dependencies]
-wasapi = "0.24"
+wasapi = "0.25"
 
 # Windows icon embedding
 [target.'cfg(target_os = "windows")'.build-dependencies]
