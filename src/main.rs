@@ -8,8 +8,10 @@
 // Controls: Space=Pause, ↑↓=Tracks, ←→=Seek ±10s, V=Viz, +/-=Vol, Q=Quit
 
 mod ansi;
+mod cli;
 mod state;
 mod theme;
+mod player;
 mod config;
 mod library;
 mod eq_ui;
@@ -20,6 +22,7 @@ mod playlist;
 mod ui;
 mod ui_hifi;
 mod ui_minimal;
+mod ui_classic;
 mod eq;
 mod effects;
 mod media_keys;
@@ -28,8 +31,12 @@ mod crossfeed;
 mod metadata;
 mod lyrics;
 mod cover;
+mod gapless;
+mod signal;
+mod term;
 #[cfg(target_os = "windows")]
 mod wasapi_out;
+mod wasapi_logic;
 
 use std::env;
 use std::io::{self, Write};
@@ -44,12 +51,10 @@ use cpal::StreamConfig;
 use crossterm::terminal;
 use rtrb::RingBuffer;
 
-use state::{PlayerState, UiState, RgMode, VizMode, ring_capacity_for, VIZ_BUFFER_SIZE};
-use viz::{StatsMonitor, VizAnalyser};
+use state::{PlayerState, UiState, RgMode, ring_capacity_for, VIZ_BUFFER_SIZE};
 use audio::{build_stream, set_output_sample_rate, probe_sample_rate, fix_bluetooth_sample_rate};
-use decode::{decode_playlist, await_consumer_drain};
 use playlist::{build_playlist, shuffle_list};
-use ui::{print_status, poll_input, poll_auto_sort, poll_library_tree, arm_auto_sort, format_time};
+use ui::arm_auto_sort;
 use resume::{ResumeState, save_state, load_state};
 
 /// Exclusive mode on a device whose driver offers a single rate (Focusrite and
@@ -79,6 +84,417 @@ fn apply_exclusive_bit_depth(state: &PlayerState, device: &cpal::Device, rate: u
     }
 }
 
+/// The output device chosen by `--device` (an exact id, then an exact name,
+/// then a substring — see audio::find_device_by_name), or the default. A name
+/// that matches nothing falls back to the default with a warning. It used to
+/// be looked up twice at startup, warning twice.
+fn select_device(host: &cpal::Host, wanted: Option<&str>) -> Result<cpal::Device, Box<dyn std::error::Error>> {
+    if let Some(name) = wanted {
+        if let Some(d) = audio::find_device_by_name(host, name) {
+            return Ok(d);
+        }
+        eprintln!("Warning: Device '{}' not found, using default", name);
+    }
+    Ok(host.default_output_device().ok_or("No output device")?)
+}
+
+/// The output as startup opened it.
+struct StartupOutput {
+    device: cpal::Device,
+    /// A notice to show once the UI is up (exclusive mode off, a locked rate).
+    note: Option<String>,
+    out_channels: u16,
+    stream_rate: u32,
+    buffer_size: cpal::BufferSize,
+    prod: rtrb::Producer<f32>,
+    viz_cons: rtrb::Consumer<f32>,
+    stream: audio::Output,
+}
+
+/// Open the output for the first track: resolve the exclusive-mode device,
+/// read its rates, set its rate and bit depth (exclusive mode only), open and
+/// start the stream, then take hog mode. Everything changed on the device is
+/// recorded in `restore` first.
+#[allow(clippy::too_many_arguments)]
+fn open_startup_output(
+    host: &cpal::Host,
+    mut device: cpal::Device,
+    mut exclusive: bool,
+    source_rate: u32,
+    current_output_rate: u32,
+    state: &Arc<PlayerState>,
+    restore: &mut audio::DeviceRestore,
+) -> Result<StartupOutput, Box<dyn std::error::Error>> {
+    // Exclusive mode binds to ONE device: the stream, hog mode and every rate
+    // switch must all be the same hardware. macOS pins the device (hogging the
+    // default makes macOS move the default away); Linux resolves the card's raw
+    // hw: device. If that is impossible — a sound-server route on Linux, an
+    // unsupported platform — say why and continue in normal mode, with state
+    // agreeing (everything downstream reads state.exclusive).
+    let mut startup_note: Option<String> = None;
+    if exclusive {
+        match audio::prepare_exclusive_device(host, &device) {
+            Ok(d) => device = d,
+            Err(e) => {
+                eprintln!("Note: {e}. Playing in normal mode.");
+                // The stderr note is wiped when the UI takes the screen; show
+                // it where it can be read (set just before playback starts).
+                startup_note = Some(format!("exclusive mode off: {e}"));
+                exclusive = false;
+                state.exclusive.store(false, Ordering::Relaxed);
+            }
+        }
+    }
+
+    // Exclusive mode changes the DAC's rate and bit depth; remember how it was
+    // so quitting can put it back (before the first change, below).
+    if exclusive {
+        restore.capture(&device);
+    }
+    // Only exclusive mode may change the device. Normal mode used to switch the
+    // DAC's system-wide rate to the first track's here (macOS; the other
+    // platforms' set_output_sample_rate never touches the device): that spared
+    // one track from resampling, resampled every other app on the DAC, never
+    // switched again, and was never put back. Normal mode now plays at whatever
+    // rate the device is set to and resamples every track the same way.
+    // Exclusive mode's rate capabilities are read first — before the startup
+    // rate is chosen (it goes through the same rule as every later switch)
+    // and BEFORE any stream opens: a Linux raw hw: device admits a single
+    // client, and listing its rates opens it — probed while our own stream had
+    // it, the query failed with EBUSY and read as "only 48 kHz", so no track
+    // ever switched rate.
+    if exclusive {
+        if let Ok(mut caps) = state.exclusive_caps.lock() {
+            *caps = audio::probe_rate_caps(&device);
+        }
+        if startup_note.is_none() {
+            startup_note = locked_rate_note(state, &device);
+        }
+    }
+    let persistent_output_rate = if exclusive {
+        let target = state.exclusive_target_rate(source_rate, current_output_rate);
+        set_output_sample_rate(target, current_output_rate, &device)
+    } else {
+        current_output_rate
+    };
+    apply_exclusive_bit_depth(state, &device, persistent_output_rate);
+    // Exclusive mode opens at the rate it chose. On macOS the device's default
+    // config reflects that rate (Keet set it); a Linux raw hw: device has no
+    // device-wide rate, and its default config is a fixed one (48 kHz) — so
+    // reading the rate back from there opened every session at 48 kHz.
+    let actual_device_rate = if exclusive {
+        persistent_output_rate
+    } else {
+        match device.default_output_config() {
+            Ok(config) => config.sample_rate(),
+            Err(_) => persistent_output_rate,
+        }
+    };
+    // Output channel count comes from the device, not an assumption. WASAPI
+    // shared mode only accepts the mixer's own format, so a non-stereo device
+    // rejects a hardcoded 2 outright. The ring stays stereo either way — the
+    // callback fans it out.
+    let out_channels: u16 = device
+        .default_output_config()
+        .map(|c| c.channels())
+        .unwrap_or(2)
+        .max(1);
+    let stream_rate = {
+        let rate_supported = device.supported_output_configs()
+            .map(|configs| {
+                configs.into_iter().any(|c| {
+                    c.channels() == out_channels
+                        && c.min_sample_rate() <= actual_device_rate
+                        && actual_device_rate <= c.max_sample_rate()
+                })
+            })
+            .unwrap_or(false);
+        // Exclusive mode already checked the rate against the device itself.
+        // cpal's list is the SHARED-mode one — on Windows just the mixer's
+        // format — and would send a 44.1 kHz file back to 48 kHz here.
+        if exclusive || rate_supported { actual_device_rate } else {
+            device.default_output_config()
+                .map(|c| c.sample_rate())
+                .unwrap_or(48000)
+        }
+    };
+    state.output_rate.store(stream_rate as u64, Ordering::Relaxed);
+
+    let is_wsl = cfg!(target_os = "linux") && std::fs::read_to_string("/proc/version")
+        .map(|v| v.contains("microsoft") || v.contains("WSL"))
+        .unwrap_or(false);
+    let buffer_size = if cfg!(target_os = "windows") || is_wsl {
+        cpal::BufferSize::Fixed(2048)
+    } else {
+        cpal::BufferSize::Default
+    };
+
+    let (prod, viz_cons, stream, built_rate) =
+        rebuild_stream(&device, stream_rate, out_channels, buffer_size, state)?;
+    stream.play()?;
+
+    // Set exclusive mode if requested (macOS only: hog mode + per-track rate switching)
+    if exclusive {
+        match audio::set_exclusive_mode(&device) {
+            Ok(Some(id)) => {
+                restore.hog = Some(id);
+                crate::term::out!("Exclusive mode: hog + per-track rate switching\r\n");
+            }
+            Ok(None) => {
+                if cfg!(target_os = "windows") {
+                    crate::term::out!("Exclusive mode: WASAPI exclusive + per-track rate switching\r\n");
+                } else {
+                    crate::term::out!("Exclusive mode: raw hardware device + per-track rate switching\r\n");
+                }
+            }
+            Err(e) => {
+                if cfg!(target_os = "macos") {
+                    // macOS: hog mode failed but rate switching still works via CoreAudio
+                    eprintln!("Note: Hog mode unavailable ({}). Per-track rate switching is still active.", e);
+                } else {
+                    // Other platforms: exclusive mode is not supported at all
+                    eprintln!("Note: {}", e);
+                    state.exclusive.store(false, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    Ok(StartupOutput {
+        device,
+        note: startup_note,
+        out_channels,
+        stream_rate: built_rate,
+        buffer_size,
+        prod,
+        viz_cons,
+        stream,
+    })
+}
+
+/// Restore the terminal on a panic (main thread only) and log it to
+/// ~/.config/keet/crash.log.
+fn install_panic_hook() {
+    // Restore terminal on panic so it doesn't stay in raw mode
+    let default_panic = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // Only a panic on the main (UI) thread ends the program, so only that
+        // one restores the terminal. Any other thread's panic — the producer
+        // (caught there: the bad file is skipped), a cover, lyrics or scan
+        // worker — leaves the UI running, and restoring cooked mode under it
+        // broke the terminal for the rest of the session. It is still logged.
+        let ends_program = thread::current().name() == Some("main");
+        if ends_program {
+            let _ = terminal::disable_raw_mode();
+            restore_cursor(&mut io::stdout());
+        }
+
+        // Write crash log to ~/.config/keet/crash.log
+        let info_str = info.to_string();
+        if should_log_crash(&info_str) {
+            if let Some(config_dir) = playlist::keet_config_dir() {
+                let _ = std::fs::create_dir_all(&config_dir);
+                let log_path = config_dir.join("crash.log");
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let entry = format!("[{}] {}\n", timestamp, info_str);
+                // Append to log file
+                use std::io::Write as _;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+                    let _ = f.write_all(entry.as_bytes());
+                }
+            }
+        }
+
+        // The default handler prints to stderr — over the running UI, for any
+        // thread but main. Those are in the crash log.
+        if ends_program {
+            default_panic(info);
+        }
+    }));
+}
+
+/// The tracks of every source (folders, files, M3U), deduplicated by
+/// canonical path, shuffled if asked. One unreadable source among several is
+/// skipped with a warning; a lone one is an error.
+fn load_initial_playlist(source_paths: &[PathBuf], shuffle: bool) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    let mut combined = Vec::new();
+    for src in source_paths {
+        match build_playlist(src, false) {
+            Ok(tracks) => combined.extend(tracks),
+            Err(e) => {
+                if source_paths.len() == 1 {
+                    return Err(e);
+                }
+                eprintln!("Skipping {}: {}", src.display(), e);
+            }
+        }
+    }
+    if combined.is_empty() {
+        return Err("No audio files found".into());
+    }
+    // Deduplicate by canonical path
+    let mut seen = std::collections::HashSet::new();
+    combined.retain(|p| {
+        let key = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+        seen.insert(key)
+    });
+    if shuffle { shuffle_list(&mut combined); }
+    Ok(combined)
+}
+
+/// `--eq`/`--fx`: a preset by name (any case), or else a JSON preset file at
+/// that path, which joins the list. Its index; None when neither works.
+fn pick_preset<T: serde::de::DeserializeOwned>(presets: &mut Vec<T>, wanted: &str, name: fn(&T) -> &str) -> Option<usize> {
+    if let Some(i) = presets.iter().position(|p| name(p).eq_ignore_ascii_case(wanted)) {
+        return Some(i);
+    }
+    let preset = serde_json::from_str::<T>(&std::fs::read_to_string(wanted).ok()?).ok()?;
+    presets.push(preset);
+    Some(presets.len() - 1)
+}
+
+/// Put a resumed session's settings back (volume, presets, a custom EQ,
+/// ReplayGain mode, crossfeed, balance). Returns where to resume, in seconds.
+fn apply_resume_state(
+    state: &PlayerState,
+    rs: &ResumeState,
+    eq_presets: &[eq::EqPreset],
+    fx_presets: &[effects::EffectsPreset],
+    cf_presets: &[crossfeed::CrossfeedPreset],
+) -> i64 {
+    state.volume.store(rs.volume, Ordering::Relaxed);
+
+    // Restore EQ preset by name
+    if let Some(idx) = eq_presets.iter().position(|p| p.name == rs.eq_preset) {
+        state.eq_preset_index.store(idx, Ordering::Relaxed);
+    }
+    // Restore a Custom (edited) EQ, if that's what was saved. Older
+    // state.json files carry gains only — the parametric fields then fall
+    // back per band to the graphic defaults (peak at the ISO centre, Q 1.41).
+    if rs.eq_custom == Some(true) {
+        if let Some(ref g) = rs.eq_gains {
+            let bands: [eq::BandSettings; eq::EQ_BANDS] = std::array::from_fn(|i| {
+                let d = eq::BandSettings::inert(i);
+                eq::BandSettings {
+                    kind: rs.eq_types.as_ref()
+                        .and_then(|t| t.get(i))
+                        .and_then(|n| eq::BandType::from_name(n))
+                        .unwrap_or(d.kind),
+                    freq: rs.eq_freqs.as_ref()
+                        .and_then(|f| f.get(i).copied())
+                        .unwrap_or(d.freq),
+                    gain: g.get(i).copied().unwrap_or(0.0),
+                    q: rs.eq_qs.as_ref()
+                        .and_then(|q| q.get(i).copied())
+                        .unwrap_or(d.q),
+                }
+                .clamped()
+            });
+            state.set_eq_bands(&bands);
+            state.set_eq_preamp_db(rs.eq_preamp.unwrap_or(0.0));
+            state.eq_custom.store(true, Ordering::Relaxed);
+        }
+    }
+    // Restore FX preset by name
+    if let Some(idx) = fx_presets.iter().position(|p| p.name == rs.effects_preset) {
+        state.effects_preset_index.store(idx, Ordering::Relaxed);
+    }
+    // Restore RG mode by name
+    if let Some(ref rg_str) = rs.rg_mode {
+        let rg = match rg_str.as_str() {
+            "album" => RgMode::Album,
+            "off" => RgMode::Off,
+            _ => RgMode::Track,
+        };
+        state.rg_mode.store(rg as u8, Ordering::Relaxed);
+    }
+    // Restore crossfeed preset by name
+    if let Some(ref cf_name) = rs.crossfeed_preset {
+        if let Some(idx) = cf_presets.iter().position(|p| p.name.eq_ignore_ascii_case(cf_name)) {
+            state.crossfeed_preset_index.store(idx, Ordering::Relaxed);
+        }
+    }
+    // Restore balance
+    if let Some(bal) = rs.balance {
+        state.balance.store(bal.clamp(-100, 100), Ordering::Relaxed);
+    }
+    rs.position_secs.round() as i64
+}
+
+/// config.json defaults: viz mode, ReplayGain mode, EQ and crossfeed preset.
+/// Each overrides the resumed value but yields to an explicit flag for the
+/// same setting (`rg_mode_flag`, `eq_flag`).
+fn apply_config(
+    state: &PlayerState,
+    config: &config::Config,
+    rg_mode_flag: bool,
+    eq_flag: bool,
+    eq_presets: &[eq::EqPreset],
+    cf_presets: &[crossfeed::CrossfeedPreset],
+) {
+    if let Some(v) = config.viz.as_deref().and_then(state::VizMode::from_str) {
+        state.viz_mode.store(v as u8, Ordering::Relaxed);
+    }
+    if !rg_mode_flag {
+        if let Some(m) = config.rg_mode.as_deref().and_then(RgMode::from_str) {
+            state.rg_mode.store(m as u8, Ordering::Relaxed);
+        }
+    }
+    if !eq_flag {
+        if let Some(name) = config.eq.as_deref() {
+            if let Some(idx) = eq_presets.iter().position(|p| p.name.eq_ignore_ascii_case(name)) {
+                state.eq_preset_index.store(idx, Ordering::Relaxed);
+            }
+        }
+    }
+    if let Some(name) = config.crossfeed.as_deref() {
+        if let Some(idx) = cf_presets.iter().position(|p| p.name.eq_ignore_ascii_case(name)) {
+            state.crossfeed_preset_index.store(idx, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Open the output at `target_rate`: in exclusive mode switch the device to it
+/// and set its bit depth first, then build and start the stream. Call with NO
+/// stream open — a stream alive during a rate change reports
+/// StreamInvalidated. The returned rate is the one the stream really runs at
+/// (a fallback can differ); spawn the producer with it. One sequence for every
+/// switch: the track-start rate match, the rate-change handler and device
+/// recovery each had their own copy.
+fn open_output(
+    device: &cpal::Device,
+    current_rate: u32,
+    target_rate: u32,
+    channels: u16,
+    buffer_size: cpal::BufferSize,
+    state: &Arc<PlayerState>,
+) -> Result<StreamParts, Box<dyn std::error::Error>> {
+    let rate = if state.exclusive.load(Ordering::Relaxed) {
+        set_output_sample_rate(target_rate, current_rate, device)
+    } else {
+        target_rate
+    };
+    apply_exclusive_bit_depth(state, device, rate);
+    // Anything the old stream reported on its way out is about that stream.
+    state.stream_error.store(false, Ordering::Relaxed);
+    let parts = rebuild_stream(device, rate, channels, buffer_size, state)?;
+    parts.2.play()?;
+    state.output_rate.store(parts.3 as u64, Ordering::Relaxed);
+    Ok(parts)
+}
+
+/// No output could be opened. Say so and hand over to the recovery block,
+/// which retries once a second (input keeps working, so quit stays possible).
+/// It used to quit the app — leaving the terminal in raw mode.
+fn output_failed(ui: &mut state::UiState, state: &PlayerState, e: &dyn std::error::Error) {
+    ui.set_status_for(format!("can't open the output: {e} — retrying"), Duration::from_secs(3));
+    state.stream_error.store(true, Ordering::Relaxed);
+    ui.recovery_retry_at = Some(Instant::now() + Duration::from_secs(1));
+}
+
 /// "44100Hz", "44100→48000Hz" when resampling, plus the DAC's format in
 /// exclusive mode once known ("96000Hz • out 24-bit").
 fn rate_label(src_rate: u32, stream_rate: u32, state: &PlayerState) -> String {
@@ -97,74 +513,33 @@ fn rate_label(src_rate: u32, stream_rate: u32, state: &PlayerState) -> String {
 /// caught decoder panic apart from one that is really taking Keet down.
 const PRODUCER_THREAD: &str = "keet-producer";
 
-/// Apply a pending banner rebuild and full-screen repaint (resize, theme or
-/// viz-layout change). Returns true when the screen was repainted from scratch,
-/// so the caller resets its frame bookkeeping (`prev_frame_lines = usize::MAX`,
-/// any Kitty viz image gone). Must run after the DEC 2026 sync-begin.
+/// Apply a pending full-screen repaint (resize, theme or viz-layout change).
+/// Returns true when the screen was repainted from scratch, so the caller
+/// resets its frame bookkeeping (`prev_frame_lines = usize::MAX`, any Kitty
+/// image gone). Must run after the DEC 2026 sync-begin.
 ///
 /// Every loop that draws frames calls this — the steady-state loop, the
 /// start-of-track buffering wait and the exclusive-mode rate-change wait. The
 /// buffering wait used to render without it, so a Shift+F or resize pressed in
-/// the ~1 s after a track change drew the new layout under the old banner.
-fn repaint_if_needed(
-    state: &PlayerState,
-    ui: &mut state::UiState,
-    build_banner_box: &dyn Fn(bool, state::RepeatMode, &PlayerState) -> String,
-) -> bool {
-    if ui.banner_dirty {
-        ui.banner_dirty = false;
-        let new_box = build_banner_box(ui.shuffle, ui.repeat_mode, state);
-        // banner_tail (device info + verbose key help) is Classic-only.
-        // It was built once at startup, so if the user starts in
-        // Classic and presses T to switch themes, the cached tail
-        // would otherwise bleed into the new theme's banner.
-        ui.banner_text = if state.theme_kind() == theme::ThemeKind::Classic {
-            format!("{}{}", new_box, ui.banner_tail)
-        } else {
-            new_box
-        };
-        ui.terminal_resized = true;
-    }
-
+/// the ~1 s after a track change drew the new layout over the old one.
+fn repaint_if_needed(ui: &mut state::UiState) -> bool {
     if !ui.terminal_resized {
         return false;
     }
     ui.terminal_resized = false;
-        // Clear entire screen and reprint banner (old lines may
-        // have wrapped at the previous terminal width).
-        // In raw mode \n doesn't imply \r, so use \r\n.
-        let term_w = terminal::size().map(|(w, _)| w as usize).unwrap_or(120);
-        // Cover overlay is Classic-only — variant-b/c mocks are
-        // text-first and the kitty image scrolls out of its slot
-        // once content exceeds terminal height. For non-Classic
-        // themes, skip compose_banner entirely so no placeholder
-        // black box is reserved in the cover slot.
-        // Full window means exactly that: the banner (and the cover
-        // it carries) is dropped so the visualization gets those
-        // rows. banner_lines going to 0 is what tells print_status
-        // the space is now the viz's.
-        let (composed, lines) = if state.viz_fullscreen() {
-            (String::new(), 0)
-        } else if state.theme_kind() == theme::ThemeKind::Classic {
-            compose_banner(&ui.banner_text, ui.cover.as_ref(), term_w)
-        } else {
-            let count = ui.banner_text.lines().count();
-            (ui.banner_text.clone(), count)
-        };
-        ui.banner_lines = lines;
-        // Remove any previously-placed kitty graphic before redrawing.
-        // No-op on terminals that don't speak the protocol.
-        let kitty_clear = if matches!(cover::detect_protocol(), cover::GraphicsProtocol::Kitty) {
-            format!("{}{}", cover::kitty_clear_escape(), cover::viz_image_clear_escape())
-        } else {
-            String::new()
-        };
-        // Home + erase-down (NOT \x1B[2J): ConPTY implements ED2 by
-        // scrolling the viewport into scrollback, so on Windows
-        // Terminal a 2J repaint shoves the whole UI out of sight
-        // instead of refreshing in place. ED0 from home erases the
-        // same cells without the scroll.
-        print!("{}\x1B[0m\x1B[H\x1B[J{}", kitty_clear, composed.replace('\n', "\r\n"));
+    // Remove any placed Kitty graphic: the frame redraws (and re-places) it.
+    // No-op on terminals that don't speak the protocol.
+    let kitty_clear = if matches!(cover::detect_protocol(), cover::GraphicsProtocol::Kitty) {
+        format!("{}{}", cover::kitty_clear_escape(), cover::viz_image_clear_escape())
+    } else {
+        String::new()
+    };
+    // Home + erase-down (NOT \x1B[2J): ConPTY implements ED2 by scrolling the
+    // viewport into scrollback, so on Windows Terminal a 2J repaint shoves the
+    // whole UI out of sight instead of refreshing in place. ED0 from home
+    // erases the same cells without the scroll.
+    crate::term::out!("{}\x1B[0m\x1B[H\x1B[J", kitty_clear);
+    ui.cover_block_intact = false;
     true
 }
 
@@ -172,13 +547,17 @@ fn repaint_if_needed(
 /// Reads embedded tags from the file if not already cached, then falls back to LRCLIB.
 /// The main thread never blocks on disk or HTTP.
 fn spawn_lyrics_worker(ui: &mut state::UiState, path: std::path::PathBuf, dur: Option<u32>) {
+    // A manual sync fix belongs to the track it was made for, and is kept.
+    ui.lyrics_offset = ui.lyrics_offsets.get(&path);
     if let Some(l) = ui.metadata_cache.lyrics(ui.current) {
         ui.lyrics = Some(lyrics::parse_lyrics(&l));
+        ui.lyrics_source = Some(lyrics::LyricsSource::Embedded);
         ui.lyrics_receiver = None;
         return;
     }
     let (cached_artist, cached_title) = ui.metadata_cache.artist_title(ui.current);
     ui.lyrics = None;
+    ui.lyrics_source = None;
     let (tx, rx) = std::sync::mpsc::channel();
     ui.lyrics_receiver = Some(rx);
     // Bump the generation; each worker snapshots this and bails out of the slow
@@ -186,6 +565,7 @@ fn spawn_lyrics_worker(ui: &mut state::UiState, path: std::path::PathBuf, dur: O
     // This prevents a backlog of blocked HTTP threads during rapid skipping.
     let gen_snap = ui.lyrics_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     let gen_ref = std::sync::Arc::clone(&ui.lyrics_gen);
+    let net_cache = ui.lyrics_lookups.clone();
     std::thread::spawn(move || {
         let (artist, title, embedded) = if cached_artist.is_some() || cached_title.is_some() {
             (cached_artist, cached_title, metadata::read_lyrics(&path))
@@ -193,13 +573,16 @@ fn spawn_lyrics_worker(ui: &mut state::UiState, path: std::path::PathBuf, dur: O
             metadata::read_artist_title_lyrics(&path)
         };
         let res = if let Some(l) = embedded {
-            Some(lyrics::parse_lyrics(&l))
+            Some((lyrics::parse_lyrics(&l), lyrics::LyricsSource::Embedded))
         } else if let (Some(a), Some(t)) = (artist, title) {
             // Skip the network round-trip if a newer request has already been issued.
             if gen_ref.load(std::sync::atomic::Ordering::Relaxed) != gen_snap {
                 None
             } else {
-                lyrics::fetch_lrclib(&a, &t, dur).map(|s| lyrics::parse_lyrics(&s))
+                let key = format!("{a}\0{t}\0{}", dur.unwrap_or(0));
+                net_cache
+                    .get_or_fetch(key, || lyrics::fetch_lrclib(&a, &t, dur))
+                    .map(|s| (lyrics::parse_lyrics(&s), lyrics::LyricsSource::Lrclib))
             }
         } else {
             None
@@ -225,6 +608,7 @@ fn spawn_cover_worker(ui: &mut state::UiState, path: std::path::PathBuf, size: c
     ui.cover_receiver = Some(rx);
     let gen_snap = ui.cover_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     let gen_ref = std::sync::Arc::clone(&ui.cover_gen);
+    let misses = ui.cover_misses.clone();
     std::thread::spawn(move || {
         // Local sources are cheap — always try them regardless of generation.
         let local = cover::resolve_local(
@@ -242,53 +626,29 @@ fn spawn_cover_worker(ui: &mut state::UiState, path: std::path::PathBuf, size: c
             let _ = tx.send(None);
             return;
         }
+        // A found cover lands in the on-disk cache (resolve_local above);
+        // what is remembered here is an album iTunes does not have, so it is
+        // not searched for again on every play.
         let remote = match (cached_artist, cached_album) {
-            (Some(a), Some(al)) => cover::resolve_remote(&a, &al, size),
+            (Some(a), Some(al)) => {
+                let key = format!("{a}\0{al}");
+                if misses.known(&key).is_some() {
+                    None
+                } else {
+                    match cover::resolve_remote(&a, &al, size) {
+                        lyrics::Lookup::Found(img) => Some(img),
+                        lyrics::Lookup::NotFound => {
+                            misses.remember(key, None);
+                            None
+                        }
+                        lyrics::Lookup::Failed => None,
+                    }
+                }
+            }
             _ => None,
         };
         let _ = tx.send(remote);
     });
-}
-
-/// Compose the banner text with the album-cover slot on its left. When no
-/// cover is loaded, fills the slot with a solid black box so the layout
-/// doesn't shift between tracks. Falls back to the plain banner only when
-/// the terminal is too narrow to fit both side-by-side.
-fn compose_banner(banner_text: &str, cover: Option<&cover::CoverImage>, term_w: usize) -> (String, usize) {
-    let cover_cols = cover::CoverSize::CLASSIC.cols as usize;
-    // Banner box is ~59 cols; need room for cover + 2-space gap + banner.
-    if term_w < cover_cols + 2 + 59 {
-        return (banner_text.to_string(), banner_text.lines().count());
-    }
-    let cover_lines = match cover {
-        Some(img) => cover::render(img),
-        None => cover::placeholder_lines(cover::CoverSize::CLASSIC),
-    };
-    let has_trailing_nl = banner_text.ends_with('\n');
-    let banner_content = if has_trailing_nl {
-        &banner_text[..banner_text.len() - 1]
-    } else {
-        banner_text
-    };
-    let banner_lines: Vec<&str> = banner_content.split('\n').collect();
-    let total = banner_lines.len().max(cover_lines.len());
-    let pad = " ".repeat(cover_cols);
-    let mut out = String::new();
-    for i in 0..total {
-        let left = cover_lines.get(i).map(|s| s.as_str()).unwrap_or(&pad);
-        let right = banner_lines.get(i).copied().unwrap_or("");
-        out.push_str(left);
-        out.push_str("  ");
-        out.push_str(right);
-        if i + 1 < total {
-            out.push('\n');
-        }
-    }
-    if has_trailing_nl {
-        out.push('\n');
-    }
-    let line_count = out.lines().count();
-    (out, line_count)
 }
 
 /// Show the terminal cursor again, ignoring write errors.
@@ -298,36 +658,20 @@ fn compose_banner(banner_text: &str, cover: Option<&cover::CoverImage>, term_w: 
 /// original panic would trigger a second panic here — and panicking while
 /// panicking aborts the process instead of exiting cleanly. Writing through a
 /// handle and discarding the `Result` keeps this total.
+/// Restores the terminal when dropped (see its use in main).
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        crate::term::flush();
+        let _ = terminal::disable_raw_mode();
+        restore_cursor(&mut io::stdout());
+    }
+}
+
 fn restore_cursor(w: &mut impl Write) {
     let _ = w.write_all(b"\x1B[?25h");
     let _ = w.flush();
-}
-
-/// Swap the name on the Classic banner's `Device:` line.
-///
-/// The banner tail is built once at startup, so after stream-error recovery
-/// fails over to a different output device the banner would otherwise keep
-/// naming the device that was unplugged. `split_inclusive` keeps each line's
-/// terminator attached so the tail's shape is byte-identical apart from the
-/// name — `banner_lines` drives the cursor-up math for every repaint, and a
-/// shifted line count corrupts the whole frame.
-///
-/// Tails without a device line (Minimal and HiFi surface the device inline)
-/// pass through unchanged.
-fn replace_device_line(tail: &str, name: &str) -> String {
-    let mut out = String::with_capacity(tail.len() + name.len());
-    for seg in tail.split_inclusive('\n') {
-        if seg.starts_with("Device: ") {
-            out.push_str("Device: ");
-            out.push_str(name);
-            if seg.ends_with('\n') {
-                out.push('\n');
-            }
-        } else {
-            out.push_str(seg);
-        }
-    }
-    out
 }
 
 /// Whether a panic deserves a `crash.log` entry.
@@ -534,140 +878,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // resetting here would wipe the screen (and emit a stray ESC c into the
     // output when piped) for commands that never draw the TUI.
 
-    // Restore terminal on panic so it doesn't stay in raw mode
-    let default_panic = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        // A panic on the producer thread is caught there (the bad file is
-        // skipped and playback goes on), so it must NOT tear the terminal
-        // down: restoring cooked mode here left the still-running UI with a
-        // broken terminal. It is still logged below.
-        let caught = thread::current().name() == Some(PRODUCER_THREAD);
-        if !caught {
-            let _ = terminal::disable_raw_mode();
-            restore_cursor(&mut io::stdout());
-        }
-
-        // Write crash log to ~/.config/keet/crash.log
-        let info_str = info.to_string();
-        if should_log_crash(&info_str) {
-            if let Some(config_dir) = playlist::keet_config_dir() {
-                let _ = std::fs::create_dir_all(&config_dir);
-                let log_path = config_dir.join("crash.log");
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                let entry = format!("[{}] {}\n", timestamp, info_str);
-                // Append to log file
-                use std::io::Write as _;
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
-                    let _ = f.write_all(entry.as_bytes());
-                }
-            }
-        }
-
-        if !caught {
-            default_panic(info);
-        }
-    }));
+    install_panic_hook();
 
     let args: Vec<String> = env::args().collect();
 
-    // Handle --help (print and exit)
-    if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("\x1B[1mKeet\x1B[0m — Terminal audio player with real-time visualization and parametric EQ");
-        println!();
-        println!("\x1B[1mUSAGE\x1B[0m");
-        println!("  keet <file|folder|playlist>... [options]");
-        println!("  keet                              Resume last session");
-        println!();
-        println!("\x1B[1mOPTIONS\x1B[0m");
-        println!("  -s, --shuffle          Randomize playlist order (re-shuffles on each repeat)");
-        println!("  -r, --repeat           Loop playlist (rescans sources for new files each cycle)");
-        println!("  -q, --quality          HQ resampler (higher CPU, inaudible difference)");
-        println!("  -e, --eq <name|path>   Start with EQ preset by name or JSON file path");
-        println!("      --fx <name|path>   Start with effects preset by name or JSON file path");
-        println!("  -x, --crossfade <secs> Crossfade duration between tracks (0 = disabled)");
-        println!("      --rg-mode <mode>   ReplayGain: track (default), album, or off");
-        println!("      --device <name>    Output device (substring match)");
-        println!("      --exclusive        Exclusive mode: bit-perfect, per-track sample rate, device lock");
-        println!("                         (macOS: any device; Linux: a card's hw: device, see --list-devices)");
-        println!("      --no-cover         Disable album cover display");
-        println!("      --theme <name>     UI theme: classic (default), minimal, hifi");
-        println!("      --list-devices     List available output devices and exit");
-        println!("      --verbose          With --list-devices: every device, with its formats");
-        println!("  -h, --help             Show this help");
-        println!();
-        println!("\x1B[1mFORMATS\x1B[0m  MP3, FLAC, WAV, OGG, AAC/M4A, ALAC, AIFF");
-        println!();
-        println!("\x1B[1mKEYBOARD\x1B[0m");
-        println!("  Space        Pause / resume");
-        println!("  Up / Down    Next / previous track");
-        println!("  Right / Left Seek forward / backward 10s");
-        println!("  + / -        Volume up / down (5% steps, 0–150%)");
-        println!("  V            Cycle visualization (off → VU → spectrum H/V → scope → vector → spectrogram)");
-        println!("  B            Toggle viz style (dots / bars)");
-        println!("  F            Toggle pre/post-fader metering");
-        println!("  E            Cycle EQ presets");
-        println!("  X            Cycle effects presets");
-        println!("  C            Cycle crossfeed (Off → Light → Medium → Strong + custom)");
-        println!("  [ / ]        Balance left / right (5% steps)");
-        println!("  L            Toggle playlist view");
-        println!("  Y            Toggle lyrics view (synced LRC auto-scrolls)");
-        println!("  S            Save playlist as M3U");
-        println!("  R            Rescan folders for new files");
-        println!("  Z            Toggle shuffle");
-        println!("  Shift+R      Toggle repeat (Off → All → One)");
-        println!("  T            Cycle UI theme (Classic → Minimal → HiFi)");
-        println!("  O            Open a new source (type a path)");
-        println!("  P            Pick a new source (native folder dialog)");
-        println!("  I            Toggle CPU/memory stats");
-        println!("  Q / Esc      Quit");
-        println!();
-        println!("\x1B[1mPLAYLIST VIEW\x1B[0m  (press L)");
-        println!("  Up / Down       Move cursor");
-        println!("  Home / End      Jump to top / bottom              (also: g / G)");
-        println!("  PgUp / PgDn     Page up / down                    (also: Ctrl+U / Ctrl+D)");
-        println!("  Enter           Jump to selected track");
-        println!("  A               Enqueue selected track (play next)");
-        println!("  Shift+S         Sort by tags (artist → album → disc → track → title)");
-        println!("  /               Search / filter by filename");
-        println!("  D / Delete      Remove selected track");
-        println!("  Esc / L         Close playlist view");
-        println!();
-        println!("\x1B[1mLYRICS VIEW\x1B[0m  (press Y)");
-        println!("  W / S        Scroll up / down (disables auto-scroll)");
-        println!("  A / D        Adjust sync offset −/+ 0.5s");
-        println!("  Esc / Y      Close lyrics view");
-        println!();
-        println!("\x1B[1mCUSTOM PRESETS\x1B[0m");
-        println!("  EQ:      ~/.config/keet/eq/*.json");
-        println!("  Effects: ~/.config/keet/effects/*.json");
-        println!("  Crossfeed: ~/.config/keet/crossfeed/*.json");
-        println!();
-        println!("\x1B[1mCONFIG\x1B[0m");
-        println!("  ~/.config/keet/config.json — persistent defaults, e.g. {{\"theme\": \"minimal\"}}");
+    let opts = match cli::parse(&args) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("{e}");
+            eprintln!("Run with --help for usage information");
+            std::process::exit(1);
+        }
+    };
+
+    if opts.help {
+        cli::print_help();
         return Ok(());
     }
-
-    // Handle --list-devices (print and exit)
-    if args.iter().any(|a| a == "--list-devices") {
+    if opts.list_devices {
         let host = cpal::default_host();
-        audio::list_output_devices(&host, args.iter().any(|a| a == "--verbose"));
+        audio::list_output_devices(&host, opts.verbose);
         return Ok(());
+    }
+    if let Some(name) = &opts.unknown_theme {
+        eprintln!("Unknown theme '{}' (expected: classic, minimal, hifi)", name);
     }
 
     // Full terminal reset in case a previous run crashed mid-draw.
     // \x1Bc = RIS (Reset to Initial State) - clears screen, resets charset,
     // tab stops, modes. Deliberately AFTER the print-and-exit flags above so
     // it only fires on the path that actually draws the TUI.
-    print!("\x1Bc");
-    io::stdout().flush().ok();
+    crate::term::out!("\x1Bc");
+    crate::term::flush();
 
-    let flags = ["--shuffle", "-s", "--repeat", "-r", "--quality", "-q", "--eq", "-e", "--fx", "--crossfade", "-x", "--rg-mode", "--list-devices", "--verbose", "--device", "--exclusive", "--no-cover", "--theme", "--help", "-h"];
     // Loaded once and reused for the volume/EQ/device restore further down.
-    let resume_state_loaded = if args.len() < 2 { load_state() } else { None };
-    let (source_paths, shuffle, repeat_mode) = if args.len() < 2 {
+    let resume_state_loaded = if opts.resume { load_state() } else { None };
+    let (source_paths, shuffle, repeat_mode) = if opts.resume {
         // Try resume from saved state
         match resume_state_loaded.as_ref() {
             Some(rs) => {
@@ -696,94 +942,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match ui::run_first_launch_picker() {
                     Some(p) => (vec![p], false, state::RepeatMode::Off),
                     None => {
-                        eprintln!("Usage: {} <file-or-folder>... [--shuffle] [--repeat] [--quality] [--eq <name>] [--fx <name>] [--crossfade <secs>] [--rg-mode track|album|off] [--device <name>] [--exclusive] [--list-devices]", args[0]);
-                        eprintln!("Controls: Space=Pause ↑↓=Tracks ←→=Seek V=Viz E=EQ X=FX L=List R=Rescan O=Open P=Pick +/-=Vol Q=Quit");
+                        eprintln!("Usage: {} <file-or-folder>... [options]  (--help for all of them)", args[0]);
                         std::process::exit(1);
                     }
                 }
             }
         }
     } else {
-        let s = args.iter().any(|a| a == "--shuffle" || a == "-s");
-        let r = args.iter().any(|a| a == "--repeat" || a == "-r");
-        // Collect positional args (not flags, not values after flag options)
-        let mut positional = Vec::new();
-        let value_flags = ["--eq", "-e", "--fx", "--crossfade", "-x", "--rg-mode", "--device", "--theme"];
-        let mut skip_next = false;
-        for arg in &args[1..] {
-            if skip_next { skip_next = false; continue; }
-            if value_flags.contains(&arg.as_str()) { skip_next = true; continue; }
-            if flags.contains(&arg.as_str()) { continue; }
-            if arg.starts_with("--") || (arg.starts_with('-') && arg.len() == 2) {
-                eprintln!("Unknown option: {}", arg);
-                eprintln!("Run with --help for usage information");
-                std::process::exit(1);
-            }
-            positional.push(PathBuf::from(arg));
-        }
-        if positional.is_empty() {
-            eprintln!("No input files or folders specified");
-            std::process::exit(1);
-        }
-        (positional, s, if r { state::RepeatMode::All } else { state::RepeatMode::Off })
+        let repeat = if opts.repeat { state::RepeatMode::All } else { state::RepeatMode::Off };
+        (opts.sources.clone(), opts.shuffle, repeat)
     };
-    let hq_resampler = args.iter().any(|a| a == "--quality" || a == "-q");
-    let eq_arg = args.iter().position(|a| a == "--eq" || a == "-e")
-        .and_then(|i| args.get(i + 1).cloned());
-    let fx_arg = args.iter().position(|a| a == "--fx")
-        .and_then(|i| args.get(i + 1).cloned());
-    let crossfade_secs: u32 = args.iter().position(|a| a == "--crossfade" || a == "-x")
-        .and_then(|i| args.get(i + 1))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let rg_mode: RgMode = args.iter().position(|a| a == "--rg-mode")
-        .and_then(|i| args.get(i + 1))
-        .map(|s| match s.to_lowercase().as_str() {
-            "album" => RgMode::Album,
-            "off" => RgMode::Off,
-            _ => RgMode::Track,
-        })
-        .unwrap_or(RgMode::Track);
-    let device_arg: Option<String> = args.iter().position(|a| a == "--device")
-        .and_then(|i| args.get(i + 1).cloned());
-    let exclusive = args.iter().any(|a| a == "--exclusive");
-    let cover_enabled = !args.iter().any(|a| a == "--no-cover");
-    let theme_arg: Option<theme::ThemeKind> = args.iter().position(|a| a == "--theme")
-        .and_then(|i| args.get(i + 1))
-        .and_then(|s| {
-            theme::ThemeKind::from_str(s).or_else(|| {
-                eprintln!("Unknown theme '{}' (expected: classic, minimal, hifi)", s);
-                None
-            })
-        });
+    let hq_resampler = opts.hq_resampler;
+    let eq_arg = opts.eq.clone();
+    let fx_arg = opts.fx.clone();
+    let crossfade_secs = opts.crossfade_secs;
+    let rg_mode: RgMode = opts.rg_mode;
+    let device_arg: Option<String> = opts.device.clone();
+    let exclusive = opts.exclusive;
+    // A half-block cover is nothing but colour: with NO_COLOR it would be a
+    // slab of identical blocks. Image protocols are pictures, not text colour.
+    let cover_enabled = opts.cover
+        && !(term::no_color()
+            && matches!(cover::detect_protocol(), cover::GraphicsProtocol::HalfBlock));
+    let theme_arg: Option<theme::ThemeKind> = opts.theme;
     // Persistent user preferences (config.json) — applies on every launch.
     let app_config = config::load();
 
-    let mut playlist = {
-        let mut combined = Vec::new();
-        for src in &source_paths {
-            match build_playlist(src, false) {
-                Ok(tracks) => combined.extend(tracks),
-                Err(e) => {
-                    if source_paths.len() == 1 {
-                        return Err(e);
-                    }
-                    eprintln!("Skipping {}: {}", src.display(), e);
-                }
-            }
-        }
-        if combined.is_empty() {
-            return Err("No audio files found".into());
-        }
-        // Deduplicate by canonical path
-        let mut seen = std::collections::HashSet::new();
-        combined.retain(|p| {
-            let key = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
-            seen.insert(key)
-        });
-        if shuffle { shuffle_list(&mut combined); }
-        combined
-    };
+    let playlist = load_initial_playlist(&source_paths, shuffle)?;
     let state = Arc::new(PlayerState::new());
     state.total_tracks.store(playlist.len(), Ordering::Relaxed);
 
@@ -793,16 +978,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     state.eq_preset_count.store(eq_presets.len(), Ordering::Relaxed);
 
     // Set initial EQ preset from --eq argument
-    if let Some(ref eq_name) = eq_arg {
-        if let Some(idx) = eq_presets.iter().position(|p| p.name.eq_ignore_ascii_case(eq_name)) {
-            state.eq_preset_index.store(idx, Ordering::Relaxed);
-        } else if let Ok(contents) = std::fs::read_to_string(eq_name) {
-            if let Ok(preset) = serde_json::from_str::<eq::EqPreset>(&contents) {
-                eq_presets.push(preset);
-                state.eq_preset_count.store(eq_presets.len(), Ordering::Relaxed);
-                state.eq_preset_index.store(eq_presets.len() - 1, Ordering::Relaxed);
-            }
-        }
+    if let Some(idx) = eq_arg.as_deref().and_then(|n| pick_preset(&mut eq_presets, n, |p| &p.name)) {
+        state.eq_preset_count.store(eq_presets.len(), Ordering::Relaxed);
+        state.eq_preset_index.store(idx, Ordering::Relaxed);
     }
 
     // Load effects presets (built-in + custom from ~/.config/keet/effects/)
@@ -810,16 +988,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fx_presets.extend(effects::load_custom_presets());
     state.effects_preset_count.store(fx_presets.len(), Ordering::Relaxed);
 
-    if let Some(ref fx_name) = fx_arg {
-        if let Some(idx) = fx_presets.iter().position(|p| p.name.eq_ignore_ascii_case(fx_name)) {
-            state.effects_preset_index.store(idx, Ordering::Relaxed);
-        } else if let Ok(contents) = std::fs::read_to_string(fx_name) {
-            if let Ok(preset) = serde_json::from_str::<effects::EffectsPreset>(&contents) {
-                fx_presets.push(preset);
-                state.effects_preset_count.store(fx_presets.len(), Ordering::Relaxed);
-                state.effects_preset_index.store(fx_presets.len() - 1, Ordering::Relaxed);
-            }
-        }
+    if let Some(idx) = fx_arg.as_deref().and_then(|n| pick_preset(&mut fx_presets, n, |p| &p.name)) {
+        state.effects_preset_count.store(fx_presets.len(), Ordering::Relaxed);
+        state.effects_preset_index.store(idx, Ordering::Relaxed);
     }
 
     state.crossfade_secs.store(crossfade_secs, Ordering::Relaxed);
@@ -833,67 +1004,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cf_presets = Arc::new(cf_presets);
 
     // Restore resume state if resuming
-    let mut resume_position: i64 = 0;
-
-    if let Some(ref rs) = resume_state_loaded {
-        state.volume.store(rs.volume, Ordering::Relaxed);
-        resume_position = rs.position_secs.round() as i64;
-
-        // Restore EQ preset by name
-        if let Some(idx) = eq_presets.iter().position(|p| p.name == rs.eq_preset) {
-            state.eq_preset_index.store(idx, Ordering::Relaxed);
-        }
-        // Restore a Custom (edited) EQ, if that's what was saved. Older
-        // state.json files carry gains only — the parametric fields then fall
-        // back per band to the graphic defaults (peak at the ISO centre, Q 1.41).
-        if rs.eq_custom == Some(true) {
-            if let Some(ref g) = rs.eq_gains {
-                let bands: [eq::BandSettings; eq::EQ_BANDS] = std::array::from_fn(|i| {
-                    let d = eq::BandSettings::inert(i);
-                    eq::BandSettings {
-                        kind: rs.eq_types.as_ref()
-                            .and_then(|t| t.get(i))
-                            .and_then(|n| eq::BandType::from_name(n))
-                            .unwrap_or(d.kind),
-                        freq: rs.eq_freqs.as_ref()
-                            .and_then(|f| f.get(i).copied())
-                            .unwrap_or(d.freq),
-                        gain: g.get(i).copied().unwrap_or(0.0),
-                        q: rs.eq_qs.as_ref()
-                            .and_then(|q| q.get(i).copied())
-                            .unwrap_or(d.q),
-                    }
-                    .clamped()
-                });
-                state.set_eq_bands(&bands);
-                state.set_eq_preamp_db(rs.eq_preamp.unwrap_or(0.0));
-                state.eq_custom.store(true, Ordering::Relaxed);
-            }
-        }
-        // Restore FX preset by name
-        if let Some(idx) = fx_presets.iter().position(|p| p.name == rs.effects_preset) {
-            state.effects_preset_index.store(idx, Ordering::Relaxed);
-        }
-        // Restore RG mode by name
-        if let Some(ref rg_str) = rs.rg_mode {
-            let rg = match rg_str.as_str() {
-                "album" => RgMode::Album,
-                "off" => RgMode::Off,
-                _ => RgMode::Track,
-            };
-            state.rg_mode.store(rg as u8, Ordering::Relaxed);
-        }
-        // Restore crossfeed preset by name
-        if let Some(ref cf_name) = rs.crossfeed_preset {
-            if let Some(idx) = cf_presets.iter().position(|p| p.name.eq_ignore_ascii_case(cf_name)) {
-                state.crossfeed_preset_index.store(idx, Ordering::Relaxed);
-            }
-        }
-        // Restore balance
-        if let Some(bal) = rs.balance {
-            state.balance.store(bal.clamp(-100, 100), Ordering::Relaxed);
-        }
-    }
+    let resume_position = resume_state_loaded
+        .as_ref()
+        .map_or(0, |rs| apply_resume_state(&state, rs, &eq_presets, &fx_presets, &cf_presets));
     // Resolve the launch theme: --theme flag → config.json default → resumed
     // last-session theme → Classic. The config default applies on every launch
     // (including with explicit source paths), unlike the resume theme.
@@ -903,31 +1016,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|rs| rs.theme.as_deref())
         .and_then(theme::ThemeKind::from_str);
     state.set_theme(theme::resolve_theme(theme_arg, config_theme, resume_theme));
+    // Classic in truecolor, when config.json asks; set before the first frame.
+    let classic_colour_problems = if app_config.classic_use_truecolor {
+        let ([hl, warn, err], bad) = app_config.classic_colors.resolve();
+        theme::use_classic_truecolor(hl, warn, err);
+        bad
+    } else {
+        Vec::new()
+    };
 
     // Apply remaining config.json defaults. Each overrides the resumed value but
     // yields to an explicit CLI flag for the same setting. (CLI flags only occur
     // with explicit paths, and resume only on a bare launch, so checking flag
     // presence gives the right priority in both modes.)
-    if let Some(v) = app_config.viz.as_deref().and_then(state::VizMode::from_str) {
-        state.viz_mode.store(v as u8, Ordering::Relaxed);
-    }
-    if !args.iter().any(|a| a == "--rg-mode") {
-        if let Some(m) = app_config.rg_mode.as_deref().and_then(RgMode::from_str) {
-            state.rg_mode.store(m as u8, Ordering::Relaxed);
-        }
-    }
-    if eq_arg.is_none() {
-        if let Some(name) = app_config.eq.as_deref() {
-            if let Some(idx) = eq_presets.iter().position(|p| p.name.eq_ignore_ascii_case(name)) {
-                state.eq_preset_index.store(idx, Ordering::Relaxed);
-            }
-        }
-    }
-    if let Some(name) = app_config.crossfeed.as_deref() {
-        if let Some(idx) = cf_presets.iter().position(|p| p.name.eq_ignore_ascii_case(name)) {
-            state.crossfeed_preset_index.store(idx, Ordering::Relaxed);
-        }
-    }
+    apply_config(&state, &app_config, args.iter().any(|a| a == "--rg-mode"), eq_arg.is_some(), &eq_presets, &cf_presets);
 
     // Override device/exclusive from resume state when resuming with no args
     let mut device_arg = device_arg;
@@ -952,146 +1054,63 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let eq_presets = Arc::new(eq_presets);
     let fx_presets = Arc::new(fx_presets);
 
-    let inner_w = 57;
-    let title = "Keet";
-    use std::fmt::Write as FmtWrite;
+    // Name of the output device, shown in the header and kept honest by the
+    // default-device poll — the OS can move playback without telling us.
+    let shown_device_name: String;
 
-    let build_banner_box = |shuffle: bool, repeat_mode: state::RepeatMode, state: &PlayerState| -> String {
-        let eq_name = &eq_presets[state.eq_index()].name;
-        let fx_name = &fx_presets[state.effects_index()].name;
-        let cf_name = &cf_presets[state.crossfeed_index()].name;
-        let bal_val = state.balance_value();
-        let theme_kind = state.theme_kind();
-
-        match theme_kind {
-            theme::ThemeKind::HiFi | theme::ThemeKind::Minimal => {
-                // HiFi and Minimal render their own anchor row inside the
-                // rewind region (header strip / wordmark), so the static
-                // banner area is zero-height.
-                let _ = (shuffle, repeat_mode, eq_name, fx_name, cf_name, bal_val);
-                String::new()
-            }
-            _ => {
-                // Classic boxed banner.
-                let pad_left = (inner_w - title.len()) / 2;
-                let pad_right = inner_w - title.len() - pad_left;
-                let eq_info = if eq_name != "Flat" { format!(" | EQ: {}", eq_name) } else { String::new() };
-                let fx_info = if fx_name != "None" { format!(" | FX: {}", fx_name) } else { String::new() };
-                let xfade_info = if crossfade_secs > 0 { format!(" | xfade: {}s", crossfade_secs) } else { String::new() };
-                let cf_info = if cf_name != "Off" { format!(" | crossfeed: {}", cf_name) } else { String::new() };
-                let bal_info = if bal_val != 0 {
-                    if bal_val < 0 { format!(" | bal: L{}%", -bal_val) } else { format!(" | bal: R{}%", bal_val) }
-                } else { String::new() };
-                let info = format!("{}{}{}{}{}{}{}{}",
-                    if shuffle { "shuffle" } else { "sequential" },
-                    repeat_mode.label(),
-                    if hq_resampler { " | HQ" } else { "" },
-                    eq_info, fx_info, xfade_info, cf_info, bal_info);
-                let info_pad = inner_w.saturating_sub(info.chars().count() + 2);
-                let mut s = String::new();
-                writeln!(s, "╔{}╗", "═".repeat(inner_w)).ok();
-                writeln!(s, "║{}{}{}║", " ".repeat(pad_left), title, " ".repeat(pad_right)).ok();
-                writeln!(s, "╠{}╣", "═".repeat(inner_w)).ok();
-                writeln!(s, "║  {}{}║", info, " ".repeat(info_pad)).ok();
-                writeln!(s, "╚{}╝", "═".repeat(inner_w)).ok();
-                s
-            }
-        }
-    };
-
-    // Name currently shown on the banner's Device: line, plus the throttle for
-    // the poll that keeps it honest — the OS can move playback without telling
-    // us (see the poll in the main loop).
-    let mut shown_device_name: String;
-    let mut last_device_poll = Instant::now();
-
-    // Create UI state before the banner so shuffle/repeat have a single home
-    // (ui.*). The parsed `shuffle`/`repeat_mode` locals feed it once here and
-    // are not read again — every later reader (banner rebuild, main loop) uses
-    // ui.shuffle / ui.repeat_mode.
+    // Create UI state first so shuffle/repeat have a single home (ui.*). The
+    // parsed `shuffle`/`repeat_mode` locals feed it once here and are not read
+    // again — every later reader uses ui.shuffle / ui.repeat_mode.
     let metadata_cache = metadata::MetadataCache::new(playlist.len());
     let mut ui = UiState::new(source_paths, std::sync::Arc::clone(&metadata_cache));
     ui.shuffle = shuffle;
     ui.repeat_mode = repeat_mode;
+    ui.hq_resampler = hq_resampler;
+    if !classic_colour_problems.is_empty() {
+        ui.set_status_for(
+            format!("config.json: classic_colors.{} is not a #RRGGBB colour — using the default", classic_colour_problems.join(", ")),
+            std::time::Duration::from_secs(8),
+        );
+    }
     state.repeat_mode.store(repeat_mode as u8, Ordering::Relaxed);
-
-    let banner_box = build_banner_box(ui.shuffle, ui.repeat_mode, &state);
-    let mut banner_tail = String::new();
 
     // Audio setup
     let host = cpal::default_host();
+    let device = select_device(&host, device_arg.as_deref())?;
     let current_output_rate = {
-        let device = if let Some(ref dev_name) = device_arg {
-            audio::find_device_by_name(&host, dev_name).unwrap_or_else(|| {
-                eprintln!("Warning: Device '{}' not found, using default", dev_name);
-                host.default_output_device().expect("No output device")
-            })
-        } else {
-            host.default_output_device().ok_or("No output device")?
-        };
         let device_name = device.description()
             .map(|d| d.name().to_string())
             .unwrap_or_else(|_| "Unknown device".to_string());
         shown_device_name = device_name.clone();
-        // Device info banner is Classic-only — Minimal/HiFi surface device
-        // and rate inline (SIGNAL block / header strip), and the extra rows
-        // would push content past the terminal bottom.
-        let classic = state.theme_kind() == theme::ThemeKind::Classic;
-        if classic {
-            writeln!(banner_tail, "\nDevice: {}", device_name).ok();
-        }
+        ui.device_name = device_name;
 
         // Fix stale sample rate on Bluetooth devices (CoreAudio can get stuck at wrong rate)
         let bt_rate = fix_bluetooth_sample_rate(&device);
         if let Some(rate) = bt_rate {
-            if classic {
-                writeln!(banner_tail, "Bluetooth device detected, using native {}Hz", rate).ok();
-            }
+            ui.set_status_for(
+                format!("Bluetooth device: using its native {rate} Hz"),
+                std::time::Duration::from_secs(5),
+            );
         }
 
         let default_config = device.default_output_config()?;
-        let rate = bt_rate.unwrap_or_else(|| default_config.sample_rate());
-        let default_channels = default_config.channels();
-        if classic {
-            writeln!(banner_tail, "Initial output: {}Hz (device default: {}ch)", rate, default_channels).ok();
-        }
-        rate
+        bt_rate.unwrap_or_else(|| default_config.sample_rate())
     };
 
-    // Stats monitor
-    let mut stats = StatsMonitor::new();
-
     // OS media transport controls (media keys, AirPods, Bluetooth headphones)
-    let mut media_controls = media_keys::setup(Arc::clone(&state));
-
-    // Verbose banner help is Classic-only. Minimal and HiFi have their own
-    // footer key bars per the design handoff, and the extra rows would push
-    // content past the terminal bottom and cause the kitty cover to scroll
-    // out of its banner slot.
-    if state.theme_kind() == theme::ThemeKind::Classic {
-        writeln!(banner_tail, "\n{0}{{Space}}{1} Pause  {0}{{↑/↓}}{1} Track  {0}{{←/→}}{1} Seek  {0}{{+/-}}{1} Vol  {0}{{[/]}}{1} Bal  {0}{{Q}}{1} Quit",
-            "\x1B[2m", "\x1B[0m").ok();
-        writeln!(banner_tail, "{0}{{E}}{1} EQ  {0}{{X}}{1} FX  {0}{{C}}{1} Crossfeed  {0}{{F}}{1} Fader  {0}{{V/B}}{1} Viz  {0}{{I}}{1} Info  {0}{{Y}}{1} Lyrics",
-            "\x1B[2m", "\x1B[0m").ok();
-        writeln!(banner_tail, "{0}{{L}}{1} List  {0}{{R}}{1} Rescan  {0}{{Shift+R}}{1} Repeat  {0}{{Z}}{1} Shuffle  {0}{{O}}{1} Open  {0}{{P}}{1} Pick\n",
-            "\x1B[2m", "\x1B[0m").ok();
-    }
-
-    // Print banner and count its lines
-    let banner = format!("{}{}", banner_box, banner_tail);
-    print!("{}", banner);
-    let banner_lines = banner.lines().count();
+    let media_controls = media_keys::setup(Arc::clone(&state));
 
     terminal::enable_raw_mode()?;
+    // From here on, ANY way out of main — an error returned through `?` (a
+    // device busy at startup), a panic on this thread — must hand the terminal
+    // back: raw mode left on eats Ctrl+C and echo in the user's shell.
+    let _terminal_guard = TerminalGuard;
 
     // Hide cursor to prevent flickering
-    print!("\x1B[?25l");
-    io::stdout().flush().ok();
+    crate::term::out!("\x1B[?25l");
+    crate::term::flush();
 
-    ui.banner_lines = banner_lines;
-    ui.banner_text = banner;
     ui.cover_enabled = cover_enabled;
-    ui.banner_tail = banner_tail;
     ui.terminal_resized = false;
     ui.scan_handle = Some(metadata::spawn_metadata_scan(
         playlist.clone(),
@@ -1108,164 +1127,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let mut prev_frame_lines: usize = usize::MAX;
-    // Tracks whether the Kitty analysis-spectrogram image was placed last frame,
-    // so we can delete it (by id) when the user switches away from that mode.
-    let mut prev_viz_image_shown = false;
-
     // --- Persistent audio setup (created once, reused across all tracks) ---
-    let mut device = if let Some(ref dev_name) = device_arg {
-        audio::find_device_by_name(&host, dev_name).unwrap_or_else(|| {
-            eprintln!("Warning: Device '{}' not found, using default", dev_name);
-            host.default_output_device().expect("No output device")
-        })
-    } else {
-        host.default_output_device().ok_or("No output device")?
-    };
-    // Exclusive mode binds to ONE device: the stream, hog mode and every rate
-    // switch must all be the same hardware. macOS pins the device (hogging the
-    // default makes macOS move the default away); Linux resolves the card's raw
-    // hw: device. If that is impossible — a sound-server route on Linux, an
-    // unsupported platform — say why and continue in normal mode, with state
-    // agreeing (everything downstream reads state.exclusive).
-    let mut startup_note: Option<String> = None;
-    if exclusive {
-        match audio::prepare_exclusive_device(&host, &device) {
-            Ok(d) => device = d,
-            Err(e) => {
-                eprintln!("Note: {e}. Playing in normal mode.");
-                // The stderr note is wiped when the UI takes the screen; show
-                // it where it can be read (set just before playback starts).
-                startup_note = Some(format!("exclusive mode off: {e}"));
-                exclusive = false;
-                state.exclusive.store(false, Ordering::Relaxed);
-            }
-        }
-    }
-
-    // Probe first track's sample rate to set output rate
+    // Declared before the stream, so the stream always drops first (see
+    // audio::DeviceRestore).
+    let mut device_restore = audio::DeviceRestore::default();
     let source_rate = probe_sample_rate(&playlist[ui.current]).unwrap_or(44100);
-    // Exclusive mode changes the DAC's rate and bit depth; remember how it was
-    // so quitting can put it back (before the first change, below).
-    let mut original_format = if exclusive { audio::capture_format(&device) } else { None };
-    // Only exclusive mode may change the device. Normal mode used to switch the
-    // DAC's system-wide rate to the first track's here (macOS; the other
-    // platforms' set_output_sample_rate never touches the device): that spared
-    // one track from resampling, resampled every other app on the DAC, never
-    // switched again, and was never put back. Normal mode now plays at whatever
-    // rate the device is set to and resamples every track the same way.
-    // Exclusive mode's rate capabilities are read first — before the startup
-    // rate is chosen (it goes through the same rule as every later switch)
-    // and BEFORE any stream opens: a Linux raw hw: device admits a single
-    // client, and listing its rates opens it — probed while our own stream had
-    // it, the query failed with EBUSY and read as "only 48 kHz", so no track
-    // ever switched rate.
-    if exclusive {
-        if let Ok(mut caps) = state.exclusive_caps.lock() {
-            *caps = audio::probe_rate_caps(&device);
-        }
-        if startup_note.is_none() {
-            startup_note = locked_rate_note(&state, &device);
-        }
-    }
-    let persistent_output_rate = if exclusive {
-        let target = state.exclusive_target_rate(source_rate, current_output_rate);
-        set_output_sample_rate(target, current_output_rate, &device)
-    } else {
-        current_output_rate
-    };
-    apply_exclusive_bit_depth(&state, &device, persistent_output_rate);
-    // Exclusive mode opens at the rate it chose. On macOS the device's default
-    // config reflects that rate (Keet set it); a Linux raw hw: device has no
-    // device-wide rate, and its default config is a fixed one (48 kHz) — so
-    // reading the rate back from there opened every session at 48 kHz.
-    let actual_device_rate = if exclusive {
-        persistent_output_rate
-    } else {
-        match device.default_output_config() {
-            Ok(config) => config.sample_rate(),
-            Err(_) => persistent_output_rate,
-        }
-    };
-    // Output channel count comes from the device, not an assumption. WASAPI
-    // shared mode only accepts the mixer's own format, so a non-stereo device
-    // rejects a hardcoded 2 outright. The ring stays stereo either way — the
-    // callback fans it out.
-    let out_channels: u16 = device
-        .default_output_config()
-        .map(|c| c.channels())
-        .unwrap_or(2)
-        .max(1);
-    let mut stream_rate = {
-        let rate_supported = device.supported_output_configs()
-            .map(|configs| {
-                configs.into_iter().any(|c| {
-                    c.channels() == out_channels
-                        && c.min_sample_rate() <= actual_device_rate
-                        && actual_device_rate <= c.max_sample_rate()
-                })
-            })
-            .unwrap_or(false);
-        // Exclusive mode already checked the rate against the device itself.
-        // cpal's list is the SHARED-mode one — on Windows just the mixer's
-        // format — and would send a 44.1 kHz file back to 48 kHz here.
-        if exclusive || rate_supported { actual_device_rate } else {
-            device.default_output_config()
-                .map(|c| c.sample_rate())
-                .unwrap_or(48000)
-        }
-    };
-    state.output_rate.store(stream_rate as u64, Ordering::Relaxed);
-
-    let is_wsl = cfg!(target_os = "linux") && std::fs::read_to_string("/proc/version")
-        .map(|v| v.contains("microsoft") || v.contains("WSL"))
-        .unwrap_or(false);
-    let buffer_size = if cfg!(target_os = "windows") || is_wsl {
-        cpal::BufferSize::Fixed(2048)
-    } else {
-        cpal::BufferSize::Default
-    };
-
-    let saved_buffer_size = buffer_size;
-
-    let (mut prod, mut viz_cons, mut stream, built_rate) =
-        rebuild_stream(&device, stream_rate, out_channels, saved_buffer_size, &state)?;
-    stream_rate = built_rate;
-    stream.play()?;
-
-    // Set exclusive mode if requested (macOS only: hog mode + per-track rate switching)
-    let mut hog_device_id: Option<u32> = None;
-    if exclusive {
-        match audio::set_exclusive_mode(&device) {
-            Ok(Some(id)) => {
-                hog_device_id = Some(id);
-                println!("Exclusive mode: hog + per-track rate switching");
-            }
-            Ok(None) => {
-                if cfg!(target_os = "windows") {
-                    println!("Exclusive mode: WASAPI exclusive + per-track rate switching");
-                } else {
-                    println!("Exclusive mode: raw hardware device + per-track rate switching");
-                }
-            }
-            Err(e) => {
-                if cfg!(target_os = "macos") {
-                    // macOS: hog mode failed but rate switching still works via CoreAudio
-                    eprintln!("Note: Hog mode unavailable ({}). Per-track rate switching is still active.", e);
-                } else {
-                    // Other platforms: exclusive mode is not supported at all
-                    eprintln!("Note: {}", e);
-                    state.exclusive.store(false, Ordering::Relaxed);
-                }
-            }
-        }
-    }
-
-    let mut last_transition_count: usize = 0;
-
-    // Media-key now-playing throttle state (see the update site in the UI loop).
-    let mut last_mk_push = Instant::now() - Duration::from_secs(2);
-    let mut last_mk_paused = false;
+    let StartupOutput {
+        device, note: mut startup_note, out_channels, stream_rate,
+        buffer_size, prod, viz_cons, stream: first_stream,
+    } = open_startup_output(&host, device, exclusive, source_rate, current_output_rate, &state, &mut device_restore)?;
 
     // Persist resume state off the main thread: serializing + writing JSON on a
     // slow/network $HOME could otherwise stall the UI at every track transition.
@@ -1283,869 +1153,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ui.set_status_for(note, Duration::from_secs(10));
     }
 
-    'playlist: loop {
-        if state.should_quit() { break; }
-
-        // Repeat-cycle check
-        if ui.current >= playlist.len() {
-            if ui.repeat_mode != state::RepeatMode::Off {
-                let old_playlist = playlist.clone();
-
-                let has_dir = ui.source_paths.iter().any(|p| p.is_dir());
-                if has_dir {
-                    let mut combined = Vec::new();
-                    for src in &ui.source_paths {
-                        if let Ok(tracks) = build_playlist(src, false) {
-                            combined.extend(tracks);
-                        }
-                    }
-                    if !combined.is_empty() {
-                        // Single pass: canonicalize each path once, then dedupe and
-                        // filter-by-removed in one retain. Previously each retain
-                        // re-ran canonicalize() on every entry.
-                        let mut seen = std::collections::HashSet::new();
-                        let removed = &ui.removed_paths;
-                        combined.retain(|p| {
-                            let key = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
-                            if removed.contains(&key) { return false; }
-                            seen.insert(key)
-                        });
-                        if ui.shuffle { shuffle_list(&mut combined); }
-                        playlist = combined;
-                        state.total_tracks.store(playlist.len(), Ordering::Relaxed);
-                    }
-                } else {
-                    // Non-directory sources: filter removed tracks from existing playlist
-                    if !ui.removed_paths.is_empty() {
-                        playlist.retain(|p| {
-                            let key = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
-                            !ui.removed_paths.contains(&key)
-                        });
-                        state.total_tracks.store(playlist.len(), Ordering::Relaxed);
-                    }
-                    if ui.shuffle { shuffle_list(&mut playlist); }
-                }
-
-                // Everything gone (in-app removals + files deleted on disk):
-                // nothing left to play. Without this guard the track fetch
-                // below would index into an empty playlist and panic.
-                if playlist.is_empty() {
-                    break;
-                }
-
-                // Reindex metadata cache
-                crate::ui::reindex_and_restart_scan(&mut ui, &playlist, &old_playlist);
-                // Re-arm the artist→album auto-sort: the rebuild above is
-                // path-ordered, so without this a folder played on repeat-all
-                // reverts to filename order instead of staying tag-sorted.
-                arm_auto_sort(&mut ui);
-
-                ui.current = 0;
-            } else {
-                break;
-            }
-        }
-
-        // Reset state for new producer
-        state.current_track.store(ui.current, Ordering::Relaxed);
-        state.producer_done.store(false, Ordering::Relaxed);
-        // A seek still pending here was aimed at audio a finished producer no
-        // longer plays (pressed during a rate-change drain, or just before a
-        // skip/jump). Left in place, the new producer would apply it to a
-        // different track. A resume position is re-issued below, after this.
-        state.take_seek();
-        state.track_info_ready.store(false, Ordering::Relaxed);
-        state.skip_next.store(false, Ordering::Relaxed);
-        state.skip_prev.store(false, Ordering::Relaxed);
-        state.buffer_level.store(0, Ordering::Relaxed);
-        if let Ok(mut err) = state.decode_error.lock() { *err = None; }
-
-        // Exclusive mode: match the device to the track about to start. The
-        // producer only checks the rate at a NATURAL track change, so a skip
-        // back, a playlist jump or a restart after recovery began the new
-        // producer at the previous track's rate — resampled, e.g. song B
-        // played at song C's rate after skipping back. The ring is empty here
-        // (every respawn path drains it first), so the stream can be rebuilt.
-        if state.exclusive.load(Ordering::Relaxed) {
-            if let Some(track_rate) = probe_sample_rate(&playlist[ui.current]) {
-                let target = state.exclusive_target_rate(track_rate, stream_rate);
-                if target != stream_rate {
-                    // Stream first, then the rate (see the rate-change handler
-                    // below): no stream may be alive while the rate changes.
-                    drop(stream);
-                    let actual = set_output_sample_rate(target, stream_rate, &device);
-                    apply_exclusive_bit_depth(&state, &device, actual);
-                    state.stream_error.store(false, Ordering::Relaxed);
-                    let (new_prod, new_viz_cons, new_stream, built_rate) =
-                        rebuild_stream(&device, actual, out_channels, saved_buffer_size, &state)?;
-                    prod = new_prod;
-                    viz_cons = new_viz_cons;
-                    stream = new_stream;
-                    stream_rate = built_rate;
-                    state.output_rate.store(stream_rate as u64, Ordering::Relaxed);
-                    stream.play()?;
-                }
-            }
-        }
-
-        let track_path = &playlist[ui.current];
-        let mut filename = ui.metadata_cache.display_name(ui.current, track_path);
-        let mut track_ext = track_path.extension()
-            .map(|e| e.to_string_lossy().to_lowercase())
-            .unwrap_or_default();
-
-        // Spawn producer thread (continuous — decodes multiple tracks)
-        let playlist_snapshot = playlist.clone();
-        let start_idx = ui.current;
-        let state_clone = Arc::clone(&state);
-        let eq_presets_clone = Arc::clone(&eq_presets);
-        let fx_presets_clone = Arc::clone(&fx_presets);
-        let cf_presets_clone = Arc::clone(&cf_presets);
-        let hq = hq_resampler;
-        let sr = stream_rate;
-        let xfade = crossfade_secs;
-        let mut prod_for_thread = prod;
-
-        let producer_handle = thread::Builder::new().name(PRODUCER_THREAD.into()).spawn(move || {
-            let mut eq_chain = eq::EqChain::new();
-            if state_clone.is_eq_custom() {
-                eq_chain.load_bands(&state_clone.eq_bands_array(), state_clone.eq_preamp_db(), sr as f32);
-            } else {
-                eq_chain.load_preset(&eq_presets_clone[state_clone.eq_index()], sr as f32);
-            }
-            let mut fx_chain = effects::EffectsChain::new(sr as f32);
-            fx_chain.load_preset(&fx_presets_clone[state_clone.effects_index()], sr as f32);
-            let mut cf_filter = crossfeed::CrossfeedFilter::new();
-            cf_filter.load_preset(&cf_presets_clone[state_clone.crossfeed_index()], sr as f32);
-
-            // A malformed file can panic inside symphonia. Uncaught, the thread
-            // died without setting producer_done and main sat in silence
-            // forever. Caught, the file is reported and playback moves on to
-            // the next track (main's jump handler respawns the producer there).
-            let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                decode_playlist(
-                    &playlist_snapshot, start_idx,
-                    &mut prod_for_thread, &state_clone, sr, hq,
-                    &mut eq_chain, &eq_presets_clone,
-                    &mut fx_chain, &fx_presets_clone,
-                    xfade,
-                    &mut cf_filter, &cf_presets_clone,
-                );
-            }));
-            if run.is_err() {
-                let idx = state_clone.producer_decoding.load(Ordering::Relaxed);
-                let name = playlist_snapshot
-                    .get(idx)
-                    .and_then(|p| p.file_name())
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                if let Ok(mut err) = state_clone.decode_error.lock() {
-                    *err = Some(format!("{name}: decoder crashed, skipped"));
-                }
-                if idx + 1 < playlist_snapshot.len() {
-                    state_clone.jump_to(idx + 1);
-                } else {
-                    state_clone.producer_done.store(true, Ordering::Relaxed);
-                }
-            }
-            prod_for_thread // Return producer ownership
-        }).expect("spawn producer thread");
-
-        // Stage 1: wait for the producer to open the file and publish track info
-        // (fast, usually < 50ms). Once this is set, sample rate / bits / duration
-        // are available so we can build track_info and show the new status line
-        // while the buffer fills underneath us.
-        while !state.track_info_ready.load(Ordering::Relaxed)
-              && !state.producer_done.load(Ordering::Relaxed)
-              && !state.should_quit()
-        {
-            poll_input(&state, &mut ui, &mut playlist);
-            thread::sleep(Duration::from_millis(10));
-        }
-
-        // If producer failed before track info, skip
-        if state.producer_done.load(Ordering::Relaxed)
-           && !state.track_info_ready.load(Ordering::Relaxed)
-        {
-            match producer_handle.join() {
-                Ok(p) => prod = p,
-                Err(_) => break 'playlist,
-            }
-            let err_msg = state.decode_error.lock().ok().and_then(|mut e| e.take());
-            if let Some(msg) = err_msg {
-                ui.set_status(format!("Skip: {}", msg));
-            }
-            ui.current += 1;
-            // Force a full redraw so the next track's status line starts clean
-            // instead of leaving orphan lines from the previous render.
-            ui.terminal_resized = true;
-            prev_frame_lines = usize::MAX;
-            continue 'playlist;
-        }
-
-        // Resume: seek to saved position (only on first track after resume)
-        if resume_position > 0 {
-            state.seek(resume_position);
-            resume_position = 0;
-        }
-
-        // Build track info string
-        let src_rate = state.sample_rate.load(Ordering::Relaxed) as u32;
-        let channels = state.channels.load(Ordering::Relaxed);
-        let bits = state.bits_per_sample.load(Ordering::Relaxed);
-        let ch_str = match channels {
-            1 => "mono".to_string(),
-            2 => "stereo".to_string(),
-            n => format!("{}ch", n),
-        };
-        let rate_str = rate_label(src_rate, stream_rate, &state);
-        let mut track_info = format!("{} • {}bit {} • {}", format_time(state.total_secs()), bits, ch_str, rate_str);
-
-        // Load lyrics off the main thread so skip stays responsive.
-        let dur = { let t = state.total_secs(); if t > 0.0 { Some(t as u32) } else { None } };
-        ui.lyrics_scroll = 0;
-        ui.lyrics_auto_scroll = true;
-        let lyrics_path = playlist[ui.current].clone();
-        spawn_lyrics_worker(&mut ui, lyrics_path.clone(), dur);
-        spawn_cover_worker(&mut ui, lyrics_path, cover::CoverSize::for_theme(state.theme_kind()));
-
-        // Visualization analyzer (created before the startup wait so print_status
-        // can draw the waveform/lissajous/spectrogram viz modes during buffering).
-        let mut viz_analyser = VizAnalyser::new(stream_rate);
-        let mut viz_scratch = Vec::with_capacity(VIZ_BUFFER_SIZE);
-
-        // Stage 2: wait for the ring buffer to fill enough that the audio callback
-        // won't underrun, while refreshing the status line so the user sees the new
-        // track name immediately instead of staring at the old one.
-        {
-            let current_eq = &eq_presets[state.eq_index()];
-            let current_fx = &fx_presets[state.effects_index()].name;
-            let current_cf = &cf_presets[state.crossfeed_index()].name;
-            // Wait for ~1 second of audio in the ring before entering the
-            // steady-state loop, so the already-running callback can't underrun
-            // right after the track starts. Using stream_rate (rather than a
-            // fraction of the raw ring size) keeps the cushion consistent
-            // across output rates.
-            let startup_threshold = stream_rate as usize * 2;
-            // Also stop on a rate-change request: that exit does not set
-            // producer_done, so a track shorter than the 1 s threshold followed
-            // by one at another rate never filled the ring and stalled here —
-            // the loop that acts on the request is the one this wait gates.
-            while state.buffer_level.load(Ordering::Relaxed) < startup_threshold
-                  && !state.producer_done.load(Ordering::Relaxed)
-                  && !state.rate_change_needed.load(Ordering::Relaxed)
-                  && !state.should_quit()
-            {
-                poll_input(&state, &mut ui, &mut playlist);
-                // A theme switch here must re-decode the cover for the new slot
-                // (Minimal drew the 20x10 Classic cover into its 18-col slot).
-                if ui.cover_resize_pending {
-                    ui.cover_resize_pending = false;
-                    if let Some(path) = playlist.get(ui.current).cloned() {
-                        spawn_cover_worker(&mut ui, path, cover::CoverSize::for_theme(state.theme_kind()));
-                    }
-                }
-                // Begin/end synchronized update (DEC mode 2026): present each frame
-                // atomically so terminals (notably Windows Terminal) don't show the
-                // mid-redraw erase-then-repaint as flickering black lines. Ignored by
-                // terminals that don't support it.
-                print!("\x1B[?2026h");
-                if repaint_if_needed(&state, &mut ui, &build_banner_box) {
-                    prev_frame_lines = usize::MAX;
-                    prev_viz_image_shown = false;
-                }
-                prev_frame_lines = print_status(&state, &mut ui, &filename, &track_info, &track_ext, current_eq, current_fx, current_cf, &mut stats, prev_frame_lines, &playlist, &viz_analyser);
-                print!("\x1B[?2026l");
-                io::stdout().flush().ok();
-                thread::sleep(Duration::from_millis(20));
-            }
-        }
-
-        // Update OS media transport. Title/artist/album come from the cache
-        // when the scan has reached this track; otherwise the display name
-        // stands in for the title (same fallback the UI itself uses).
-        if let Some(ref mut mc) = media_controls {
-            let (mk_artist, mk_album) = ui.metadata_cache.artist_album(ui.current);
-            let mk_title = ui.metadata_cache.title(ui.current).unwrap_or_else(|| filename.clone());
-            media_keys::update_metadata(
-                mc, &mk_title, mk_artist.as_deref(), mk_album.as_deref(), state.total_secs(),
-            );
-            media_keys::update_playback(mc, state.is_paused(), 0.0);
-        }
-
-        // Playback loop (stays here across natural track transitions)
-        let mut last_ui = Instant::now();
-
-        loop {
-            // Input. Also honor a quit that was raised while this loop wasn't
-            // watching (the stage-1/2 buffering waits poll input but discard
-            // the quit return) — otherwise Q during buffering keeps playing
-            // until the ring drains, or hangs entirely when paused.
-            if poll_input(&state, &mut ui, &mut playlist) || state.should_quit() {
-                print!("\x1B[?25h");
-                if prev_frame_lines != usize::MAX {
-                    // One row above the frame's anchor line (the gap row under
-                    // the banner), then erase down to wipe the whole frame.
-                    let up = 1 + prev_frame_lines;
-                    print!("\x1B[{}F", up);
-                }
-                print!("\x1B[J");
-                io::stdout().flush().ok();
-                let _ = save_tx.send(build_resume_state(&ui, &playlist, &state, &eq_presets, &fx_presets, &cf_presets, &device_arg));
-                // Stop the stream BEFORE giving the device back. Releasing hog
-                // mode while our IO was still running reconfigured the device
-                // mid-stream, and the process then exited with the stream never
-                // stopped — heard as a buzz on quit. `take()` so the release at
-                // the end of main does not run a second time.
-                // Exclusive mode: give the DAC back as it was found. Silence
-                // and close the stream first — releasing hog mode under
-                // running IO buzzed, and a format change under a live stream is
-                // what StreamInvalidated reports — then restore the format
-                // while hog mode is still ours (no other app sees the
-                // in-between state), then release it. Also taken when hog mode
-                // was refused but the rate/bit depth were still changed.
-                let hog = hog_device_id.take();
-                if hog.is_some() || original_format.is_some() {
-                    let _ = stream.pause();
-                    drop(stream);
-                    if let Some(saved) = original_format.take() {
-                        let _ = audio::restore_format(&saved);
-                    }
-                    if let Some(id) = hog {
-                        audio::release_exclusive_mode(id);
-                    }
-                    let _ = producer_handle.join();
-                    break 'playlist;
-                }
-                // Producer will exit when state.should_quit() is true
-                let _ = producer_handle.join();
-                break 'playlist;
-            }
-
-            // Fire the one-shot artist→album auto-sort once the metadata scan
-            // has loaded tags (no-op until armed + scan finished + not shuffling).
-            poll_auto_sort(&state, &mut ui, &mut playlist);
-            // Keep the library tree fresh while it's showing (no-op otherwise).
-            poll_library_tree(&mut ui, &playlist);
-
-            // A theme switch changes the cover slot's cell size, and half-block
-            // and Sixel bake that in at decode time — so re-decode rather than
-            // stretch. Cheap: local sources are hit first and the worker is
-            // generation-counted like any other cover load.
-            if ui.cover_resize_pending {
-                ui.cover_resize_pending = false;
-                if let Some(path) = playlist.get(ui.current).cloned() {
-                    spawn_cover_worker(&mut ui, path, cover::CoverSize::for_theme(state.theme_kind()));
-                }
-            }
-
-            // Check for track transitions from the producer
-            let current_count = state.track_transition_count.load(Ordering::Acquire);
-            if current_count != last_transition_count {
-                let new_index = state.producer_track_index.load(Ordering::Relaxed);
-                last_transition_count = current_count;
-
-                // Surface mid-playlist decode failures. The producer skips a
-                // bad file and signals the next track; without this the error
-                // text it stored was never shown anywhere.
-                let skip_err = state.decode_error.lock().ok().and_then(|mut e| e.take());
-                if let Some(msg) = skip_err {
-                    ui.set_status(format!("Skip: {}", msg));
-                }
-
-                // Playlist was modified — producer's new_index is from the stale snapshot.
-                // Schedule a jump to the right track; skip the rest of this transition so we
-                // don't display/fetch-lyrics for the wrong file. The jump_to_track check on the
-                // next loop iteration will respawn the producer with the fresh playlist.
-                if ui.playlist_dirty {
-                    ui.playlist_dirty = false;
-                    let target = if ui.current_track_removed {
-                        ui.current_track_removed = false;
-                        ui.current
-                    } else {
-                        (ui.current + 1).min(playlist.len().saturating_sub(1))
-                    };
-                    state.jump_to(target);
-                } else if new_index < playlist.len() {
-                    ui.current = new_index;
-                    ui.enqueue_count = 0;
-                    state.current_track.store(ui.current, Ordering::Relaxed);
-
-                    if ui.view_mode == state::ViewMode::Playlist && ui.filtered_indices.is_empty() {
-                        ui.cursor = ui.current;
-                    }
-
-                    // Update display info for new track
-                    let new_path = &playlist[ui.current];
-                    filename = ui.metadata_cache.display_name(ui.current, new_path);
-                    track_ext = new_path.extension()
-                        .map(|e| e.to_string_lossy().to_lowercase())
-                        .unwrap_or_default();
-
-                    ui.lyrics_scroll = 0;
-                    ui.lyrics_auto_scroll = true;
-                    let dur = { let t = state.total_secs(); if t > 0.0 { Some(t as u32) } else { None } };
-                    spawn_lyrics_worker(&mut ui, new_path.clone(), dur);
-                    spawn_cover_worker(&mut ui, new_path.clone(), cover::CoverSize::for_theme(state.theme_kind()));
-
-                    let src_rate = state.sample_rate.load(Ordering::Relaxed) as u32;
-                    let channels = state.channels.load(Ordering::Relaxed);
-                    let bits = state.bits_per_sample.load(Ordering::Relaxed);
-                    let ch_str = match channels {
-                        1 => "mono".to_string(),
-                        2 => "stereo".to_string(),
-                        n => format!("{}ch", n),
-                    };
-                    let rate_str = rate_label(src_rate, stream_rate, &state);
-                    track_info = format!("{} • {}bit {} • {}", format_time(state.total_secs()), bits, ch_str, rate_str);
-
-                    if let Some(ref mut mc) = media_controls {
-                        let (mk_artist, mk_album) = ui.metadata_cache.artist_album(ui.current);
-                        let mk_title = ui.metadata_cache.title(ui.current)
-                            .unwrap_or_else(|| filename.clone());
-                        media_keys::update_metadata(
-                            mc, &mk_title, mk_artist.as_deref(), mk_album.as_deref(),
-                            state.total_secs(),
-                        );
-                        media_keys::update_playback(mc, state.is_paused(), 0.0);
-                    }
-
-                    let _ = save_tx.send(build_resume_state(&ui, &playlist, &state, &eq_presets, &fx_presets, &cf_presets, &device_arg));
-                }
-            }
-
-            // Skip-prev or jump: join producer, respawn
-            if state.skip_prev.load(Ordering::Relaxed) || state.jump_to_track.load(Ordering::Relaxed) >= 0 {
-                match producer_handle.join() {
-                    Ok(p) => prod = p,
-                    Err(_) => break 'playlist,
-                }
-                // Flush ring buffer, and wait for the callback to actually
-                // consume the drain request before the respawned producer can
-                // push — otherwise the drain may fire late and discard the new
-                // track's first samples.
-                if state.ring_capacity.load(Ordering::Relaxed) - prod.slots() > 0 {
-                    state.reset_consumer_counter.store(true, Ordering::Release);
-                    await_consumer_drain(&state);
-                }
-                // The respawn below clears decode_error, so show it first — a
-                // producer that caught a decoder crash jumps here to skip.
-                if let Some(msg) = state.decode_error.lock().ok().and_then(|mut e| e.take()) {
-                    ui.set_status(format!("Skip: {msg}"));
-                }
-                if let Some(target) = state.take_jump() {
-                    ui.current = target;
-                } else if state.take_skip_prev() {
-                    ui.current = ui.current.saturating_sub(1);
-                }
-                ui.enqueue_count = 0;
-                continue 'playlist;
-            }
-
-            // Exclusive mode: rate change needed (producer detected different sample rate)
-            if state.rate_change_needed.swap(false, Ordering::Relaxed) {
-                // Wait for the buffer to drain so the current track finishes before we
-                // tear the stream down. A paused stream never drains, so wait out the
-                // pause instead of bailing — bailing here would truncate the buffered
-                // tail and click. The rate switch simply defers until playback resumes.
-                //
-                // The wait keeps the UI alive: it polls input (so pause/unpause
-                // and quit work — a paused wait used to be unbreakable from the
-                // keyboard, and raw mode swallows Ctrl+C) and keeps painting.
-                // It also bails on a stream error: a dead callback never drains
-                // the ring, so an unplug during the tail used to hang here
-                // forever. Either bail falls through WITHOUT the rate switch —
-                // quit is handled at the top of the next pass, and the stream
-                // error by the recovery block just below, which restarts the
-                // current track where it was.
-                while !state.should_quit()
-                    && !state.stream_error.load(Ordering::Relaxed)
-                    && (state.is_paused() || state.buffer_level.load(Ordering::Relaxed) > 0)
-                {
-                    poll_input(&state, &mut ui, &mut playlist);
-                    let current_eq = &eq_presets[state.eq_index()];
-                    let current_fx = &fx_presets[state.effects_index()].name;
-                    let current_cf = &cf_presets[state.crossfeed_index()].name;
-                    print!("\x1B[?2026h");
-                    if repaint_if_needed(&state, &mut ui, &build_banner_box) {
-                        prev_frame_lines = usize::MAX;
-                        prev_viz_image_shown = false;
-                    }
-                    prev_frame_lines = print_status(&state, &mut ui, &filename, &track_info, &track_ext, current_eq, current_fx, current_cf, &mut stats, prev_frame_lines, &playlist, &viz_analyser);
-                    print!("\x1B[?2026l");
-                    io::stdout().flush().ok();
-                    thread::sleep(Duration::from_millis(20));
-                }
-                if !state.should_quit() && !state.stream_error.load(Ordering::Relaxed) {
-                    match producer_handle.join() {
-                        Ok(_) => {} // Old producer dropped; new ring buffer below
-                        Err(_) => break 'playlist,
-                    }
-
-                    // Drop the old stream BEFORE changing the device rate: a
-                    // stream alive during the change gets StreamInvalidated from
-                    // cpal's rate listener, which ran a full recovery ("output
-                    // moved", restart at the last whole second) on every switch.
-                    drop(stream);
-                    // The same rule the producer used to predict this switch
-                    // (state::RateCaps::resolve): the file's rate, else a
-                    // whole-number ratio of it, else the next rate up — never
-                    // just capped to the device maximum (352.8k -> 192k).
-                    let new_rate = state.next_track_rate.load(Ordering::Relaxed);
-                    let target_rate = state.exclusive_target_rate(new_rate, stream_rate);
-                    let actual_rate = set_output_sample_rate(target_rate, stream_rate, &device);
-                    apply_exclusive_bit_depth(&state, &device, actual_rate);
-                    stream_rate = actual_rate;
-                    state.output_rate.store(stream_rate as u64, Ordering::Relaxed);
-                    // Forget anything the old stream reported on its way out.
-                    state.stream_error.store(false, Ordering::Relaxed);
-
-                    let (new_prod, new_viz_cons, new_stream, built_rate) =
-                        rebuild_stream(&device, stream_rate, out_channels, saved_buffer_size, &state)?;
-                    stream_rate = built_rate;
-                    prod = new_prod;
-                    viz_cons = new_viz_cons;
-                    stream = new_stream;
-                    stream.play()?;
-
-                    // Continue playlist from the track that needs the new rate
-                    // (viz_analyser is re-created at the top of each 'playlist iteration)
-                    let new_idx = state.producer_track_index.load(Ordering::Relaxed);
-                    if new_idx < playlist.len() {
-                        ui.current = new_idx;
-                    }
-                    continue 'playlist;
-                }
-            }
-
-            // Stream error recovery (device disconnected, AirPods removed, etc.)
-            if state.stream_error.swap(false, Ordering::Relaxed) {
-                // Normal mode follows the current default output device.
-                // Exclusive mode stays on ITS device while that device exists
-                // (chasing the default is what split the stream from the hogged
-                // device); only if it is gone does it move to the new default,
-                // pinned again.
-                let replacement = if state.exclusive.load(Ordering::Relaxed) {
-                    audio::pin_device(&host, &device).or_else(|| {
-                        host.default_output_device()
-                            .and_then(|d| audio::prepare_exclusive_device(&host, &d).ok())
-                    })
-                } else {
-                    host.default_output_device()
-                };
-                if let Some(new_device) = replacement {
-                    // Recovery tears down the producer and re-enters the
-                    // playlist loop, which starts the track from 0:00. Capture
-                    // where we were so it can seek back: changing output device
-                    // should not lose your place in the song. Read before the
-                    // teardown — the producer zeroes samples_played on restart.
-                    let resume_at = state.time_secs().floor().max(0.0) as i64;
-                    // Signal the producer to exit — it may be stuck in the
-                    // buffer-full sleep loop since the audio callback stopped
-                    // draining the ring buffer.
-                    state.jump_to(ui.current);
-                    match producer_handle.join() {
-                        Ok(_) => {}
-                        Err(_) => break 'playlist,
-                    }
-                    // Consume the unstick signal: it was only set to break the old
-                    // producer out of its buffer-full sleep. Leaving it set would make
-                    // the producer we respawn below peek jump_to_track >= 0 and exit
-                    // immediately, wasting a spawn/join cycle before playback resumes.
-                    state.take_jump();
-                    drop(stream);
-                    // The dying stream's error callback can fire once more
-                    // after the swap that brought us here; anything set so far
-                    // is about the stream just dropped, not the one built below.
-                    state.stream_error.store(false, Ordering::Relaxed);
-
-                    device = new_device;
-
-                    // Re-label the banner: recovery has moved playback to a
-                    // different endpoint, and the tail still names the one that
-                    // was unplugged.
-                    if let Ok(desc) = device.description() {
-                        let new_name = desc.name().to_string();
-                        ui.banner_tail = replace_device_line(&ui.banner_tail, &new_name);
-                        ui.banner_dirty = true;
-                        ui.set_status(format!("output moved to {new_name}"));
-                    }
-
-                    // Re-acquire exclusive (hog) mode on the new device if it
-                    // was active before the disconnect. The old hog_device_id
-                    // refers to the (likely gone) previous device — release is
-                    // best-effort and harmless if the device no longer exists.
-                    if state.exclusive.load(Ordering::Relaxed) {
-                        if let Some(old_id) = hog_device_id.take() {
-                            audio::release_exclusive_mode(old_id);
-                        }
-                        if let Ok(Some(id)) = audio::set_exclusive_mode(&device) {
-                            hog_device_id = Some(id);
-                        }
-                        // A new device means new reachable rates.
-                        if let Ok(mut caps) = state.exclusive_caps.lock() {
-                            *caps = audio::probe_rate_caps(&device);
-                        }
-                        if let Some(note) = locked_rate_note(&state, &device) {
-                            ui.set_status_for(note, Duration::from_secs(10));
-                        }
-                    }
-
-                    let new_rate = device.default_output_config()
-                        .map(|c| c.sample_rate())
-                        .unwrap_or(48000);
-                    // New device (or the same one back): its format is set
-                    // again, before the stream is built.
-                    apply_exclusive_bit_depth(&state, &device, new_rate);
-                    stream_rate = new_rate;
-                    state.output_rate.store(stream_rate as u64, Ordering::Relaxed);
-
-                    match rebuild_stream(&device, stream_rate, out_channels, saved_buffer_size, &state) {
-                        Ok((new_prod, new_viz_cons, new_stream, built_rate)) => {
-                            stream_rate = built_rate;
-                            prod = new_prod;
-                            viz_cons = new_viz_cons;
-                            stream = new_stream;
-                            if stream.play().is_err() {
-                                break 'playlist;
-                            }
-                        }
-                        Err(_) => break 'playlist,
-                    }
-                    // Resume the current track where it left off.
-                    resume_position = resume_at;
-                    continue 'playlist;
-                } else {
-                    // No default device right now — Windows can report none
-                    // for a while after a USB DAC is yanked. The swap above
-                    // already consumed the flag; put it back so we retry on
-                    // the next frame instead of abandoning recovery forever.
-                    // The loop keeps polling input, so quit stays responsive.
-                    state.stream_error.store(true, Ordering::Relaxed);
-                    ui.set_status("audio device lost — waiting for an output device".to_string());
-                }
-            }
-
-            // Producer done (playlist exhausted or error)
-            if state.producer_done.load(Ordering::Relaxed)
-               && state.buffer_level.load(Ordering::Relaxed) == 0
-            {
-                thread::sleep(Duration::from_millis(200));
-                match producer_handle.join() {
-                    Ok(p) => prod = p,
-                    Err(_) => break 'playlist,
-                }
-
-                let _ = save_tx.send(build_resume_state(&ui, &playlist, &state, &eq_presets, &fx_presets, &cf_presets, &device_arg));
-                ui.current = playlist.len(); // Will trigger repeat-cycle or exit
-                continue 'playlist;
-            }
-
-            // UI update. The analysis spectrogram is the one continuously-scrolling
-            // mode; match the render cadence to its (sample-rate-adaptive) column
-            // rate so it advances one column per frame, evenly. Other modes stay at
-            // 20fps. The loop sleep below uses the SAME value, which keeps the cadence
-            // even — an unequal sleep/interval is what made it judder before.
-            let analysis_viz = state.viz_mode() == VizMode::SpectrogramAnalysis;
-            let frame_ms: u64 = if analysis_viz {
-                crate::state::spectro_frame_ms(state.output_rate.load(Ordering::Relaxed))
-            } else {
-                50
-            };
-            if last_ui.elapsed() >= Duration::from_millis(frame_ms) {
-                if state.viz_mode() != VizMode::None {
-                    let viz_available = viz_cons.slots();
-                    if viz_available > 0 {
-                        if let Ok(chunk) = viz_cons.read_chunk(viz_available) {
-                            let (first, second) = chunk.as_slices();
-                            viz_scratch.clear();
-                            viz_scratch.extend_from_slice(first);
-                            viz_scratch.extend_from_slice(second);
-                            chunk.commit_all();
-                            viz_analyser.process(&viz_scratch, 2, &state);
-                        }
-                    }
-                } else {
-                    let viz_available = viz_cons.slots();
-                    if viz_available > 0 {
-                        if let Ok(chunk) = viz_cons.read_chunk(viz_available) {
-                            chunk.commit_all();
-                        }
-                    }
-                }
-
-                // Minimal keeps cpu/mem in its SIGNAL panel permanently, so the
-                // sampler has to run there regardless of the `I` toggle.
-                if state.show_stats() || state.theme_kind() == theme::ThemeKind::Minimal {
-                    stats.update();
-                }
-
-                // Detect an endpoint change the stream never reported.
-                //
-                // Unplugging a device does not always raise a stream error:
-                // WASAPI shared mode reroutes the stream to the new default
-                // endpoint transparently, so playback carries on and the error
-                // callback never fires — leaving the banner naming a device
-                // that is no longer producing sound. Only meaningful when we
-                // follow the default (an explicit --device stays put), and
-                // polled at ~1 Hz because enumerating endpoints is a COM call.
-                // The OS rerouted our default-device stream (cpal DeviceChanged,
-                // e.g. AirPods connecting). The stream is STILL PLAYING on the
-                // new output — rebuilding it (the old behaviour) restarted the
-                // track at the last whole second. Only our device handle and the
-                // banner label follow; the poll below runs now rather than
-                // after its 1 s throttle. Exclusive mode never gets here: its
-                // reroutes are classified as a rebuild (see classify_stream_error).
-                let rerouted = state.device_rerouted.swap(false, Ordering::Relaxed);
-                if rerouted {
-                    if let Some(d) = host.default_output_device() {
-                        device = d;
-                    }
-                }
-                // Exclusive mode is pinned to its device, so the system default
-                // moving (which Keet's own hog mode causes) is not our output
-                // moving — relabelling to it announced "output now on MacBook
-                // speakers" while playback stayed on the DAC.
-                if device_arg.is_none()
-                    && !state.exclusive.load(Ordering::Relaxed)
-                    && (rerouted || last_device_poll.elapsed() >= Duration::from_secs(1))
-                {
-                    last_device_poll = Instant::now();
-                    let current = host
-                        .default_output_device()
-                        .and_then(|d| d.description().ok().map(|desc| desc.name().to_string()));
-                    if let Some(name) = current {
-                        if name != shown_device_name {
-                            shown_device_name = name.clone();
-                            ui.banner_tail = replace_device_line(&ui.banner_tail, &name);
-                            ui.banner_dirty = true;
-                            ui.set_status(format!("output now on {name}"));
-                        }
-                    }
-                }
-
-                // Check if background lyrics fetch has completed
-                if let Some(ref rx) = ui.lyrics_receiver {
-                    if let Ok(lyrics) = rx.try_recv() {
-                        if let Some(parsed) = lyrics {
-                            ui.lyrics = Some(parsed);
-                        }
-                        ui.lyrics_receiver = None;
-                    }
-                }
-
-                // Check if background cover fetch has completed
-                if let Some(ref rx) = ui.cover_receiver {
-                    if let Ok(cover) = rx.try_recv() {
-                        ui.cover = cover;
-                        ui.cover_receiver = None;
-                        // Minimal draws the cover per-frame with emit-on-change,
-                        // so a newly arrived image needs exactly one repaint.
-                        ui.cover_dirty_frame = true;
-                        // Only Classic shows the cover, so only Classic needs
-                        // a banner repaint when it arrives. For Minimal/HiFi
-                        // we skip the dirty flag — the full-screen redraw
-                        // would briefly flash the banner before the per-frame
-                        // UI overwrites it.
-                        if state.theme_kind() == theme::ThemeKind::Classic {
-                            ui.banner_dirty = true;
-                        }
-                    }
-                }
-
-                // Begin synchronized update (DEC mode 2026) before any frame
-                // output — including the full repaint below, which now also runs
-                // on every viz mode/style key — so the erase-then-repaint is
-                // presented atomically. Closed after print_status. Ignored by
-                // terminals that don't support it.
-                print!("\x1B[?2026h");
-
-                if repaint_if_needed(&state, &mut ui, &build_banner_box) {
-                    prev_frame_lines = usize::MAX;
-                    prev_viz_image_shown = false; // the repaint cleared any viz image
-                }
-
-                // Refresh filename from the metadata cache once the background
-                // scan has caught up (replaces the raw filename fallback shown
-                // right after a skip).
-                if ui.current < playlist.len() {
-                    let fresh = ui.metadata_cache.display_name(ui.current, &playlist[ui.current]);
-                    if fresh != filename {
-                        filename = fresh;
-                    }
-                }
-
-                let current_eq = &eq_presets[state.eq_index()];
-                let current_fx = &fx_presets[state.effects_index()].name;
-                let current_cf = &cf_presets[state.crossfeed_index()].name;
-
-                // Delete the Kitty analysis-spectrogram image (by id) when it's no
-                // longer being drawn — leaving the mode OR switching away from the
-                // Player view (playlist/lyrics). The image is a graphics overlay, so
-                // unlike the text viz it isn't painted over by the new view.
-                let viz_image_shown = ui.view_mode == state::ViewMode::Player
-                    && state.viz_mode() == VizMode::SpectrogramAnalysis
-                    && matches!(cover::detect_protocol(), cover::GraphicsProtocol::Kitty);
-                if prev_viz_image_shown && !viz_image_shown {
-                    print!("{}", cover::viz_image_clear_escape());
-                }
-                prev_viz_image_shown = viz_image_shown;
-
-                prev_frame_lines = print_status(&state, &mut ui, &filename, &track_info, &track_ext, current_eq, current_fx, current_cf, &mut stats, prev_frame_lines, &playlist, &viz_analyser);
-                print!("\x1B[?2026l");
-                io::stdout().flush().ok();
-
-                // OS now-playing refresh: pushing one every UI frame (~20 Hz)
-                // is needless objc/D-Bus traffic. Pause-state changes go out
-                // immediately; the position otherwise syncs at ~1 Hz.
-                if let Some(ref mut mc) = media_controls {
-                    let paused_now = state.is_paused();
-                    if paused_now != last_mk_paused
-                        || last_mk_push.elapsed() >= Duration::from_secs(1)
-                    {
-                        media_keys::update_playback(mc, paused_now, state.time_secs());
-                        last_mk_paused = paused_now;
-                        last_mk_push = Instant::now();
-                    }
-                }
-
-                last_ui = Instant::now();
-            }
-
-            media_keys::poll();
-            thread::sleep(Duration::from_millis(frame_ms));
-        }
-    }
+    let mut player = player::Player::new(player::PlayerSetup {
+        stream: first_stream,
+        device_restore,
+        device,
+        prod,
+        viz_cons,
+        stream_rate,
+        out_channels,
+        buffer_size,
+        host,
+        state: Arc::clone(&state),
+        ui,
+        playlist,
+        eq_presets,
+        fx_presets,
+        cf_presets,
+        hq_resampler,
+        crossfade_secs,
+        device_arg,
+        save_tx,
+        media_controls,
+        resume_position,
+        shown_device_name,
+    });
+    player.run();
 
     // Flush any queued resume-state writes before exit.
-    drop(save_tx);
+    player.close_saves();
     let _ = saver_handle.join();
 
     terminal::disable_raw_mode()?;
 
-    print!("\x1B[?25h");
+    crate::term::out!("\x1B[?25h");
 
-    let _ = prev_frame_lines; // no longer needed: full screen clear below covers everything
-    // Wipe the whole header (banner + status + viz + playlist/lyrics) and any
+    // Wipe the whole frame (header + status + viz + playlist/lyrics) and any
     // kitty graphic, leaving only the goodbye line.
     if matches!(cover::detect_protocol(), cover::GraphicsProtocol::Kitty) {
-        print!("{}{}", cover::kitty_clear_escape(), cover::viz_image_clear_escape());
+        crate::term::out!("{}{}", cover::kitty_clear_escape(), cover::viz_image_clear_escape());
     }
     // Home + erase-down, not ED2 — see the resize repaint above (ConPTY turns
     // 2J into a scrollback push on Windows Terminal).
-    print!("\x1B[H\x1B[J");
-    println!("✓ Done");
-    io::stdout().flush().ok();
+    crate::term::out!("\x1B[H\x1B[J✓ Done\n");
+    crate::term::flush();
 
     // Release exclusive mode and restore the DAC's format. Normally already
     // done (and taken) by the quit key, which silences the stream first; this
     // covers the rarer exits, most of which have already dropped the stream.
-    if let Some(saved) = original_format.take() {
-        let _ = audio::restore_format(&saved);
-    }
-    if let Some(id) = hog_device_id {
-        audio::release_exclusive_mode(id);
-    }
+    player.release_output();
 
     // Exit immediately — implicit drops of cpal::Stream (ALSA backend) and
     // souvlaki::MediaControls (D-Bus) can block indefinitely on Linux, hanging
@@ -2180,33 +1235,25 @@ mod main_tests {
     }
 
     #[test]
+    fn eq_and_fx_flags_take_a_preset_name_or_a_json_file() {
+        let mut presets = eq::builtin_presets();
+        let n = presets.len();
+        let bass = presets.iter().position(|p| p.name == "Bass Boost").unwrap();
+        assert_eq!(pick_preset(&mut presets, "bass BOOST", |p| &p.name), Some(bass), "any case");
+        let file = std::env::temp_dir().join(format!("keet_pick_{}.json", std::process::id()));
+        std::fs::write(&file, r#"{"name":"Mine","gains":[1,2,3,4,5,6,7,8,9,10]}"#).unwrap();
+        let got = pick_preset(&mut presets, file.to_str().unwrap(), |p| &p.name);
+        let _ = std::fs::remove_file(&file);
+        assert_eq!(got, Some(n), "a file joins the list");
+        assert_eq!(presets[n].name, "Mine");
+        assert_eq!(pick_preset(&mut presets, "no-such-preset", |p| &p.name), None);
+    }
+
+    #[test]
     fn restore_cursor_emits_the_show_cursor_sequence() {
         let mut buf: Vec<u8> = Vec::new();
         restore_cursor(&mut buf);
         assert_eq!(buf, b"\x1B[?25h");
-    }
-
-    #[test]
-    fn device_line_is_rewritten_without_disturbing_the_banner_shape() {
-        // The banner tail is built once at startup, so after stream-error
-        // recovery swaps to a different output device it kept naming the one
-        // that was unplugged. Rewriting must preserve the line structure
-        // exactly — banner_lines drives the cursor-up math for every repaint.
-        let tail = "\nDevice: SteelSeries Sonar - Media\nInitial output: 48000Hz\n";
-        let out = replace_device_line(tail, "Speakers (Focusrite USB Audio)");
-        assert_eq!(
-            out,
-            "\nDevice: Speakers (Focusrite USB Audio)\nInitial output: 48000Hz\n"
-        );
-        assert_eq!(out.lines().count(), tail.lines().count(), "line count must not shift");
-
-        // Minimal/HiFi tails carry no device line — must pass through untouched.
-        let no_device = "\n{Space} Pause  {Q} Quit\n";
-        assert_eq!(replace_device_line(no_device, "Anything"), no_device);
-
-        // A tail with no trailing newline keeps not having one.
-        let no_nl = "\nDevice: Old";
-        assert_eq!(replace_device_line(no_nl, "New"), "\nDevice: New");
     }
 
     #[test]

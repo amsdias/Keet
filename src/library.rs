@@ -64,13 +64,10 @@ pub fn build(tags: &[TrackTags]) -> LibraryTree {
         })
         .collect();
 
-    rows.sort_by(|a, b| {
-        a.0.to_lowercase()
-            .cmp(&b.0.to_lowercase())
-            .then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase()))
-            .then(a.2.cmp(&b.2))
-            .then(a.3.unwrap_or(0).cmp(&b.3.unwrap_or(0)))
-            .then_with(|| a.4.to_lowercase().cmp(&b.4.to_lowercase()))
+    // Lowercase each key ONCE: lowercasing inside the comparator allocated
+    // several strings per comparison (~a million at 10k tracks).
+    rows.sort_by_cached_key(|r| {
+        (r.0.to_lowercase(), r.1.to_lowercase(), r.2, r.3.unwrap_or(0), r.4.to_lowercase())
     });
 
     // Fold consecutive same-name (case-insensitive) rows into nested nodes,
@@ -473,12 +470,11 @@ mod tests {
         // Expanded artist shows ▾, collapsed shows ▸; names present.
         assert!(lines[0].contains('▾') && lines[0].contains("Arctic Monkeys"));
         assert!(lines[2].contains('▸') && lines[2].contains("Radiohead"));
-        // Album row indented deeper than the artist row (more leading spaces).
-        let indent = |s: &str| s.chars().take_while(|c| *c == ' ').count();
-        // strip ANSI first: the visible prefix spaces come after the SGR codes,
-        // so compare the raw byte position of the name instead.
-        assert!(lines[1].find("AM").unwrap() > lines[0].find("Arctic Monkeys").unwrap());
-        let _ = indent;
+        // Album row indented deeper than the artist row: compare where the
+        // names start in the VISIBLE text (the cursor row's colour escapes
+        // differ in length per theme, so raw byte positions mean nothing).
+        let plain = |s: &str| crate::ansi::strip_ansi(s);
+        assert!(plain(&lines[1]).find("AM").unwrap() > plain(&lines[0]).find("Arctic Monkeys").unwrap());
 
         // Windowing: height 1 from scroll 1 yields just the album row.
         let one = render_library_tree(&tree, &fold, &vis, 1, 1, 1, 40, p, None);

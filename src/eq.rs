@@ -27,31 +27,52 @@ pub(crate) fn flush_denormal_f64(x: f64) -> f64 {
 /// +2.4 dB — the recursion `-a1*y1 - a2*y2` cancels away the signal. f64 has
 /// 29 more mantissa bits and lands it exactly. Scalar f64 costs the same as
 /// f32 on x86-64/ARM64 for ~1M evals/sec, so this is free.
+///
+/// Shared by every biquad in Keet (the EQ and the crossfeed low-pass), which
+/// each used to carry their own copy of the types and the recursion.
 #[derive(Clone)]
-struct BiquadState {
+pub(crate) struct BiquadState {
     x1: f64, x2: f64,
     y1: f64, y2: f64,
 }
 
 impl BiquadState {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self { x1: 0.0, x2: 0.0, y1: 0.0, y2: 0.0 }
     }
 
-    fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.x1 = 0.0; self.x2 = 0.0;
         self.y1 = 0.0; self.y2 = 0.0;
+    }
+
+    /// One sample through the filter (direct form I).
+    #[inline]
+    pub(crate) fn process(&mut self, c: &BiquadCoeffs, input: f64) -> f64 {
+        let out = c.b0 * input + c.b1 * self.x1 + c.b2 * self.x2 - c.a1 * self.y1 - c.a2 * self.y2;
+        self.x2 = self.x1;
+        self.x1 = input;
+        self.y2 = self.y1;
+        // Flush the feedback state: during silence y decays into denormal
+        // range, where x86 float ops are 10-100x slower.
+        self.y1 = flush_denormal_f64(out);
+        out
     }
 }
 
 /// Biquad filter coefficients (normalized, a0 = 1.0). f64 — see [`BiquadState`].
 #[derive(Clone)]
-struct BiquadCoeffs {
+pub(crate) struct BiquadCoeffs {
     b0: f64, b1: f64, b2: f64,
     a1: f64, a2: f64,
 }
 
 impl BiquadCoeffs {
+    /// A filter that passes the signal unchanged.
+    pub(crate) fn passthrough() -> Self {
+        Self { b0: 1.0, b1: 0.0, b2: 0.0, a1: 0.0, a2: 0.0 }
+    }
+
     /// Peaking EQ filter from Audio EQ Cookbook (Robert Bristow-Johnson)
     fn peaking_eq(freq: f64, gain_db: f64, q: f64, sample_rate: f64) -> Self {
         if gain_db.abs() < 0.01 {
@@ -139,8 +160,9 @@ impl BiquadCoeffs {
         }
     }
 
-    /// 2nd-order low-pass (RBJ cookbook) — the "high cut".
-    fn low_pass(freq: f64, q: f64, sample_rate: f64) -> Self {
+    /// 2nd-order low-pass (RBJ cookbook) — the "high cut", and the crossfeed's
+    /// filter (Butterworth, q = 1/√2).
+    pub(crate) fn low_pass(freq: f64, q: f64, sample_rate: f64) -> Self {
         let w0 = 2.0 * std::f64::consts::PI * freq / sample_rate;
         let (sin_w0, cos_w0) = w0.sin_cos();
         let alpha = sin_w0 / (2.0 * q);
@@ -162,7 +184,18 @@ impl BiquadCoeffs {
     /// (peak/shelf at ~0 dB). Freq is clamped away from DC and Nyquist so the
     /// bilinear designs stay stable at any output rate.
     fn for_band(band: &BandSettings, sample_rate: f32) -> Option<Self> {
-        let freq = band.freq.clamp(EQ_FREQ_MIN, (sample_rate * 0.45).min(EQ_FREQ_MAX));
+        let limit = (sample_rate * 0.45).min(EQ_FREQ_MAX);
+        // A peak, high shelf or low-pass ABOVE what this rate can carry acts on
+        // nothing the stream holds: drop it. Clamping moved them all onto the
+        // limit, where a treble preset's bands stacked (+18 dB at 3.6 kHz on
+        // an 8 kHz stream). A low shelf or high-pass up there does reach the
+        // whole band, so those keep the clamp.
+        if band.freq > limit
+            && matches!(band.kind, BandType::Peak | BandType::HighShelf | BandType::HighCut)
+        {
+            return None;
+        }
+        let freq = band.freq.clamp(EQ_FREQ_MIN, limit);
         let q = band.q.clamp(EQ_Q_MIN, EQ_Q_MAX);
         let gain = band.gain.clamp(-EQ_GAIN_LIMIT, EQ_GAIN_LIMIT);
         if band.kind.uses_gain() && gain.abs() < 0.01 {
@@ -202,6 +235,41 @@ pub fn response_db(bands: &[BandSettings], freq: f32, sample_rate: f32) -> f32 {
         .filter_map(|b| BiquadCoeffs::for_band(b, sample_rate))
         .map(|c| c.response_at(freq as f64, sample_rate as f64))
         .sum::<f64>() as f32
+}
+
+/// How much the EQ boosts above its preamp, and the preamp that would cancel
+/// it. A boost the preamp does not cover pushes loud tracks into the peak
+/// limiter (the clip lamp): the limiter catches it, but it is working.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Headroom {
+    /// The curve's highest point (dB, never below 0) and where it is.
+    pub max_boost_db: f32,
+    pub at_hz: f32,
+    /// Boost left over after the preamp (dB): above 0, loud tracks clip.
+    pub over_db: f32,
+    /// The preamp that exactly covers the boost, when it differs from the
+    /// current one by at least 0.1 dB.
+    pub suggested_preamp: Option<f32>,
+}
+
+pub fn headroom(bands: &[BandSettings], preamp_db: f32, sample_rate: f32) -> Headroom {
+    // Log-spaced points across the audible band (and below the rate's limit),
+    // plus every band's own frequency: a narrow peak can fall between points.
+    let top = EQ_FREQ_MAX.min(0.45 * sample_rate);
+    const POINTS: usize = 240;
+    let grid = (0..POINTS).map(|i| EQ_FREQ_MIN * (top / EQ_FREQ_MIN).powf(i as f32 / (POINTS - 1) as f32));
+    let centres = bands.iter().map(|b| b.freq).filter(|&f| (EQ_FREQ_MIN..=top).contains(&f));
+    let (mut max_boost_db, mut at_hz) = (0.0f32, 0.0f32);
+    for f in grid.chain(centres) {
+        let db = response_db(bands, f, sample_rate);
+        if db > max_boost_db {
+            (max_boost_db, at_hz) = (db, f);
+        }
+    }
+    // Rounded UP to 0.1 dB, so following the suggestion never leaves a sliver over.
+    let cover = -(max_boost_db * 10.0).ceil() / 10.0 + 0.0; // + 0.0: no "-0.0"
+    let suggested_preamp = ((cover - preamp_db).abs() >= 0.05).then_some(cover);
+    Headroom { max_boost_db, at_hz, over_db: max_boost_db + preamp_db, suggested_preamp }
 }
 
 /// Default band centres (ISO octave, Hz) — the graphic-EQ layout every band
@@ -417,6 +485,8 @@ impl EqPreset {
 
 /// One filter per band per channel (stereo)
 struct FilterBand {
+    /// Which of the EQ_BANDS slots this filter implements.
+    slot: usize,
     coeffs: BiquadCoeffs,
     state_l: BiquadState,
     state_r: BiquadState,
@@ -444,15 +514,23 @@ impl EqChain {
     /// bands (peak/shelf at 0 dB) are skipped entirely, so a mostly-flat set
     /// only pays for the bands that do something. `preamp_db` is a flat gain
     /// ahead of the filters (clamped ±12 dB) — headroom for boosted bands.
+    /// Install new band settings. A slot that was already filtering keeps its
+    /// state and only takes the new coefficients: every live EQ keypress lands
+    /// here, and rebuilding from zero state mid-signal put a step at the edit
+    /// point (a thump on bass-heavy material). Filters are reset only where
+    /// the audio itself jumps (`reset`: seek, skip, a new producer).
     pub fn load_bands(&mut self, bands: &[BandSettings; EQ_BANDS], preamp_db: f32, sample_rate: f32) {
-        self.filters.clear();
-        for band in bands {
+        let mut old = std::mem::take(&mut self.filters);
+        for (slot, band) in bands.iter().enumerate() {
             if let Some(coeffs) = BiquadCoeffs::for_band(band, sample_rate) {
-                self.filters.push(FilterBand {
-                    coeffs,
-                    state_l: BiquadState::new(),
-                    state_r: BiquadState::new(),
-                });
+                let (state_l, state_r) = match old.iter().position(|f| f.slot == slot) {
+                    Some(i) => {
+                        let f = old.swap_remove(i);
+                        (f.state_l, f.state_r)
+                    }
+                    None => (BiquadState::new(), BiquadState::new()),
+                };
+                self.filters.push(FilterBand { slot, coeffs, state_l, state_r });
             }
         }
         let preamp_db = preamp_db.clamp(-EQ_GAIN_LIMIT, EQ_GAIN_LIMIT);
@@ -492,77 +570,14 @@ impl EqChain {
             let mut right = samples[ri] as f64 * pre;
 
             for f in &mut self.filters {
-                let out_l = f.coeffs.b0 * left
-                          + f.coeffs.b1 * f.state_l.x1
-                          + f.coeffs.b2 * f.state_l.x2
-                          - f.coeffs.a1 * f.state_l.y1
-                          - f.coeffs.a2 * f.state_l.y2;
-                f.state_l.x2 = f.state_l.x1;
-                f.state_l.x1 = left;
-                f.state_l.y2 = f.state_l.y1;
-                // Flush the feedback state: during silence y decays into
-                // denormal range, where x86 float ops are 10-100x slower.
-                f.state_l.y1 = flush_denormal_f64(out_l);
-                left = out_l;
-
-                let out_r = f.coeffs.b0 * right
-                          + f.coeffs.b1 * f.state_r.x1
-                          + f.coeffs.b2 * f.state_r.x2
-                          - f.coeffs.a1 * f.state_r.y1
-                          - f.coeffs.a2 * f.state_r.y2;
-                f.state_r.x2 = f.state_r.x1;
-                f.state_r.x1 = right;
-                f.state_r.y2 = f.state_r.y1;
-                f.state_r.y1 = flush_denormal_f64(out_r);
-                right = out_r;
+                left = f.state_l.process(&f.coeffs, left);
+                right = f.state_r.process(&f.coeffs, right);
             }
 
             samples[li] = left as f32;
             samples[ri] = right as f32;
         }
     }
-}
-
-/// Render a compact EQ curve visualization for the status line (Classic banner).
-/// Shows the summed response using block characters: ▁▂▃▄▅▆▇█ for boost, `·`
-/// for flat. Evaluates the actual biquad responses (|H(e^jω)|), so shelves and
-/// cuts draw truthfully — what's shown is what the audio gets.
-pub fn render_eq_curve(bands: &[BandSettings; EQ_BANDS], sample_rate: f32) -> String {
-    use crate::state::{C_RESET, C_DIM, C_CYAN, C_GREEN, C_YELLOW, C_RED};
-
-    if bands.iter().all(|b| !b.is_effective()) {
-        return String::new();
-    }
-
-    // Display 20 log-spaced points across 20Hz-20kHz.
-    let n_points = 20;
-    let bars: &[char] = &[' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-
-    let mut result = format!("  {C_DIM}EQ:{C_RESET} ");
-
-    for i in 0..n_points {
-        // Log-spaced frequency from 20Hz to 20kHz
-        let t = i as f32 / (n_points - 1) as f32;
-        let freq = 20.0 * (1000.0f32).powf(t); // 20 * 10^(t*3) = 20..20000
-
-        let gain = response_db(bands, freq, sample_rate);
-
-        // One glyph step per dB of summed gain, capped at the 8-step block ramp.
-        let (ch, color) = if gain > 0.1 {
-            let idx = gain.clamp(1.0, 8.0) as usize;
-            let color = if gain > 5.0 { C_RED } else if gain > 3.0 { C_YELLOW } else { C_GREEN };
-            (bars[idx], color)
-        } else if gain < -0.1 {
-            let idx = (-gain).clamp(1.0, 8.0) as usize;
-            (bars[idx], C_CYAN)
-        } else {
-            ('·', C_DIM)
-        };
-
-        result.push_str(&format!("{}{}", color, ch));
-    }
-    result.push_str(C_RESET);
-    result
 }
 
 /// Built-in presets as 10-band gain shapes (dB). Bands: 31 62 125 250 500 1k 2k
@@ -585,37 +600,43 @@ pub fn builtin_presets() -> Vec<EqPreset> {
 
 /// Load custom presets from ~/.config/keet/eq/*.json (or %APPDATA%\keet\eq\ on Windows)
 pub fn load_custom_presets() -> Vec<EqPreset> {
-    let dir = if cfg!(target_os = "windows") {
-        std::env::var("APPDATA").ok().map(|p| std::path::PathBuf::from(p).join("keet").join("eq"))
-    } else {
-        std::env::var("HOME").ok().map(|h| std::path::PathBuf::from(h).join(".config").join("keet").join("eq"))
-    };
-
-    let dir = match dir {
-        Some(d) if d.is_dir() => d,
-        _ => return Vec::new(),
-    };
-
-    let mut presets = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().map(|e| e == "json").unwrap_or(false) {
-                if let Ok(contents) = std::fs::read_to_string(&path) {
-                    if let Ok(preset) = serde_json::from_str::<EqPreset>(&contents) {
-                        presets.push(preset);
-                    }
-                }
-            }
-        }
-    }
-    presets.sort_by(|a, b| a.name.cmp(&b.name));
-    presets
+    crate::config::load_presets("eq", |p: &mut EqPreset| &mut p.name)
 }
 
 #[cfg(test)]
 mod denormal_tests {
     use super::*;
+
+    fn peak(freq: f32, gain: f32, q: f32) -> BandSettings {
+        BandSettings { kind: BandType::Peak, freq, gain, q }
+    }
+
+    #[test]
+    fn headroom_finds_the_boost_and_the_preamp_that_covers_it() {
+        let bands = [peak(40.0, 3.1, 1.0)];
+        let h = headroom(&bands, -3.0, 48_000.0);
+        assert!((h.max_boost_db - 3.1).abs() < 0.02, "{h:?}");
+        assert!((h.at_hz - 40.0).abs() < 1.0, "{h:?}");
+        assert!(h.over_db > 0.05, "0.1 dB over: loud tracks reach the limiter");
+        assert_eq!(h.suggested_preamp, Some(-3.1));
+        // Following the suggestion leaves nothing over and nothing to suggest.
+        let h = headroom(&bands, -3.1, 48_000.0);
+        assert!(h.over_db <= 0.0 && h.suggested_preamp.is_none(), "{h:?}");
+    }
+
+    #[test]
+    fn a_narrow_peak_between_grid_points_is_still_found() {
+        let h = headroom(&[peak(1234.0, 6.0, 10.0)], 0.0, 48_000.0);
+        assert!((h.max_boost_db - 6.0).abs() < 0.01, "{h:?}");
+    }
+
+    #[test]
+    fn cuts_need_no_preamp_and_an_unneeded_one_is_given_back() {
+        let h = headroom(&[peak(250.0, -4.0, 1.0)], 0.0, 48_000.0);
+        assert_eq!((h.max_boost_db, h.suggested_preamp), (0.0, None));
+        let h = headroom(&[peak(250.0, -4.0, 1.0)], -6.0, 48_000.0);
+        assert_eq!(h.suggested_preamp, Some(0.0), "a preamp nothing needs only costs level");
+    }
 
     #[test]
     fn flush_denormal_zeroes_tiny_values_keeps_audio() {
@@ -779,6 +800,53 @@ mod parametric_tests {
     }
 
     #[test]
+    fn bands_above_what_the_rate_can_carry_are_dropped_not_piled_up() {
+        // Every band's frequency was clamped to 0.45 x rate, so at a low
+        // output rate a treble preset's 10-16 kHz bands all landed on the same
+        // frequency and stacked: +18 dB at 3.6 kHz on an 8 kHz stream.
+        let mut bands: [BandSettings; EQ_BANDS] = std::array::from_fn(BandSettings::inert);
+        bands[0] = band(BandType::Peak, 16_000.0, 6.0, 1.0);
+        bands[1] = band(BandType::Peak, 12_000.0, 6.0, 1.0);
+        bands[2] = band(BandType::HighShelf, 10_000.0, 6.0, 0.707);
+        bands[3] = band(BandType::HighCut, 15_000.0, 0.0, 0.707);
+        let at = response_db(&bands, 3_500.0, 8_000.0);
+        assert!(at.abs() < 0.5, "{at} dB at 3.5 kHz");
+        // A low shelf above the limit still lifts the whole band, as asked.
+        let mut shelf: [BandSettings; EQ_BANDS] = std::array::from_fn(BandSettings::inert);
+        shelf[0] = band(BandType::LowShelf, 16_000.0, 6.0, 0.707);
+        assert!(response_db(&shelf, 1_000.0, 8_000.0) > 5.0);
+    }
+
+    #[test]
+    fn a_live_edit_keeps_the_filter_state() {
+        // Every EQ keypress went through load_bands, which rebuilt the filters
+        // from zero state mid-signal: a step at the edit point that thumps on
+        // bass-heavy material. Reloading the same settings must be seamless —
+        // bit-identical to never reloading.
+        let mut bands: [BandSettings; EQ_BANDS] = std::array::from_fn(BandSettings::inert);
+        bands[0] = band(BandType::Peak, 60.0, 9.0, 1.0);
+        let sig: Vec<f32> = (0..9600)
+            .flat_map(|i| {
+                let v = 0.4 * (2.0 * std::f32::consts::PI * 55.0 * i as f32 / 48000.0).sin();
+                [v, v]
+            })
+            .collect();
+        let mut whole = sig.clone();
+        let mut a = EqChain::new();
+        a.load_bands(&bands, 0.0, 48000.0);
+        a.process_stereo(&mut whole);
+
+        let mut split = sig.clone();
+        let mut b = EqChain::new();
+        b.load_bands(&bands, 0.0, 48000.0);
+        let (first, second) = split.split_at_mut(9600);
+        b.process_stereo(first);
+        b.load_bands(&bands, 0.0, 48000.0); // the "edit"
+        b.process_stereo(second);
+        assert_eq!(whole, split);
+    }
+
+    #[test]
     fn load_bands_flat_is_inactive_but_a_cut_band_is_always_active() {
         let mut eq = EqChain::new();
         let flat: [BandSettings; EQ_BANDS] =
@@ -858,21 +926,6 @@ mod parametric_tests {
         let high = peak_after(5000.0, &mut eq);
         assert!(low < 0.05, "50 Hz should be gutted by a 500 Hz low cut, peak={low}");
         assert!(high > 0.45, "5 kHz should pass nearly unity, peak={high}");
-    }
-
-    #[test]
-    fn render_eq_curve_draws_cuts_not_just_gains() {
-        let flat: [BandSettings; EQ_BANDS] = std::array::from_fn(BandSettings::inert);
-        assert!(render_eq_curve(&flat, 48000.0).is_empty(), "flat set renders nothing");
-
-        // A lone cut band has zero gain everywhere — the old gains-based curve
-        // would have skipped it. It must render now.
-        let mut cut_only = flat;
-        cut_only[0] = band(BandType::LowCut, 200.0, 0.0, 0.707);
-        assert!(
-            !render_eq_curve(&cut_only, 48000.0).is_empty(),
-            "cut-only set must draw a curve"
-        );
     }
 
     #[test]

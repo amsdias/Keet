@@ -82,6 +82,14 @@ impl AllpassFilter {
 const COMB_TUNINGS: [usize; 8] = [1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617];
 const ALLPASS_TUNINGS: [usize; 4] = [556, 441, 341, 225];
 const STEREO_SPREAD: usize = 23;
+/// Freeverb's `scaledamp`: the damping parameter is scaled by this before it
+/// reaches the combs' low-pass. Applied raw, damping 1.0 froze the low-pass
+/// at zero and cut the comb feedback entirely — no tail.
+const DAMP_SCALE: f32 = 0.4;
+/// Limiter release time constant: 2000 samples at 44.1 kHz, now in seconds so
+/// it is the same at every rate (a per-sample step recovered 4.35x faster at
+/// 192 kHz).
+const LIMITER_RELEASE_SECS: f32 = 2000.0 / 44_100.0;
 
 pub struct Freeverb {
     combs_l: Vec<CombFilter>,
@@ -96,17 +104,19 @@ pub struct Freeverb {
 impl Freeverb {
     fn new(sample_rate: f32) -> Self {
         let scale = sample_rate / 44100.0;
+        // The L/R offset is a time like the tunings, so it scales with them.
+        let spread = ((STEREO_SPREAD as f32) * scale).round() as usize;
         let combs_l: Vec<_> = COMB_TUNINGS.iter()
             .map(|&t| CombFilter::new(((t as f32) * scale) as usize))
             .collect();
         let combs_r: Vec<_> = COMB_TUNINGS.iter()
-            .map(|&t| CombFilter::new(((t as f32) * scale) as usize + STEREO_SPREAD))
+            .map(|&t| CombFilter::new(((t as f32) * scale) as usize + spread))
             .collect();
         let allpasses_l: Vec<_> = ALLPASS_TUNINGS.iter()
             .map(|&t| AllpassFilter::new(((t as f32) * scale) as usize))
             .collect();
         let allpasses_r: Vec<_> = ALLPASS_TUNINGS.iter()
-            .map(|&t| AllpassFilter::new(((t as f32) * scale) as usize + STEREO_SPREAD))
+            .map(|&t| AllpassFilter::new(((t as f32) * scale) as usize + spread))
             .collect();
 
         Self { combs_l, combs_r, allpasses_l, allpasses_r, wet: 0.0, dry: 1.0, width: 1.0 }
@@ -121,7 +131,7 @@ impl Freeverb {
         let (wet, dry, width) = (wet.clamp(0.0, 1.0), dry.clamp(0.0, 1.0), width.clamp(0.0, 1.0));
         for comb in self.combs_l.iter_mut().chain(self.combs_r.iter_mut()) {
             comb.set_feedback(feedback);
-            comb.set_damp(damping);
+            comb.set_damp(damping * DAMP_SCALE);
         }
         self.wet = wet;
         self.dry = dry;
@@ -379,13 +389,16 @@ pub struct EffectsChain {
     /// Smoothed safety-limiter gain (1.0 = no reduction). Persisted across buffers
     /// so the gain doesn't jump discontinuously between `process_stereo` calls.
     limiter_gain: f32,
+    /// Per-frame release step for this sample rate (see LIMITER_RELEASE_SECS).
+    limiter_release: f32,
 }
 
 impl EffectsChain {
-    pub fn new(_sample_rate: f32) -> Self {
+    pub fn new(sample_rate: f32) -> Self {
         // Lazy: skip the ~44KB reverb/chorus/delay allocations until a preset that
         // needs them is loaded. The "None" preset keeps this at zero overhead.
-        Self { reverb: None, chorus: None, delay: None, limiter_gain: 1.0 }
+        let limiter_release = 1.0 - (-1.0 / (LIMITER_RELEASE_SECS * sample_rate.max(1.0))).exp();
+        Self { reverb: None, chorus: None, delay: None, limiter_gain: 1.0, limiter_release }
     }
 
     pub fn load_preset(&mut self, preset: &EffectsPreset, sample_rate: f32) {
@@ -445,7 +458,6 @@ impl EffectsChain {
     /// sample is replaced with silence — NaN passes straight through `.clamp`
     /// and must never reach the DAC.
     pub fn limit_output(&mut self, samples: &mut [f32]) {
-        const LIMITER_RELEASE: f32 = 0.0005;
         for frame in samples.chunks_mut(2) {
             for s in frame.iter_mut() {
                 if !s.is_finite() {
@@ -457,7 +469,7 @@ impl EffectsChain {
             if target < self.limiter_gain {
                 self.limiter_gain = target; // instant attack — never clip
             } else {
-                self.limiter_gain += (target - self.limiter_gain) * LIMITER_RELEASE;
+                self.limiter_gain += (target - self.limiter_gain) * self.limiter_release;
             }
             for s in frame.iter_mut() {
                 *s *= self.limiter_gain;
@@ -521,32 +533,7 @@ pub fn builtin_presets() -> Vec<EffectsPreset> {
 
 /// Load custom effects presets from ~/.config/keet/effects/*.json
 pub fn load_custom_presets() -> Vec<EffectsPreset> {
-    let dir = if cfg!(target_os = "windows") {
-        std::env::var("APPDATA").ok().map(|p| std::path::PathBuf::from(p).join("keet").join("effects"))
-    } else {
-        std::env::var("HOME").ok().map(|h| std::path::PathBuf::from(h).join(".config").join("keet").join("effects"))
-    };
-
-    let dir = match dir {
-        Some(d) if d.is_dir() => d,
-        _ => return Vec::new(),
-    };
-
-    let mut presets = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().map(|e| e == "json").unwrap_or(false) {
-                if let Ok(contents) = std::fs::read_to_string(&path) {
-                    if let Ok(preset) = serde_json::from_str::<EffectsPreset>(&contents) {
-                        presets.push(preset);
-                    }
-                }
-            }
-        }
-    }
-    presets.sort_by(|a, b| a.name.cmp(&b.name));
-    presets
+    crate::config::load_presets("effects", |p: &mut EffectsPreset| &mut p.name)
 }
 
 #[cfg(test)]
@@ -555,6 +542,38 @@ mod tests {
 
     fn preset(json: &str) -> EffectsPreset {
         serde_json::from_str(json).expect("preset json")
+    }
+
+    #[test]
+    fn limiter_recovers_in_the_same_time_at_every_sample_rate() {
+        // The release was a fixed per-SAMPLE step, so at 192 kHz the gain
+        // came back 4.35x faster than at 44.1 kHz (10 ms instead of 45).
+        let gain_after_20ms = |rate: f32| {
+            let mut fx = EffectsChain::new(rate);
+            let mut hit = vec![2.0f32, 2.0];
+            fx.limit_output(&mut hit); // gain drops to 0.5
+            let mut quiet = vec![0.1f32; 2 * (rate * 0.02) as usize];
+            fx.limit_output(&mut quiet);
+            fx.limiter_gain
+        };
+        let (a, b) = (gain_after_20ms(44_100.0), gain_after_20ms(192_000.0));
+        assert!((a - b).abs() < 0.01, "44.1k: {a}, 192k: {b}");
+    }
+
+    #[test]
+    fn full_damping_still_leaves_a_reverb_tail() {
+        // Freeverb scales damping by 0.4 before it reaches the combs. Used
+        // raw, damping 1.0 froze each comb's low-pass at zero and the tail
+        // died: a "reverb" that only produced its dry signal.
+        let p = preset(r#"{"name":"damp","reverb":{"room_size":0.8,"damping":1.0,"wet":1.0,"dry":0.0,"width":1.0}}"#);
+        let mut fx = EffectsChain::new(44_100.0);
+        fx.load_preset(&p, 44_100.0);
+        let mut buf = vec![0.0f32; 2 * 22_050];
+        buf[0] = 1.0;
+        buf[1] = 1.0;
+        fx.process_stereo(&mut buf);
+        let tail: f32 = buf[2 * 13_230..].iter().map(|s| s * s).sum(); // from 300 ms
+        assert!(tail > 1e-4, "no tail: energy {tail}");
     }
 
     #[test]

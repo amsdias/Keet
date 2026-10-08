@@ -10,7 +10,8 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::TrackType;
 use symphonia::core::common::Limit;
-use symphonia::core::meta::{MetadataOptions, RawValue, StandardTag};
+use symphonia::core::formats::FormatReader;
+use symphonia::core::meta::{MetadataOptions, MetadataRevision, RawValue, StandardTag};
 
 #[derive(Clone)]
 struct CachedMeta {
@@ -145,6 +146,20 @@ impl MetadataCache {
     // spawned with, so any reshape of the entries Vec must go through
     // `ui::reindex_and_restart_scan` (cancel → join → remap by path → respawn).
 
+    /// Sum of every known track duration, under ONE read lock — HiFi's
+    /// library header totals the playlist each frame, and summing through
+    /// `duration(i)` took a lock per track (10k locks a frame on a big list).
+    pub fn total_duration(&self) -> f64 {
+        let entries = self.entries.read().unwrap();
+        entries.iter().flatten().filter_map(|m| m.duration_secs).sum()
+    }
+
+    /// The longest known track duration (one read lock).
+    pub fn max_duration(&self) -> f64 {
+        let entries = self.entries.read().unwrap();
+        entries.iter().flatten().filter_map(|m| m.duration_secs).fold(0.0, f64::max)
+    }
+
     pub fn duration(&self, index: usize) -> Option<f64> {
         let entries = self.entries.read().unwrap();
         entries.get(index).and_then(|e| e.as_ref()).and_then(|m| m.duration_secs)
@@ -156,19 +171,59 @@ impl MetadataCache {
     }
 }
 
-/// Parse a ReplayGain gain string like "-7.2 dB" or "-7.2" into an f32 dB value.
-pub fn parse_rg_gain_value(s: &str) -> Option<f32> {
-    let s = s.trim();
-    let s = s.strip_suffix(" dB")
-        .or_else(|| s.strip_suffix(" db"))
-        .or_else(|| s.strip_suffix("dB"))
-        .or_else(|| s.strip_suffix("db"))
-        .unwrap_or(s);
-    s.trim().parse::<f32>().ok()
+/// The default audio track's sample rate.
+fn rate_of(format: &dyn FormatReader) -> Option<u32> {
+    format
+        .default_track(TrackType::Audio)?
+        .codec_params
+        .as_ref()?
+        .audio()?
+        .sample_rate
 }
 
-fn parse_rg_peak_value(s: &str) -> Option<f32> {
-    s.trim().parse::<f32>().ok()
+/// Every metadata block the reader holds, NEWEST first. Symphonia logs them
+/// oldest first, and the probe reads trailing tags (ID3v1, APE) before the
+/// leading ID3v2, which the container's own tags then follow. Its `current()`
+/// is the oldest block — so reading only that gave an MP3 tagged both ways a
+/// 30-character ID3v1 title, no lyrics, no ReplayGain and no cover. Callers
+/// fill each field from the first block that has it, so newest-first makes the
+/// richer, more specific block win and older ones only fill its gaps.
+pub(crate) fn revisions_newest_first(format: &mut dyn FormatReader) -> Vec<MetadataRevision> {
+    let mut md = format.metadata();
+    let mut older = Vec::new();
+    while let Some(r) = md.pop() {
+        older.push(r);
+    }
+    let mut out: Vec<MetadataRevision> = md.current().cloned().into_iter().collect();
+    out.extend(older.into_iter().rev());
+    out
+}
+
+/// A tag's number, read leniently: surrounding space and a decimal comma
+/// ("-6,50", as some European-locale taggers write it) are accepted. Never a
+/// non-finite value: "nan" and "inf" parse as f32, and a NaN gain made the
+/// limiter zero every sample — a silent track.
+fn parse_tag_number(s: &str) -> Option<f32> {
+    let v = s.trim().replace(',', ".").parse::<f32>().ok()?;
+    v.is_finite().then_some(v)
+}
+
+/// Parse a ReplayGain gain string like "-7.2 dB" or "-7.2" into an f32 dB
+/// value. The unit is matched case-insensitively ("DB" occurs).
+pub fn parse_rg_gain_value(s: &str) -> Option<f32> {
+    let s = s.trim();
+    let num = if s.len() >= 2 && s[s.len() - 2..].eq_ignore_ascii_case("db") {
+        &s[..s.len() - 2]
+    } else {
+        s
+    };
+    parse_tag_number(num)
+}
+
+/// Parse a ReplayGain peak (linear sample peak, 1.0 = full scale). Only a
+/// positive value is a usable peak.
+pub(crate) fn parse_rg_peak_value(s: &str) -> Option<f32> {
+    parse_tag_number(s).filter(|&p| p > 0.0)
 }
 
 /// Tag values accumulated across one or more metadata sources. Each field is
@@ -294,11 +349,19 @@ fn read_metadata_full(path: &Path) -> Option<CachedMeta> {
         None
     });
 
+    // AAC in MP4: the container's length includes the encoder's priming and
+    // padding; the real length is in iTunSMPB or the edit list.
+    let revisions = revisions_newest_first(format.as_mut());
+    let duration_secs = match (crate::gapless::for_mp4(path, &revisions).and_then(|g| g.length), rate_of(format.as_ref())) {
+        (Some(len), Some(rate)) if rate > 0 => Some(len as f64 / rate as f64),
+        _ => duration_secs,
+    };
+
     let mut fields = TagFields::default();
 
-    // 0.6 folds probe-side metadata (e.g. a leading ID3v2 block) into the
-    // format reader, so the separate second pass 0.5 needed is gone.
-    if let Some(rev) = format.metadata().current() {
+    // 0.6 folds probe-side metadata (leading ID3v2, trailing ID3v1/APE) into
+    // the format reader's log, alongside the container's own tags.
+    for rev in &revisions {
         merge_metadata_tags(&mut fields, &rev.media.tags);
     }
 
@@ -417,6 +480,47 @@ pub fn spawn_metadata_scan(
 #[cfg(test)]
 mod real_file_tests {
     use super::*;
+
+    #[test]
+    fn replaygain_values_parse_leniently_but_never_to_a_non_finite_gain() {
+        assert_eq!(parse_rg_gain_value("-7.2 dB"), Some(-7.2));
+        assert_eq!(parse_rg_gain_value("+3.50 DB"), Some(3.5));
+        assert_eq!(parse_rg_gain_value("-6,50 dB"), Some(-6.5), "decimal comma");
+        assert_eq!(parse_rg_gain_value(" -1.25db "), Some(-1.25));
+        // "nan"/"inf" parse as f32 and made the gain NaN -> the limiter turned
+        // every sample into 0 -> a silent track.
+        for bad in ["nan", "NaN dB", "inf", "-inf dB", "", "dB", "loud"] {
+            assert_eq!(parse_rg_gain_value(bad), None, "{bad:?}");
+        }
+        assert_eq!(parse_rg_peak_value("0,988"), Some(0.988));
+        for bad in ["nan", "inf", "-0.5", "0"] {
+            assert_eq!(parse_rg_peak_value(bad), None, "peak {bad:?}");
+        }
+    }
+
+    #[test]
+    fn aac_durations_leave_out_priming_and_padding() {
+        for f in ["sine_aac_itunsmpb.m4a", "sine_aac_editlist.m4a"] {
+            let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(f);
+            let d = read_metadata_full(&p).and_then(|m| m.duration_secs).unwrap();
+            assert!((d - 1.0).abs() < 1e-6, "{f}: {d}");
+        }
+    }
+
+    #[test]
+    fn mp3_tags_come_from_id3v2_when_an_id3v1_block_is_also_present() {
+        // Symphonia reads the TRAILING ID3v1 block before the leading ID3v2
+        // and its `current()` is the oldest block, so reading only that gave
+        // a title cut to 30 characters, no artist beyond ID3v1's and no
+        // ReplayGain at all. The newest block must win.
+        let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/sine_lr_id3v1v2.mp3");
+        let m = read_metadata_full(&p).expect("fixture reads");
+        assert_eq!(m.title.as_deref(), Some("A Title Much Longer Than Thirty Characters"));
+        assert_eq!(m.artist.as_deref(), Some("Fixture Artist"));
+        assert_eq!(m.rg_track_gain, Some(-6.02));
+        assert_eq!(m.rg_track_peak, Some(0.5));
+    }
 
     /// Reads real tagged files from the user's library. Ignored by default;
     /// run with `cargo test -- --ignored --nocapture`.

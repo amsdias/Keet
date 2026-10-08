@@ -70,8 +70,8 @@ pub fn pin_device(host: &cpal::Host, device: &cpal::Device) -> Option<cpal::Devi
 /// match beats a substring one. Substring-only matching took the FIRST hit,
 /// so asking for "Speakers" could land on "External Speakers" when
 /// "MacBook Pro Speakers" was meant, or vice versa.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn pick_device_id(devices: &[(u32, String)], wanted: &str) -> Option<u32> {
+/// Used for `--device` on every platform and for CoreAudio ids on macOS.
+fn pick_device_id<T: Copy>(devices: &[(T, String)], wanted: &str) -> Option<T> {
     let want = wanted.trim().to_lowercase();
     if want.is_empty() {
         return None;
@@ -265,12 +265,14 @@ pub fn find_device_by_name(host: &cpal::Host, name: &str) -> Option<cpal::Device
     if let Some(d) = devices.iter().find(|d| d.id().is_ok_and(|i| i.id() == name)) {
         return Some(d.clone());
     }
-    let name_lower = name.to_lowercase();
-    devices.into_iter().find(|d| {
-        d.description()
-            .map(|desc| desc.name().to_lowercase().contains(&name_lower))
-            .unwrap_or(false)
-    })
+    // Then by name, exact before substring (see pick_device_id): taking the
+    // first substring hit let "Speakers" pick "External Speakers".
+    let named: Vec<(usize, String)> = devices
+        .iter()
+        .enumerate()
+        .filter_map(|(i, d)| d.description().ok().map(|desc| (i, desc.name().to_string())))
+        .collect();
+    pick_device_id(&named, name).map(|i| devices[i].clone())
 }
 
 /// Query the maximum sample rate supported by a device
@@ -1116,6 +1118,72 @@ pub fn restore_format(saved: &SavedFormat) -> Result<(), String> {
     {
         let _ = saved;
         Ok(())
+    }
+}
+
+/// Everything exclusive mode changed on output devices, put back on request
+/// or, failing that, on drop. Drop covers the exits that skip the quit key's
+/// orderly path: an error returned from `main` (a device busy at startup), a
+/// panic on the main thread. Declare it BEFORE the stream: locals drop in
+/// reverse order, so the stream is gone first — a format change under a live
+/// stream is what StreamInvalidated reports, and releasing hog mode under
+/// running IO buzzed.
+///
+/// It holds every device whose format was changed, not just the first: after
+/// a recovery onto another device, that one's format used to be changed and
+/// never put back.
+#[derive(Default)]
+pub struct DeviceRestore {
+    formats: Vec<SavedFormat>,
+    /// The hog-mode device to release (macOS).
+    pub hog: Option<u32>,
+}
+
+impl DeviceRestore {
+    /// Remember `device`'s format before exclusive mode first changes it. A
+    /// device already captured keeps its ORIGINAL format.
+    pub fn capture(&mut self, device: &cpal::Device) {
+        let Some(saved) = capture_format(device) else { return };
+        if !self.formats.iter().any(|f| f.same_device(&saved)) {
+            self.formats.push(saved);
+        }
+    }
+
+    /// Anything to put back.
+    pub fn pending(&self) -> bool {
+        !self.formats.is_empty() || self.hog.is_some()
+    }
+
+    /// Restore every captured format (devices that have gone away are left
+    /// alone), then release hog mode — while it is still held, so no other app
+    /// sees the in-between state. Call with no stream open.
+    pub fn restore(&mut self) {
+        for saved in self.formats.drain(..) {
+            let _ = restore_format(&saved);
+        }
+        if let Some(id) = self.hog.take() {
+            release_exclusive_mode(id);
+        }
+    }
+}
+
+impl Drop for DeviceRestore {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
+impl SavedFormat {
+    fn same_device(&self, other: &SavedFormat) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            self.uid == other.uid
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = other;
+            true
+        }
     }
 }
 

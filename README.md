@@ -4,7 +4,7 @@ A high-performance, low-CPU terminal audio player with real-time spectrum visual
 
 ## Features
 
-- **Switchable themes**: Three UI themes — **Classic** (green-on-default), **Minimal** (warm-cyan editorial), **Hi-Fi** (amber studio-monitor) — cycled at runtime with `T`, with a launch default via `--theme` or `~/.config/keet/config.json`. Every screen (Player, Library, Lyrics, EQ+FX) is themed
+- **Switchable themes**: Three UI themes — **Classic** (the terminal's own colours, or truecolor ones of your choice), **Minimal** (warm-cyan editorial), **Hi-Fi** (amber studio-monitor) — cycled at runtime with `T`, with a launch default via `--theme` or `~/.config/keet/config.json`. Every screen (Player, Library, Lyrics, EQ+FX) is themed
 - **Multi-format support**: MP3, FLAC, WAV, OGG, AAC/M4A, ALAC, AIFF — decoded by symphonia 0.6 with SIMD enabled
 - **Any channel layout**: Mono, stereo, quad, 5.1, and 7.1 sources all play correctly — surround is downmixed to stereo (ITU-style: center at -3dB into both sides, LFE dropped)
 - **Low CPU usage**: <0.5% total system CPU (release mode)
@@ -226,6 +226,8 @@ For a *persistent* default that applies on every launch (including with explicit
 | `rg_mode` | `track` \| `album` \| `off` |
 | `eq` | any preset name (built-in or custom) |
 | `crossfeed` | `off` \| `light` \| `medium` \| `strong` \| any custom preset name |
+| `classic_use_truecolor` | `false` (default: Classic uses the terminal's ANSI green / yellow / red, which follow its colour scheme) \| `true` (use `classic_colors`) |
+| `classic_colors` | `{"highlight": "#7DD3B8", "warning": "#E9B65C", "error": "#F07A78"}` — any left out keep these defaults |
 
 ## EQ + FX Editor
 

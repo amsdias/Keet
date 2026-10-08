@@ -26,6 +26,47 @@ pub struct Config {
     /// Default crossfeed preset name: `off | light | medium | strong`.
     #[serde(default)]
     pub crossfeed: Option<String>,
+    /// Classic in truecolor (`classic_colors`) instead of the terminal's ANSI
+    /// green / yellow / red. Off by default: ANSI follows the terminal's own
+    /// palette, light backgrounds included.
+    #[serde(default)]
+    pub classic_use_truecolor: bool,
+    #[serde(default)]
+    pub classic_colors: ClassicColors,
+}
+
+/// Classic's three truecolor roles as `#RRGGBB`; any left out (or unreadable)
+/// keeps its default.
+#[derive(Deserialize, Default, Debug)]
+pub struct ClassicColors {
+    #[serde(default)]
+    pub highlight: Option<String>,
+    #[serde(default)]
+    pub warning: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// Classic's truecolor defaults (the Nocturne mock-ups' mint, amber, coral).
+pub const CLASSIC_DEFAULTS: [(u8, u8, u8); 3] = [(125, 211, 184), (233, 182, 92), (240, 122, 120)];
+
+impl ClassicColors {
+    /// The three colours, each its configured value or the default, plus the
+    /// names of any that were set but could not be read.
+    pub fn resolve(&self) -> ([(u8, u8, u8); 3], Vec<&'static str>) {
+        let mut out = CLASSIC_DEFAULTS;
+        let mut bad = Vec::new();
+        let fields = [("highlight", &self.highlight), ("warning", &self.warning), ("error", &self.error)];
+        for (i, (name, value)) in fields.into_iter().enumerate() {
+            if let Some(v) = value {
+                match crate::theme::parse_hex(v) {
+                    Some(rgb) => out[i] = rgb,
+                    None => bad.push(name),
+                }
+            }
+        }
+        (out, bad)
+    }
 }
 
 // Each field applies on every launch, overriding the resumed last-session value;
@@ -49,6 +90,33 @@ pub fn load() -> Config {
     }
 }
 
+/// Every `*.json` in `~/.config/keet/<subdir>/` (`%APPDATA%\keet\<subdir>\`
+/// on Windows) that parses as a preset, sorted by name. The one loader for EQ,
+/// effects and crossfeed presets — each kept its own copy, two of them
+/// building the config path by hand. Names are shown on screen, so they are
+/// sanitised like any other untrusted text (an ESC in one would be executed).
+pub fn load_presets<T: serde::de::DeserializeOwned>(subdir: &str, name: fn(&mut T) -> &mut String) -> Vec<T> {
+    let Some(dir) = crate::playlist::keet_config_dir().map(|d| d.join(subdir)) else {
+        return Vec::new();
+    };
+    let mut presets: Vec<(String, T)> = std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "json"))
+        .filter_map(|p| std::fs::read_to_string(p).ok())
+        .filter_map(|text| serde_json::from_str::<T>(&text).ok())
+        .map(|mut p| {
+            let n = name(&mut p);
+            *n = crate::ansi::sanitize_display(n);
+            (n.clone(), p)
+        })
+        .collect();
+    presets.sort_by(|a, b| a.0.cmp(&b.0));
+    presets.into_iter().map(|(_, p)| p).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -62,6 +130,19 @@ mod tests {
         assert_eq!(parse(r#"{"theme": "hifi", "future": 1}"#).theme.as_deref(), Some("hifi"));
         // Malformed JSON → defaults, never a panic.
         assert_eq!(parse("not json").theme, None);
+    }
+
+    #[test]
+    fn classic_truecolor_is_off_unless_asked_and_colours_fall_back_one_by_one() {
+        let c = parse(r#"{}"#);
+        assert!(!c.classic_use_truecolor);
+        assert_eq!(c.classic_colors.resolve(), (CLASSIC_DEFAULTS, vec![]));
+
+        let c = parse(r##"{"classic_use_truecolor": true, "classic_colors": {"highlight": "#7FB2F0", "error": "red"}}"##);
+        assert!(c.classic_use_truecolor);
+        let (rgb, bad) = c.classic_colors.resolve();
+        assert_eq!(rgb, [(127, 178, 240), CLASSIC_DEFAULTS[1], CLASSIC_DEFAULTS[2]]);
+        assert_eq!(bad, ["error"], "an unreadable colour is reported and keeps its default");
     }
 
     #[test]

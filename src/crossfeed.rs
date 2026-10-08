@@ -13,7 +13,7 @@
 //! JSON presets can dial the effect from a hint of blend to a wide, soft image
 //! without touching code.
 
-use std::f64::consts::{FRAC_1_SQRT_2, PI};
+use std::f64::consts::FRAC_1_SQRT_2;
 
 use serde::Deserialize;
 
@@ -46,83 +46,7 @@ pub struct CrossfeedPreset {
     pub delay_us: f32,
 }
 
-/// Biquad filter coefficients (normalized, a0 = 1.0). f64 for the same reason
-/// as the EQ's biquads — see `eq::BiquadState`.
-struct BiquadCoeffs {
-    b0: f64,
-    b1: f64,
-    b2: f64,
-    a1: f64,
-    a2: f64,
-}
-
-impl BiquadCoeffs {
-    fn passthrough() -> Self {
-        Self { b0: 1.0, b1: 0.0, b2: 0.0, a1: 0.0, a2: 0.0 }
-    }
-
-    /// 2nd-order Butterworth low-pass filter (Audio EQ Cookbook)
-    fn low_pass(cutoff: f64, sample_rate: f64) -> Self {
-        if sample_rate <= 0.0 || cutoff <= 0.0 {
-            return Self::passthrough();
-        }
-        let w0 = 2.0 * PI * cutoff / sample_rate;
-        let cos_w0 = w0.cos();
-        let alpha = w0.sin() / (2.0 * FRAC_1_SQRT_2); // Q = 1/sqrt(2) for Butterworth
-
-        let b0 = (1.0 - cos_w0) / 2.0;
-        let b1 = 1.0 - cos_w0;
-        let b2 = (1.0 - cos_w0) / 2.0;
-        let a0 = 1.0 + alpha;
-        let a1 = -2.0 * cos_w0;
-        let a2 = 1.0 - alpha;
-
-        Self {
-            b0: b0 / a0,
-            b1: b1 / a0,
-            b2: b2 / a0,
-            a1: a1 / a0,
-            a2: a2 / a0,
-        }
-    }
-}
-
-/// Biquad filter state (2nd-order IIR) for one channel
-struct BiquadState {
-    x1: f64,
-    x2: f64,
-    y1: f64,
-    y2: f64,
-}
-
-impl BiquadState {
-    fn new() -> Self {
-        Self { x1: 0.0, x2: 0.0, y1: 0.0, y2: 0.0 }
-    }
-
-    fn reset(&mut self) {
-        self.x1 = 0.0;
-        self.x2 = 0.0;
-        self.y1 = 0.0;
-        self.y2 = 0.0;
-    }
-
-    fn process(&mut self, coeffs: &BiquadCoeffs, input: f64) -> f64 {
-        let output = coeffs.b0 * input
-            + coeffs.b1 * self.x1
-            + coeffs.b2 * self.x2
-            - coeffs.a1 * self.y1
-            - coeffs.a2 * self.y2;
-        // Flush the feedback state: during silence y decays into denormal
-        // range, where x86 float ops are 10-100x slower.
-        let output = crate::eq::flush_denormal_f64(output);
-        self.x2 = self.x1;
-        self.x1 = input;
-        self.y2 = self.y1;
-        self.y1 = output;
-        output
-    }
-}
+use crate::eq::{BiquadCoeffs, BiquadState};
 
 /// Simple delay line (circular buffer)
 struct DelayLine {
@@ -193,10 +117,17 @@ impl CrossfeedFilter {
             return;
         }
 
-        self.lpf_coeffs = BiquadCoeffs::low_pass(preset.cutoff_hz as f64, sample_rate as f64);
-        self.level = 10.0_f64.powf(preset.level_db as f64 / 20.0);
+        // Custom presets are user-editable JSON, so every value is clamped. A
+        // cutoff at or above half the sample rate (12 kHz at a 22.05 kHz
+        // source in exclusive mode) made the low-pass unstable: inf, then NaN,
+        // which the limiter turns into silence for good.
+        let cutoff = preset.cutoff_hz.min(sample_rate * 0.45).max(20.0);
+        let level_db = preset.level_db.clamp(-40.0, 0.0);
+        let delay_us = preset.delay_us.clamp(0.0, 2_000.0);
+        self.lpf_coeffs = BiquadCoeffs::low_pass(cutoff as f64, FRAC_1_SQRT_2, sample_rate.max(1.0) as f64);
+        self.level = 10.0_f64.powf(level_db as f64 / 20.0);
 
-        let delay_samples = (preset.delay_us / 1_000_000.0 * sample_rate).round() as usize;
+        let delay_samples = (delay_us / 1_000_000.0 * sample_rate).round() as usize;
         self.delay_l.resize(delay_samples);
         self.delay_r.resize(delay_samples);
 
@@ -236,9 +167,15 @@ impl CrossfeedFilter {
             let delayed_r = self.delay_l.process(filtered_r);
             let delayed_l = self.delay_r.process(filtered_l);
 
-            // Blend: add filtered+delayed opposite channel
-            samples[li] = (left + self.level * delayed_r) as f32;
-            samples[ri] = (right + self.level * delayed_l) as f32;
+            // Blend the DIFFERENCE, not the opposite channel: each side gets
+            // the low-passed, delayed (opposite - own). Content common to both
+            // channels cancels, so centred bass and vocals come out exactly as
+            // they went in; adding the opposite channel outright raised them by
+            // 20·log10(1 + level) — up to +4.6 dB of bass at "Strong", straight
+            // into the limiter. Panned content still crosses to the other ear.
+            let cross = self.level * (delayed_r - delayed_l);
+            samples[li] = (left + cross) as f32;
+            samples[ri] = (right - cross) as f32;
         }
     }
 }
@@ -263,26 +200,7 @@ pub fn builtin_presets() -> Vec<CrossfeedPreset> {
 /// preset folders. This is where the depth lives: a preset may set any of
 /// level, cutoff and ITD.
 pub fn load_custom_presets() -> Vec<CrossfeedPreset> {
-    let dir = match crate::playlist::keet_config_dir().map(|d| d.join("crossfeed")) {
-        Some(d) if d.is_dir() => d,
-        _ => return Vec::new(),
-    };
-
-    let mut presets = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().map(|e| e == "json").unwrap_or(false) {
-                if let Ok(contents) = std::fs::read_to_string(&path) {
-                    if let Ok(preset) = serde_json::from_str::<CrossfeedPreset>(&contents) {
-                        presets.push(preset);
-                    }
-                }
-            }
-        }
-    }
-    presets.sort_by(|a, b| a.name.cmp(&b.name));
-    presets
+    crate::config::load_presets("crossfeed", |p: &mut CrossfeedPreset| &mut p.name)
 }
 
 #[cfg(test)]
@@ -334,6 +252,53 @@ mod crossfeed_tests {
             "R leaked before the 48-sample ITD"
         );
         assert!(right[48].abs() > 1e-6, "R silent after the ITD elapsed");
+    }
+
+    fn run(preset: CrossfeedPreset, sr: f32, l: impl Fn(usize) -> f32, r: impl Fn(usize) -> f32, frames: usize) -> Vec<f32> {
+        let mut cf = CrossfeedFilter::new();
+        cf.load_preset(&preset, sr);
+        let mut buf: Vec<f32> = (0..frames).flat_map(|i| [l(i), r(i)]).collect();
+        cf.process_stereo(&mut buf);
+        buf
+    }
+
+    fn strong() -> CrossfeedPreset {
+        builtin_presets().into_iter().find(|p| p.name == "Strong").unwrap()
+    }
+
+    #[test]
+    fn centred_content_passes_at_its_own_level() {
+        // Crossfeed used to ADD the filtered opposite channel to each side, so
+        // anything centred (bass, vocals) rose by 20·log10(1 + level): +4.6 dB
+        // of bass at "Strong", which then fed the limiter. Mixing only the
+        // stereo difference leaves a mono signal exactly as it came in.
+        let sr = 48000.0;
+        let tone = |i: usize| 0.5 * (2.0 * std::f32::consts::PI * 100.0 * i as f32 / sr).sin();
+        let out = run(strong(), sr, tone, tone, 9600);
+        let worst = (0..9600).map(|i| (out[i * 2] - tone(i)).abs()).fold(0.0f32, f32::max);
+        assert!(worst < 1e-5, "mono changed by up to {worst}");
+    }
+
+    #[test]
+    fn hard_panned_bass_still_crosses_to_the_other_ear() {
+        let sr = 48000.0;
+        let tone = |i: usize| 0.5 * (2.0 * std::f32::consts::PI * 100.0 * i as f32 / sr).sin();
+        let out = run(strong(), sr, tone, |_| 0.0, 9600);
+        let peak_r = (4800..9600).map(|i| out[i * 2 + 1].abs()).fold(0.0f32, f32::max);
+        // Strong is -3 dB: about 0.7 of the low-passed left reaches the right.
+        assert!(peak_r > 0.25 && peak_r < 0.4, "right peak {peak_r}");
+    }
+
+    #[test]
+    fn out_of_range_preset_values_cannot_destabilise_the_filter() {
+        // A cutoff above half the sample rate made the low-pass unstable:
+        // the output ran to inf, then NaN, and the limiter turned NaN into
+        // silence for good. Custom presets are user-editable JSON.
+        let sr = 22050.0;
+        let wild = CrossfeedPreset { name: "wild".into(), level_db: 40.0, cutoff_hz: 12000.0, delay_us: 300.0 };
+        let noise = |i: usize| (((i * 7919) % 1000) as f32 / 500.0 - 1.0) * 0.5;
+        let out = run(wild, sr, noise, |i| -noise(i), 44100);
+        assert!(out.iter().all(|s| s.is_finite() && s.abs() < 4.0), "filter ran away");
     }
 
     #[test]

@@ -59,16 +59,32 @@ fn char_width(c: char) -> usize {
 pub(crate) fn visible_len(s: &str) -> usize {
     let chars: Vec<char> = s.chars().collect();
     let mut n = 0usize;
+    let mut prev = None;
     let mut i = 0usize;
     while i < chars.len() {
         if chars[i] == '\x1B' {
             i += escape_len(&chars, i);
         } else {
-            n += char_width(chars[i]);
+            n += cluster_width(prev, chars[i]);
+            prev = Some(chars[i]);
             i += 1;
         }
     }
     n
+}
+
+/// Columns `c` adds after `prev`, for the emoji sequences a per-char count
+/// gets wrong: a variation selector 16 turns a 1-column symbol into a
+/// 2-column emoji (❤ + VS16 = ❤️), anything after a zero-width joiner merges
+/// into the preceding emoji (👨‍👩‍👧 is one glyph), and a skin-tone modifier
+/// colours the emoji before it rather than adding one.
+fn cluster_width(prev: Option<char>, c: char) -> usize {
+    match (prev, c) {
+        (Some('\u{200D}'), _) => 0,
+        (Some(p), '\u{FE0F}') if char_width(p) == 1 => 1,
+        (Some(p), '\u{1F3FB}'..='\u{1F3FF}') if char_width(p) == 2 => 0,
+        _ => char_width(c),
+    }
 }
 
 /// Core of every truncation: keep escapes whole, keep printable characters
@@ -79,19 +95,28 @@ fn cut_to_width(s: &str, max_cols: usize) -> (String, bool) {
     let chars: Vec<char> = s.chars().collect();
     let mut cols = 0usize;
     let mut out = String::with_capacity(s.len());
+    let mut prev = None;
+    let mut styled = false;
     let mut i = 0usize;
     while i < chars.len() {
         if chars[i] == '\x1B' {
             let n = escape_len(&chars, i);
             out.extend(&chars[i..(i + n).min(chars.len())]);
+            styled = true;
             i += n;
             continue;
         }
-        let w = char_width(chars[i]);
+        let w = cluster_width(prev, chars[i]);
         if cols + w > max_cols {
+            // The cut drops the line's closing reset along with its tail; put
+            // one back, or the colour runs on into whatever is drawn next.
+            if styled {
+                out.push_str("\x1B[0m");
+            }
             return (out, true);
         }
         out.push(chars[i]);
+        prev = Some(chars[i]);
         cols += w;
         i += 1;
     }
@@ -149,6 +174,25 @@ pub(crate) fn strip_ansi(s: &str) -> String {
     out
 }
 
+/// Join `segments` with `sep`, keeping as many as fit in `width` columns and
+/// dropping the rest WHOLE from the end — cutting the joined line mid-way left
+/// half a word or a separator dangling at the edge. A first segment too long
+/// on its own is cut with an ellipsis. Segments may carry colour escapes.
+pub(crate) fn fit_segments(segments: &[String], sep: &str, width: usize) -> String {
+    let mut out = String::new();
+    for (i, seg) in segments.iter().enumerate() {
+        let candidate = if i == 0 { seg.clone() } else { format!("{out}{sep}{seg}") };
+        if visible_len(&candidate) > width {
+            if i == 0 {
+                return truncate_plain(seg, width);
+            }
+            break;
+        }
+        out = candidate;
+    }
+    out
+}
+
 /// Make untrusted text (tags, filenames, LRCLIB lyrics) safe to put in a frame
 /// line: every control character — C0 (including ESC, `\n`, `\r`, tab), DEL
 /// and C1 (including the 8-bit CSI U+009B) — becomes a space. Printed raw, a
@@ -163,6 +207,42 @@ pub(crate) fn sanitize_display(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn segments_drop_whole_from_the_end_never_leaving_a_separator() {
+        let segs = ["track 1 of 4", "16-bit stereo", "44.1k", "eq Rock"].map(String::from);
+        assert_eq!(fit_segments(&segs, "  ·  ", 100), "track 1 of 4  ·  16-bit stereo  ·  44.1k  ·  eq Rock");
+        // "eq Rock" no longer fits: it goes, and its separator with it.
+        assert_eq!(fit_segments(&segs, "  ·  ", 40), "track 1 of 4  ·  16-bit stereo  ·  44.1k");
+        assert_eq!(fit_segments(&segs, "  ·  ", 20), "track 1 of 4");
+        // Even the first does not fit: it is cut (with an ellipsis).
+        assert_eq!(fit_segments(&segs, "  ·  ", 8), "track 1…");
+        assert_eq!(fit_segments(&segs, "  ·  ", 0), "");
+    }
+
+    #[test]
+    fn emoji_sequences_measure_as_drawn() {
+        // Counted char by char, these measured wider or narrower than the two
+        // columns a terminal draws, and the frame drifted.
+        assert_eq!(visible_len("\u{2764}\u{FE0F}"), 2, "VS16 makes ❤ an emoji (2 cols)");
+        assert_eq!(visible_len("\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}"), 2, "ZWJ family");
+        assert_eq!(visible_len("\u{1F44D}\u{1F3FD}"), 2, "skin-tone modifier");
+        assert_eq!(visible_len("a\u{2764}\u{FE0F}b"), 4);
+        // Cutting never splits a sequence.
+        assert_eq!(truncate_ansi("\u{1F468}\u{200D}\u{1F469}x", 2), "\u{1F468}\u{200D}\u{1F469}");
+    }
+
+    #[test]
+    fn a_cut_line_does_not_bleed_its_colour_into_the_next() {
+        // The cut dropped the line's closing reset along with its tail, so its
+        // colour (or background) ran on into whatever the terminal drew next.
+        let cut = truncate_ansi("\x1B[32mgreen text\x1B[0m", 5);
+        assert!(cut.ends_with("\x1B[0m"), "{cut:?}");
+        assert_eq!(visible_len(&cut), 5);
+        // Nothing dropped, nothing added.
+        assert_eq!(truncate_ansi("\x1B[32mok\x1B[0m", 5), "\x1B[32mok\x1B[0m");
+        assert_eq!(truncate_ansi("plain text", 5), "plain");
+    }
 
     #[test]
     fn visible_len_handles_string_terminated_escapes() {

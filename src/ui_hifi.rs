@@ -7,7 +7,7 @@
 //! Same line-count contract as Classic and Minimal: returns lines drawn
 //! *below* the anchor (line 1). The anchor is the header strip's top edge.
 
-use std::io::{self, Write};
+
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
@@ -33,7 +33,7 @@ pub fn print_status_hifi(
     let term_w = terminal::size().map(|(w, _)| w as usize).unwrap_or(120);
 
     if prev_viz_lines != usize::MAX && prev_viz_lines > 0 {
-        print!("\x1B[{}F", prev_viz_lines);
+        crate::term::out!("\x1B[{}F", prev_viz_lines);
     }
 
     // Pull metadata
@@ -51,11 +51,13 @@ pub fn print_status_hifi(
     let buf_pct = stats.smoothed_buf_pct as u32;
 
     // Width budget. Keep the cap modest so the design stays poster-like
-    // even on very wide terminals.
-    let inner_w = term_w.saturating_sub(4).clamp(60, 110);
+    // even on very wide terminals; below it the layout follows the window down
+    // to HIFI_MIN_INNER (it had a 60-column floor, and a narrower window cut
+    // off every right border and the last knob).
+    let inner_w = term_w.saturating_sub(4).clamp(HIFI_MIN_INNER, 110);
 
     // === Anchor (line 1): top edge of header strip (double border) ===
-    let mut w = crate::ui::FrameWriter::new();
+    let mut w = crate::ui::FrameWriter::fitted();
     let top = format!("╔{}╗", "═".repeat(inner_w));
     w.first_line(&format!("  {fg}{bar}{rst}", fg = p.fg, rst = p.reset, bar = top));
 
@@ -91,12 +93,19 @@ pub fn print_status_hifi(
         dim = p.dim, fg = p.fg, rst = p.reset, n = track_n, tot = track_total,
     );
 
+    // Narrow window: the track counter goes first, then the left side is
+    // cut, so the row still ends on its border.
+    let row_inner_w = inner_w.saturating_sub(2);
+    let (header_left, header_right) = if visible_len(&header_left) + 2 + visible_len(&header_right) > row_inner_w {
+        (crate::ansi::truncate_ansi(&header_left, row_inner_w), String::new())
+    } else {
+        (header_left, header_right)
+    };
     let lvis = visible_len(&header_left);
     let rvis = visible_len(&header_right);
-    let row_inner_w = inner_w.saturating_sub(2);
-    let hpad = row_inner_w.saturating_sub(lvis + rvis).max(2);
+    let hpad = row_inner_w.saturating_sub(lvis + rvis);
     w.line(&format!(
-        "  {fg}║{rst} {left}{gap}{right} {fg}║{rst}",
+        "  {fg}║{rst} {left}{rst}{gap}{right} {fg}║{rst}",
         fg = p.fg, rst = p.reset,
         left = header_left, gap = " ".repeat(hpad), right = header_right,
     ));
@@ -146,7 +155,7 @@ pub fn print_status_hifi(
     // Right column width = inner_w - seg_box_total_w - gap
     let seg_total_w = seg_w + 2; // borders included
     let gap_left = 4; // spacing between seg box and right column
-    let right_w = inner_w.saturating_sub(seg_total_w + gap_left).max(20);
+    let right_w = inner_w.saturating_sub(seg_total_w + gap_left).max(8);
 
     // Row 1: seg_top  +  title (right column)
     let title_truncated = pad_or_truncate(&title_up, right_w);
@@ -169,7 +178,7 @@ pub fn print_status_hifi(
     ));
 
     // Row 3: seg_bot  +  progress + " / TOTAL"
-    let bar_w = right_w.saturating_sub(visible_len(&tot) + 4).max(20);
+    let bar_w = right_w.saturating_sub(visible_len(&tot) + 4).max(2);
     let bar = render_solid_bar(progress, bar_w);
     w.line(&format!(
         "  {fg}{seg}{rst}{gap}{accent}{bar}{rst}  {dim}/ {tot}{rst}",
@@ -179,8 +188,19 @@ pub fn print_status_hifi(
         bar = bar, tot = tot,
     ));
 
-    // Spacer
-    w.line("");
+    // Exclusive mode: the signal path verdict under the progress bar, in the
+    // spacer row (an empty row otherwise).
+    let verdict = crate::signal::verdict(&crate::signal::PathInputs::from_state(state, fx_name, cf_name));
+    match crate::signal::fitted(&verdict, "  ·  ", right_w) {
+        Some((ok, text)) => w.line(&format!(
+            "  {pad}{c}{text}{rst}",
+            pad = " ".repeat(seg_total_w + gap_left),
+            c = if ok { p.good } else { p.warn },
+            rst = p.reset,
+            text = text.to_uppercase(),
+        )),
+        None => w.line(""),
+    }
 
     // === VU panel (single border) ===
     let (lp, rp) = state.get_peaks();
@@ -202,7 +222,7 @@ pub fn print_status_hifi(
     // L/R bars: row inner content (between │ │) is " L {bar}{tail} " — that's
     // 4 fixed chars (lead space, L, space, trailing space) + meter_w + l_pad.
     // Solve for l_pad so that 4 + meter_w + l_pad == inner_w.
-    let meter_w = inner_w.saturating_sub(8).max(24);
+    let meter_w = inner_w.saturating_sub(8).max(8);
     let l_bar = vu_bar(lp, lp_dot, meter_w, p);
     let r_bar = vu_bar(rp, rp_dot, meter_w, p);
     let l_pad = inner_w.saturating_sub(meter_w + 4);
@@ -252,6 +272,10 @@ pub fn print_status_hifi(
         ("BUF",   format!("{}", buf_pct),               buf_pct >= 60),
     ];
     let knob_unit: Vec<&str> = vec!["%", "", "", "", "", "%"];
+    // As many knobs as the width holds (minimum cell 8 + 1 gap), in this
+    // order: the sixth used to be cut off at the window edge.
+    let fit = ((inner_w + 1) / 9).clamp(1, knobs.len());
+    let knobs = &knobs[..fit];
 
     // Knob cell width: total inner / 6 minus gap
     let gap_w = 1usize;
@@ -292,7 +316,11 @@ pub fn print_status_hifi(
         // Value row: bold accent, with optional dim unit suffix.
         let unit = knob_unit[i];
         let val_color = if *good { p.good } else { p.accent };
-        let val_visible = visible_len(value) + if unit.is_empty() { 0 } else { 1 + visible_len(unit) };
+        // A long (custom) preset name pushed the cell — and every cell after
+        // it — past the box: cut it to the cell.
+        let unit_w = if unit.is_empty() { 0 } else { 1 + visible_len(unit) };
+        let value = &crate::ansi::truncate_plain(value, cell_inner.saturating_sub(unit_w));
+        let val_visible = visible_len(value) + unit_w;
         let v_lpad = (cell_inner.saturating_sub(val_visible)) / 2;
         let v_rpad = cell_inner.saturating_sub(val_visible + v_lpad);
         let val_styled = if unit.is_empty() {
@@ -333,8 +361,8 @@ pub fn print_status_hifi(
     };
     w.line(&truncate_ansi(&footer, term_w));
 
-    print!("\x1B[J");
-    io::stdout().flush().ok();
+    crate::term::out!("\x1B[J");
+    crate::term::flush();
 
     w.count()
 }
@@ -368,6 +396,14 @@ fn render_db_scale(meter_w: usize, p: &crate::theme::Palette) -> String {
         } else {
             target
         };
+        // A label that would run into the next one, or past the meter (a
+        // narrow window), is left out; the end labels always stay.
+        let last = i == labels.len() - 1;
+        let room_after = if last { 0 } else { visible_len(labels[labels.len() - 1].0) + 1 };
+        let gap = usize::from(placed > 0);
+        if !last && (col < placed + gap || col + visible_len(label) + room_after > meter_w) {
+            continue;
+        }
         if col > placed {
             out.push_str(&" ".repeat(col - placed));
             placed = col;
@@ -398,9 +434,14 @@ fn hifi_marquee_keys(p: &crate::theme::Palette, term_w: usize) -> String {
         ("Y",   "LYRICS"),
         ("T",   "THEME"),
     ];
+    // As many keys as the window holds: a key cut in half reads as noise.
     let mut s = String::with_capacity(200);
     s.push_str("  ");
     for (i, (k, label)) in pairs.iter().enumerate() {
+        let sep = if i > 0 { 3 } else { 0 };
+        if visible_len(&s) + sep + visible_len(k) + 1 + visible_len(label) > term_w {
+            break;
+        }
         if i > 0 {
             s.push_str(&format!(" {dim}·{rst} ", dim = p.dim, rst = p.reset));
         }
@@ -412,20 +453,24 @@ fn hifi_marquee_keys(p: &crate::theme::Palette, term_w: usize) -> String {
         s.push_str(label);
         s.push_str(p.reset);
     }
-    let _ = term_w;
     s
 }
+
+/// Narrowest box interior HiFi lays out for (a 34-column window). Below that
+/// FrameWriter cuts lines at the window edge.
+const HIFI_MIN_INNER: usize = 30;
 
 /// Inner content of the VU panel label row: "VU METER" on the left, a
 /// hardware-style CLIP lamp right-aligned (good-colored idle, danger on clip).
 /// Spans exactly `inner_w` visible columns so the box borders line up.
 fn vu_label_row(inner_w: usize, clipping: bool, p: &crate::theme::Palette) -> String {
     let label = "VU METER";
-    let lamp = if clipping { p.danger } else { p.good };
+    // Shape as well as colour: ● clipping, ○ idle (NO_COLOR, colour blindness).
+    let (lamp, glyph) = if clipping { (p.danger, '●') } else { (p.good, '○') };
     // 1 lead space + label + pad + "CLIP" + space + dot + 1 trail space.
     let pad = inner_w.saturating_sub(label.len() + 8);
     format!(
-        " {dim}{label}{rst}{pad}{dim}CLIP{rst} {lamp}●{rst} ",
+        " {dim}{label}{rst}{pad}{dim}CLIP{rst} {lamp}{glyph}{rst} ",
         dim = p.dim, rst = p.reset, lamp = lamp,
         label = label, pad = " ".repeat(pad),
     )
@@ -496,21 +541,21 @@ fn render_solid_bar(progress: f64, width: usize) -> String {
     }
 
     // Dim rail: solid blocks in the rail colour (shrinks as the fill grows).
+    // Without colour a solid rail is indistinguishable from the fill: a line.
     let tail = width.saturating_sub(full + if has_partial { 1 } else { 0 });
     if tail > 0 {
         s.push_str(RAIL_FG);
+        let rail = if crate::term::no_color() { '─' } else { '█' };
         for _ in 0..tail {
-            s.push('█');
+            s.push(rail);
         }
     }
     s
 }
 
-fn format_time(secs: f64) -> String {
-    let m = (secs / 60.0) as u32;
-    let s = (secs % 60.0) as u32;
-    format!("{:02}:{:02}", m, s)
-}
+// The one clock format (h:mm:ss past an hour); this theme's own copy had
+// drifted and printed 75:00.
+use crate::ui::format_time;
 
 /// Pad with spaces to `width` columns (or truncate with ellipsis if too long).
 /// Measured in display columns: a wide (CJK) title padded by char count
@@ -536,21 +581,19 @@ pub fn print_status_hifi_library(
     let term_h = terminal::size().map(|(_, h)| h as usize).unwrap_or(24);
 
     if prev_viz_lines != usize::MAX && prev_viz_lines > 0 {
-        print!("\x1B[{}F", prev_viz_lines);
+        crate::term::out!("\x1B[{}F", prev_viz_lines);
     }
 
-    let inner_w = term_w.saturating_sub(4).clamp(60, 110);
+    let inner_w = term_w.saturating_sub(4).clamp(HIFI_MIN_INNER, 110);
     let row_inner_w = inner_w.saturating_sub(2);
 
     // === Anchor (line 1): top edge of header strip (double border) ===
-    let mut w = crate::ui::FrameWriter::new();
+    let mut w = crate::ui::FrameWriter::fitted();
     let top = format!("╔{}╗", "═".repeat(inner_w));
     w.first_line(&format!("  {fg}{bar}{rst}", fg = p.fg, rst = p.reset, bar = top));
 
     // === Header content row: "L I B R A R Y" + right "N TRK · Hh Mm" ===
-    let total_secs: f64 = (0..playlist.len())
-        .filter_map(|i| ui.metadata_cache.duration(i))
-        .sum();
+    let total_secs = ui.metadata_cache.total_duration();
     let dur_summary = format_dur_short(total_secs);
     let header_left = format!(
         "{accent}{bold}L I B R A R Y{rst}",
@@ -585,7 +628,7 @@ pub fn print_status_hifi_library(
     let footer_consumed = 3;
     const HIFI_BODY_CAP: usize = 20;
     let visible_rows = term_h
-        .saturating_sub(header_consumed + footer_consumed + ui.banner_lines + 1)
+        .saturating_sub(header_consumed + footer_consumed + 1)
         .clamp(1, HIFI_BODY_CAP);
     ui.last_visible_rows = visible_rows;
 
@@ -619,15 +662,7 @@ pub fn print_status_hifi_library(
         ui.filtered_indices.len()
     };
 
-    let scroll_margin = 4.min(visible_rows / 2);
-    if ui.cursor >= ui.scroll_offset + visible_rows.saturating_sub(scroll_margin) {
-        ui.scroll_offset = ui.cursor.saturating_sub(visible_rows.saturating_sub(scroll_margin + 1));
-    }
-    if ui.cursor < ui.scroll_offset + scroll_margin {
-        ui.scroll_offset = ui.cursor.saturating_sub(scroll_margin);
-    }
-    let max_offset = items_len.saturating_sub(visible_rows);
-    ui.scroll_offset = ui.scroll_offset.min(max_offset);
+    ui.scroll_offset = crate::ui::list_scroll(ui.cursor, ui.scroll_offset, items_len, visible_rows);
 
     // Row layout (inside the box, padded "  " on each side). Total body
     // visible chars (between the two `│`) must equal `inner_w` to match the
@@ -636,8 +671,11 @@ pub fn print_status_hifi_library(
     let pad_l = 2usize;
     let pad_r = 2usize;
     let marker_w = 1usize;
-    let num_w = 2usize;
-    let dur_w = 5usize;
+    // As many digits as the longest number: a fixed 2 pushed every row of a
+    // 100+ track list one column past the box border.
+    let num_w = playlist.len().to_string().len().max(2);
+    // Wide enough for the longest track's time (h:mm:ss past an hour).
+    let dur_w = format_time(ui.metadata_cache.max_duration()).len().max(5);
     let inter = 1usize;
     let name_w = inner_w
         .saturating_sub(pad_l + marker_w + inter + num_w + inter + inter + dur_w + pad_r)
@@ -678,7 +716,7 @@ pub fn print_status_hifi_library(
             };
 
             let marker = if is_playing { "▶" } else { " " };
-            let num = format!("{:0>2}", track_idx + 1);
+            let num = format!("{:0>num_w$}", track_idx + 1);
 
             let row_color = if is_playing { p.accent } else { p.fg };
             let mark_color = if is_playing { p.accent } else { p.dim };
@@ -751,8 +789,8 @@ pub fn print_status_hifi_library(
     };
     w.line(&truncate_ansi(&footer, term_w));
 
-    print!("\x1B[J");
-    io::stdout().flush().ok();
+    crate::term::out!("\x1B[J");
+    crate::term::flush();
     w.count()
 }
 
@@ -803,14 +841,14 @@ pub fn print_status_hifi_lyrics(
     let term_h = terminal::size().map(|(_, h)| h as usize).unwrap_or(24);
 
     if prev_viz_lines != usize::MAX && prev_viz_lines > 0 {
-        print!("\x1B[{}F", prev_viz_lines);
+        crate::term::out!("\x1B[{}F", prev_viz_lines);
     }
 
-    let inner_w = term_w.saturating_sub(4).clamp(60, 110);
+    let inner_w = term_w.saturating_sub(4).clamp(HIFI_MIN_INNER, 110);
     let row_inner_w = inner_w.saturating_sub(2);
 
     // === Anchor (line 1): top edge of header strip (double border) ===
-    let mut w = crate::ui::FrameWriter::new();
+    let mut w = crate::ui::FrameWriter::fitted();
     let top = format!("╔{}╗", "═".repeat(inner_w));
     w.first_line(&format!("  {fg}{bar}{rst}", fg = p.fg, rst = p.reset, bar = top));
 
@@ -823,8 +861,8 @@ pub fn print_status_hifi_lyrics(
     let tot_t = format_time(state.total_secs());
 
     let mut right_meta = String::new();
-    if ui.lyrics.is_some() {
-        right_meta.push_str(if is_synced { "SYNC" } else { "PLAIN" });
+    if let Some(l) = &ui.lyrics {
+        right_meta.push_str(&crate::lyrics::source_line(l, ui.lyrics_source).to_uppercase());
         right_meta.push_str("  ·  ");
     }
     right_meta.push_str(&format!("{}  /  {}", cur_t, tot_t));
@@ -870,7 +908,7 @@ pub fn print_status_hifi_lyrics(
     let footer_consumed = 3;
     const HIFI_BODY_CAP: usize = 20;
     let body_rows = term_h
-        .saturating_sub(header_consumed + footer_consumed + ui.banner_lines + 1)
+        .saturating_sub(header_consumed + footer_consumed + 1)
         .clamp(1, HIFI_BODY_CAP);
 
     if let Some(ref lyrics) = ui.lyrics {
@@ -977,8 +1015,8 @@ pub fn print_status_hifi_lyrics(
     }
     w.line(&truncate_ansi(&bar, term_w));
 
-    print!("\x1B[J");
-    io::stdout().flush().ok();
+    crate::term::out!("\x1B[J");
+    crate::term::flush();
     w.count()
 }
 
@@ -1038,9 +1076,10 @@ mod hifi_tests {
         let hot = vu_label_row(60, true, p);
         assert_eq!(crate::ansi::visible_len(&idle), 60, "idle row: {idle:?}");
         assert_eq!(crate::ansi::visible_len(&hot), 60, "hot row: {hot:?}");
-        // Lamp is always present: good-colored dot idle, danger dot on clip.
+        // Lamp is always present: a good-coloured ring idle, a danger dot on
+        // clip — shape as well as colour, so it still reads without colour.
         assert!(idle.contains("CLIP"));
-        assert!(idle.contains(&format!("{}●", p.good)), "idle lamp not green: {idle:?}");
+        assert!(idle.contains(&format!("{}○", p.good)), "idle lamp not a green ring: {idle:?}");
         assert!(hot.contains(&format!("{}●", p.danger)), "hot lamp not red: {hot:?}");
     }
 }

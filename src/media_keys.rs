@@ -17,39 +17,43 @@ pub fn setup(state: Arc<PlayerState>) -> Option<MediaControls> {
 
     let mut controls = MediaControls::new(config).ok()?;
 
-    controls.attach(move |event: MediaControlEvent| {
-        match event {
-            MediaControlEvent::Play
-                if state.is_paused() => { state.toggle_pause(); }
-            MediaControlEvent::Pause
-                if !state.is_paused() => { state.toggle_pause(); }
-            MediaControlEvent::Toggle => state.toggle_pause(),
-            MediaControlEvent::Next => state.next(),
-            MediaControlEvent::Previous => state.prev(),
-            MediaControlEvent::Stop => state.quit(),
-            MediaControlEvent::Seek(dir) => {
-                state.seek(match dir {
-                    SeekDirection::Forward => 10,
-                    SeekDirection::Backward => -10,
-                });
-            }
-            MediaControlEvent::SeekBy(dir, dur) => {
-                let secs = dur.as_secs() as i64;
-                state.seek(match dir {
-                    SeekDirection::Forward => secs,
-                    SeekDirection::Backward => -secs,
-                });
-            }
-            // Player seeks are relative; translate the absolute target.
-            MediaControlEvent::SetPosition(pos) => {
-                let delta = pos.0.as_secs_f64() - state.time_secs();
-                state.seek(delta.round() as i64);
-            }
-            _ => {}
-        }
-    }).ok()?;
+    controls.attach(move |event: MediaControlEvent| handle_event(&state, event)).ok()?;
 
     Some(controls)
+}
+
+/// What a media key (or the OS now-playing widget) does to the player. Kept
+/// apart from the OS callback so it can be tested.
+fn handle_event(state: &PlayerState, event: MediaControlEvent) {
+    match event {
+        // Play and Pause name a STATE: setting it outright means a repeat
+        // press, or one racing a keyboard toggle, cannot invert it.
+        MediaControlEvent::Play => state.set_paused(false),
+        MediaControlEvent::Pause => state.set_paused(true),
+        MediaControlEvent::Toggle => state.toggle_pause(),
+        MediaControlEvent::Next => state.next(),
+        MediaControlEvent::Previous => state.prev(),
+        MediaControlEvent::Stop => state.quit(),
+        MediaControlEvent::Seek(dir) => {
+            state.seek(match dir {
+                SeekDirection::Forward => 10,
+                SeekDirection::Backward => -10,
+            });
+        }
+        MediaControlEvent::SeekBy(dir, dur) => {
+            let secs = dur.as_secs() as i64;
+            state.seek(match dir {
+                SeekDirection::Forward => secs,
+                SeekDirection::Backward => -secs,
+            });
+        }
+        // Player seeks are relative; translate the absolute target.
+        MediaControlEvent::SetPosition(pos) => {
+            let delta = pos.0.as_secs_f64() - state.time_secs();
+            state.seek(delta.round() as i64);
+        }
+        _ => {}
+    }
 }
 
 pub fn update_metadata(
@@ -223,4 +227,50 @@ fn platform_hwnd() -> Option<*mut std::ffi::c_void> {
 #[cfg(not(target_os = "windows"))]
 fn platform_hwnd() -> Option<*mut std::ffi::c_void> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn play_and_pause_set_a_state_toggle_flips_it() {
+        let st = PlayerState::new();
+        handle_event(&st, MediaControlEvent::Pause);
+        assert!(st.is_paused());
+        // Pause again stays paused (a check-then-toggle could flip it back).
+        handle_event(&st, MediaControlEvent::Pause);
+        assert!(st.is_paused());
+        handle_event(&st, MediaControlEvent::Play);
+        handle_event(&st, MediaControlEvent::Play);
+        assert!(!st.is_paused());
+        handle_event(&st, MediaControlEvent::Toggle);
+        assert!(st.is_paused());
+    }
+
+    #[test]
+    fn track_keys_skip_and_stop_quits() {
+        let st = PlayerState::new();
+        handle_event(&st, MediaControlEvent::Next);
+        assert!(st.take_skip_next());
+        handle_event(&st, MediaControlEvent::Previous);
+        assert!(st.take_skip_prev());
+        assert!(!st.should_quit());
+        handle_event(&st, MediaControlEvent::Stop);
+        assert!(st.should_quit(), "Stop quits (a deliberate choice: Pause covers stopping)");
+    }
+
+    #[test]
+    fn seeks_are_relative_and_accumulate() {
+        let st = PlayerState::new();
+        handle_event(&st, MediaControlEvent::Seek(SeekDirection::Forward));
+        handle_event(&st, MediaControlEvent::Seek(SeekDirection::Backward));
+        handle_event(&st, MediaControlEvent::Seek(SeekDirection::Backward));
+        assert_eq!(st.take_seek(), -10);
+        handle_event(&st, MediaControlEvent::SeekBy(SeekDirection::Forward, Duration::from_secs(25)));
+        assert_eq!(st.take_seek(), 25);
+        // An absolute position becomes a seek relative to the clock (0 here).
+        handle_event(&st, MediaControlEvent::SetPosition(MediaPosition(Duration::from_secs_f64(42.4))));
+        assert_eq!(st.take_seek(), 42);
+    }
 }

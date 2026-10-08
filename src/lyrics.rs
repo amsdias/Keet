@@ -56,6 +56,14 @@ impl Lyrics {
     pub fn is_synced(&self) -> bool {
         matches!(self, Lyrics::Synced(_))
     }
+
+    /// A synced line's timestamp (None for plain lyrics).
+    pub fn line_time(&self, index: usize) -> Option<f64> {
+        match self {
+            Lyrics::Synced(lines) => lines.get(index).map(|l| l.time),
+            Lyrics::Plain(_) => None,
+        }
+    }
 }
 
 /// Parse raw lyrics text into a Lyrics struct.
@@ -65,6 +73,10 @@ pub fn parse_lyrics(raw: &str) -> Lyrics {
     let has_timestamps = raw.lines().any(|line| !parse_lrc_line(line).is_empty());
 
     if has_timestamps {
+        // [offset:±N]: a whole-file adjustment in milliseconds; positive shows
+        // the lyrics earlier. It was ignored, so files that rely on it ran
+        // out of sync by exactly that much.
+        let offset_secs = raw.lines().find_map(parse_lrc_offset).unwrap_or(0.0);
         let mut lines: Vec<LrcLine> = Vec::new();
         for line in raw.lines() {
             // A line may carry several timestamps sharing the same text.
@@ -72,6 +84,7 @@ pub fn parse_lyrics(raw: &str) -> Lyrics {
             for (time, text) in parse_lrc_line(line) {
                 // Lyrics are drawn straight into frame lines, and LRCLIB text
                 // is user-submitted: strip control characters (ESC, CR, ...).
+                let time = (time - offset_secs).max(0.0);
                 lines.push(LrcLine { time, text: crate::ansi::sanitize_display(&text) });
             }
         }
@@ -112,20 +125,37 @@ fn parse_lrc_line(line: &str) -> Vec<(f64, String)> {
     times.into_iter().map(|t| (t, text.clone())).collect()
 }
 
-/// Parse the inside of an LRC time tag (`MM:SS`, `MM:SS.xx`, or `HH:MM:SS.xx`) to seconds.
+/// The `[offset:±N]` tag (milliseconds) as seconds, if `line` is one.
+fn parse_lrc_offset(line: &str) -> Option<f64> {
+    let inner = line.trim().strip_prefix('[')?.strip_suffix(']')?;
+    let (key, value) = inner.split_once(':')?;
+    if !key.trim().eq_ignore_ascii_case("offset") {
+        return None;
+    }
+    let ms: f64 = value.trim().trim_start_matches('+').parse().ok()?;
+    ms.is_finite().then_some(ms / 1000.0)
+}
+
+/// Parse the inside of an LRC time tag to seconds: `MM:SS`, `MM:SS.xx`,
+/// `MM:SS:xx` (hundredths after a colon, as some editors write them) or
+/// `HH:MM:SS.xx`. A three-part tag is hours only when its seconds carry a
+/// decimal point; `[01:02:50]` used to be read as one HOUR and two minutes.
 fn parse_lrc_time(inside: &str) -> Option<f64> {
     let parts: Vec<&str> = inside.split(':').collect();
+    let num = |s: &str| -> Option<f64> {
+        let v: f64 = s.trim().parse().ok()?;
+        (v.is_finite() && v >= 0.0).then_some(v)
+    };
     match parts.as_slice() {
-        [m, s] => {
-            let minutes: f64 = m.parse().ok()?;
-            let seconds: f64 = s.parse().ok()?;
-            Some(minutes * 60.0 + seconds)
-        }
-        [h, m, s] => {
-            let hours: f64 = h.parse().ok()?;
-            let minutes: f64 = m.parse().ok()?;
-            let seconds: f64 = s.parse().ok()?;
-            Some(hours * 3600.0 + minutes * 60.0 + seconds)
+        [m, s] => Some(num(m)? * 60.0 + num(s)?),
+        [h, m, s] if s.contains('.') => Some(num(h)? * 3600.0 + num(m)? * 60.0 + num(s)?),
+        [m, s, frac] => {
+            let digits = frac.trim();
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let frac = num(digits)? / 10f64.powi(digits.len() as i32);
+            Some(num(m)? * 60.0 + num(s)? + frac)
         }
         _ => None,
     }
@@ -175,60 +205,266 @@ pub(crate) fn http_agent() -> ureq::Agent {
 /// Fetch lyrics from LRCLIB (free, no API key, ~3M entries).
 /// Prefers synced (LRC) lyrics over plain.
 /// Returns raw lyrics text or None on failure/not found.
-pub fn fetch_lrclib(artist: &str, title: &str, duration_secs: Option<u32>) -> Option<String> {
+/// The outcome of a network lookup. A definite answer (found or not found)
+/// can be remembered; a failure (offline, timeout, server error) says nothing
+/// about the next attempt.
+pub enum Lookup<T> {
+    Found(T),
+    NotFound,
+    Failed,
+}
+
+/// Session cache of network lookups, keyed by query. Shared with the worker
+/// threads that do the fetching. Each play of a track used to ask LRCLIB (and
+/// iTunes) again — the same answer every time, and up to 15 s of waiting.
+#[derive(Clone, Default)]
+pub struct LookupCache<T: Clone = String> {
+    map: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Option<T>>>>,
+}
+
+impl<T: Clone> LookupCache<T> {
+    /// The remembered answer for `key`, or `fetch` it — remembering found and
+    /// not-found answers, but not failures.
+    pub fn get_or_fetch(&self, key: String, fetch: impl FnOnce() -> Lookup<T>) -> Option<T> {
+        if let Some(hit) = self.known(&key) {
+            return hit;
+        }
+        match fetch() {
+            Lookup::Found(v) => {
+                self.remember(key, Some(v.clone()));
+                Some(v)
+            }
+            Lookup::NotFound => {
+                self.remember(key, None);
+                None
+            }
+            Lookup::Failed => None,
+        }
+    }
+
+    /// The remembered answer, if there is one (`Some(None)` = known missing).
+    pub fn known(&self, key: &str) -> Option<Option<T>> {
+        self.map.lock().ok().and_then(|m| m.get(key).cloned())
+    }
+
+    pub fn remember(&self, key: String, answer: Option<T>) {
+        if let Ok(mut m) = self.map.lock() {
+            m.insert(key, answer);
+        }
+    }
+}
+
+pub fn fetch_lrclib(artist: &str, title: &str, duration_secs: Option<u32>) -> Lookup<String> {
     let mut url = format!(
         "https://lrclib.net/api/get?artist_name={}&track_name={}",
-        urlencod(artist),
-        urlencod(title),
+        crate::cover::urlencoded(artist),
+        crate::cover::urlencoded(title),
     );
     if let Some(dur) = duration_secs {
         url.push_str(&format!("&duration={}", dur));
     }
 
-    let response = http_agent().get(&url).call().ok()?;
-
-    if response.status() != 200 {
-        return None;
-    }
-
-    let text = response.into_body().read_to_string().ok()?;
-    let body: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let response = match http_agent().get(&url).call() {
+        Ok(r) if r.status() == 200 => r,
+        // LRCLIB answers 404 for a track it has no lyrics for.
+        Err(ureq::Error::StatusCode(404)) => return Lookup::NotFound,
+        _ => return Lookup::Failed,
+    };
+    let Some(body) = response
+        .into_body()
+        .read_to_string()
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+    else {
+        return Lookup::Failed;
+    };
 
     // Prefer syncedLyrics (LRC format) over plainLyrics
-    if let Some(synced) = body.get("syncedLyrics").and_then(|v| v.as_str()) {
-        if !synced.is_empty() {
-            return Some(synced.to_string());
+    for field in ["syncedLyrics", "plainLyrics"] {
+        if let Some(text) = body.get(field).and_then(|v| v.as_str()) {
+            if !text.is_empty() {
+                return Lookup::Found(text.to_string());
+            }
         }
     }
-    if let Some(plain) = body.get("plainLyrics").and_then(|v| v.as_str()) {
-        if !plain.is_empty() {
-            return Some(plain.to_string());
-        }
-    }
-    None
+    Lookup::NotFound
 }
 
-/// Minimal percent-encoding for URL query parameters.
-fn urlencod(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() * 2);
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char);
+
+/// Where a track's lyrics came from, shown beside them ("synced · LRCLIB"):
+/// LRCLIB is user-submitted, so its timing and text deserve less trust than
+/// the file's own tags.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LyricsSource {
+    Embedded,
+    Lrclib,
+}
+
+impl LyricsSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            LyricsSource::Embedded => "embedded",
+            LyricsSource::Lrclib => "LRCLIB",
+        }
+    }
+}
+
+/// "synced · LRCLIB" — the kind and origin of the lyrics on screen.
+pub fn source_line(lyrics: &Lyrics, source: Option<LyricsSource>) -> String {
+    let kind = if lyrics.is_synced() { "synced" } else { "plain" };
+    match source {
+        Some(s) => format!("{kind} · {}", s.label()),
+        None => kind.to_string(),
+    }
+}
+
+/// Per-track lyrics sync offsets, remembered across sessions in
+/// `lyrics_offsets.json` (path → seconds). A sync fix belongs to the track it
+/// was made for: LRCLIB timings are off by a different amount for every file.
+/// Loaded on first use; written on every change (a key press, so rare).
+#[derive(Default)]
+pub struct OffsetStore {
+    map: Option<std::collections::HashMap<String, f64>>,
+}
+
+impl OffsetStore {
+    fn file() -> Option<std::path::PathBuf> {
+        // Tests must never read or write the user's real file.
+        if cfg!(test) {
+            return None;
+        }
+        crate::playlist::keet_config_dir().map(|d| d.join("lyrics_offsets.json"))
+    }
+
+    fn map(&mut self) -> &mut std::collections::HashMap<String, f64> {
+        self.map.get_or_insert_with(|| {
+            Self::file()
+                .and_then(|f| std::fs::read_to_string(f).ok())
+                .and_then(|t| serde_json::from_str(&t).ok())
+                .unwrap_or_default()
+        })
+    }
+
+    /// The saved offset for `track` (0 when none).
+    pub fn get(&mut self, track: &std::path::Path) -> f64 {
+        self.map().get(&*track.to_string_lossy()).copied().unwrap_or(0.0)
+    }
+
+    /// Remember `secs` for `track` and save. Zero forgets it.
+    pub fn set(&mut self, track: &std::path::Path, secs: f64) {
+        set_offset(self.map(), &track.to_string_lossy(), secs);
+        if let (Some(f), Some(map)) = (Self::file(), self.map.as_ref()) {
+            if let Some(dir) = f.parent() {
+                let _ = std::fs::create_dir_all(dir);
             }
-            b' ' => out.push_str("%20"),
-            _ => {
-                out.push('%');
-                out.push_str(&format!("{:02X}", b));
+            if let Ok(json) = serde_json::to_string_pretty(map) {
+                let _ = std::fs::write(f, json);
             }
         }
     }
-    out
+}
+
+/// Record an offset, rounded to the 0.1 s it is shown at; zero removes the
+/// entry so the file only lists tracks that need a fix.
+fn set_offset(map: &mut std::collections::HashMap<String, f64>, key: &str, secs: f64) {
+    let secs = (secs * 10.0).round() / 10.0;
+    if secs == 0.0 {
+        map.remove(key);
+    } else {
+        map.insert(key.to_string(), secs);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_line_names_kind_and_origin() {
+        let synced = parse_lyrics("[00:01.00]hi");
+        let plain = parse_lyrics("hi\nthere");
+        assert_eq!(source_line(&synced, Some(LyricsSource::Lrclib)), "synced · LRCLIB");
+        assert_eq!(source_line(&plain, Some(LyricsSource::Embedded)), "plain · embedded");
+        assert_eq!(source_line(&plain, None), "plain");
+    }
+
+    #[test]
+    fn offsets_are_rounded_and_zero_forgets_the_track() {
+        let mut map = std::collections::HashMap::new();
+        set_offset(&mut map, "a.flac", 0.30000000000000004);
+        assert_eq!(map.get("a.flac"), Some(&0.3));
+        set_offset(&mut map, "a.flac", 0.0000001);
+        assert!(map.is_empty(), "a track back at zero leaves no entry");
+    }
+
+    #[test]
+    fn the_offset_store_is_per_track() {
+        let mut store = OffsetStore::default();
+        let (a, b) = (std::path::Path::new("/m/a.flac"), std::path::Path::new("/m/b.flac"));
+        store.set(a, 1.5);
+        assert_eq!(store.get(a), 1.5);
+        assert_eq!(store.get(b), 0.0);
+    }
+
+    fn times(raw: &str) -> Vec<f64> {
+        match parse_lyrics(raw) {
+            Lyrics::Synced(lines) => lines.iter().map(|l| l.time).collect(),
+            Lyrics::Plain(_) => panic!("expected synced lyrics"),
+        }
+    }
+
+    fn close(a: &[f64], b: &[f64]) -> bool {
+        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-9)
+    }
+
+    #[test]
+    fn network_lookups_are_cached_except_failures() {
+        // Every play of a track re-asked LRCLIB (or iTunes) — the same answer
+        // each time, up to 15 s of waiting for it. Found and definitively
+        // missing results are remembered for the session; a failure (offline,
+        // timeout) is retried next time.
+        let cache = LookupCache::default();
+        let mut calls = 0;
+        for _ in 0..3 {
+            let got = cache.get_or_fetch("a\0b".into(), || { calls += 1; Lookup::Found("words".to_string()) });
+            assert_eq!(got.as_deref(), Some("words"));
+        }
+        assert_eq!(calls, 1);
+
+        let mut calls = 0;
+        for _ in 0..3 {
+            assert_eq!(cache.get_or_fetch("missing".into(), || { calls += 1; Lookup::NotFound }), None);
+        }
+        assert_eq!(calls, 1, "a definite miss is remembered too");
+
+        let mut calls = 0;
+        for _ in 0..3 {
+            assert_eq!(cache.get_or_fetch("offline".into(), || { calls += 1; Lookup::Failed }), None);
+        }
+        assert_eq!(calls, 3, "failures are retried");
+    }
+
+    #[test]
+    fn lrc_timestamps_in_every_common_form() {
+        assert!(close(&times("[01:02]a\n[01:02.50]b\n[01:02.5]c"), &[62.0, 62.5, 62.5]));
+        // [mm:ss:xx] — centiseconds after a colon, as some editors write them.
+        // It was read as HOURS:minutes:seconds: a line meant for 1:02 showed
+        // after an hour.
+        assert!(close(&times("[01:02:50]a"), &[62.5]));
+        // A real hours form keeps its decimal point on the seconds.
+        assert!(close(&times("[01:00:02.25]a"), &[3602.25]));
+        // Edge cases: the tags may carry no lines worth showing.
+        assert!(close(&times("[00:01.00][00:03.00]chorus"), &[1.0, 3.0]));
+    }
+
+    #[test]
+    fn lrc_offset_tag_shifts_every_line() {
+        // [offset:+N] is in milliseconds; positive shows lyrics EARLIER.
+        assert!(close(&times("[offset:+500]\n[00:10.00]a\n[00:20.00]b"), &[9.5, 19.5]));
+        assert!(close(&times("[offset:-250]\n[00:10.00]a"), &[10.25]));
+        // Never before the start of the track.
+        assert!(close(&times("[offset:2000]\n[00:01.00]a"), &[0.0]));
+    }
 
     #[test]
     fn lyric_lines_are_stripped_of_control_characters() {
@@ -278,7 +514,10 @@ mod network_tests {
         }
 
         let started = std::time::Instant::now();
-        let got = fetch_lrclib("Radiohead", "Creep", Some(238));
+        let got = match fetch_lrclib("Radiohead", "Creep", Some(238)) {
+            Lookup::Found(l) => Some(l),
+            _ => None,
+        };
         let elapsed = started.elapsed();
         println!("[3] fetch_lrclib in {:?}, some={}", elapsed, got.is_some());
 

@@ -15,6 +15,16 @@ fn center_cell(s: &str, vis: usize, w: usize) -> String {
     format!("{}{}{}", " ".repeat(lp), s, " ".repeat(pad - lp))
 }
 
+/// "105 Hz" / "3.2 kHz" — a frequency in running text (the column labels
+/// use the unitless `format_freq`).
+fn freq_with_unit(freq: f32) -> String {
+    if freq >= 1000.0 {
+        format!("{:.1} kHz", freq / 1000.0)
+    } else {
+        format!("{:.0} Hz", freq)
+    }
+}
+
 /// Long-form band description for the selected-band readout, e.g.
 /// `BAND 3 · LOW SHELF · 105 Hz · +5.5 dB · Q 0.71` (gain omitted for cuts).
 fn band_readout(selected: usize, b: &BandSettings, p: &Palette) -> String {
@@ -26,11 +36,7 @@ fn band_readout(selected: usize, b: &BandSettings, p: &Palette) -> String {
         BandType::LowCut => "LOW CUT",
         BandType::HighCut => "HIGH CUT",
     };
-    let freq = if b.freq >= 1000.0 {
-        format!("{:.1} kHz", b.freq / 1000.0)
-    } else {
-        format!("{:.0} Hz", b.freq)
-    };
+    let freq = freq_with_unit(b.freq);
     let sep = format!(" {}·{} ", p.rule, rst);
     let mut line = format!(
         "  {dim}BAND{rst} {acc}{n}{rst}{sep}{fg}{kind}{rst}{sep}{fg}{freq}{rst}",
@@ -41,6 +47,32 @@ fn band_readout(selected: usize, b: &BandSettings, p: &Palette) -> String {
         line.push_str(&format!("{sep}{fg}{:+.1} dB{rst}", b.gain, fg = p.fg, rst = rst));
     }
     line.push_str(&format!("{sep}{fg}Q {:.2}{rst}", b.q, fg = p.fg, rst = rst));
+    line
+}
+
+/// The headroom row: the curve's highest boost against the preamp, whether
+/// loud tracks will reach the limiter, and the key that fixes it.
+pub fn headroom_line(h: &crate::eq::Headroom, preamp_db: f32, p: &Palette) -> String {
+    let rst = p.reset;
+    let sep = format!("  {}·{}  ", p.rule, rst);
+    let mut line = format!("  {}HEADROOM{rst}  ", p.dim);
+    if h.max_boost_db < 0.05 {
+        line.push_str(&format!("{}no boost{rst}", p.fg));
+    } else {
+        line.push_str(&format!(
+            "{fg}max boost {:+.1} dB{rst} {dim}@ {}{rst}",
+            h.max_boost_db, freq_with_unit(h.at_hz), fg = p.fg, dim = p.dim,
+        ));
+    }
+    line.push_str(&format!("{sep}{}preamp {:+.1} dB{rst}", p.fg, preamp_db));
+    if h.over_db >= 0.05 {
+        line.push_str(&format!("{sep}{}▲ {:.1} dB over{rst}", p.warn, h.over_db));
+    } else if h.max_boost_db >= 0.05 {
+        line.push_str(&format!("{sep}{}✓ covered{rst}", p.good));
+    }
+    if let Some(s) = h.suggested_preamp {
+        line.push_str(&format!("{sep}{}[a]{rst} {}set preamp {:+.1} dB{rst}", p.accent, p.dim, s));
+    }
     line
 }
 

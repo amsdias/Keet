@@ -51,6 +51,13 @@ pub fn detect_protocol() -> GraphicsProtocol {
         let term_program = std::env::var("TERM_PROGRAM").ok();
         let term = std::env::var("TERM").ok();
         let lc_terminal = std::env::var("LC_TERMINAL").ok();
+        if in_multiplexer(
+            std::env::var_os("TMUX").is_some(),
+            std::env::var_os("STY").is_some(),
+            term.as_deref(),
+        ) {
+            return GraphicsProtocol::HalfBlock;
+        }
         protocol_from_env(
             term_program.as_deref(),
             term.as_deref(),
@@ -60,6 +67,15 @@ pub fn detect_protocol() -> GraphicsProtocol {
             cfg!(windows),
         )
     })
+}
+
+/// Running inside tmux or GNU screen. The outer terminal's hints
+/// (KITTY_WINDOW_ID, LC_TERMINAL, WT_SESSION) are inherited into the session,
+/// but the multiplexer does not pass image escapes through by default — Kitty,
+/// iTerm2 or Sixel then drew blank covers. Half-block is plain text and
+/// survives any multiplexer.
+fn in_multiplexer(tmux: bool, sty: bool, term: Option<&str>) -> bool {
+    tmux || sty || term.is_some_and(|t| t.starts_with("tmux") || t.starts_with("screen"))
 }
 
 /// Pure decision core of `detect_protocol`, parameterized for testability.
@@ -280,15 +296,25 @@ pub fn resolve_local(
 
 /// Fetch a cover from iTunes Search and persist it to the on-disk cache for
 /// next time. Requires both artist and album — returns None otherwise.
-pub fn resolve_remote(artist: &str, album: &str, size: CoverSize) -> Option<CoverImage> {
-    let bytes = fetch_itunes(artist, album)?;
+/// Fetch the album's cover from iTunes and save it to the on-disk cover cache
+/// (which `resolve_local` reads first next time).
+pub fn resolve_remote(artist: &str, album: &str, size: CoverSize) -> crate::lyrics::Lookup<CoverImage> {
+    use crate::lyrics::Lookup;
+    let bytes = match fetch_itunes(artist, album) {
+        Lookup::Found(b) => b,
+        Lookup::NotFound => return Lookup::NotFound,
+        Lookup::Failed => return Lookup::Failed,
+    };
     if let Some(p) = cache_path_for(Some(artist), Some(album)) {
         if let Some(dir) = p.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
         let _ = std::fs::write(&p, &bytes);
     }
-    decode_and_resize(&bytes, size)
+    match decode_and_resize(&bytes, size) {
+        Some(img) => Lookup::Found(img),
+        None => Lookup::NotFound,
+    }
 }
 
 fn read_embedded(track_path: &Path) -> Option<Vec<u8>> {
@@ -302,13 +328,12 @@ fn read_embedded(track_path: &Path) -> Option<Vec<u8>> {
         .probe(&hint, mss, FormatOptions::default(), MetadataOptions::default())
         .ok()?;
 
-    // 0.6 folds the probe's own metadata into the format reader, so the
-    // separate `probed.metadata` pass this used to need is gone. The Metadata
-    // guard must outlive the revision borrowed out of it, hence the binding.
-    let meta = format.metadata();
-    let rev = meta.current()?;
-    let v = rev.media.visuals.first()?;
-    Some(v.data.to_vec())
+    // Every block, newest first: the oldest one (symphonia's `current()`) is
+    // a trailing ID3v1/APE on an MP3 tagged both ways, which carries no
+    // picture — the ID3v2 APIC is in a newer block.
+    crate::metadata::revisions_newest_first(format.as_mut())
+        .into_iter()
+        .find_map(|rev| rev.media.visuals.first().map(|v| v.data.to_vec()))
 }
 
 fn read_sidecar(track_path: &Path) -> Option<Vec<u8>> {
@@ -364,7 +389,8 @@ fn sanitize_fs(s: &str) -> String {
     out.trim().to_string()
 }
 
-fn fetch_itunes(artist: &str, album: &str) -> Option<Vec<u8>> {
+fn fetch_itunes(artist: &str, album: &str) -> crate::lyrics::Lookup<Vec<u8>> {
+    use crate::lyrics::Lookup;
     let query = format!("{} {}", artist, album);
     let url = format!(
         "https://itunes.apple.com/search?term={}&media=music&entity=album&limit=1",
@@ -375,27 +401,39 @@ fn fetch_itunes(artist: &str, album: &str) -> Option<Vec<u8>> {
     // `timeout_global`, see lyrics::http_agent).
     let agent = crate::lyrics::http_agent();
 
-    let response = agent.get(&url).call().ok()?;
-    if response.status() != 200 {
-        return None;
-    }
-    let text = response.into_body().read_to_string().ok()?;
-    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
-
-    let art_url = json.get("results")?.as_array()?
-        .first()?.get("artworkUrl100")?.as_str()?
-        .to_string();
+    let json: Option<serde_json::Value> = match agent.get(&url).call() {
+        Ok(r) if r.status() == 200 => r
+            .into_body()
+            .read_to_string()
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok()),
+        _ => return Lookup::Failed,
+    };
+    let Some(json) = json else { return Lookup::Failed };
+    // No result: iTunes does not know the album.
+    let Some(art_url) = json
+        .get("results")
+        .and_then(|r| r.as_array())
+        .and_then(|r| r.first())
+        .and_then(|r| r.get("artworkUrl100"))
+        .and_then(|u| u.as_str())
+    else {
+        return Lookup::NotFound;
+    };
 
     // Upgrade thumbnail URL to the largest standard size iTunes serves.
     let big_url = art_url.replacen("100x100", "600x600", 1);
-    let img_resp = agent.get(&big_url).call().ok()?;
-    if img_resp.status() != 200 {
-        return None;
+    match agent.get(&big_url).call() {
+        Ok(r) if r.status() == 200 => match r.into_body().with_config().limit(8 * 1024 * 1024).read_to_vec() {
+            Ok(b) => Lookup::Found(b),
+            Err(_) => Lookup::Failed,
+        },
+        _ => Lookup::Failed,
     }
-    img_resp.into_body().with_config().limit(8 * 1024 * 1024).read_to_vec().ok()
 }
 
-fn urlencoded(s: &str) -> String {
+/// Percent-encode a URL query value (the one encoder: LRCLIB uses it too).
+pub(crate) fn urlencoded(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 2);
     for b in s.bytes() {
         match b {
@@ -412,8 +450,17 @@ fn urlencoded(s: &str) -> String {
     out
 }
 
+/// Largest decode a cover may cost. A terminal cover is a few hundred pixels
+/// across; image's default ceiling is 512 MiB, so a 10000x10000 embedded JPEG
+/// (~400 MB as RGBA) decoded — once per cover worker. 4096x4096 RGBA fits.
+const COVER_MAX_ALLOC: u64 = 64 * 1024 * 1024;
+
 fn decode_and_resize(bytes: &[u8], size: CoverSize) -> Option<CoverImage> {
-    let img = image::load_from_memory(bytes).ok()?;
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?;
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(COVER_MAX_ALLOC);
+    reader.limits(limits);
+    let img = reader.decode().ok()?;
     // `thumbnail_exact` uses nearest-neighbor and allocates only the output
     // buffer. `resize_exact(_, _, Lanczos3)` allocates two intermediate f32
     // RGBA planes sized `dst × src` and `src × dst` — together ~5–8 MB for a
@@ -566,53 +613,14 @@ fn encode_png_rgb(rgb: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
 }
 
 fn viz_kitty_lines(png: &[u8], cols: u32, rows: u32) -> Vec<String> {
-    let b64 = base64_encode(png);
-    let chunk_size = 4096;
-    let total = b64.len();
-    let mut transmit = String::with_capacity(total + 256);
-    let mut pos = 0;
-    let mut first = true;
-    while pos < total {
-        let end = (pos + chunk_size).min(total);
-        let is_last = end == total;
-        transmit.push_str("\x1B_G");
-        if first {
-            // p=1 pins a single placement: re-transmitting each frame with the same
-            // image id + placement id REPLACES it in place rather than spawning a new
-            // placement every frame (which otherwise piles up and slows the terminal).
-            let _ = write!(transmit, "a=T,f=100,i={},p=1,c={},r={},C=1,q=2,m={}",
-                VIZ_IMAGE_ID, cols, rows, if is_last { 0 } else { 1 });
-            first = false;
-        } else {
-            let _ = write!(transmit, "m={}", if is_last { 0 } else { 1 });
-        }
-        transmit.push(';');
-        transmit.push_str(&b64[pos..end]);
-        transmit.push_str("\x1B\\");
-        pos = end;
-    }
-    let blank = " ".repeat(cols as usize);
-    let mut lines = Vec::with_capacity(rows as usize);
-    lines.push(format!("{transmit}{blank}"));
-    for _ in 1..rows { lines.push(blank.clone()); }
-    lines
+    // p=1 pins a single placement: re-transmitting each frame with the same
+    // image id + placement id REPLACES it in place rather than spawning a new
+    // placement every frame (which otherwise piles up and slows the terminal).
+    kitty_lines(&kitty_transmit_with(png, VIZ_IMAGE_ID, Some(1), cols, rows), cols, rows)
 }
 
 fn viz_iterm2_lines(png: &[u8], cols: u32, rows: u32) -> Vec<String> {
-    let b64 = base64_encode(png);
-    let mut first = String::with_capacity(b64.len() + 128);
-    first.push_str("\x1B[s\x1B]1337;File=size=");
-    let _ = write!(first, "{}", png.len());
-    let _ = write!(first, ";width={};height={};inline=1;preserveAspectRatio=1:", cols, rows);
-    first.push_str(&b64);
-    first.push('\x07');
-    first.push_str("\x1B[u");
-    let _ = write!(first, "\x1B[{}C", cols);
-    let skip = format!("\x1B[{}C", cols);
-    let mut lines = Vec::with_capacity(rows as usize);
-    lines.push(first);
-    for _ in 1..rows { lines.push(skip.clone()); }
-    lines
+    iterm2_lines(png, cols, rows)
 }
 
 /// Encode an indexed-color image as a sixel blob with a caller-supplied FIXED
@@ -761,15 +769,6 @@ fn viz_sixel_lines(data: &str, cols: u32, rows: u32, gutter: Gutter<'_>) -> Vec<
     lines
 }
 
-/// Solid black cells filling the cover slot. Used as a placeholder when no
-/// cover is available so the banner layout doesn't shift while one loads or
-/// for tracks without artwork.
-pub fn placeholder_lines(size: CoverSize) -> Vec<String> {
-    let cells = " ".repeat(size.cols as usize);
-    let line = format!("\x1B[48;2;0;0;0m{}\x1B[0m", cells);
-    (0..size.rows).map(|_| line.clone()).collect()
-}
-
 /// Render the cover to a Vec of COVER_ROWS lines, each COVER_COLS wide.
 /// For Kitty, line 0 carries the image-transmit escape plus blank spaces;
 /// subsequent lines are blank spaces that the image overlays.
@@ -786,14 +785,16 @@ pub fn render(img: &CoverImage) -> Vec<String> {
 }
 
 fn render_kitty(png: &[u8], size: CoverSize) -> Vec<String> {
-    let cols = size.cols as usize;
-    let mut lines = Vec::with_capacity(size.rows as usize);
-    let blank = " ".repeat(cols);
-    let mut first = String::with_capacity(png.len() * 2);
-    first.push_str(&kitty_transmit(png, size));
-    first.push_str(&blank);
-    lines.push(first);
-    for _ in 1..size.rows {
+    kitty_lines(&kitty_transmit(png, size), size.cols, size.rows)
+}
+
+/// An image's cell block: the transmit escape on the first row followed by
+/// blanks, blank rows below — the cells the image is placed over.
+fn kitty_lines(transmit: &str, cols: u32, rows: u32) -> Vec<String> {
+    let blank = " ".repeat(cols as usize);
+    let mut lines = Vec::with_capacity(rows as usize);
+    lines.push(format!("{transmit}{blank}"));
+    for _ in 1..rows {
         lines.push(blank.clone());
     }
     lines
@@ -818,34 +819,44 @@ fn render_sixel(data: &str, size: CoverSize) -> Vec<String> {
 }
 
 fn render_iterm2(png: &[u8], size: CoverSize) -> Vec<String> {
-    let mut lines = Vec::with_capacity(size.rows as usize);
+    iterm2_lines(png, size.cols, size.rows)
+}
+
+/// An iTerm2 inline image (OSC 1337) over a cols x rows cell block. Save
+/// cursor, emit the image (which would otherwise leave the cursor in an
+/// implementation-defined position), restore cursor, then advance exactly
+/// `cols` cells. The image is "attached" to the cells it occupies; using
+/// `CSI n C` instead of literal spaces avoids overwriting those image cells on
+/// the rows below. One encoder for the cover and the analysis spectrogram.
+fn iterm2_lines(png: &[u8], cols: u32, rows: u32) -> Vec<String> {
     let b64 = base64_encode(png);
-    // Save cursor, emit the image (which would otherwise leave the cursor
-    // in an implementation-defined position), restore cursor, then advance
-    // exactly size.cols cells. The image is "attached" to the cells it
-    // occupies; using \x1B[NC instead of literal spaces avoids overwriting
-    // those image cells on rows 1-9.
     let mut first = String::with_capacity(b64.len() + 128);
     first.push_str("\x1B[s\x1B]1337;File=size=");
     let _ = write!(first, "{}", png.len());
-    let _ = write!(
-        first,
-        ";width={};height={};inline=1;preserveAspectRatio=1:",
-        size.cols, size.rows
-    );
+    let _ = write!(first, ";width={};height={};inline=1;preserveAspectRatio=1:", cols, rows);
     first.push_str(&b64);
     first.push('\x07');
     first.push_str("\x1B[u");
-    let _ = write!(first, "\x1B[{}C", size.cols);
+    let _ = write!(first, "\x1B[{}C", cols);
+    let skip = format!("\x1B[{}C", cols);
+    let mut lines = Vec::with_capacity(rows as usize);
     lines.push(first);
-    let skip = format!("\x1B[{}C", size.cols);
-    for _ in 1..size.rows {
+    for _ in 1..rows {
         lines.push(skip.clone());
     }
     lines
 }
 
 fn kitty_transmit(png: &[u8], size: CoverSize) -> String {
+    kitty_transmit_with(png, KITTY_IMAGE_ID, None, size.cols, size.rows)
+}
+
+/// The Kitty graphics transmit for a PNG, chunked at 4096 base64 bytes:
+/// a=T transmit+display, f=100 PNG, i=<id> so a re-send replaces the image,
+/// p=<placement> when given, c/r fit it to the cell block, C=1 don't move the
+/// cursor, q=2 suppress the terminal's responses (which would arrive on
+/// stdin). One encoder for the cover and the analysis spectrogram.
+fn kitty_transmit_with(png: &[u8], id: u32, placement: Option<u32>, cols: u32, rows: u32) -> String {
     let b64 = base64_encode(png);
     let chunk_size = 4096;
     let total = b64.len();
@@ -854,23 +865,17 @@ fn kitty_transmit(png: &[u8], size: CoverSize) -> String {
     let mut first = true;
     while pos < total {
         let end = (pos + chunk_size).min(total);
-        let is_last = end == total;
+        let more = if end == total { 0 } else { 1 };
         out.push_str("\x1B_G");
         if first {
-            // a=T transmit+display, f=100 PNG, i=<id> for replacement,
-            // c=COLS,r=ROWS fit into our banner slot, C=1 don't move cursor,
-            // q=2 suppress responses from the terminal.
-            let _ = write!(
-                out,
-                "a=T,f=100,i={},c={},r={},C=1,q=2,m={}",
-                KITTY_IMAGE_ID,
-                size.cols,
-                size.rows,
-                if is_last { 0 } else { 1 }
-            );
+            let _ = write!(out, "a=T,f=100,i={id}");
+            if let Some(p) = placement {
+                let _ = write!(out, ",p={p}");
+            }
+            let _ = write!(out, ",c={cols},r={rows},C=1,q=2,m={more}");
             first = false;
         } else {
-            let _ = write!(out, "m={}", if is_last { 0 } else { 1 });
+            let _ = write!(out, "m={more}");
         }
         out.push(';');
         out.push_str(&b64[pos..end]);
@@ -1133,6 +1138,49 @@ mod viz_sixel_tests {
             assert!(h as usize <= size.rows as usize * ch, "height {h} overflows {} rows", size.rows);
             assert_eq!(h % 6, 0, "height {h} ends on a partial sixel band");
         }
+    }
+
+    #[test]
+    fn a_huge_cover_is_refused_instead_of_decoded() {
+        // 5000x5000 RGB = 75 MB decoded: past the cover budget.
+        let mut png = Vec::new();
+        let big = image::RgbImage::new(5000, 5000);
+        image::DynamicImage::ImageRgb8(big)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        assert!(decode_and_resize(&png, CoverSize::for_theme(crate::theme::ThemeKind::Classic)).is_none());
+        let mut small = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(600, 600))
+            .write_to(&mut std::io::Cursor::new(&mut small), image::ImageFormat::Png)
+            .unwrap();
+        assert!(decode_and_resize(&small, CoverSize::for_theme(crate::theme::ThemeKind::Classic)).is_some());
+    }
+
+    #[test]
+    fn kitty_transmits_keep_their_exact_bytes() {
+        // The cover and the spectrogram share one encoder; their escapes must
+        // stay exactly what each sent before (the spectrogram pins placement 1).
+        assert_eq!(
+            kitty_transmit_with(b"abc", 2, Some(1), 10, 5),
+            "\x1B_Ga=T,f=100,i=2,p=1,c=10,r=5,C=1,q=2,m=0;YWJj\x1B\\"
+        );
+        assert_eq!(
+            kitty_transmit_with(b"abc", 1, None, 20, 10),
+            "\x1B_Ga=T,f=100,i=1,c=20,r=10,C=1,q=2,m=0;YWJj\x1B\\"
+        );
+        // Chunked: the first chunk carries the keys, the rest only m=.
+        let big = kitty_transmit_with(&[0u8; 4000], 1, None, 1, 1);
+        assert!(big.contains("m=1;") && big.ends_with("\x1B\\") && big.matches("\x1B_Gm=").count() == 1);
+    }
+
+    #[test]
+    fn multiplexers_get_half_block() {
+        assert!(in_multiplexer(true, false, Some("xterm-256color")));
+        assert!(in_multiplexer(false, true, None));
+        assert!(in_multiplexer(false, false, Some("tmux-256color")));
+        assert!(in_multiplexer(false, false, Some("screen-256color")));
+        assert!(!in_multiplexer(false, false, Some("xterm-kitty")));
+        assert!(!in_multiplexer(false, false, None));
     }
 
     #[test]

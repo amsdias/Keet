@@ -24,19 +24,7 @@ use wasapi::{
 use crate::audio::{pack_samples, DeviceBusyError, OutputRenderer};
 use crate::state::PlayerState;
 
-// AUDCLNT_E_* HRESULTs (values from windows-rs 0.62, Win32::Media::Audio).
-const E_DEVICE_INVALIDATED: u32 = 0x8889_0004;
-const E_DEVICE_IN_USE: u32 = 0x8889_000A;
-const E_BUFFER_SIZE_NOT_ALIGNED: u32 = 0x8889_0019;
-
-/// Sample layouts tried, most precise first: (bits stored, bits used).
-/// 24-in-32 is the common USB DAC layout; packed 24 and 16 are fallbacks.
-const LAYOUTS: [(u16, u16); 4] = [(32, 32), (32, 24), (24, 24), (16, 16)];
-
-/// Rates probed for exclusive-mode support.
-const RATES: [u32; 10] = [
-    44_100, 48_000, 88_200, 96_000, 176_400, 192_000, 352_800, 384_000, 705_600, 768_000,
-];
+use crate::wasapi_logic::{self as logic, Check, LAYOUTS, RATES};
 
 fn hresult(e: &WasapiError) -> Option<u32> {
     match e {
@@ -81,7 +69,7 @@ pub fn best_layout(device_id: &str, rate: u32, channels: u16) -> Option<(u16, u1
     let id = device_id.to_string();
     with_mta(move || {
         let client = DeviceEnumerator::new().ok()?.get_device(&id).ok()?.get_iaudioclient().ok()?;
-        LAYOUTS.iter().copied().find(|&l| accepts(&client, l, rate, channels))
+        logic::pick_layout(|l| accepts(&client, l, rate, channels))
     })
     .flatten()
 }
@@ -121,33 +109,26 @@ pub fn exclusive_report(device_id: &str, channels: u16) -> Vec<String> {
             Some(h) => format!("{h:#010x}"),
             None => e.to_string(),
         };
-        let mut out = vec![format!("exclusive ({channels} ch): rate  check[32/32 32/24 24/24 16/16]  open")];
+        let mut out = vec![logic::report_header(channels)];
         for &rate in &RATES {
             let Ok(client) = device.get_iaudioclient() else {
                 out.push(format!("  {rate}: <no audio client>"));
                 continue;
             };
-            let checks: Vec<String> = LAYOUTS
+            let checks: Vec<Check> = LAYOUTS
                 .iter()
                 .map(|&l| match client.is_supported(&format(l, rate, channels), &wasapi::ShareMode::Exclusive) {
-                    Ok(_) => "ok".to_string(),
+                    Ok(_) => Check::Ok,
                     Err(e) => match client.is_supported_exclusive_with_quirks(&format(l, rate, channels)) {
-                        Ok(_) => "ok*".to_string(),
-                        Err(_) => code(&e),
+                        Ok(_) => Check::OkWithQuirks,
+                        Err(_) => Check::Refused(code(&e)),
                     },
                 })
                 .collect();
-            let layout = LAYOUTS
-                .iter()
-                .copied()
-                .find(|&l| accepts(&client, l, rate, channels))
-                .unwrap_or((32, 24));
+            let layout = logic::pick_layout(|l| accepts(&client, l, rate, channels)).unwrap_or((32, 24));
             drop(client);
-            let opened = match open(&id, rate, channels, layout, false) {
-                Ok(_) => format!("ok ({}/{})", layout.0, layout.1),
-                Err((e, _)) => e.trim_start_matches("exclusive mode: ").to_string(),
-            };
-            out.push(format!("  {rate}: {}  {opened}", checks.join(" ")));
+            let opened = open(&id, rate, channels, layout, false).map(|_| layout).map_err(|(e, _)| e);
+            out.push(logic::report_row(rate, &checks, opened.as_ref().map(|l| *l).map_err(|e| e.as_str())));
         }
         out
     })
@@ -201,7 +182,15 @@ impl WasapiOutput {
                     }
                     Ok(o) => {
                         let _ = tx.send(Ok(()));
-                        run(o, &mut renderer, &stop_thread, &state);
+                        // The render loop ending for ANY reason but `stop` is a
+                        // dead stream — a frozen track with no sound unless
+                        // main hears about it. A panic counts too.
+                        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            run(o, &mut renderer, &stop_thread, &state)
+                        }));
+                        if ran.is_err() && !stop_thread.load(Ordering::Relaxed) {
+                            state.stream_error.store(true, Ordering::Relaxed);
+                        }
                     }
                 }
             })?;
@@ -243,13 +232,8 @@ impl Drop for WasapiOutput {
 /// see whether the driver's answer to the check matches what it will open).
 fn open(id: &str, rate: u32, channels: u16, layout: (u16, u16), checked: bool) -> Result<Opened, (String, bool)> {
     let fail = |what: &str, e: WasapiError| {
-        let in_use = hresult(&e) == Some(E_DEVICE_IN_USE);
-        // AUDCLNT codes often have no system message text, so keep the code.
-        let msg = match hresult(&e) {
-            Some(h) => format!("{what}: {h:#010x} {e}"),
-            None => format!("{what}: {e}"),
-        };
-        (msg.trim_end().to_string(), in_use)
+        let code = hresult(&e);
+        (logic::error_message(what, code, &e.to_string()), logic::is_busy(code))
     };
     let device = DeviceEnumerator::new()
         .and_then(|en| en.get_device(id))
@@ -268,7 +252,7 @@ fn open(id: &str, rate: u32, channels: u16, layout: (u16, u16), checked: bool) -
         .calculate_aligned_period_near(default_period, Some(128), &fmt)
         .map_err(|e| fail("exclusive mode: period", e))?;
     if let Err(e) = client.initialize_client(&fmt, &Direction::Render, &StreamMode::EventsExclusive { period_hns: period }) {
-        if hresult(&e) != Some(E_BUFFER_SIZE_NOT_ALIGNED) {
+        if !logic::needs_realign(hresult(&e)) {
             return Err(fail("exclusive mode: open", e));
         }
         // Documented recovery: re-create the client with the aligned buffer's period.
@@ -285,14 +269,17 @@ fn open(id: &str, rate: u32, channels: u16, layout: (u16, u16), checked: bool) -
 }
 
 /// The render loop: wait for the device's event, render, pack, write. Ends on
-/// `stop`, or on device loss (which raises `stream_error`, so main's recovery
-/// takes over exactly as for a cpal stream).
+/// `stop`, or on ANY error, which raises `stream_error` so main's recovery
+/// takes over exactly as for a cpal stream. Only device loss
+/// (AUDCLNT_E_DEVICE_INVALIDATED) used to: any other failure ended the loop
+/// silently, leaving a frozen track with no sound and no recovery.
 fn run(o: Opened, renderer: &mut OutputRenderer, stop: &AtomicBool, state: &PlayerState) {
     let bytes_per_sample = (o.layout.0 / 8) as usize;
     let max_frames = o.client.get_buffer_size().unwrap_or(8192) as usize;
     let mut samples = vec![0i32; max_frames * o.channels];
     let mut bytes = vec![0u8; max_frames * o.channels * bytes_per_sample];
-    let lost = |e: &WasapiError| hresult(e) == Some(E_DEVICE_INVALIDATED);
+    // Ended by an error rather than by `stop`.
+    let failed = |_: &WasapiError| !stop.load(Ordering::Relaxed);
 
     let mut write = |renderer: &mut OutputRenderer| -> Result<(), WasapiError> {
         let frames = (o.client.get_available_space_in_frames()? as usize).min(max_frames);
@@ -307,7 +294,7 @@ fn run(o: Opened, renderer: &mut OutputRenderer, stop: &AtomicBool, state: &Play
 
     // Fill the whole buffer before starting, so playback begins with audio.
     if let Err(e) = write(renderer).and_then(|_| o.client.start_stream()) {
-        if lost(&e) {
+        if failed(&e) {
             state.stream_error.store(true, Ordering::Relaxed);
         }
         return;
@@ -317,7 +304,7 @@ fn run(o: Opened, renderer: &mut OutputRenderer, stop: &AtomicBool, state: &Play
             // No event: a pause in the device's clock or the device going
             // away. Asking the client tells the two apart.
             if let Err(e) = o.client.get_available_space_in_frames() {
-                if lost(&e) {
+                if failed(&e) {
                     state.stream_error.store(true, Ordering::Relaxed);
                     break;
                 }
@@ -325,7 +312,7 @@ fn run(o: Opened, renderer: &mut OutputRenderer, stop: &AtomicBool, state: &Play
             continue;
         }
         if let Err(e) = write(renderer) {
-            if lost(&e) {
+            if failed(&e) {
                 state.stream_error.store(true, Ordering::Relaxed);
             }
             break;

@@ -6,7 +6,7 @@
 //! number of lines drawn *below* the anchor (line 1). The caller rewinds
 //! via `\x1B[<n>F` on the next frame, so mismatched counts leave orphans.
 
-use std::io::{self, Write};
+
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
@@ -75,7 +75,7 @@ pub fn print_status_minimal(
     ui.spectro_block_intact = false;
 
     if prev_viz_lines != usize::MAX && prev_viz_lines > 0 {
-        print!("\x1B[{}F", prev_viz_lines);
+        crate::term::out!("\x1B[{}F", prev_viz_lines);
     }
 
     let idx = state.current_track.load(Ordering::Relaxed);
@@ -96,14 +96,17 @@ pub fn print_status_minimal(
     // and the visualization is suppressed.
     let fullscreen = state.viz_fullscreen();
     let extras = state.viz_extras();
-    let mut w = crate::ui::FrameWriter::new();
+    let mut w = crate::ui::FrameWriter::fitted();
     if fullscreen {
-        w.first_line(&crate::ansi::truncate_ansi(&format!(
-            "  {bold}{name}{rst} {dim}{info}  {cur}/{tot}  {{⇧F}} exit{rst}",
-            bold = p.accent, dim = p.dim, rst = p.reset,
-            name = name, info = track_info,
-            cur = format_time(state.time_secs()), tot = format_time(state.total_secs()),
-        ), term_w));
+        let head = format!("  {bold}{name}{rst}  ", bold = p.accent, rst = p.reset, name = name);
+        let room = term_w.saturating_sub(visible_len(&head));
+        let items = crate::ansi::fit_segments(
+            &crate::ui::fullscreen_items(track_info, state.time_secs(), state.total_secs()), "  •  ", room,
+        );
+        w.first_line(&crate::ansi::truncate_ansi(
+            &format!("{head}{dim}{items}{rst}", dim = p.dim, rst = p.reset),
+            term_w,
+        ));
     } else {
         w.first_line(&wordmark_anchor(p));
 
@@ -175,7 +178,15 @@ pub fn print_status_minimal(
         visible_len(&sub_truncated),
     ));
 
-    ident.push((String::new(), 0));
+    // Exclusive mode: the signal path verdict, in the row above NOW PLAYING.
+    let verdict = crate::signal::verdict(&crate::signal::PathInputs::from_state(state, fx_name, cf_name));
+    match crate::signal::fitted(&verdict, "  ·  ", ident_w) {
+        Some((ok, text)) => {
+            let c = if ok { p.accent } else { p.warn };
+            ident.push((format!("{c}{text}{rst}", rst = p.reset), visible_len(&text)));
+        }
+        None => ident.push((String::new(), 0)),
+    }
 
     let np_label = if state.is_paused() { "PAUSED" } else { "NOW PLAYING" };
     ident.push((
@@ -214,25 +225,31 @@ pub fn print_status_minimal(
     // (whose `output` row also shows it) is only drawn from 100 columns up —
     // narrower, the bit depth was shown nowhere. Right after the rate, ahead
     // of eq/fx/cf, so it is the last thing truncation removes.
-    let rate_label = match state.output_bits.load(Ordering::Relaxed) {
-        0 => rate_label,
-        b => format!("{rate_label}  ·  out {b}-bit"),
-    };
-    let mut meta = format!(
-        "track {n} of {tot}  ·  {bits}-bit {ch}  ·  {rate}",
-        n = track_n, tot = track_total, bits = bits, ch = ch_label, rate = rate_label,
-    );
-    if eq_preset.name != "Flat" { meta.push_str(&format!("  ·  eq {}", eq_preset.name)); }
-    if fx_name != "None" { meta.push_str(&format!("  ·  fx {}", fx_name)); }
-    if cf_name != "Off"  { meta.push_str(&format!("  ·  cf {}", cf_name)); }
-    let clip_color = if state.is_clipping() { p.danger } else { p.good };
-    meta.push_str(&format!("  ·  {c}●{rst}", c = clip_color, rst = p.reset));
-    let meta_visible = visible_len(&meta).min(ident_w);
-    let meta_styled = format!(
-        "{dim}{m}{rst}",
-        dim = p.dim, rst = p.reset,
-        m = if visible_len(&meta) > ident_w { truncate_plain_ansi_aware(&meta, ident_w) } else { meta },
-    );
+    let mut segments = vec![
+        format!("track {track_n} of {track_total}"),
+        format!("{bits}-bit {ch_label}"),
+        rate_label,
+    ];
+    // Exclusive mode: the DAC's format, as on Classic's track info line. It
+    // lives here, on the always-visible meta line, because the SIGNAL column
+    // (whose `output` row also shows it) is only drawn from 100 columns up.
+    // Right after the rate, ahead of eq/fx/cf, so it is the last item dropped.
+    if let b @ 1.. = state.output_bits.load(Ordering::Relaxed) {
+        segments.push(format!("out {b}-bit"));
+    }
+    if eq_preset.name != "Flat" { segments.push(format!("eq {}", eq_preset.name)); }
+    if fx_name != "None" { segments.push(format!("fx {}", fx_name)); }
+    if cf_name != "Off"  { segments.push(format!("cf {}", cf_name)); }
+    // The clip lamp ends the line, always: it is a status light, not one more
+    // item, so no separator before it, and a narrow window drops whole items
+    // from the end instead (the lamp used to be cut first, leaving a "·"
+    // dangling at the edge).
+    // Shape as well as colour: ● clipping, ○ idle (NO_COLOR, colour blindness).
+    let (clip_color, clip_glyph) = if state.is_clipping() { (p.danger, '●') } else { (p.good, '○') };
+    let lamp = format!("  {c}{clip_glyph}{rst}", c = clip_color, rst = p.reset);
+    let text = crate::ansi::fit_segments(&segments, "  ·  ", ident_w.saturating_sub(3));
+    let meta_visible = visible_len(&text) + 3;
+    let meta_styled = format!("{dim}{text}{rst}{lamp}", dim = p.dim, rst = p.reset);
     ident.push((meta_styled, meta_visible));
 
     // Right column: SIGNAL's label sits two rows above NOW PLAYING so its eight
@@ -408,8 +425,8 @@ pub fn print_status_minimal(
         }
     }
 
-    print!("\x1B[J");
-    io::stdout().flush().ok();
+    crate::term::out!("\x1B[J");
+    crate::term::flush();
     w.count()
 }
 
@@ -598,11 +615,9 @@ fn viz_section_label(mode: VizMode) -> &'static str {
     }
 }
 
-fn format_time(secs: f64) -> String {
-    let m = (secs / 60.0) as u32;
-    let s = (secs % 60.0) as u32;
-    format!("{:02}:{:02}", m, s)
-}
+// The one clock format (h:mm:ss past an hour); this theme's own copy had
+// drifted and printed 75:00.
+use crate::ui::format_time;
 
 /// Editorial progress bar: solid accent fill + 1/8 partial + dotted rule rail.
 fn render_progress_bar(progress: f64, width: usize, fg: &str, rule: &str, reset: &str) -> String {
@@ -652,11 +667,11 @@ pub fn print_status_minimal_library(
     let term_h = terminal::size().map(|(_, h)| h as usize).unwrap_or(24);
 
     if prev_viz_lines != usize::MAX && prev_viz_lines > 0 {
-        print!("\x1B[{}F", prev_viz_lines);
+        crate::term::out!("\x1B[{}F", prev_viz_lines);
     }
 
     // === Anchor (line 1): wordmark — survives terminal scroll ===
-    let mut w = crate::ui::FrameWriter::new();
+    let mut w = crate::ui::FrameWriter::fitted();
     w.first_line(&wordmark_anchor(p));
 
     // === Library header row: "Library  N tracks · Hh Mm" + right hints ===
@@ -695,7 +710,9 @@ pub fn print_status_minimal_library(
 
     // === Column layout: # | TITLE | ALBUM | TIME ===
     let num_w = 4usize;
-    let time_w = 5usize;
+    // Wide enough for the longest track's time: h:mm:ss once anything runs
+    // past an hour (a fixed 5 pushed those rows past the window).
+    let time_w = crate::ui::format_time(ui.metadata_cache.max_duration()).len().max(5);
     let inter_gap = 2usize;
     // Album takes ~22% of remaining space, clamped 14..28.
     let avail = term_w.saturating_sub(2 + num_w + inter_gap + inter_gap + time_w + 2);
@@ -715,11 +732,11 @@ pub fn print_status_minimal_library(
 
     // Compute visible rows. Header above the rows: library row + rule + col
     // headers = 3. Footer: top rule + key bar = 2. Anchor (+1) is the
-    // wordmark; banner area is now zero-height for Minimal.
+    // wordmark.
     let footer_lines = 2;
     let header_consumed = 3; // library header row + rule + column headers
     let visible_rows = term_h
-        .saturating_sub(header_consumed + footer_lines + ui.banner_lines + 1)
+        .saturating_sub(header_consumed + footer_lines + 1)
         .max(1);
     ui.last_visible_rows = visible_rows;
 
@@ -742,17 +759,7 @@ pub fn print_status_minimal_library(
         ui.filtered_indices.len()
     };
 
-    let scroll_margin = 4.min(visible_rows / 2);
-    if ui.cursor >= ui.scroll_offset + visible_rows.saturating_sub(scroll_margin) {
-        ui.scroll_offset = ui
-            .cursor
-            .saturating_sub(visible_rows.saturating_sub(scroll_margin + 1));
-    }
-    if ui.cursor < ui.scroll_offset + scroll_margin {
-        ui.scroll_offset = ui.cursor.saturating_sub(scroll_margin);
-    }
-    let max_offset = items_len.saturating_sub(visible_rows);
-    ui.scroll_offset = ui.scroll_offset.min(max_offset);
+    ui.scroll_offset = crate::ui::list_scroll(ui.cursor, ui.scroll_offset, items_len, visible_rows);
 
     if items_len == 0 && search_active {
         w.line(&format!(
@@ -863,8 +870,8 @@ pub fn print_status_minimal_library(
     ));
     w.line(&truncate_ansi(&footer_content, term_w));
 
-    print!("\x1B[J");
-    io::stdout().flush().ok();
+    crate::term::out!("\x1B[J");
+    crate::term::flush();
     w.count()
 }
 
@@ -937,11 +944,11 @@ pub fn print_status_minimal_lyrics(
     let term_h = terminal::size().map(|(_, h)| h as usize).unwrap_or(24);
 
     if prev_viz_lines != usize::MAX && prev_viz_lines > 0 {
-        print!("\x1B[{}F", prev_viz_lines);
+        crate::term::out!("\x1B[{}F", prev_viz_lines);
     }
 
     // === Anchor (line 1): wordmark — survives terminal scroll ===
-    let mut w = crate::ui::FrameWriter::new();
+    let mut w = crate::ui::FrameWriter::fitted();
     w.first_line(&wordmark_anchor(p));
 
     // === Line 2: title bold + dim metadata + accent time on right ===
@@ -954,9 +961,9 @@ pub fn print_status_minimal_lyrics(
     let is_synced = ui.lyrics.as_ref().map(|l| l.is_synced()).unwrap_or(false);
     let mut meta = String::new();
     if let Some(a) = artist.as_ref() { meta.push_str(a); }
-    if ui.lyrics.is_some() {
+    if let Some(l) = &ui.lyrics {
         if !meta.is_empty() { meta.push_str("  ·  "); }
-        meta.push_str(if is_synced { "synced" } else { "plain" });
+        meta.push_str(&crate::lyrics::source_line(l, ui.lyrics_source));
     }
     let cur_t = format_time(state.time_secs());
     let tot_t = format_time(state.total_secs());
@@ -996,7 +1003,7 @@ pub fn print_status_minimal_lyrics(
     let header_consumed = 2;
     let footer_consumed = 2;
     let body_rows = term_h
-        .saturating_sub(header_consumed + footer_consumed + ui.banner_lines + 1)
+        .saturating_sub(header_consumed + footer_consumed + 1)
         .max(1);
 
     w.line("");
@@ -1107,8 +1114,8 @@ pub fn print_status_minimal_lyrics(
         bar = bar,
     ));
 
-    print!("\x1B[J");
-    io::stdout().flush().ok();
+    crate::term::out!("\x1B[J");
+    crate::term::flush();
     w.count()
 }
 

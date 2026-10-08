@@ -162,54 +162,180 @@ pub fn save_m3u(playlist: &[PathBuf], name: &str) -> Result<PathBuf, Box<dyn std
     Ok(path)
 }
 
-/// Rescan source path and diff against current playlist.
-/// Returns (added_count, removed_count).
-pub fn rescan_playlist(
-    source_path: &Path,
-    playlist: &mut Vec<PathBuf>,
-    current_track_path: Option<&Path>,
-) -> Result<(usize, usize), Box<dyn std::error::Error>> {
-    let fresh = if source_path.extension()
-        .map(|e| e.to_string_lossy().to_lowercase())
-        .map(|e| e == "m3u" || e == "m3u8")
-        .unwrap_or(false)
-    {
-        parse_m3u(source_path)?
+/// The playlist for the next repeat-all cycle (before any shuffle). With a
+/// folder among the sources, every source is read again so new files join the
+/// cycle; otherwise (M3U or single files) the current list is kept. Either way
+/// tracks the user removed stay out (`removed` holds canonical paths) and
+/// duplicates collapse. All of it is I/O — directory walks and one path lookup
+/// per track — so it runs off the UI thread; on a big or network library it
+/// froze the UI at every wrap.
+pub fn next_cycle(
+    sources: &[PathBuf],
+    current: &[PathBuf],
+    removed: &std::collections::HashSet<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut list: Vec<PathBuf> = if sources.iter().any(|p| p.is_dir()) {
+        let combined: Vec<PathBuf> = sources
+            .iter()
+            .filter_map(|src| build_playlist(src, false).ok())
+            .flatten()
+            .collect();
+        // Nothing readable this time (a share gone offline): keep playing
+        // what there was rather than ending.
+        if combined.is_empty() { current.to_vec() } else { combined }
     } else {
-        build_playlist(source_path, false)?
+        current.to_vec()
     };
-
-    let current_set: std::collections::HashSet<&std::path::Path> = playlist.iter().map(|p| p.as_path()).collect();
-    let fresh_set: std::collections::HashSet<&std::path::Path> = fresh.iter().map(|p| p.as_path()).collect();
-
-    // Find new files (in fresh but not in current)
-    let mut added: Vec<PathBuf> = fresh.iter()
-        .filter(|p| !current_set.contains(p.as_path()))
-        .cloned()
-        .collect();
-    let added_count = added.len();
-
-    // Find removed files (in current but not in fresh)
-    let removed_count = current_set.difference(&fresh_set).count();
-
-    // Remove missing files (preserve order, skip currently playing track)
-    playlist.retain(|p| {
-        if !fresh_set.contains(p.as_path()) {
-            current_track_path.map(|c| c == p.as_path()).unwrap_or(false)
-        } else {
-            true
-        }
+    let mut seen = std::collections::HashSet::new();
+    list.retain(|p| {
+        let key = fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+        !removed.contains(&key) && seen.insert(key)
     });
+    list
+}
 
-    // Append new files to tail
-    playlist.append(&mut added);
+/// What a rescan found on disk. Built off the UI thread by [`scan_sources`]
+/// (directory walks and path canonicalisation can take seconds on a large or
+/// network library) and applied on it by [`apply_rescan`].
+pub struct RescanResult {
+    /// Every track the sources hold now, in source order.
+    pub fresh: Vec<PathBuf>,
+    /// Canonical form of each path seen (fresh tracks and the playlist
+    /// snapshot), so applying needs no filesystem access.
+    pub canon: std::collections::HashMap<PathBuf, PathBuf>,
+    /// A source could not be read: its tracks are then unknown, not gone.
+    pub had_error: bool,
+}
 
-    Ok((added_count, removed_count))
+/// Read every source (folder or M3U) and canonicalise the paths. Pure I/O;
+/// `snapshot` is the playlist at the time, canonicalised here too.
+pub fn scan_sources(sources: &[PathBuf], snapshot: &[PathBuf]) -> RescanResult {
+    let mut fresh = Vec::new();
+    let mut had_error = false;
+    for src in sources {
+        match build_playlist(src, false) {
+            Ok(list) => fresh.extend(list),
+            Err(_) => had_error = true,
+        }
+    }
+    let canon = fresh
+        .iter()
+        .chain(snapshot)
+        .map(|p| (p.clone(), fs::canonicalize(p).unwrap_or_else(|_| p.clone())))
+        .collect();
+    RescanResult { fresh, canon, had_error }
+}
+
+/// Diff the playlist against what is on disk, across ALL sources at once.
+/// Tracks no longer found are dropped (except the one playing), new ones are
+/// appended in source order, duplicates collapse, and tracks the user removed
+/// (`removed`, canonical paths) are never brought back. Each source used to be
+/// diffed on its own, so with two folders the second pass dropped everything
+/// the first had kept. When a source could not be read nothing is dropped:
+/// its tracks are unknown, not gone. Returns (added, removed).
+pub fn apply_rescan(
+    playlist: &mut Vec<PathBuf>,
+    r: &RescanResult,
+    current_track_path: Option<&Path>,
+    removed: &std::collections::HashSet<PathBuf>,
+) -> (usize, usize) {
+    use std::collections::HashSet;
+    let key = |p: &PathBuf| r.canon.get(p).cloned().unwrap_or_else(|| p.clone());
+    let fresh_keys: HashSet<PathBuf> = r.fresh.iter().map(key).filter(|k| !removed.contains(k)).collect();
+
+    let before = playlist.len();
+    if !r.had_error {
+        playlist.retain(|p| fresh_keys.contains(&key(p)) || current_track_path == Some(p.as_path()));
+    }
+    let dropped = before - playlist.len();
+
+    let mut have: HashSet<PathBuf> = playlist.iter().map(key).collect();
+    let mut added = 0;
+    for f in &r.fresh {
+        let k = key(f);
+        if !removed.contains(&k) && have.insert(k) {
+            playlist.push(f.clone());
+            added += 1;
+        }
+    }
+    // Collapse duplicates already in the list (the same file reached through
+    // two sources or a symlink), keeping the first.
+    let mut seen = HashSet::new();
+    playlist.retain(|p| seen.insert(key(p)));
+    (added, dropped)
 }
 
 #[cfg(test)]
 mod m3u_tests {
     use super::*;
+
+    fn tmp_lib(name: &str, files: &[&str]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("keet_rescan_{name}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        for f in files {
+            fs::write(dir.join(f), b"").unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn the_next_repeat_cycle_rereads_folders_without_removed_tracks() {
+        let a = tmp_lib("cycle_a", &["a1.flac", "a2.flac"]);
+        fs::write(a.join("a3.flac"), b"").unwrap(); // added since the last cycle
+        let current = vec![a.join("a1.flac"), a.join("a2.flac")];
+        let removed: std::collections::HashSet<PathBuf> =
+            [fs::canonicalize(a.join("a2.flac")).unwrap()].into_iter().collect();
+        let next = next_cycle(std::slice::from_ref(&a), &current, &removed);
+        let _ = fs::remove_dir_all(&a);
+        assert_eq!(next, vec![a.join("a1.flac"), a.join("a3.flac")]);
+    }
+
+    #[test]
+    fn the_next_repeat_cycle_of_a_playlist_file_keeps_its_order_minus_removals() {
+        // Not a folder: nothing to rescan, the list stays as it was.
+        let current = vec![PathBuf::from("/m/x.flac"), PathBuf::from("/m/y.flac")];
+        let removed: std::collections::HashSet<PathBuf> = [PathBuf::from("/m/x.flac")].into_iter().collect();
+        let next = next_cycle(&[PathBuf::from("/m/list.m3u")], &current, &removed);
+        assert_eq!(next, vec![PathBuf::from("/m/y.flac")]);
+    }
+
+    #[test]
+    fn rescan_keeps_every_source_folder() {
+        // Each source used to be diffed on its own: the pass for ~/A removed
+        // every track not under ~/A, then the pass for ~/B removed all of A's.
+        let a = tmp_lib("multi_a", &["a1.flac", "a2.flac"]);
+        let b = tmp_lib("multi_b", &["b1.flac"]);
+        let sources = vec![a.clone(), b.clone()];
+        let mut playlist = vec![a.join("a1.flac"), a.join("a2.flac"), b.join("b1.flac")];
+        fs::remove_file(a.join("a2.flac")).unwrap();
+        fs::write(b.join("b2.flac"), b"").unwrap();
+
+        let r = scan_sources(&sources, &playlist);
+        let (added, removed) =
+            apply_rescan(&mut playlist, &r, None, &std::collections::HashSet::new());
+        let _ = (fs::remove_dir_all(&a), fs::remove_dir_all(&b));
+        assert_eq!((added, removed), (1, 1));
+        assert_eq!(playlist, vec![a.join("a1.flac"), b.join("b1.flac"), b.join("b2.flac")]);
+    }
+
+    #[test]
+    fn rescan_does_not_bring_back_removed_tracks_or_drop_an_unreadable_source() {
+        let a = tmp_lib("removed_a", &["a1.flac", "a2.flac"]);
+        let gone = a.join("no-such-folder");
+        let mut playlist = vec![a.join("a1.flac"), PathBuf::from("/elsewhere/x.flac")];
+        let r = scan_sources(&[a.clone(), gone], &playlist);
+        assert!(r.had_error);
+        // a2 was removed by the user: it must stay out.
+        let removed: std::collections::HashSet<PathBuf> =
+            [fs::canonicalize(a.join("a2.flac")).unwrap()].into_iter().collect();
+        let (added, dropped) = apply_rescan(&mut playlist, &r, None, &removed);
+        let _ = fs::remove_dir_all(&a);
+        // A source that failed to read says nothing about its tracks, so
+        // nothing is dropped on its account (/elsewhere/x.flac stays).
+        assert_eq!((added, dropped), (0, 0));
+        assert_eq!(playlist, vec![a.join("a1.flac"), PathBuf::from("/elsewhere/x.flac")]);
+    }
 
     #[test]
     fn parse_m3u_strips_utf8_bom_from_first_entry() {

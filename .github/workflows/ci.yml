@@ -8,6 +8,16 @@ on:
     branches:
       - main
 
+# Read-only token: nothing here writes to the repository.
+permissions:
+  contents: read
+
+# Actions are pinned by commit SHA (a tag can be moved to other code), and
+# the Rust version is pinned so a new stable release cannot turn CI red with
+# no code change (new lints + `-D warnings`). Bump RUST_VERSION deliberately.
+env:
+  RUST_VERSION: "1.98.1"
+
 jobs:
   # Fast gate: unit + DSP-chain integration tests (no audio device needed —
   # the chain tests drain the rtrb ring in place of the callback). Platform-
@@ -16,71 +26,42 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
 
       - name: Install Linux deps
-        run: |
-          # The runner image ships third-party apt repos (Chrome, Microsoft)
-          # that we never use. `apt-get update` exits 100 if ANY index fails,
-          # so a hash-sum mismatch mid-publish on Google's CDN fails the whole
-          # job — which is exactly what happened. Drop those lists first: the
-          # three dev packages below all come from Ubuntu's own repos. Ubuntu's
-          # own sources live in sources.list.d too (deb822 on 24.04), so remove
-          # the specific vendor files rather than the directory.
-          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
-                     /etc/apt/sources.list.d/microsoft-prod.list
-          # Still retry: a mirror can be mid-sync for genuinely transient
-          # reasons. Fail loudly if all attempts fail — `|| sleep` would leave
-          # the loop exiting 0 and hide a real outage behind a later error.
-          ok=
-          for _ in 1 2 3; do
-            if sudo apt-get update; then ok=1; break; fi
-            sleep 5
-          done
-          [ -n "$ok" ] || { echo "apt-get update failed after 3 attempts"; exit 1; }
-          sudo apt-get install -y libasound2-dev libdbus-1-dev pkg-config
+        uses: ./.github/actions/linux-deps
 
       - name: Test
         run: cargo test --workspace
 
   # Lint gate. `-D warnings` promotes clippy warnings to errors so the tree
-  # stays at zero. Drop the `-- -D warnings` to match CLAUDE.md's "warnings are
-  # informational" stance (then only hard clippy errors fail CI).
+  # stays at zero. Every OS: platform code (WASAPI exclusive mode and media
+  # keys on Windows, CoreAudio on macOS) is compiled out everywhere else, so a
+  # Linux-only lint never saw it.
   clippy:
-    name: Clippy
-    runs-on: ubuntu-latest
+    name: Clippy (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
+          toolchain: ${{ env.RUST_VERSION }}
           components: clippy
 
       - name: Install Linux deps
-        run: |
-          # The runner image ships third-party apt repos (Chrome, Microsoft)
-          # that we never use. `apt-get update` exits 100 if ANY index fails,
-          # so a hash-sum mismatch mid-publish on Google's CDN fails the whole
-          # job — which is exactly what happened. Drop those lists first: the
-          # three dev packages below all come from Ubuntu's own repos. Ubuntu's
-          # own sources live in sources.list.d too (deb822 on 24.04), so remove
-          # the specific vendor files rather than the directory.
-          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
-                     /etc/apt/sources.list.d/microsoft-prod.list
-          # Still retry: a mirror can be mid-sync for genuinely transient
-          # reasons. Fail loudly if all attempts fail — `|| sleep` would leave
-          # the loop exiting 0 and hide a real outage behind a later error.
-          ok=
-          for _ in 1 2 3; do
-            if sudo apt-get update; then ok=1; break; fi
-            sleep 5
-          done
-          [ -n "$ok" ] || { echo "apt-get update failed after 3 attempts"; exit 1; }
-          sudo apt-get install -y libasound2-dev libdbus-1-dev pkg-config
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/linux-deps
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
@@ -112,42 +93,23 @@ jobs:
             out: keet-windows-x86_64.exe
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
+          toolchain: ${{ env.RUST_VERSION }}
           targets: ${{ matrix.target }}
 
-      # Linux system dependencies
       - name: Install Linux deps
         if: matrix.os == 'ubuntu-latest'
-        run: |
-          # The runner image ships third-party apt repos (Chrome, Microsoft)
-          # that we never use. `apt-get update` exits 100 if ANY index fails,
-          # so a hash-sum mismatch mid-publish on Google's CDN fails the whole
-          # job — which is exactly what happened. Drop those lists first: the
-          # three dev packages below all come from Ubuntu's own repos. Ubuntu's
-          # own sources live in sources.list.d too (deb822 on 24.04), so remove
-          # the specific vendor files rather than the directory.
-          sudo rm -f /etc/apt/sources.list.d/google-chrome.list \
-                     /etc/apt/sources.list.d/microsoft-prod.list
-          # Still retry: a mirror can be mid-sync for genuinely transient
-          # reasons. Fail loudly if all attempts fail — `|| sleep` would leave
-          # the loop exiting 0 and hide a real outage behind a later error.
-          ok=
-          for _ in 1 2 3; do
-            if sudo apt-get update; then ok=1; break; fi
-            sleep 5
-          done
-          [ -n "$ok" ] || { echo "apt-get update failed after 3 attempts"; exit 1; }
-          sudo apt-get install -y libasound2-dev libdbus-1-dev pkg-config
+        uses: ./.github/actions/linux-deps
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.out }}
           path: target/${{ matrix.target }}/release/${{ matrix.bin }}

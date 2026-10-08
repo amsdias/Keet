@@ -92,13 +92,6 @@ impl RepeatMode {
         }
     }
 
-    pub fn label(self) -> &'static str {
-        match self {
-            RepeatMode::Off => "",
-            RepeatMode::All => " | repeat",
-            RepeatMode::One => " | repeat-1",
-        }
-    }
 }
 
 // Visualization style
@@ -119,7 +112,7 @@ impl VizStyle {
 
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum RgMode {
     Track = 0,
@@ -373,7 +366,7 @@ pub struct PlayerState {
 
     // Visualization style (bars vs dots)
     pub(crate) viz_style: AtomicU8,
-    /// Full-window viz: the banner is dropped and the visualization takes every
+    /// Full-window viz: the header is dropped and the visualization takes every
     /// row the frame can spare. Relaxed — UI-thread state with no ordering
     /// relationship to anything else.
     pub(crate) viz_fullscreen: AtomicBool,
@@ -392,6 +385,9 @@ pub struct PlayerState {
 
     // ReplayGain mode
     pub(crate) rg_mode: AtomicU8,
+    /// The ReplayGain the producer applies to the current track, in dB as f32
+    /// bits (0 = none: mode off, or no tags). For the bit-perfect verdict.
+    pub(crate) rg_gain_db: AtomicU32,
 
     // Clipping indicator
     pub(crate) clipping: AtomicBool,
@@ -494,6 +490,7 @@ impl PlayerState {
             track_transition_count: AtomicUsize::new(0),
             producer_track_index: AtomicUsize::new(0),
             rg_mode: AtomicU8::new(RgMode::Track as u8),
+            rg_gain_db: AtomicU32::new(0f32.to_bits()),
             clipping: AtomicBool::new(false),
             crossfeed_preset_index: AtomicUsize::new(0),
             crossfeed_preset_count: AtomicUsize::new(0),
@@ -539,6 +536,10 @@ impl PlayerState {
     }
 
     pub fn toggle_pause(&self) { self.paused.fetch_xor(true, Ordering::Relaxed); }
+    /// Set the pause state outright. Media keys' Play and Pause mean a state,
+    /// not a toggle: checking then toggling could invert a keypress landing
+    /// in between (Play pausing).
+    pub fn set_paused(&self, paused: bool) { self.paused.store(paused, Ordering::Relaxed); }
     pub fn is_paused(&self) -> bool { self.paused.load(Ordering::Relaxed) }
     pub fn quit(&self) { self.quit.store(true, Ordering::Relaxed); }
     pub fn should_quit(&self) -> bool { self.quit.load(Ordering::Relaxed) }
@@ -731,6 +732,13 @@ impl PlayerState {
         self.mark_eq_edited();
     }
 
+    /// Set the preamp from the editor (the headroom suggestion): the EQ
+    /// becomes Custom like any other edit.
+    pub fn set_eq_preamp_edited(&self, db: f32) {
+        self.set_eq_preamp_db(db.clamp(-crate::eq::EQ_GAIN_LIMIT, crate::eq::EQ_GAIN_LIMIT));
+        self.mark_eq_edited();
+    }
+
     fn mark_eq_edited(&self) {
         self.eq_custom.store(true, Ordering::Relaxed);
         self.eq_changed.store(true, Ordering::Relaxed);
@@ -809,6 +817,10 @@ impl PlayerState {
 
     pub fn rg_mode(&self) -> RgMode {
         RgMode::from_u8(self.rg_mode.load(Ordering::Relaxed))
+    }
+
+    pub fn rg_gain_db(&self) -> f32 {
+        f32::from_bits(self.rg_gain_db.load(Ordering::Relaxed))
     }
 
     pub fn is_clipping(&self) -> bool {
@@ -969,12 +981,10 @@ pub struct UiState {
     /// A pending bulk remove awaiting `[y/n]` confirmation: (label, playlist indices).
     pub tree_pending_remove: Option<(String, Vec<usize>)>,
     pub removed_paths: std::collections::HashSet<PathBuf>,
-    pub banner_lines: usize,
-    pub banner_text: String,
-    pub banner_tail: String,
-    pub banner_dirty: bool,
     pub playlist_dirty: bool,
-    pub current_track_removed: bool,
+    /// The playing track was removed: where its successor now sits (may be
+    /// the playlist length = past the end). Read by the transition handler.
+    pub removed_current_next: Option<usize>,
     pub terminal_resized: bool,
     /// Whether the previous frame left the analysis-spectrogram sixel block on
     /// screen untouched. Cleared at the top of every print_status frame and
@@ -991,10 +1001,30 @@ pub struct UiState {
     /// old image stranded (clipped by the trailing erase).
     pub last_viz_block: (usize, usize),
     pub lyrics: Option<crate::lyrics::Lyrics>,
-    pub lyrics_receiver: Option<std::sync::mpsc::Receiver<Option<crate::lyrics::Lyrics>>>,
+    pub lyrics_receiver: Option<std::sync::mpsc::Receiver<Option<(crate::lyrics::Lyrics, crate::lyrics::LyricsSource)>>>,
+    /// Where `lyrics` came from (None while there are none).
+    pub lyrics_source: Option<crate::lyrics::LyricsSource>,
+    /// The window is below ui::MIN_WINDOW and shows the too-small screen.
+    pub too_small: bool,
+    /// The output device's name, for Classic's header (kept current by
+    /// recovery and the default-device poll).
+    pub device_name: String,
+    /// `--quality`: the HQ resampler, shown on Classic's mode row.
+    pub hq_resampler: bool,
+    /// Saved per-track sync offsets (see lyrics::OffsetStore).
+    pub lyrics_offsets: crate::lyrics::OffsetStore,
+    /// LRCLIB answers this session (see lyrics::LookupCache).
+    pub lyrics_lookups: crate::lyrics::LookupCache,
+    /// Albums iTunes has no cover for, this session. A found cover is in the
+    /// on-disk cover cache instead.
+    pub cover_misses: crate::lyrics::LookupCache<()>,
+    /// After a failed attempt to open the output, the next try waits until then.
+    pub recovery_retry_at: Option<Instant>,
+    /// A rescan in progress on a worker thread (see `ui::poll_rescan`).
+    pub rescan_receiver: Option<std::sync::mpsc::Receiver<crate::playlist::RescanResult>>,
     pub lyrics_scroll: usize,
     pub lyrics_auto_scroll: bool,
-    pub lyrics_offset: f64, // seconds, positive = lyrics later, negative = lyrics earlier
+    pub lyrics_offset: f64, // seconds added to the playback clock: positive = lyrics EARLIER. Per track, saved in lyrics_offsets
     /// Monotonic counter incremented on each lyrics spawn. Workers capture a snapshot
     /// and abort their slow LRCLIB fetch if the counter has advanced (i.e. user skipped).
     pub lyrics_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -1051,17 +1081,22 @@ impl UiState {
             tree_filter: String::new(),
             tree_pending_remove: None,
             removed_paths: std::collections::HashSet::new(),
-            banner_lines: 0,
-            banner_text: String::new(),
-            banner_tail: String::new(),
-            banner_dirty: false,
             playlist_dirty: false,
-            current_track_removed: false,
+            removed_current_next: None,
             terminal_resized: false,
             spectro_block_intact: false,
             last_viz_block: (0, 0),
             lyrics: None,
             lyrics_receiver: None,
+            lyrics_source: None,
+            too_small: false,
+            device_name: String::new(),
+            hq_resampler: false,
+            lyrics_offsets: Default::default(),
+            rescan_receiver: None,
+            recovery_retry_at: None,
+            lyrics_lookups: Default::default(),
+            cover_misses: Default::default(),
             lyrics_scroll: 0,
             lyrics_auto_scroll: true,
             lyrics_offset: 0.0,
@@ -1077,15 +1112,28 @@ impl UiState {
         }
     }
 
+    /// Show a status message for 2 s. The text is sanitised here, once for
+    /// every caller: messages carry file names and error text, and a control
+    /// character in a frame line adds an uncounted row (newline) or is
+    /// executed by the terminal (ESC — a query's reply arrives on stdin as
+    /// keystrokes).
+    /// A routine message (a key's confirmation, "Sorted by tags"), up for 2 s.
+    /// It does not replace a held notice that is still up: there is one
+    /// status slot, and the folder auto-sort's message used to wipe a notice
+    /// meant to be read (exclusive mode falling back, a bad config colour)
+    /// before the first frame was even drawn.
     pub fn set_status(&mut self, msg: String) {
-        self.status_message = Some((msg, Instant::now()));
-        self.status_hold = std::time::Duration::from_secs(2);
+        let routine = std::time::Duration::from_secs(2);
+        let held = matches!(self.status_message, Some((_, when)) if self.status_hold > routine && when.elapsed() < self.status_hold);
+        if !held {
+            self.set_status_for(msg, routine);
+        }
     }
 
     /// A status message that stays up for `hold` — for notices that matter
     /// more than a key's confirmation (e.g. exclusive mode falling back).
     pub fn set_status_for(&mut self, msg: String, hold: std::time::Duration) {
-        self.status_message = Some((msg, Instant::now()));
+        self.status_message = Some((crate::ansi::sanitize_display(&msg), Instant::now()));
         self.status_hold = hold;
     }
 
@@ -1109,6 +1157,21 @@ impl UiState {
 #[cfg(test)]
 mod state_tests {
     use super::*;
+
+    #[test]
+    fn a_routine_message_does_not_wipe_a_notice_meant_to_be_read() {
+        let mut ui = UiState::new(Vec::new(), crate::metadata::MetadataCache::new(0));
+        ui.set_status_for("exclusive mode unavailable".into(), std::time::Duration::from_secs(10));
+        ui.set_status("Sorted by tags".into());
+        assert_eq!(ui.active_status().as_deref(), Some("exclusive mode unavailable"));
+        // Another held notice still replaces it, and routine ones replace routine ones.
+        ui.set_status_for("output moved".into(), std::time::Duration::from_secs(5));
+        assert_eq!(ui.active_status().as_deref(), Some("output moved"));
+        let mut ui = UiState::new(Vec::new(), crate::metadata::MetadataCache::new(0));
+        ui.set_status("Shuffle ON".into());
+        ui.set_status("Shuffle OFF".into());
+        assert_eq!(ui.active_status().as_deref(), Some("Shuffle OFF"));
+    }
 
     #[test]
     fn rate_caps_predict_what_a_switch_can_reach() {
@@ -1156,6 +1219,18 @@ mod state_tests {
         *st.exclusive_caps.lock().unwrap() =
             Some(RateCaps { ranges: vec![(44_100, 192_000)], max: 192_000, ..Default::default() });
         assert_eq!(st.exclusive_target_rate(96_000, 48_000), 96_000);
+    }
+
+    #[test]
+    fn status_messages_cannot_carry_terminal_escapes() {
+        // Status text includes file names (a failed open shows the path). A
+        // name holding ESC [6n made the terminal answer on stdin — where the
+        // reply is read as keystrokes.
+        let mut ui = UiState::new(vec![], crate::metadata::MetadataCache::new(0));
+        ui.set_status("Skip: /music/evil\x1B[6n.mp3: not found".to_string());
+        assert!(!ui.active_status().unwrap().contains('\x1B'));
+        ui.set_status_for("bad\nname".to_string(), std::time::Duration::from_secs(5));
+        assert!(!ui.active_status().unwrap().contains('\n'));
     }
 
     #[test]

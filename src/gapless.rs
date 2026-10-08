@@ -1,0 +1,175 @@
+//! Encoder delay and padding for AAC in MP4 (M4A/M4B).
+//!
+//! An AAC decoder emits "priming" samples before the real audio (2112 for
+//! Apple's encoder, 1024 for ffmpeg's) and pads the last frame out to a whole
+//! 1024. Played as decoded, every track starts ~25-50 ms late and ends with
+//! up to 23 ms of silence — an audible gap between the tracks of a live album.
+//! The container records the real extent in one of two ways, and symphonia
+//! applies neither: its MP4 reader never sets the packets' trim values.
+//!
+//! - iTunSMPB, Apple's tag: hex fields " 00000000 DELAY PADDING LENGTH …"
+//! - an edit list (`moov/trak/edts/elst`), which ffmpeg writes: the media time
+//!   where playback starts, and how long it runs.
+
+/// The real audio inside the decoded stream, in frames at the track's rate:
+/// skip `delay` frames, then play `length` (when known).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Gapless {
+    pub delay: u64,
+    pub length: Option<u64>,
+}
+
+/// Encoder delay and padding for an MP4 file, in units of the audio track's
+/// timescale (its sample rate): Apple's iTunSMPB tag first, then the edit
+/// list. None for any other container.
+pub fn for_mp4(
+    path: &std::path::Path,
+    revisions: &[symphonia::core::meta::MetadataRevision],
+) -> Option<Gapless> {
+    let ext = path.extension()?.to_string_lossy().to_ascii_lowercase();
+    if !matches!(ext.as_str(), "m4a" | "m4b" | "mp4" | "m4p") {
+        return None;
+    }
+    revisions
+        .iter()
+        .flat_map(|r| &r.media.tags)
+        .find(|t| t.raw.key.to_ascii_lowercase().ends_with("itunsmpb"))
+        .and_then(|t| match &t.raw.value {
+            symphonia::core::meta::RawValue::String(s) => from_itunsmpb(s),
+            _ => None,
+        })
+        .or_else(|| from_mp4_edit_list(path))
+}
+
+/// Parse an iTunSMPB value. None for a malformed one or one saying nothing.
+pub fn from_itunsmpb(value: &str) -> Option<Gapless> {
+    let fields: Vec<u64> = value
+        .split_whitespace()
+        .take(4)
+        .map(|f| u64::from_str_radix(f, 16).ok())
+        .collect::<Option<_>>()?;
+    let [_, delay, _padding, length] = fields[..] else { return None };
+    if delay == 0 && length == 0 {
+        return None;
+    }
+    Some(Gapless { delay, length: (length > 0).then_some(length) })
+}
+
+/// Read the first audio track's edit list from an MP4 file, in frames at the
+/// track's media timescale (the sample rate, for audio). Only the common
+/// single-segment form is used: an empty edit (a leading gap) or several
+/// segments are left alone rather than half-applied.
+pub fn from_mp4_edit_list(path: &std::path::Path) -> Option<Gapless> {
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let moov = find(&mut f, 0, len, b"moov")?;
+    let mvhd = find(&mut f, moov.0, moov.1, b"mvhd")?;
+    let movie_ts = timescale(&mut f, mvhd)?;
+    for trak in children(&mut f, moov.0, moov.1).into_iter().filter(|a| &a.0 == b"trak") {
+        let (start, end) = (trak.1, trak.2);
+        let Some(mdia) = find(&mut f, start, end, b"mdia") else { continue };
+        let Some(hdlr) = find(&mut f, mdia.0, mdia.1, b"hdlr") else { continue };
+        if read_at(&mut f, hdlr.0 + 8, 4)? != b"soun" {
+            continue;
+        }
+        let mdhd = find(&mut f, mdia.0, mdia.1, b"mdhd")?;
+        let media_ts = timescale(&mut f, mdhd)?;
+        let edts = find(&mut f, start, end, b"edts")?;
+        let elst = find(&mut f, edts.0, edts.1, b"elst")?;
+        let head = read_at(&mut f, elst.0, 8)?;
+        let (version, count) = (head[0], u32::from_be_bytes(head[4..8].try_into().ok()?));
+        if count != 1 {
+            return None;
+        }
+        let (segment, media_time) = if version == 1 {
+            let e = read_at(&mut f, elst.0 + 8, 16)?;
+            (u64::from_be_bytes(e[..8].try_into().ok()?), i64::from_be_bytes(e[8..].try_into().ok()?))
+        } else {
+            let e = read_at(&mut f, elst.0 + 8, 8)?;
+            (u32::from_be_bytes(e[..4].try_into().ok()?) as u64, i32::from_be_bytes(e[4..].try_into().ok()?) as i64)
+        };
+        if media_time < 0 || movie_ts == 0 {
+            return None; // an empty edit: a gap before the audio, not a trim
+        }
+        // The segment's duration is in the MOVIE's timescale, the start in
+        // the media's.
+        let length = (segment as u128 * media_ts as u128 / movie_ts as u128) as u64;
+        return Some(Gapless { delay: media_time as u64, length: (length > 0).then_some(length) });
+    }
+    None
+}
+
+/// (body start, body end) of the first `kind` atom among the children of the
+/// byte range.
+fn find(f: &mut std::fs::File, start: u64, end: u64, kind: &[u8; 4]) -> Option<(u64, u64)> {
+    children(f, start, end).into_iter().find(|a| &a.0 == kind).map(|a| (a.1, a.2))
+}
+
+/// The atoms directly inside a byte range: (type, body start, body end).
+fn children(f: &mut std::fs::File, start: u64, end: u64) -> Vec<([u8; 4], u64, u64)> {
+    let mut out = Vec::new();
+    let mut pos = start;
+    while pos + 8 <= end {
+        let Some(h) = read_at(f, pos, 8) else { break };
+        let kind: [u8; 4] = h[4..8].try_into().unwrap_or_default();
+        let (size, header) = match u32::from_be_bytes(h[..4].try_into().unwrap_or_default()) {
+            0 => (end - pos, 8),
+            1 => match read_at(f, pos + 8, 8) {
+                Some(b) => (u64::from_be_bytes(b[..].try_into().unwrap_or_default()), 16),
+                None => break,
+            },
+            n => (n as u64, 8),
+        };
+        if size < header || pos + size > end {
+            break; // corrupt: stop rather than wander
+        }
+        out.push((kind, pos + header, pos + size));
+        pos += size;
+    }
+    out
+}
+
+/// The timescale field of an mvhd/mdhd body (after version, flags and the
+/// creation/modification times, which are 32- or 64-bit by version).
+fn timescale(f: &mut std::fs::File, body: (u64, u64)) -> Option<u32> {
+    let version = read_at(f, body.0, 1)?[0];
+    let at = if version == 1 { body.0 + 20 } else { body.0 + 12 };
+    let b = read_at(f, at, 4)?;
+    Some(u32::from_be_bytes(b[..].try_into().ok()?))
+}
+
+fn read_at(f: &mut std::fs::File, pos: u64, n: usize) -> Option<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    f.seek(SeekFrom::Start(pos)).ok()?;
+    let mut buf = vec![0; n];
+    f.read_exact(&mut buf).ok()?;
+    Some(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture(name: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name)
+    }
+
+    #[test]
+    fn itunsmpb_gives_delay_and_length() {
+        let v = " 00000000 00000840 0000037C 000000000000AC44 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000";
+        assert_eq!(from_itunsmpb(v), Some(Gapless { delay: 2112, length: Some(44100) }));
+        assert_eq!(from_itunsmpb("garbage"), None);
+        assert_eq!(from_itunsmpb(" 00000000 00000000 00000000 0000000000000000"), None, "says nothing");
+    }
+
+    #[test]
+    fn edit_list_gives_delay_and_length() {
+        // ffmpeg's AAC: 1024 priming frames, 1 s at 44.1 kHz.
+        assert_eq!(
+            from_mp4_edit_list(&fixture("sine_aac_editlist.m4a")),
+            Some(Gapless { delay: 1024, length: Some(44100) })
+        );
+        // Apple's file carries iTunSMPB and no usable edit list.
+        assert_eq!(from_mp4_edit_list(&fixture("sine_lr.flac")), None, "not an MP4");
+    }
+}

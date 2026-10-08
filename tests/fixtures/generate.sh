@@ -23,6 +23,28 @@ ffmpeg -y -v error -i sine_lr.flac -c copy \
     -metadata REPLAYGAIN_TRACK_GAIN="-6.02 dB" \
     -metadata REPLAYGAIN_TRACK_PEAK="0.500000" sine_lr_rg.flac
 
+# MP3 tagged both ways, as many taggers leave files: ID3v2 at the front (full
+# title, ReplayGain in TXXX frames) AND a trailing ID3v1 (title cut to 30
+# characters, no ReplayGain). Symphonia reads the trailing block first; Keet
+# must still take the ID3v2 values.
+ffmpeg -y -v error -i sine_lr.flac -c:a libmp3lame -b:a 128k -id3v2_version 3 -write_id3v1 1 \
+    -metadata title="A Title Much Longer Than Thirty Characters" -metadata artist="Fixture Artist" \
+    -metadata REPLAYGAIN_TRACK_GAIN="-6.02 dB" -metadata REPLAYGAIN_TRACK_PEAK="0.500000" \
+    sine_lr_id3v1v2.mp3
+
+# AAC in MP4, 1 s of 440 Hz stereo at 0.5. An AAC decoder emits priming
+# samples first and padding last; the container says how many, in one of two
+# ways, and both are tested: ffmpeg writes an edit list (elst), Apple's
+# encoder an iTunSMPB tag. afconvert exists only on macOS — keep the
+# committed file when regenerating elsewhere.
+ffmpeg -y -v error -f lavfi -i "sine=frequency=440:duration=1:sample_rate=44100" \
+    -af volume=4.0 -ac 2 -c:a pcm_s16le aac_src.wav
+ffmpeg -y -v error -i aac_src.wav -c:a aac -b:a 96k sine_aac_editlist.m4a
+if command -v afconvert >/dev/null; then
+    afconvert -f m4af -d aac -b 96000 aac_src.wav sine_aac_itunsmpb.m4a
+fi
+rm aac_src.wav
+
 # Chained Ogg: two complete Ogg Vorbis streams back to back in one file (how
 # internet radio rips and concatenated .ogg files look). 1 s of 440 Hz, then
 # 1 s of 1000 Hz, both mono-to-stereo at amplitude 0.5. Uses ffmpeg's native
@@ -43,4 +65,4 @@ ffmpeg -y -v error -f lavfi -i "sine=frequency=997:duration=0.25:sample_rate=960
     -map "[a]" -sample_fmt s32 -bits_per_raw_sample 24 -c:a flac hires_24_96.flac
 
 echo "fixtures regenerated:"
-ls -la sine_lr.flac sine_lr.mp3 sine_lr_rg.flac chained.ogg hires_24_96.flac
+ls -la sine_lr.flac sine_lr.mp3 sine_lr_rg.flac sine_lr_id3v1v2.mp3 sine_aac_editlist.m4a sine_aac_itunsmpb.m4a chained.ogg hires_24_96.flac

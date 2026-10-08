@@ -70,11 +70,153 @@ fn interleaved_to_stereo(input: &[f32], channels: usize, out: &mut Vec<f32>) {
     }
 }
 
+/// Most channels a declared layout is folded by position; wider ones (and any
+/// layout without positions) use the count-based fold.
+const MAX_POSITIONED_CHANNELS: usize = 32;
+
+/// Append `input` (interleaved) to `out` as interleaved stereo, using the
+/// buffer's declared speaker positions when it has them. The count-based fold
+/// (`interleaved_to_stereo`) has to guess a layout from the channel count, and
+/// guessed wrong for 2.1 (its LFE taken for a centre and mixed into both
+/// sides) and 6.1 (rear centre and side surrounds alternated left/right). Mono
+/// and stereo always take the direct paths, which leave samples untouched.
+fn downmix_to_stereo(input: &[f32], channels: &symphonia::core::audio::Channels, out: &mut Vec<f32>) {
+    use symphonia::core::audio::Channels;
+    let count = channels.count();
+    let mask = match channels {
+        Channels::Positioned(mask) if count > 2 && count <= MAX_POSITIONED_CHANNELS => *mask,
+        _ => return interleaved_to_stereo(input, count.max(1), out),
+    };
+    let mut weights = [(0.0f32, 0.0f32); MAX_POSITIONED_CHANNELS];
+    let mut n = 0;
+    for bit in 0..64 {
+        if mask.bits() & (1u64 << bit) != 0 {
+            weights[n] = position_weights(bit);
+            n += 1;
+        }
+    }
+    out.reserve(input.len() / n * 2);
+    for frame in input.chunks_exact(n) {
+        let (mut l, mut r) = (0.0, 0.0);
+        for (&s, &(wl, wr)) in frame.iter().zip(&weights[..n]) {
+            l += wl * s;
+            r += wr * s;
+        }
+        out.push(l);
+        out.push(r);
+    }
+}
+
+/// (left, right) weight of the speaker at `bit` of symphonia's `Position`
+/// mask (WAVEFORMATEXTENSIBLE order for the first 18): front left/right at
+/// unity, everything else that has a side at -3 dB on that side, centred
+/// speakers at -3 dB on both, LFE dropped (as in the count-based fold).
+fn position_weights(bit: u32) -> (f32, f32) {
+    const G: f32 = std::f32::consts::FRAC_1_SQRT_2;
+    match bit {
+        0 => (1.0, 0.0),                       // front left
+        1 => (0.0, 1.0),                       // front right
+        3 | 18 => (0.0, 0.0),                  // LFE 1, LFE 2
+        4 | 6 | 9 | 12 | 15 | 19 | 22 | 24 => (G, 0.0), // rear/left-of-centre/side/top/bottom/wide left
+        5 | 7 | 10 | 14 | 17 | 20 | 23 | 25 => (0.0, G), // their right-hand counterparts
+        _ => (G, G),                           // centre, rear/top/bottom centre, unknown
+    }
+}
+
 fn deinterleave_into(samples: &[f32], ch: usize, out: &mut Vec<Vec<f32>>) {
     out.resize_with(ch, Vec::new);
     for plane in out.iter_mut() { plane.clear(); }
     for (i, &s) in samples.iter().enumerate() {
         out[i % ch].push(s);
+    }
+}
+
+/// Where playback is within a chained stream (concatenated Ogg files,
+/// internet-radio rips): each link's packets are timed from its own start, and
+/// the container reports only the first link's length.
+#[derive(Default)]
+struct Links {
+    /// Where the current link starts in the file.
+    start_secs: f64,
+    /// The current link (0 = first).
+    index: usize,
+    /// The furthest link whose length is already in `total_samples`.
+    counted: usize,
+}
+
+/// Move onto the next link of a chained stream (the demuxer returned
+/// ResetRequired): re-select the audio track and rebuild the decoder. The
+/// track grows by each link the first time it is reached, so the progress bar
+/// and seek range cover the whole file. False when the link cannot continue
+/// the track (no audio, a different sample rate — that would need a new
+/// resampler — or no decoder).
+fn enter_next_link(
+    format: &mut dyn symphonia::core::formats::FormatReader,
+    track: &mut symphonia::core::formats::Track,
+    decoder: &mut Box<dyn symphonia::core::codecs::audio::AudioDecoder>,
+    links: &mut Links,
+    sample_rate: u32,
+    state: &PlayerState,
+) -> bool {
+    let Some(next) = format.default_track(TrackType::Audio).cloned() else { return false };
+    let Some(params) = next.codec_params.as_ref().and_then(|c| c.audio()).cloned() else { return false };
+    if params.sample_rate.unwrap_or(sample_rate) != sample_rate {
+        return false;
+    }
+    let Ok(d) = symphonia::default::get_codecs().make_audio_decoder(&params, &AudioDecoderOptions::default()) else {
+        return false;
+    };
+    links.start_secs += track.num_frames.unwrap_or(0) as f64 / sample_rate as f64;
+    links.index += 1;
+    if links.index > links.counted {
+        links.counted = links.index;
+        if let Some(n) = next.num_frames {
+            state.total_samples.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+    *decoder = d;
+    *track = next;
+    true
+}
+
+/// The reader, track and decoder of a file's FIRST link, for a seek back
+/// past the link playing. None if the file no longer opens as before.
+#[allow(clippy::type_complexity)]
+fn open_first_link(
+    path: &std::path::Path,
+    sample_rate: u32,
+) -> Option<(
+    Box<dyn symphonia::core::formats::FormatReader>,
+    symphonia::core::formats::Track,
+    Box<dyn symphonia::core::codecs::audio::AudioDecoder>,
+)> {
+    let mss = MediaSourceStream::new(Box::new(File::open(path).ok()?), Default::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+    let meta_opts = MetadataOptions::default().limit_visual_bytes(Limit::Maximum(0));
+    let format = symphonia::default::get_probe().probe(&hint, mss, FormatOptions::default(), meta_opts).ok()?;
+    let track = format.default_track(TrackType::Audio)?.clone();
+    let params = track.codec_params.as_ref()?.audio()?.clone();
+    if params.sample_rate.unwrap_or(sample_rate) != sample_rate {
+        return None;
+    }
+    let decoder = symphonia::default::get_codecs()
+        .make_audio_decoder(&params, &AudioDecoderOptions::default())
+        .ok()?;
+    Some((format, track, decoder))
+}
+
+/// A track that cannot be opened or decoded is skipped. Only when nothing is
+/// playing yet (the producer's first track) does that change what is on
+/// screen now. Otherwise the previous track still has up to a ring's depth
+/// (~4 s) to play, and signalling here moved the title, clock and lyrics on
+/// that early; the next playable track's own transition — which waits for the
+/// ring to drain — signals instead, and shows the stored skip error with it.
+fn signal_unplayable(state: &PlayerState, first_iteration: bool, next: usize) {
+    if first_iteration {
+        state.signal_next_track(next);
     }
 }
 
@@ -511,13 +653,13 @@ fn extract_rg_from_tags(tags: &[symphonia::core::meta::Tag], rg: &mut RgTags) {
                 rg.track_gain = crate::metadata::parse_rg_gain_value(s);
             }
             Some(StandardTag::ReplayGainTrackPeak(s)) if rg.track_peak.is_none() => {
-                rg.track_peak = s.trim().parse::<f32>().ok();
+                rg.track_peak = crate::metadata::parse_rg_peak_value(s);
             }
             Some(StandardTag::ReplayGainAlbumGain(s)) if rg.album_gain.is_none() => {
                 rg.album_gain = crate::metadata::parse_rg_gain_value(s);
             }
             Some(StandardTag::ReplayGainAlbumPeak(s)) if rg.album_peak.is_none() => {
-                rg.album_peak = s.trim().parse::<f32>().ok();
+                rg.album_peak = crate::metadata::parse_rg_peak_value(s);
             }
             _ => {}
         }
@@ -528,19 +670,33 @@ fn extract_rg_from_tags(tags: &[symphonia::core::meta::Tag], rg: &mut RgTags) {
                     rg.track_gain = crate::metadata::parse_rg_gain_value(s);
                 }
                 "replaygain_track_peak" if rg.track_peak.is_none() => {
-                    rg.track_peak = s.trim().parse::<f32>().ok();
+                    rg.track_peak = crate::metadata::parse_rg_peak_value(s);
                 }
                 "replaygain_album_gain" if rg.album_gain.is_none() => {
                     rg.album_gain = crate::metadata::parse_rg_gain_value(s);
                 }
                 "replaygain_album_peak" if rg.album_peak.is_none() => {
-                    rg.album_peak = s.trim().parse::<f32>().ok();
+                    rg.album_peak = crate::metadata::parse_rg_peak_value(s);
                 }
                 _ => {}
             }
         }
     }
 }
+
+/// The frames of a decoded buffer to keep, as (first, end) offsets into it:
+/// the buffer holds `n` frames starting at stream frame `first`, and only
+/// [delay, delay + length) is the track's real audio.
+fn gapless_keep(g: crate::gapless::Gapless, first: u64, n: u64) -> (usize, usize) {
+    let start = g.delay;
+    let end = g.length.map_or(u64::MAX, |l| start + l);
+    let lo = start.saturating_sub(first).min(n);
+    let hi = end.saturating_sub(first).min(n).max(lo);
+    (lo as usize, hi as usize)
+}
+
+/// Largest ReplayGain adjustment applied, either way, in dB.
+const RG_GAIN_LIMIT_DB: f32 = 24.0;
 
 /// Compute the linear gain multiplier from RG tags and mode.
 fn compute_rg_gain(mode: RgMode, tags: &RgTags) -> f32 {
@@ -566,7 +722,10 @@ fn compute_rg_gain(mode: RgMode, tags: &RgTags) -> f32 {
         None => return 1.0,
     };
 
-    let mut linear = 10.0_f32.powf(gain_db / 20.0);
+    // A sane range: real ReplayGain values sit within about ±20 dB, and a
+    // corrupt tag must not turn into a 60 dB boost (the limiter would then
+    // flatten the whole track) or a near-mute.
+    let mut linear = 10.0_f32.powf(gain_db.clamp(-RG_GAIN_LIMIT_DB, RG_GAIN_LIMIT_DB) / 20.0);
 
     // Peak-based clipping prevention
     if let Some(peak) = peak {
@@ -635,7 +794,7 @@ pub fn decode_playlist(
                 if let Ok(mut err) = state.decode_error.lock() {
                     *err = Some(format!("{}: {}", path.display(), e));
                 }
-                state.signal_next_track(track_index + 1);
+                signal_unplayable(state, first_iteration, track_index + 1);
                 track_index += 1;
                 continue;
             }
@@ -661,7 +820,7 @@ pub fn decode_playlist(
                 if let Ok(mut err) = state.decode_error.lock() {
                     *err = Some(format!("{}: {}", path.display(), e));
                 }
-                state.signal_next_track(track_index + 1);
+                signal_unplayable(state, first_iteration, track_index + 1);
                 track_index += 1;
                 continue;
             }
@@ -673,7 +832,7 @@ pub fn decode_playlist(
                 if let Ok(mut err) = state.decode_error.lock() {
                     *err = Some(format!("{}: No audio track", path.display()));
                 }
-                state.signal_next_track(track_index + 1);
+                signal_unplayable(state, first_iteration, track_index + 1);
                 track_index += 1;
                 continue;
             }
@@ -688,7 +847,7 @@ pub fn decode_playlist(
                 if let Ok(mut err) = state.decode_error.lock() {
                     *err = Some(format!("{}: No audio codec parameters", path.display()));
                 }
-                state.signal_next_track(track_index + 1);
+                signal_unplayable(state, first_iteration, track_index + 1);
                 track_index += 1;
                 continue;
             }
@@ -710,7 +869,7 @@ pub fn decode_playlist(
                 if let Ok(mut err) = state.decode_error.lock() {
                     *err = Some(format!("{}: {}", path.display(), e));
                 }
-                state.signal_next_track(track_index + 1);
+                signal_unplayable(state, first_iteration, track_index + 1);
                 track_index += 1;
                 continue;
             }
@@ -723,10 +882,26 @@ pub fn decode_playlist(
             track_gain: None, track_peak: None,
             album_gain: None, album_peak: None,
         };
-        if let Some(rev) = format.metadata().current() {
+        let revisions = crate::metadata::revisions_newest_first(format.as_mut());
+        for rev in &revisions {
             extract_rg_from_tags(&rev.media.tags, &mut rg_tags);
         }
         let rg_linear = compute_rg_gain(state.rg_mode(), &rg_tags);
+
+        // AAC in MP4: the real audio inside the decoded stream (see gapless.rs).
+        // Converted from the track's timescale to frames at its sample rate.
+        let gapless = crate::gapless::for_mp4(path, &revisions).map(|g| {
+            let units_per_sec = track
+                .time_base
+                .map(|tb| tb.denom.get() as f64 / tb.numer.get() as f64)
+                .unwrap_or(sample_rate as f64);
+            let to_frames = |u: u64| (u as f64 * sample_rate as f64 / units_per_sec).round() as u64;
+            crate::gapless::Gapless { delay: to_frames(g.delay), length: g.length.map(to_frames) }
+        });
+        let total = gapless.and_then(|g| g.length).unwrap_or(total);
+        // Priming frames are not part of the track's time: the clock and seek
+        // targets are shifted by them.
+        let priming_secs = gapless.map_or(0.0, |g| g.delay as f64 / sample_rate as f64);
 
         // --- Create resampler if needed ---
         // Created before the drain wait so a failure skips the track like the
@@ -784,7 +959,7 @@ pub fn decode_playlist(
                     if let Ok(mut err) = state.decode_error.lock() {
                         *err = Some(format!("{}: resampler: {}", path.display(), e));
                     }
-                    state.signal_next_track(track_index + 1);
+                    signal_unplayable(state, first_iteration, track_index + 1);
                     track_index += 1;
                     continue;
                 }
@@ -872,6 +1047,8 @@ pub fn decode_playlist(
         last_track = Some(track_index);
         state.channels.store(src_channels, Ordering::Relaxed);
         state.bits_per_sample.store(bits_per_sample as usize, Ordering::Relaxed);
+        let rg_db = if rg_linear == 1.0 { 0.0 } else { 20.0 * rg_linear.log10() };
+        state.rg_gain_db.store(rg_db.to_bits(), Ordering::Relaxed);
         state.track_info_ready.store(true, Ordering::Relaxed);
 
         // Signal track transition (skip for the producer's first track — main
@@ -902,6 +1079,12 @@ pub fn decode_playlist(
         // Start time of the last decoded packet — where decoding resumes if a
         // seek fails after the ring has been drained.
         let mut decode_pos_secs = 0.0f64;
+        // Where playback is in a chained stream (concatenated Ogg).
+        let mut links = Links::default();
+        let chained_capable = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "ogg" | "oga" | "opus"));
         let mut pending: Vec<f32> = Vec::with_capacity(chunk_size * channels * 2);
         if let Some(p) = carried_pending.take() {
             pending.extend_from_slice(&p);
@@ -957,6 +1140,35 @@ pub fn decode_playlist(
                 None => None,
             };
             if let Some(new_time) = seek_to {
+                // A chained stream's demuxer seeks within ONE link: bring the
+                // reader to the link that holds the target first. Before the
+                // current link, start over from the first; past it, skip
+                // through packets (no decoding) link by link.
+                if chained_capable {
+                    if new_time < links.start_secs {
+                        if let Some((f, t, d)) = open_first_link(path, sample_rate) {
+                            (format, track, decoder) = (f, t, d);
+                            track_id = track.id;
+                            links.start_secs = 0.0;
+                            links.index = 0;
+                        }
+                    }
+                    while let Some(n) = track.num_frames {
+                        if new_time < links.start_secs + n as f64 / sample_rate as f64 {
+                            break;
+                        }
+                        match format.next_packet() {
+                            Ok(Some(_)) => {}
+                            Err(symphonia::core::errors::Error::ResetRequired) => {
+                                if !enter_next_link(format.as_mut(), &mut track, &mut decoder, &mut links, sample_rate, state) {
+                                    break;
+                                }
+                                track_id = track.id;
+                            }
+                            _ => break, // no further link: past the end, below
+                        }
+                    }
+                }
                 let track_len = state.total_secs();
                 if track_len > 0.0 && new_time >= track_len {
                     // Past the end: move on to the next track. Draining first
@@ -985,7 +1197,11 @@ pub fn decode_playlist(
 
                 // 0.6 replaced the infallible From<f64> with a checked
                 // constructor; an unrepresentable target just skips the seek.
-                let landed = Time::try_from_secs_f64(new_time).and_then(|time| {
+                // A chained stream seeks within its current link only (the
+                // demuxer has no view of earlier links): a target before the
+                // link starts lands on its start.
+                let link_time = (new_time - links.start_secs + priming_secs).max(0.0);
+                let landed = Time::try_from_secs_f64(link_time).and_then(|time| {
                     format.seek(SeekMode::Coarse, SeekTo::Time { time, track_id: Some(track_id) }).ok()
                 });
                 let clock_at = match landed {
@@ -1000,7 +1216,7 @@ pub fn decode_playlist(
                         track
                             .time_base
                             .and_then(|tb| tb.calc_time(seeked.actual_ts))
-                            .map(|t| t.as_secs_f64())
+                            .map(|t| (links.start_secs + t.as_secs_f64() - priming_secs).max(0.0))
                             .unwrap_or(new_time)
                     }
                     // The seek failed after the ring was already drained: the
@@ -1067,29 +1283,19 @@ pub fn decode_playlist(
                 // at a different sample rate would need a new resampler, so
                 // that case still ends the track.
                 Err(symphonia::core::errors::Error::ResetRequired) => {
-                    let Some(next) = format.default_track(TrackType::Audio).cloned() else { break };
-                    let Some(params) = next.codec_params.as_ref().and_then(|c| c.audio()).cloned() else { break };
-                    if params.sample_rate.unwrap_or(sample_rate) != sample_rate {
+                    if !enter_next_link(format.as_mut(), &mut track, &mut decoder, &mut links, sample_rate, state) {
                         break;
                     }
-                    match symphonia::default::get_codecs()
-                        .make_audio_decoder(&params, &AudioDecoderOptions::default())
-                    {
-                        Ok(d) => {
-                            decoder = d;
-                            track_id = next.id;
-                            track = next;
-                            continue;
-                        }
-                        Err(_) => break,
-                    }
+                    track_id = track.id;
+                    continue;
                 }
                 Err(_) => break,    // read error
             };
 
             if packet.track_id != track_id { continue; }
-            if let Some(t) = track.time_base.and_then(|tb| tb.calc_time(packet.pts)) {
-                decode_pos_secs = t.as_secs_f64();
+            let packet_secs = track.time_base.and_then(|tb| tb.calc_time(packet.pts)).map(|t| t.as_secs_f64());
+            if let Some(t) = packet_secs {
+                decode_pos_secs = (links.start_secs + t - priming_secs).max(0.0);
             }
 
             let decoded = match decoder.decode(&packet) {
@@ -1102,6 +1308,14 @@ pub fn decode_playlist(
             raw_buf.clear();
             raw_buf.resize(decoded.samples_interleaved(), 0.0);
             decoded.copy_to_slice_interleaved(&mut raw_buf);
+            // Cut the encoder's priming and padding (AAC in MP4).
+            if let (Some(g), Some(t)) = (gapless, packet_secs) {
+                let first = (t * sample_rate as f64).round() as u64;
+                let ch = decoded.spec().channels().count().max(1);
+                let (lo, hi) = gapless_keep(g, first, (raw_buf.len() / ch) as u64);
+                raw_buf.truncate(hi * ch);
+                raw_buf.drain(..lo * ch);
+            }
             if raw_buf.is_empty() { continue; }
 
             // Convert the source layout to interleaved stereo (appends to pending).
@@ -1109,8 +1323,7 @@ pub fn decode_playlist(
             // stream can change channel count mid-file (concatenated MP3s going
             // mono -> stereo), and reading it with the old count misreads the
             // interleave — half- or double-speed playback.
-            let buf_channels = decoded.spec().channels().count().max(1);
-            interleaved_to_stereo(&raw_buf, buf_channels, &mut pending);
+            downmix_to_stereo(&raw_buf, decoded.spec().channels(), &mut pending);
 
             // Resample if needed
             decoded_buf.clear();
@@ -1306,6 +1519,38 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert!((out[0] - want_l).abs() < 1e-6, "L: got {} want {}", out[0], want_l);
         assert!((out[1] - want_r).abs() < 1e-6, "R: got {} want {}", out[1], want_r);
+    }
+
+    #[test]
+    fn declared_speaker_positions_decide_the_downmix() {
+        use symphonia::core::audio::{Channels, Position};
+        let g = std::f32::consts::FRAC_1_SQRT_2;
+        // 2.1 (FL FR LFE): the third channel is the LFE, not a centre. The
+        // count-based guess took it for FC and mixed the sub into both sides.
+        let two_one = Channels::Positioned(Position::FRONT_LEFT | Position::FRONT_RIGHT | Position::LFE1);
+        let mut out = Vec::new();
+        downmix_to_stereo(&[0.2, 0.4, 1.0], &two_one, &mut out);
+        assert_eq!(out, vec![0.2, 0.4]);
+
+        // 6.1 (FL FR FC LFE RC SL SR): the guess alternated the surrounds
+        // left/right in order, sending RC left, SL right and SR left.
+        let six_one = Channels::Positioned(
+            Position::FRONT_LEFT | Position::FRONT_RIGHT | Position::FRONT_CENTER | Position::LFE1
+                | Position::REAR_CENTER | Position::SIDE_LEFT | Position::SIDE_RIGHT,
+        );
+        let mut out = Vec::new();
+        downmix_to_stereo(&[0.1, 0.2, 0.3, 1.0, 0.4, 0.5, 0.6], &six_one, &mut out);
+        let want_l = 0.1 + g * 0.3 + g * 0.4 + g * 0.5;
+        let want_r = 0.2 + g * 0.3 + g * 0.4 + g * 0.6;
+        assert!((out[0] - want_l).abs() < 1e-6 && (out[1] - want_r).abs() < 1e-6, "{out:?}");
+
+        // Undeclared layouts keep the count-based fold.
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        let frame = [0.2, 0.4, 0.6, 1.0, 0.1, 0.3];
+        downmix_to_stereo(&frame, &Channels::Discrete(6), &mut a);
+        interleaved_to_stereo(&frame, 6, &mut b);
+        assert_eq!(a, b);
     }
 
     #[test]
@@ -1549,6 +1794,14 @@ mod chain_tests {
         paths: &[PathBuf], output_rate: u32, rg: RgMode, crossfade_secs: u32, hq: bool,
         eq_preset: Option<usize>,
     ) -> Vec<f32> {
+        run_chain_state(paths, output_rate, rg, crossfade_secs, hq, eq_preset).0
+    }
+
+    /// `run_chain_with`, also returning the player state as the run left it.
+    fn run_chain_state(
+        paths: &[PathBuf], output_rate: u32, rg: RgMode, crossfade_secs: u32, hq: bool,
+        eq_preset: Option<usize>,
+    ) -> (Vec<f32>, Arc<PlayerState>) {
         let state = Arc::new(PlayerState::new());
         let cap = 1 << 16;
         state.ring_capacity.store(cap, Ordering::Relaxed);
@@ -1593,7 +1846,7 @@ mod chain_tests {
                 panic!("decode error: {}", msg);
             }
         }
-        out
+        (out, state)
     }
 
     // ---- analysis ----------------------------------------------------------
@@ -1767,6 +2020,17 @@ mod chain_tests {
         let (l, _) = channels(&out);
         let amp = tone_amplitude(&l, 44100.0, 440.0);
         assert!((amp - 0.25).abs() < 0.04, "rg-adjusted level: {} (want ~0.25)", amp);
+    }
+
+    #[test]
+    fn chain_applies_replaygain_from_id3v2_on_an_mp3_that_also_has_id3v1() {
+        // ReplayGain sits in the leading ID3v2 (TXXX); the trailing ID3v1 has
+        // none. Reading only symphonia's oldest metadata block (the ID3v1)
+        // played the file at full level.
+        let out = run_chain(&[fixture("sine_lr_id3v1v2.mp3")], 44100, RgMode::Track);
+        let (l, _) = channels(&out);
+        let amp = tone_amplitude(&l, 44100.0, 440.0);
+        assert!((amp - 0.25).abs() < 0.05, "rg-adjusted level: {amp} (want ~0.25)");
     }
 
     #[test]
@@ -1968,6 +2232,41 @@ mod chain_tests {
     }
 
     #[test]
+    fn a_seek_into_a_later_link_of_a_chained_ogg_lands_there() {
+        // chained.ogg: 1 s of 440 Hz, then a second link of 1 kHz. The
+        // demuxer seeks within ONE link, so a target in the second link (1.2 s)
+        // was handed to the first, which cannot reach it.
+        let out = run_chain_paced(&[fixture("chained.ogg")], 44100, &[(0.2, 1)]);
+        let t = secs(&out, 44100);
+        assert!((0.8..1.3).contains(&t), "expected ~0.2 s + the last 0.8 s, got {t:.2} s");
+        let (l, _) = channels(&out);
+        let after = &l[l.len() - 22_050..];
+        assert!(tone_amplitude(after, 44100.0, 1000.0) > 0.3, "not in the second link after the seek");
+        assert!(tone_amplitude(after, 44100.0, 440.0) < 0.05, "still in the first link");
+    }
+
+    #[test]
+    fn a_seek_back_into_an_earlier_link_of_a_chained_ogg_lands_there() {
+        // Twelve links (440 Hz / 1 kHz alternating, 1 s each), far longer than
+        // the ring, so the producer is still in a late link when the seek comes:
+        // the demuxer cannot go back across links, the file is reopened.
+        let one = std::fs::read(fixture("chained.ogg")).unwrap();
+        let path = std::env::temp_dir().join(format!("keet_chain6_{}.ogg", std::process::id()));
+        std::fs::write(&path, one.repeat(6)).unwrap();
+        // At 5.0 s (the producer ~4 s ahead, in link 10) jump back 3 s to
+        // 2.0 s: link 3, 440 Hz.
+        let out = run_chain_paced(std::slice::from_ref(&path), 44100, &[(5.0, -3)]);
+        let _ = std::fs::remove_file(&path);
+        // The length is what tells the two apart: from ~2 s the rest of the
+        // file (~10 s) still plays. Unfixed, the target fell before the link
+        // playing and the seek only reached that link's start (~3 s left).
+        // Where exactly the seek lands is left to the coarse demuxer seek, and
+        // when the harness applies the drain varies under load.
+        let t = secs(&out, 44100);
+        assert!((14.0..16.0).contains(&t), "expected 5 s + the last ~10 s, got {t:.2} s");
+    }
+
+    #[test]
     fn seeking_past_the_end_moves_on_to_the_next_track() {
         // 1 s into an 8 s track, seek +10 s: that lands past the end, so the
         // player should move on to B. It used to drain the ring, have the seek
@@ -2041,6 +2340,32 @@ mod chain_tests {
         assert!(t > 1.8, "only {t:.2} s played of a 2 s chained file");
         let second = &l[l.len() - 30_000..];
         assert!(tone_amplitude(second, 44100.0, 1000.0) > 0.3, "second link's 1 kHz missing");
+    }
+
+    #[test]
+    fn aac_plays_exactly_its_real_length() {
+        // AAC decodes to priming + audio + padding: 47104 frames for a 1 s
+        // Apple file (2112 + 44100 + 892), 46080 for ffmpeg's (1024 + 44100 +
+        // padding). Played untrimmed, each track started ~25-50 ms late and
+        // ended in silence — a gap between gapless tracks.
+        for f in ["sine_aac_itunsmpb.m4a", "sine_aac_editlist.m4a"] {
+            let (out, state) = run_chain_state(&[fixture(f)], 44100, RgMode::Off, 0, false, None);
+            assert_eq!(out.len() / 2, 44100, "{f}: frames played");
+            assert_eq!(state.total_samples.load(Ordering::Relaxed), 44100, "{f}: reported length");
+            // The tone starts at once: no priming silence at the front.
+            let head = out[..2 * 2048].iter().step_by(2).fold(0.0f32, |m, s| m.max(s.abs()));
+            assert!(head > 0.3, "{f}: silent start (peak {head})");
+        }
+    }
+
+    #[test]
+    fn chained_ogg_length_covers_every_link() {
+        // The container reports only the FIRST link's length, so a 2 s file
+        // showed 1 s: the progress bar ran past its end and a seek beyond
+        // 1 s counted as "past the end" and skipped the rest.
+        let (_, state) = run_chain_state(&[fixture("chained.ogg")], 44100, RgMode::Off, 0, false, None);
+        let secs = state.total_secs();
+        assert!(secs > 1.9, "length after both links: {secs:.2} s");
     }
 
     // ---- bit-perfect ------------------------------------------------------

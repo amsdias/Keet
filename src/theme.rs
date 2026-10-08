@@ -75,7 +75,7 @@ pub struct Palette {
     pub bold: &'static str,
     pub reset: &'static str,
     /// Highlight for the cursor row in lists: the accent as a background with
-    /// dark text over it. Empty = reverse video (Classic). Apply it through
+    /// dark text over it. Empty = reverse video. Apply it through
     /// [`cursor_row`], never by prefixing a coloured row.
     pub cursor_hl: &'static str,
 }
@@ -100,6 +100,12 @@ impl Borders {
     pub const DOUBLE: Self = Self { h: '═', v: '║', tl: '╔', tr: '╗', bl: '╚', br: '╝' };
 }
 
+// Classic: the terminal's own ground and text, and three ANSI colours that
+// each mean one thing — signal green (what is playing, where you are, keys),
+// caution yellow (peaks, "not bit-perfect", EQ over headroom) and fault red
+// (errors, the lit clip lamp). ANSI rather than truecolor on purpose: they
+// follow the user's terminal palette, so Classic reads on a light background
+// too, and stays distinct from Minimal's cyan and HiFi's amber.
 const CLASSIC_PAL: Palette = Palette {
     fg: "\x1B[0m",
     dim: "\x1B[2m",
@@ -110,8 +116,49 @@ const CLASSIC_PAL: Palette = Palette {
     danger: "\x1B[31m",
     bold: "\x1B[1m",
     reset: "\x1B[0m",
-    cursor_hl: "",
+    cursor_hl: "\x1B[42m\x1B[30m",
 };
+
+/// An RGB colour from `#RRGGBB` (or `RRGGBB`). None for anything else.
+pub fn parse_hex(s: &str) -> Option<(u8, u8, u8)> {
+    let h = s.trim().strip_prefix('#').unwrap_or(s.trim());
+    if h.len() != 6 || !h.is_ascii() {
+        return None;
+    }
+    let byte = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).ok();
+    Some((byte(0)?, byte(2)?, byte(4)?))
+}
+
+/// The truecolor Classic chosen in config.json (`classic_use_truecolor`), set
+/// once at startup; unset = the ANSI palette.
+static CLASSIC_TRUECOLOR: std::sync::OnceLock<Palette> = std::sync::OnceLock::new();
+
+fn leak(s: String) -> &'static str {
+    Box::leak(s.into_boxed_str())
+}
+
+/// Classic in the user's own truecolor highlight, warning and error colours.
+/// The cursor bar is the highlight as a background, its text dark or light
+/// by the highlight's brightness so it reads on any choice.
+fn classic_truecolor_palette(hl: (u8, u8, u8), warn: (u8, u8, u8), err: (u8, u8, u8)) -> Palette {
+    let fg = |(r, g, b): (u8, u8, u8)| leak(format!("\x1B[38;2;{r};{g};{b}m"));
+    let (r, g, b) = hl;
+    let luma = 0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32;
+    let text = if luma > 140.0 { "\x1B[38;2;14;16;20m" } else { "\x1B[38;2;245;245;245m" };
+    Palette {
+        accent: fg(hl),
+        good: fg(hl),
+        warn: fg(warn),
+        danger: fg(err),
+        cursor_hl: leak(format!("\x1B[48;2;{r};{g};{b}m{text}")),
+        ..CLASSIC_PAL
+    }
+}
+
+/// Switch Classic to truecolor for this run. Called once, before the first frame.
+pub fn use_classic_truecolor(hl: (u8, u8, u8), warn: (u8, u8, u8), err: (u8, u8, u8)) {
+    let _ = CLASSIC_TRUECOLOR.set(classic_truecolor_palette(hl, warn, err));
+}
 
 // Minimal: warm cyan accent on the terminal default background. Truecolor for
 // the accent so it lands on #9adcd0 regardless of palette mapping; fg/dim use
@@ -153,7 +200,8 @@ const HIFI_PAL: Palette = Palette {
 pub fn cursor_row(p: &Palette, row: &str, width: usize) -> String {
     let plain = crate::ansi::truncate_plain(&crate::ansi::strip_ansi(row), width);
     let pad = " ".repeat(width.saturating_sub(crate::ansi::visible_len(&plain)));
-    if p.cursor_hl.is_empty() {
+    // NO_COLOR removes the accent background, so the cursor is reverse video.
+    if p.cursor_hl.is_empty() || crate::term::no_color() {
         format!("\x1B[7m{plain}{pad}\x1B[27m")
     } else {
         format!("{}{plain}{pad}{}", p.cursor_hl, p.reset)
@@ -162,7 +210,7 @@ pub fn cursor_row(p: &Palette, row: &str, width: usize) -> String {
 
 pub fn palette(kind: ThemeKind) -> &'static Palette {
     match kind {
-        ThemeKind::Classic => &CLASSIC_PAL,
+        ThemeKind::Classic => CLASSIC_TRUECOLOR.get().unwrap_or(&CLASSIC_PAL),
         ThemeKind::Minimal => &MINIMAL_PAL,
         ThemeKind::HiFi => &HIFI_PAL,
     }
@@ -179,6 +227,29 @@ pub fn borders(kind: ThemeKind) -> Borders {
 #[cfg(test)]
 mod theme_tests {
     use super::*;
+
+    #[test]
+    fn hex_colours_parse_with_or_without_the_hash() {
+        assert_eq!(parse_hex("#7DD3B8"), Some((125, 211, 184)));
+        assert_eq!(parse_hex("e9b65c"), Some((233, 182, 92)));
+        assert_eq!(parse_hex(" #F07A78 "), Some((240, 122, 120)));
+        for bad in ["", "#fff", "#12345G", "#1234567", "green", "#ééé"] {
+            assert_eq!(parse_hex(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_truecolor_classic_uses_the_three_colours_and_keeps_the_rest() {
+        let p = classic_truecolor_palette((125, 211, 184), (233, 182, 92), (240, 122, 120));
+        assert_eq!(p.accent, "\x1B[38;2;125;211;184m");
+        assert_eq!(p.warn, "\x1B[38;2;233;182;92m");
+        assert_eq!(p.danger, "\x1B[38;2;240;122;120m");
+        assert_eq!((p.fg, p.dim, p.rule), (CLASSIC_PAL.fg, CLASSIC_PAL.dim, CLASSIC_PAL.rule));
+        // The cursor text flips with the highlight's brightness.
+        assert!(p.cursor_hl.ends_with("\x1B[38;2;14;16;20m"), "light highlight, dark text");
+        let dark = classic_truecolor_palette((40, 60, 140), (0, 0, 0), (0, 0, 0));
+        assert!(dark.cursor_hl.ends_with("\x1B[38;2;245;245;245m"), "dark highlight, light text");
+    }
 
     #[test]
     fn resolve_theme_priority_flag_then_config_then_resume_then_classic() {

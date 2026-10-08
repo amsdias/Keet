@@ -37,14 +37,19 @@ struct VizPalette {
 
 fn viz_palette(kind: ThemeKind) -> VizPalette {
     match kind {
-        ThemeKind::Classic => VizPalette {
-            low: C_GREEN,
-            mid: C_YELLOW,
-            hot: C_RED,
-            accent: C_CYAN,
-            dim: C_DIM,
-            reset: C_RESET,
-        },
+        ThemeKind::Classic => {
+            // The signal colour for the body, caution for the loud top rows:
+            // one meaning per colour (theme.rs).
+            let p = theme_palette(ThemeKind::Classic);
+            VizPalette {
+                low: p.accent,
+                mid: p.accent,
+                hot: p.warn,
+                accent: p.accent,
+                dim: p.dim,
+                reset: p.reset,
+            }
+        }
         ThemeKind::Minimal => {
             // Monochrome: the warm-cyan accent for content, danger only for clip/hot.
             let p = theme_palette(ThemeKind::Minimal);
@@ -72,10 +77,6 @@ fn viz_palette(kind: ThemeKind) -> VizPalette {
     }
 }
 
-/// Per-band color for the spectrum ribbon. Classic uses the rainbow gradient
-/// already baked into `BAND_COLORS`; Minimal/HiFi project onto a 3-stop ramp
-/// (low→mid→hot) sized to the band index so the visual identity stays
-/// consistent with the rest of the theme.
 /// ISO ⅓-octave centre frequency of each spectrum band. Drives both the band
 /// energies and the frequency legend, so the labels cannot drift from the bins.
 pub(crate) const ISO_CENTERS: [f32; SPECTRUM_BANDS] = [
@@ -85,9 +86,15 @@ pub(crate) const ISO_CENTERS: [f32; SPECTRUM_BANDS] = [
     20000.0,
 ];
 
+/// Per-band color for the spectrum ribbon. Classic draws every band in its
+/// signal colour; Minimal/HiFi project onto a 3-stop ramp (low→mid→hot) sized
+/// to the band index so the visual identity stays consistent with the rest of
+/// the theme.
 fn band_color(idx: usize, vp: &VizPalette, kind: ThemeKind) -> &'static str {
     if matches!(kind, ThemeKind::Classic) {
-        BAND_COLORS.get(idx).copied().unwrap_or(C_YELLOW)
+        // One signal colour across the bands: the old colour per frequency
+        // range meant nothing (theme.rs, one meaning per colour).
+        vp.low
     } else {
         // Map idx in 0..SPECTRUM_BANDS onto the 3 ramp stops.
         let third = SPECTRUM_BANDS / 3;
@@ -337,6 +344,8 @@ pub struct VizAnalyser {
     vu_peak_timer_l: u8,
     vu_peak_timer_r: u8,
     sample_rate: u32,
+    // Spectrum bar/dot ballistics for this rate's hop length.
+    ballistics: Ballistics,
     // Recent raw (L, R) samples, newest at back. Used by oscilloscope and lissajous.
     pub(crate) waveform_buf: VecDeque<(f32, f32)>,
     // History of mono spectrum frames, newest at back. Used by spectrogram.
@@ -356,6 +365,76 @@ pub struct VizAnalyser {
     // Running sum of hops for the in-progress spectrogram column (time dilation).
     spectrogram_accum: [f32; SPECTRUM_BANDS],
     spectrogram_accum_count: usize,
+}
+
+/// Spectrum bar and peak-dot ballistics, per analysis hop. They run once per
+/// FFT hop (FFT_SIZE/2 samples), so constants tuned per hop at 44.1 kHz fell
+/// 4.35x faster at 192 kHz. Each is rescaled to the hop's real duration:
+/// factors by power, linear steps and hold counts by ratio.
+#[derive(Clone, Copy)]
+struct Ballistics {
+    attack: f32,
+    bar_decay: f32,
+    gravity: f32,
+    viz_attack: f32,
+    viz_decay: f32,
+    dot_gravity: f32,
+    hold: u8,
+}
+
+impl Ballistics {
+    fn for_rate(sample_rate: u32) -> Self {
+        // The tuned constants are per hop at 44.1 kHz.
+        let r = 44_100.0 / sample_rate.max(1) as f32;
+        let keep = |f: f32| f.powf(r);
+        Self {
+            attack: 1.0 - keep(1.0 - ATTACK),
+            bar_decay: keep(BAR_DECAY),
+            gravity: GRAVITY * r,
+            viz_attack: keep(VIZ_ATTACK),
+            viz_decay: keep(VIZ_DECAY),
+            dot_gravity: DOT_GRAVITY * r,
+            hold: ((HOLD_TIME as f32 / r).round() as u32).clamp(1, u8::MAX as u32) as u8,
+        }
+    }
+
+    /// Apply bar ballistics (attack/decay/smoothing) to raw band values.
+    fn apply(
+        &self,
+        bands: &[f32; SPECTRUM_BANDS],
+        heights: &mut [f32; SPECTRUM_BANDS],
+        smoothed: &mut [f32; SPECTRUM_BANDS],
+    ) {
+        for i in 0..SPECTRUM_BANDS {
+            if bands[i] > heights[i] {
+                heights[i] = heights[i] * (1.0 - self.attack) + bands[i] * self.attack;
+            } else {
+                // Proportional fall + small linear floor: high bars fall at the same
+                // rate as low ones, so loud passages stay responsive instead of the
+                // bars crawling down from a fixed per-frame step.
+                heights[i] = (heights[i] * self.bar_decay - self.gravity).max(0.0);
+            }
+            // Fast attack so beats land on time, slow release so the fall stays
+            // smooth. A symmetric low-pass here added ~150 ms of onset lag.
+            smoothed[i] = if heights[i] > smoothed[i] {
+                smoothed[i] * self.viz_attack + heights[i] * (1.0 - self.viz_attack)
+            } else {
+                smoothed[i] * self.viz_decay + heights[i] * (1.0 - self.viz_decay)
+            };
+        }
+    }
+}
+
+/// Fill the FFT input with the next frame, mean removed, then windowed. A DC
+/// offset is no frequency anyone wants on a spectrum, and the Hann window
+/// spreads it over the first bins — at 192 kHz bin 1 is centred on 47 Hz, so
+/// an offset lit the sub-bass bars.
+fn load_frame(dst: &mut [f32], samples: &VecDeque<f32>, window: &[f32]) {
+    let n = dst.len().min(samples.len());
+    let mean = samples.iter().take(n).sum::<f32>() / n.max(1) as f32;
+    for ((d, &s), &w) in dst.iter_mut().zip(samples.iter()).zip(window) {
+        *d = (s - mean) * w;
+    }
 }
 
 impl VizAnalyser {
@@ -386,6 +465,7 @@ impl VizAnalyser {
             vu_peak_timer_l: 0,
             vu_peak_timer_r: 0,
             sample_rate,
+            ballistics: Ballistics::for_rate(sample_rate),
             waveform_buf: VecDeque::with_capacity(WAVEFORM_BUF_SIZE),
             spectrogram_history: VecDeque::with_capacity(SPECTROGRAM_COLS),
             spectro_raw_history: VecDeque::with_capacity(SPECTRO_ANALYSIS_COLS),
@@ -472,9 +552,7 @@ impl VizAnalyser {
         // Process FFT for each channel when enough samples collected
         while self.ch_l.sample_buffer.len() >= FFT_SIZE && self.ch_r.sample_buffer.len() >= FFT_SIZE {
             // Process L channel
-            for (i, (&sample, &w)) in self.ch_l.sample_buffer.iter().take(FFT_SIZE).zip(&self.window).enumerate() {
-                self.fft_input[i] = sample * w;
-            }
+            load_frame(&mut self.fft_input, &self.ch_l.sample_buffer, &self.window);
             let l_bands = Self::run_fft_and_compute(&*self.fft, &mut self.fft_input, &mut self.fft_output, &mut self.fft_scratch, self.sample_rate);
 
             // Analysis-spectrogram capture: stash L magnitudes (fft_output now holds L's spectrum).
@@ -488,9 +566,7 @@ impl VizAnalyser {
             }
 
             // Process R channel
-            for (i, (&sample, &w)) in self.ch_r.sample_buffer.iter().take(FFT_SIZE).zip(&self.window).enumerate() {
-                self.fft_input[i] = sample * w;
-            }
+            load_frame(&mut self.fft_input, &self.ch_r.sample_buffer, &self.window);
             let r_bands = Self::run_fft_and_compute(&*self.fft, &mut self.fft_input, &mut self.fft_output, &mut self.fft_scratch, self.sample_rate);
 
             // Analysis-spectrogram capture: accumulate mono magnitude = avg(|L|,|R|)
@@ -533,8 +609,9 @@ impl VizAnalyser {
             }
 
             // Apply ballistics per channel
-            Self::apply_ballistics(&l_bands, &mut self.ch_l.heights, &mut self.ch_l.smoothed);
-            Self::apply_ballistics(&r_bands, &mut self.ch_r.heights, &mut self.ch_r.smoothed);
+            let b = self.ballistics;
+            b.apply(&l_bands, &mut self.ch_l.heights, &mut self.ch_l.smoothed);
+            b.apply(&r_bands, &mut self.ch_r.heights, &mut self.ch_r.smoothed);
 
             // Mono average for peak dots (used by vertical spectrum)
             let mono: [f32; SPECTRUM_BANDS] = std::array::from_fn(|i| {
@@ -543,11 +620,11 @@ impl VizAnalyser {
             for i in 0..SPECTRUM_BANDS {
                 if mono[i] >= self.peak_hold[i] {
                     self.peak_hold[i] = mono[i];
-                    self.peak_hold_timer[i] = HOLD_TIME;
+                    self.peak_hold_timer[i] = b.hold;
                 } else if self.peak_hold_timer[i] > 0 {
                     self.peak_hold_timer[i] -= 1;
                 } else {
-                    self.peak_hold[i] = (self.peak_hold[i] - DOT_GRAVITY).max(0.0);
+                    self.peak_hold[i] = (self.peak_hold[i] - b.dot_gravity).max(0.0);
                 }
                 self.peak_hold[i] = self.peak_hold[i].max(mono[i]);
             }
@@ -594,9 +671,11 @@ impl VizAnalyser {
             return [0.0; SPECTRUM_BANDS];
         }
 
-        let nyquist = sample_rate as f32 / 2.0;
+        // Bin k is CENTRED on k·fs/N and spans half a bin either side. The
+        // width used to be Nyquist / (N/2 + 1) with bin k spanning [k, k+1):
+        // half a bin high, which put the 20 Hz band inside bin 0 — DC.
         let n_bins = fft_output.len();
-        let bin_hz = nyquist / n_bins as f32;
+        let bin_hz = sample_rate as f32 / FFT_SIZE as f32;
         let n = FFT_SIZE as f32;
         let window_correction = 2.0;
         let psd_norm = 2.0 / (n * n);
@@ -617,14 +696,15 @@ impl VizAnalyser {
 
             let bin_lo_exact = f_lo / bin_hz;
             let bin_hi_exact = f_hi / bin_hz;
-            let bin_lo = bin_lo_exact.floor() as usize;
-            let bin_hi = (bin_hi_exact.ceil() as usize).min(n_bins);
+            // Bin 0 is DC — never part of a band.
+            let bin_lo = (bin_lo_exact.round() as usize).max(1);
+            let bin_hi = (bin_hi_exact.round() as usize + 1).min(n_bins);
 
             let mut sum_power = 0.0f32;
             let mut weight_sum = 0.0f32;
             for bin in bin_lo..bin_hi {
-                let bin_start = bin as f32;
-                let bin_end = bin_start + 1.0;
+                let bin_start = bin as f32 - 0.5;
+                let bin_end = bin as f32 + 0.5;
                 let overlap_lo = bin_start.max(bin_lo_exact);
                 let overlap_hi = bin_end.min(bin_hi_exact);
                 let weight = (overlap_hi - overlap_lo).max(0.0);
@@ -648,31 +728,6 @@ impl VizAnalyser {
         }
 
         bands
-    }
-
-    /// Apply bar ballistics (attack/decay/smoothing) to raw band values
-    fn apply_ballistics(
-        bands: &[f32; SPECTRUM_BANDS],
-        heights: &mut [f32; SPECTRUM_BANDS],
-        smoothed: &mut [f32; SPECTRUM_BANDS],
-    ) {
-        for i in 0..SPECTRUM_BANDS {
-            if bands[i] > heights[i] {
-                heights[i] = heights[i] * (1.0 - ATTACK) + bands[i] * ATTACK;
-            } else {
-                // Proportional fall + small linear floor: high bars fall at the same
-                // rate as low ones, so loud passages stay responsive instead of the
-                // bars crawling down from a fixed per-frame step.
-                heights[i] = (heights[i] * BAR_DECAY - GRAVITY).max(0.0);
-            }
-            // Fast attack so beats land on time, slow release so the fall stays
-            // smooth. A symmetric low-pass here added ~150 ms of onset lag.
-            smoothed[i] = if heights[i] > smoothed[i] {
-                smoothed[i] * VIZ_ATTACK + heights[i] * (1.0 - VIZ_ATTACK)
-            } else {
-                smoothed[i] * VIZ_DECAY + heights[i] * (1.0 - VIZ_DECAY)
-            };
-        }
     }
 }
 
@@ -753,7 +808,7 @@ fn vu_layout(rows: usize, style: VizStyle, extras: bool) -> VuLayout {
 /// Render-driven rather than analyser-driven: the meter is the only consumer,
 /// and it is drawn once per UI frame, so the strip advances at a steady ~20 px
 /// per second without another buffer in the analyser.
-fn vu_push_history(l: f32, r: f32) -> Vec<(f32, f32)> {
+fn vu_push_history(l: f32, r: f32, want: bool) -> Vec<(f32, f32)> {
     use std::cell::RefCell;
     thread_local! {
         static HIST: RefCell<std::collections::VecDeque<(f32, f32)>> =
@@ -765,7 +820,8 @@ fn vu_push_history(l: f32, r: f32) -> Vec<(f32, f32)> {
             h.pop_front();
         }
         h.push_back((l, r));
-        h.iter().copied().collect()
+        // Copied out only when the history strip is drawn this frame.
+        if want { h.iter().copied().collect() } else { Vec::new() }
     })
 }
 
@@ -949,8 +1005,8 @@ fn render_vu_meter_body(state: &PlayerState, style: VizStyle, width: usize, rows
         bar
     }
 
-    let hist = vu_push_history(left, right);
     let lay = vu_layout(rows, style, extras);
+    let hist = vu_push_history(left, right, lay.history > 0);
     let mut lines: Vec<String> = Vec::with_capacity(rows);
     if lay.thickness > 0 {
         // One label per channel, on the block's middle row. Repeating it on
@@ -993,19 +1049,6 @@ const H_UP_BRAILLE: [char; 5] = [' ', '⣀', '⣤', '⣶', '⣿'];
 const H_DN_BRAILLE: [char; 5] = [' ', '⠉', '⠛', '⠿', '⣿'];
 // Block chars inverted: index N → bar fills N/8 from the top
 const SPECTRUM_H_BLOCKS_DN: &[char] = &[' ', '▇', '▆', '▅', '▄', '▃', '▂', '▁', '█'];
-
-// 31-band color gradient: sub-bass → bass → mid → upper-mid → treble → air
-const BAND_COLORS: [&str; 31] = [
-    C_CYAN, C_CYAN, C_CYAN, C_CYAN,           // 20-40Hz sub-bass
-    C_GREEN, C_GREEN, C_GREEN, C_GREEN,         // 50-100Hz bass
-    C_GREEN, C_GREEN, C_GREEN,                  // 125-200Hz upper bass
-    C_YELLOW, C_YELLOW, C_YELLOW, C_YELLOW,     // 250-500Hz low-mid
-    C_YELLOW, C_YELLOW, C_YELLOW, C_YELLOW,     // 630-1.6kHz mid
-    C_RED, C_RED, C_RED, C_RED,                 // 2-4kHz presence
-    C_RED, C_RED, C_RED,                        // 5-8kHz brilliance
-    C_MAGENTA, C_MAGENTA, C_MAGENTA, C_MAGENTA, // 10-20kHz air
-    C_MAGENTA,
-];
 
 /// See `render_spectrum_horizontal_body`; this enforces the width half of the renderer contract
 /// (`fit_width`).
@@ -1841,13 +1884,7 @@ fn analysis_levels_into(out: &mut Vec<u8>, analyser: &VizAnalyser, width_px: usi
         return;
     }
     let n = hist.len();
-    let row_bin: Vec<usize> = (0..height_px)
-        .map(|y| if log_axis {
-            analysis_row_to_bin_log(y, height_px, nbins, analyser.sample_rate as f32)
-        } else {
-            analysis_row_to_bin_linear(y, height_px, nbins)
-        })
-        .collect();
+    let row_bins = analysis_row_bin_ranges(height_px, nbins, log_axis, analyser.sample_rate as f32);
     // Pixel columns map through a fixed timeline of `logical_cols` slots
     // (newest at the right) so the pixel width is decoupled from the history
     // depth. Kitty renders 1 px per slot; Sixel images are wider than the
@@ -1865,8 +1902,14 @@ fn analysis_levels_into(out: &mut Vec<u8>, analyser: &VizAnalyser, width_px: usi
         let slot = x * logical_cols / content_w.max(1);
         if slot < blank_slots { continue; }
         let col = &hist[oldest_shown + (slot - blank_slots)];
-        for (y, &bin) in row_bin.iter().enumerate() {
-            let db = col.get(bin).copied().unwrap_or(SPECTRO_ANALYSIS_FLOOR_DB);
+        for (y, &(lo, hi)) in row_bins.iter().enumerate() {
+            // The loudest bin the row covers: a row spanning many bins (the
+            // top of a log axis) read only its centre bin, so a peak between
+            // two rows' centres never showed.
+            let db = col
+                .get(lo..=hi.min(col.len().saturating_sub(1)))
+                .and_then(|bins| bins.iter().copied().reduce(f32::max))
+                .unwrap_or(SPECTRO_ANALYSIS_FLOOR_DB);
             let t = analysis_intensity(db, SPECTRO_ANALYSIS_FLOOR_DB, SPECTRO_ANALYSIS_CEIL_DB);
             out[y * width_px + left_px + x] = (t * 255.0).round() as u8;
         }
@@ -2211,6 +2254,28 @@ fn analysis_intensity(db: f32, floor_db: f32, ceil_db: f32) -> f32 {
     ((db - floor_db) / span).clamp(0.0, 1.0)
 }
 
+/// The FFT bins each display row covers, as inclusive (lo, hi), top row first.
+/// Each row owns the bins from halfway to the row below up to halfway to the
+/// row above, so adjacent rows tile the spectrum with no bin left out.
+fn analysis_row_bin_ranges(rows: usize, nbins: usize, log_axis: bool, sample_rate: f32) -> Vec<(usize, usize)> {
+    let centre: Vec<usize> = (0..rows)
+        .map(|y| if log_axis {
+            analysis_row_to_bin_log(y, rows, nbins, sample_rate)
+        } else {
+            analysis_row_to_bin_linear(y, rows, nbins)
+        })
+        .collect();
+    (0..rows)
+        .map(|y| {
+            let c = centre[y];
+            // Row y+1 is the next LOWER frequency, y-1 the next higher.
+            let lo = if y + 1 < rows { (centre[y + 1] + c) / 2 + 1 } else { c };
+            let hi = if y > 0 { (c + centre[y - 1]) / 2 } else { c };
+            (lo.min(c), hi.max(c))
+        })
+        .collect()
+}
+
 /// Map a display row (0 = top = highest freq) to an FFT bin index, linear in Hz.
 fn analysis_row_to_bin_linear(row: usize, rows: usize, nbins: usize) -> usize {
     if rows <= 1 || nbins == 0 { return 0; }
@@ -2539,6 +2604,71 @@ fn analysis_colormap(t: f32) -> (u8, u8, u8) {
 #[cfg(test)]
 mod analysis_tests {
     use super::*;
+
+    /// One analysis hop's band values for a windowed signal.
+    fn bands_for(signal: impl Fn(f32) -> f32, rate: u32) -> [f32; SPECTRUM_BANDS] {
+        let mut a = VizAnalyser::new(rate);
+        let frame: VecDeque<f32> = (0..FFT_SIZE).map(|i| signal(i as f32 / rate as f32)).collect();
+        load_frame(&mut a.fft_input, &frame, &a.window);
+        VizAnalyser::run_fft_and_compute(&*a.fft, &mut a.fft_input, &mut a.fft_output, &mut a.fft_scratch, rate)
+    }
+
+    #[test]
+    fn analysis_rows_cover_every_bin_between_them() {
+        // One bin per pixel row aliased: where a row spans many bins (the top
+        // of a log axis), a tone between two rows' centre bins was not drawn.
+        for log in [true, false] {
+            for rows in [24, 96, 400] {
+                let r = analysis_row_bin_ranges(rows, 2049, log, 48_000.0);
+                for y in 0..rows - 1 {
+                    let (upper, lower) = (r[y], r[y + 1]);
+                    assert!(lower.1 + 1 >= upper.0, "gap between rows {y} and {} ({log}, {rows}): {lower:?} {upper:?}", y + 1);
+                }
+                assert_eq!(r[0].1, 2048, "top row reaches Nyquist");
+            }
+        }
+    }
+
+    #[test]
+    fn bars_fall_at_the_same_speed_at_every_sample_rate() {
+        // Ballistics step once per FFT hop, and a hop is 46 ms at 44.1 kHz but
+        // 11 ms at 192 kHz: per-hop constants made bars and dots fall 4.35x
+        // faster on a hi-res stream.
+        let after = |rate: u32, secs: f32| {
+            let b = Ballistics::for_rate(rate);
+            let (mut h, mut s) = ([1.0; SPECTRUM_BANDS], [1.0; SPECTRUM_BANDS]);
+            let hops = (secs * rate as f32 / (FFT_SIZE / 2) as f32).round() as usize;
+            for _ in 0..hops {
+                b.apply(&[0.0; SPECTRUM_BANDS], &mut h, &mut s);
+            }
+            s[0]
+        };
+        let (cd, hires) = (after(44_100, 0.25), after(192_000, 0.25));
+        assert!((cd - hires).abs() < 0.05, "after 250 ms: {cd} at 44.1k, {hires} at 192k");
+    }
+
+    #[test]
+    fn dc_never_shows_up_as_sub_bass() {
+        // The bin width was taken as Nyquist / (N/2 + 1) and each bin as
+        // spanning [k, k+1) — half a bin high. At 192 kHz a bin is 47 Hz wide,
+        // so the 20 Hz band sat inside bin 0: DC (any offset in the signal)
+        // lit the lowest bars.
+        for rate in [44_100, 192_000] {
+            let b = bands_for(|_| 0.5, rate);
+            assert!(b[0] < 0.05 && b[1] < 0.05, "{rate}: DC read as {:.2}/{:.2}", b[0], b[1]);
+        }
+    }
+
+    #[test]
+    fn a_tone_lands_in_its_own_band() {
+        // 1 kHz is ISO band 17 (20 Hz is 0). The half-bin skew shifted energy
+        // toward the band above.
+        for rate in [44_100, 192_000] {
+            let b = bands_for(|t| 0.5 * (2.0 * std::f32::consts::PI * 1000.0 * t).sin(), rate);
+            let loudest = (0..SPECTRUM_BANDS).max_by(|&x, &y| b[x].total_cmp(&b[y])).unwrap();
+            assert_eq!(ISO_CENTERS[loudest], 1000.0, "{rate}: loudest band {}", ISO_CENTERS[loudest]);
+        }
+    }
 
     /// Every scaled mode, both styles, swept across window sizes the way a drag
     /// resizes one — one row and one column at a time. Two invariants hold at
