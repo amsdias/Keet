@@ -772,12 +772,12 @@ impl VuLayout {
     }
 }
 
-fn vu_layout(rows: usize, style: VizStyle, extras: bool) -> VuLayout {
+fn vu_layout(rows: usize, extras: bool) -> VuLayout {
     if rows == 0 {
         return VuLayout { thickness: 0, gap: 0, ruler: 0, history: 0, blank: 0 };
     }
     if rows < 4 {
-        // Natural size: one row per channel, and the Bars style's spacer.
+        // Natural size: one row per channel, and the spacer between them.
         let gap = if rows >= 3 { rows - 2 } else { 0 };
         let thickness = if rows == 1 { 0 } else { 1 };
         // rows == 1 has no room for two channels; give the single row to L.
@@ -792,7 +792,9 @@ fn vu_layout(rows: usize, style: VizStyle, extras: bool) -> VuLayout {
     // The scale is permanent from here up: a meter without one is just a
     // moving bar, and it costs a single row.
     let ruler = 1;
-    let gap = if matches!(style, VizStyle::Bars) { 1 } else { 0 };
+    // A blank row between the channels in both styles: without it the two
+    // braille bars ran together and read as one thick meter.
+    let gap = 1;
     let body = rows - ruler - gap;
     // Snap down to odd: 1, 3, 5, 7. An even block has no middle row, so the
     // channel label would have to sit off-centre.
@@ -1005,7 +1007,7 @@ fn render_vu_meter_body(state: &PlayerState, style: VizStyle, width: usize, rows
         bar
     }
 
-    let lay = vu_layout(rows, style, extras);
+    let lay = vu_layout(rows, extras);
     let hist = vu_push_history(left, right, lay.history > 0);
     let mut lines: Vec<String> = Vec::with_capacity(rows);
     if lay.thickness > 0 {
@@ -2898,22 +2900,24 @@ mod analysis_tests {
 
     #[test]
     fn vu_spends_height_on_information_not_on_thicker_bars() {
-        for style in [VizStyle::Dots, VizStyle::Bars] {
-            for rows in 0..40usize {
-                let lay = vu_layout(rows, style, true);
-                assert_eq!(lay.total(), rows, "layout must account for every row (rows={rows})");
-                assert!(lay.thickness <= VU_MAX_THICKNESS, "rows={rows}");
-            }
-            // Odd at every height, so `thickness / 2` is always a real middle.
-            for rows in 0..40usize {
-                let t = vu_layout(rows, style, true).thickness;
-                assert!(t == 0 || !t.is_multiple_of(2), "rows={rows}: even thickness {t}");
-            }
-            // Past the thickness cap the extra rows go to the history strip,
-            // which is the only part carrying information a single row cannot.
-            let tall = vu_layout(24, style, true);
-            assert_eq!(tall.thickness, VU_MAX_THICKNESS);
-            assert!(tall.history > 0, "tall meter must show level history");
+        for rows in 0..40usize {
+            let lay = vu_layout(rows, true);
+            assert_eq!(lay.total(), rows, "layout must account for every row (rows={rows})");
+            assert!(lay.thickness <= VU_MAX_THICKNESS, "rows={rows}");
+        }
+        // Odd at every height, so `thickness / 2` is always a real middle.
+        for rows in 0..40usize {
+            let t = vu_layout(rows, true).thickness;
+            assert!(t == 0 || !t.is_multiple_of(2), "rows={rows}: even thickness {t}");
+        }
+        // Past the thickness cap the extra rows go to the history strip,
+        // which is the only part carrying information a single row cannot.
+        let tall = vu_layout(24, true);
+        assert_eq!(tall.thickness, VU_MAX_THICKNESS);
+        assert!(tall.history > 0, "tall meter must show level history");
+        // The channels never touch, in either style.
+        for rows in 3..40usize {
+            assert_eq!(vu_layout(rows, false).gap, 1, "rows={rows}");
         }
     }
 
