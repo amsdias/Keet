@@ -2,6 +2,7 @@ use serde::Deserialize;
 
 // --- Comb Filter (used by Freeverb) ---
 
+#[derive(Clone)]
 struct CombFilter {
     buffer: Vec<f32>,
     index: usize,
@@ -52,6 +53,7 @@ impl CombFilter {
 
 // --- Allpass Filter (used by Freeverb) ---
 
+#[derive(Clone)]
 struct AllpassFilter {
     buffer: Vec<f32>,
     index: usize,
@@ -91,6 +93,7 @@ const DAMP_SCALE: f32 = 0.4;
 /// 192 kHz).
 const LIMITER_RELEASE_SECS: f32 = 2000.0 / 44_100.0;
 
+#[derive(Clone)]
 pub struct Freeverb {
     combs_l: Vec<CombFilter>,
     combs_r: Vec<CombFilter>,
@@ -175,6 +178,7 @@ impl Freeverb {
 
 // --- Chorus ---
 
+#[derive(Clone)]
 pub struct Chorus {
     delay_l: Vec<f32>,
     delay_r: Vec<f32>,
@@ -263,6 +267,7 @@ impl Chorus {
 
 // --- Delay ---
 
+#[derive(Clone)]
 pub struct Delay {
     buffer_l: Vec<f32>,
     buffer_r: Vec<f32>,
@@ -382,7 +387,11 @@ pub struct EffectsPreset {
 
 // --- Effects Chain ---
 
+#[derive(Clone)]
 pub struct EffectsChain {
+    /// The preset being faded away from after a change (see fade.rs): its
+    /// reverb or delay tail fades out instead of being cut.
+    xfade: crate::fade::Crossfade<EffectsChain>,
     reverb: Option<Freeverb>,
     chorus: Option<Chorus>,
     delay: Option<Delay>,
@@ -398,10 +407,13 @@ impl EffectsChain {
         // Lazy: skip the ~44KB reverb/chorus/delay allocations until a preset that
         // needs them is loaded. The "None" preset keeps this at zero overhead.
         let limiter_release = 1.0 - (-1.0 / (LIMITER_RELEASE_SECS * sample_rate.max(1.0))).exp();
-        Self { reverb: None, chorus: None, delay: None, limiter_gain: 1.0, limiter_release }
+        Self { xfade: Default::default(), reverb: None, chorus: None, delay: None, limiter_gain: 1.0, limiter_release }
     }
 
     pub fn load_preset(&mut self, preset: &EffectsPreset, sample_rate: f32) {
+        let before = self.clone();
+        let was_active = before.is_active();
+        self.xfade.retire(before, crate::fade::frames(crate::fade::EFFECTS_FADE_SECS, sample_rate));
         self.reverb = None;
         self.chorus = None;
         self.delay = None;
@@ -423,9 +435,14 @@ impl EffectsChain {
                 self.delay = Some(dl);
             }
         }
+        // None to None is no change: no fade (see EqChain::load_bands).
+        if !was_active && self.reverb.is_none() && self.chorus.is_none() && self.delay.is_none() {
+            self.xfade.cancel();
+        }
     }
 
     pub fn reset(&mut self) {
+        self.xfade.clear();
         self.limiter_gain = 1.0;
         if let Some(r) = self.reverb.as_mut() { r.reset(); }
         if let Some(c) = self.chorus.as_mut() { c.reset(); }
@@ -433,11 +450,20 @@ impl EffectsChain {
     }
 
     pub fn is_active(&self) -> bool {
-        self.reverb.is_some() || self.chorus.is_some() || self.delay.is_some()
+        self.reverb.is_some() || self.chorus.is_some() || self.delay.is_some() || self.xfade.running()
     }
 
     /// Process interleaved stereo samples: chorus -> delay -> reverb
     pub fn process_stereo(&mut self, samples: &mut [f32]) {
+        // Always through the fade: it also records that audio has flowed
+        // (a fresh stage takes new settings without one), and with no fade
+        // running it just calls `process_preset`.
+        let mut xf = std::mem::take(&mut self.xfade);
+        xf.run(samples, |s| self.process_preset(s), |old, s| old.process_preset(s));
+        self.xfade = xf;
+    }
+
+    fn process_preset(&mut self, samples: &mut [f32]) {
         if let Some(c) = self.chorus.as_mut() { c.process_stereo(samples); }
         if let Some(d) = self.delay.as_mut() { d.process_stereo(samples); }
         if let Some(r) = self.reverb.as_mut() { r.process_stereo(samples); }
@@ -539,6 +565,24 @@ pub fn load_custom_presets() -> Vec<EffectsPreset> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn switching_effects_off_fades_the_tail_instead_of_cutting_it() {
+        let sr = 48000.0;
+        let presets = builtin_presets();
+        let hall = presets.iter().find(|p| p.reverb.is_some()).unwrap();
+        let mut fx = EffectsChain::new(sr);
+        fx.load_preset(hall, sr);
+        let mut buf: Vec<f32> = (0..9600).flat_map(|i| { let v = if i < 4800 { ((i % 50) as f32 / 25.0 - 1.0) * 0.5 } else { 0.0 }; [v, v] }).collect();
+        fx.process_stereo(&mut buf);
+        let last = buf[buf.len() - 2];
+        assert!(last.abs() > 1e-4, "the reverb tail should still be ringing");
+        fx.load_preset(&presets[0], sr); // None
+        let mut silence = vec![0.0f32; 2 * 4800];
+        fx.process_stereo(&mut silence);
+        assert!((silence[0] - last).abs() < 0.05, "tail cut: {last} then {}", silence[0]);
+        assert!(silence.iter().any(|s| s.abs() > 1e-5), "the tail fades out over time");
+    }
 
     fn preset(json: &str) -> EffectsPreset {
         serde_json::from_str(json).expect("preset json")

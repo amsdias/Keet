@@ -714,7 +714,20 @@ impl VizAnalyser {
                 weight_sum += weight;
             }
 
-            let rms_power = if weight_sum > 0.0 { sum_power / weight_sum } else { 0.0 };
+            // A band narrower than one bin can fall between bins entirely —
+            // at 192 kHz every band below ~50 Hz sits inside DC's bin. It takes
+            // the nearest bin past DC instead: the finest the analysis can
+            // resolve at this rate (the Hann window leaks a low tone into it,
+            // and the frame mean is gone, so DC does not). Dark whatever
+            // played was the alternative.
+            let (sum_power, weight_sum) = if weight_sum > 0.0 {
+                (sum_power, weight_sum)
+            } else {
+                let bin = ((center_freq / bin_hz).round() as usize).clamp(1, n_bins - 1);
+                let mag = fft_output[bin].norm() * window_correction;
+                (mag * mag * psd_norm, 1.0)
+            };
+            let rms_power = sum_power / weight_sum;
 
             // Spectral Tilt Correction (+3dB per octave relative to 1kHz)
             // Compensates for pink-noise spectral slope, no A-weighting
@@ -2658,6 +2671,16 @@ mod analysis_tests {
         for rate in [44_100, 192_000] {
             let b = bands_for(|_| 0.5, rate);
             assert!(b[0] < 0.05 && b[1] < 0.05, "{rate}: DC read as {:.2}/{:.2}", b[0], b[1]);
+        }
+    }
+
+    #[test]
+    fn the_lowest_bands_still_respond_at_high_rates() {
+        // At 192 kHz a bin is 94 Hz wide: every band below ~50 Hz covered no
+        // bin past DC and stayed dark whatever played.
+        for rate in [96_000, 192_000] {
+            let b = bands_for(|t| 0.5 * (2.0 * std::f32::consts::PI * 25.0 * t).sin(), rate);
+            assert!(b[0] > 0.3 && b[1] > 0.3, "{rate}: 20/25 Hz bands at {:.2}/{:.2}", b[0], b[1]);
         }
     }
 

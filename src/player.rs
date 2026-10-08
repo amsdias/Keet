@@ -278,6 +278,10 @@ impl Player {
     /// update (DEC mode 2026: presented atomically, so terminals — notably
     /// Windows Terminal — don't show the erase-then-repaint as flicker).
     fn paint_wait_frame(&mut self) {
+        // Media keys are pumped here too: the waits (start-of-track buffering,
+        // a rate change, the repeat-all rebuild) used to leave them queued, so
+        // a pause pressed just before a rate switch landed after it.
+        media_keys::poll();
         crate::term::out!("\x1B[?2026h");
         self.repaint_screen();
         self.draw_status();
@@ -310,7 +314,9 @@ impl Player {
             n => format!("{}ch", n),
         };
         let rate_str = rate_label(src_rate, self.stream_rate, state);
-        format!("{} • {}bit {} • {}", format_time(state.total_secs()), bits, ch_str, rate_str)
+        // 0 = a lossy codec: it has no bit depth to show.
+        let depth = if bits > 0 { format!("{bits}bit ") } else { String::new() };
+        format!("{} • {depth}{ch_str} • {rate_str}", format_time(state.total_secs()))
     }
 
     /// Push the current track's title/artist/album to the OS now-playing
@@ -464,6 +470,7 @@ impl Player {
         }
         let (sources, current, removed) =
             (self.ui.source_paths.clone(), self.playlist.clone(), self.ui.removed_paths.clone());
+        let sources_then = sources.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         thread::spawn(move || {
             let _ = tx.send(next_cycle(&sources, &current, &removed));
@@ -477,11 +484,22 @@ impl Player {
                     if self.state.should_quit() {
                         return false;
                     }
+                    // A new source was opened meanwhile: it already replaced
+                    // the playlist, and this rebuild is of the old one.
+                    if self.ui.source_paths != sources_then {
+                        return true;
+                    }
                     self.paint_wait_frame();
                     thread::sleep(Duration::from_millis(20));
                 }
             }
         };
+        // Tracks removed while the rebuild ran: it started from the removals
+        // as they were then, so it would bring these back.
+        next.retain(|p| {
+            let key = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+            !self.ui.removed_paths.contains(&key)
+        });
 
         // Everything gone (in-app removals + files deleted on disk): nothing
         // left to play. Without this guard the track fetch would index into
@@ -535,6 +553,7 @@ impl Player {
                 self.viz_cons = v;
                 self.stream = Some(s);
                 self.stream_rate = rate;
+                self.ui.recovery_failures = 0;
             }
             Err(e) => output_failed(&mut self.ui, &self.state, e.as_ref()),
         }
@@ -717,8 +736,8 @@ impl Player {
             state.jump_to(target);
         } else if new_index < self.playlist.len() {
             let ui = &mut self.ui;
+            ui.enqueue_count = ui::queue_after_advance(ui.enqueue_count, ui.current, new_index);
             ui.current = new_index;
-            ui.enqueue_count = 0;
             state.current_track.store(ui.current, Ordering::Relaxed);
 
             if ui.view_mode == state::ViewMode::Playlist && ui.filtered_indices.is_empty() {
@@ -924,9 +943,13 @@ impl Player {
             if let Ok(Some(id)) = audio::set_exclusive_mode(&self.device) {
                 self.device_restore.hog = Some(id);
             }
-            // A new device means new reachable rates.
+            // A new device means new reachable rates. The same device (a retry
+            // after a failed open) keeps the ones already probed: probing is
+            // slow, on this thread, and ran again on every retry.
             if let Ok(mut caps) = state.exclusive_caps.lock() {
-                *caps = audio::probe_rate_caps(&self.device);
+                if moved || caps.is_none() {
+                    *caps = audio::probe_rate_caps(&self.device);
+                }
             }
             if let Some(note) = locked_rate_note(&state, &self.device) {
                 self.ui.set_status_for(note, Duration::from_secs(10));
@@ -997,6 +1020,14 @@ impl Player {
         }
 
         self.follow_default_device();
+
+        // A damaged stretch the producer skipped, or a device note.
+        if let Some(msg) = self.state.decode_notice.lock().ok().and_then(|mut n| n.take()) {
+            self.ui.set_status_for(msg, Duration::from_secs(4));
+        }
+        if let Some(msg) = audio::take_notice() {
+            self.ui.set_status_for(msg, Duration::from_secs(5));
+        }
 
         // Check if background lyrics fetch has completed
         if let Some(ref rx) = self.ui.lyrics_receiver {

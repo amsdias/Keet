@@ -180,6 +180,11 @@ impl WasapiOutput {
                         busy_thread.store(in_use, Ordering::Relaxed);
                         let _ = tx.send(Err(e));
                     }
+                    // The caller gave up waiting (5 s) and moved on: an open that
+                    // finally succeeds must let the device go at once — it used
+                    // to fill the buffer and START the stream (a burst of audio,
+                    // the device held) before the loop first looked at `stop`.
+                    Ok(o) if stop_thread.load(Ordering::Relaxed) => drop(o),
                     Ok(o) => {
                         let _ = tx.send(Ok(()));
                         // The render loop ending for ANY reason but `stop` is a
@@ -223,6 +228,33 @@ impl WasapiOutput {
 impl Drop for WasapiOutput {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+/// The render thread's MMCSS registration, reverted on drop. Best effort: if
+/// the service refuses, the thread simply keeps its normal priority.
+struct Mmcss(*mut std::ffi::c_void);
+
+#[link(name = "avrt")]
+extern "system" {
+    fn AvSetMmThreadCharacteristicsW(task: *const u16, index: *mut u32) -> *mut std::ffi::c_void;
+    fn AvRevertMmThreadCharacteristics(handle: *mut std::ffi::c_void) -> i32;
+}
+
+impl Mmcss {
+    fn pro_audio() -> Option<Self> {
+        let task: Vec<u16> = "Pro Audio\0".encode_utf16().collect();
+        let mut index = 0u32;
+        // SAFETY: a NUL-terminated UTF-16 task name and a valid out pointer.
+        let h = unsafe { AvSetMmThreadCharacteristicsW(task.as_ptr(), &mut index) };
+        (!h.is_null()).then_some(Self(h))
+    }
+}
+
+impl Drop for Mmcss {
+    fn drop(&mut self) {
+        // SAFETY: the handle came from AvSetMmThreadCharacteristicsW on this thread.
+        unsafe { AvRevertMmThreadCharacteristics(self.0) };
     }
 }
 
@@ -274,6 +306,10 @@ fn open(id: &str, rate: u32, channels: u16, layout: (u16, u16), checked: bool) -
 /// (AUDCLNT_E_DEVICE_INVALIDATED) used to: any other failure ended the loop
 /// silently, leaving a frozen track with no sound and no recovery.
 fn run(o: Opened, renderer: &mut OutputRenderer, stop: &AtomicBool, state: &PlayerState) {
+    // Real-time scheduling for the render thread (MMCSS "Pro Audio", what
+    // audio applications register as): at normal priority a busy machine could
+    // starve it past the device's buffer, an audible dropout.
+    let _mmcss = Mmcss::pro_audio();
     let bytes_per_sample = (o.layout.0 / 8) as usize;
     let max_frames = o.client.get_buffer_size().unwrap_or(8192) as usize;
     let mut samples = vec![0i32; max_frames * o.channels];

@@ -701,6 +701,21 @@ pub fn probe_rate_caps(device: &cpal::Device) -> Option<crate::state::RateCaps> 
 /// rate and reports `StreamInvalidated` for a stream alive during a change,
 /// which Keet's recovery then acted on — a spurious rebuild, "output moved"
 /// status and a restart at the last whole second on every rate switch.
+/// A message for the status line from code that cannot reach the UI state
+/// (the rate-switch helpers); the UI thread shows it with `take_notice`.
+static NOTICE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn notice(msg: String) {
+    if let Ok(mut n) = NOTICE.lock() {
+        *n = Some(msg);
+    }
+}
+
+pub fn take_notice() -> Option<String> {
+    NOTICE.lock().ok().and_then(|mut n| n.take())
+}
+
 pub fn set_output_sample_rate(desired_rate: u32, current_rate: u32, device: &cpal::Device) -> u32 {
     if desired_rate == current_rate {
         return current_rate;
@@ -739,7 +754,9 @@ pub fn set_output_sample_rate(desired_rate: u32, current_rate: u32, device: &cpa
             // Ok means the device has already settled at `desired_rate`.
             Ok(()) => return desired_rate,
             Err(e) => {
-                eprintln!("  Note: Could not switch to {}Hz: {}", desired_rate, e);
+                // Not eprintln!: the UI is drawn over stderr's terminal, and
+                // the line landed on top of the running frame.
+                notice(format!("could not switch the device to {desired_rate} Hz: {e}"));
             }
         }
     }

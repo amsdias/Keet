@@ -144,10 +144,12 @@ pub fn print_status_hifi(
     let src_rate = state.sample_rate.load(Ordering::Relaxed) as u32;
     let out_rate = state.output_rate.load(Ordering::Relaxed) as u32;
     let bits = state.bits_per_sample.load(Ordering::Relaxed);
+    // 0 = a lossy codec: no bit depth.
+    let depth = if bits > 0 { format!("{bits}-BIT ") } else { String::new() };
     let rate_part = if src_rate == out_rate {
-        format!("{}-BIT {:.1}K", bits, src_rate as f32 / 1000.0)
+        format!("{depth}{:.1}K", src_rate as f32 / 1000.0)
     } else {
-        format!("{}-BIT {:.1}→{:.1}K", bits, src_rate as f32 / 1000.0, out_rate as f32 / 1000.0)
+        format!("{depth}{:.1}→{:.1}K", src_rate as f32 / 1000.0, out_rate as f32 / 1000.0)
     };
     if !meta.is_empty() { meta.push_str("  ·  "); }
     meta.push_str(&rate_part);

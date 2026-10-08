@@ -49,6 +49,7 @@ pub struct CrossfeedPreset {
 use crate::eq::{BiquadCoeffs, BiquadState};
 
 /// Simple delay line (circular buffer)
+#[derive(Clone)]
 struct DelayLine {
     buffer: Vec<f64>,
     write_pos: usize,
@@ -82,7 +83,10 @@ impl DelayLine {
 }
 
 /// Meier-style headphone crossfeed filter
+#[derive(Clone)]
 pub struct CrossfeedFilter {
+    /// The preset being faded away from after a change (see fade.rs).
+    xfade: crate::fade::Crossfade<CrossfeedFilter>,
     // LPF for each crossfeed path (R→L and L→R)
     lpf_coeffs: BiquadCoeffs,
     lpf_state_l: BiquadState, // filters R channel signal that feeds into L
@@ -100,6 +104,7 @@ pub struct CrossfeedFilter {
 impl CrossfeedFilter {
     pub fn new() -> Self {
         Self {
+            xfade: Default::default(),
             lpf_coeffs: BiquadCoeffs::passthrough(),
             lpf_state_l: BiquadState::new(),
             lpf_state_r: BiquadState::new(),
@@ -111,9 +116,18 @@ impl CrossfeedFilter {
     }
 
     pub fn load_preset(&mut self, preset: &CrossfeedPreset, sample_rate: f32) {
+        // Fade from the old preset: it is rebuilt from silence below (and
+        // "Off" stops at once), a step in the output either way.
+        let before = self.clone();
+        let was_active = before.is_active();
+        self.xfade.retire(before, crate::fade::frames(crate::fade::CROSSFEED_FADE_SECS, sample_rate));
         if preset.name == "Off" {
             self.active = false;
             self.level = 0.0;
+            // Off to Off is no change: no fade (see EqChain::load_bands).
+            if !was_active {
+                self.xfade.cancel();
+            }
             return;
         }
 
@@ -125,17 +139,29 @@ impl CrossfeedFilter {
         let level_db = preset.level_db.clamp(-40.0, 0.0);
         let delay_us = preset.delay_us.clamp(0.0, 2_000.0);
         self.lpf_coeffs = BiquadCoeffs::low_pass(cutoff as f64, FRAC_1_SQRT_2, sample_rate.max(1.0) as f64);
-        self.level = 10.0_f64.powf(level_db as f64 / 20.0);
+        // The preset's level g is how much of the opposite channel a side
+        // takes; mixed as a DIFFERENCE (see process_stereo) that is g/(1+g) —
+        // the Meier mix (own + g·opposite)/(1 + g) rewritten. Using g itself
+        // moved panned bass to the other ear once g passed 0.5 (Strong, −3 dB:
+        // a hard-left note played 0.29 left, 0.71 right).
+        let g = 10.0_f64.powf(level_db as f64 / 20.0);
+        self.level = g / (1.0 + g);
 
         let delay_samples = (delay_us / 1_000_000.0 * sample_rate).round() as usize;
         self.delay_l.resize(delay_samples);
         self.delay_r.resize(delay_samples);
 
-        self.reset();
+        self.reset_filters();
         self.active = true;
     }
 
+    /// The audio jumped (seek, skip): no fade, fresh filters.
     pub fn reset(&mut self) {
+        self.xfade.clear();
+        self.reset_filters();
+    }
+
+    fn reset_filters(&mut self) {
         self.lpf_state_l.reset();
         self.lpf_state_r.reset();
         self.delay_l.reset();
@@ -143,11 +169,20 @@ impl CrossfeedFilter {
     }
 
     pub fn is_active(&self) -> bool {
-        self.active
+        self.active || self.xfade.running()
     }
 
     /// Process interleaved stereo samples in-place
     pub fn process_stereo(&mut self, samples: &mut [f32]) {
+        // Always through the fade: it also records that audio has flowed
+        // (a fresh stage takes new settings without one), and with no fade
+        // running it just calls `process_preset`.
+        let mut xf = std::mem::take(&mut self.xfade);
+        xf.run(samples, |s| self.process_preset(s), |old, s| old.process_preset(s));
+        self.xfade = xf;
+    }
+
+    fn process_preset(&mut self, samples: &mut [f32]) {
         if !self.active {
             return;
         }
@@ -168,11 +203,12 @@ impl CrossfeedFilter {
             let delayed_l = self.delay_r.process(filtered_l);
 
             // Blend the DIFFERENCE, not the opposite channel: each side gets
-            // the low-passed, delayed (opposite - own). Content common to both
-            // channels cancels, so centred bass and vocals come out exactly as
-            // they went in; adding the opposite channel outright raised them by
-            // 20·log10(1 + level) — up to +4.6 dB of bass at "Strong", straight
-            // into the limiter. Panned content still crosses to the other ear.
+            // the low-passed, delayed (opposite - own), scaled by g/(1+g).
+            // Content common to both channels cancels, so centred bass and
+            // vocals come out exactly as they went in; adding the opposite
+            // channel outright raised them by 20·log10(1 + g) — up to +4.6 dB
+            // of bass at "Strong", straight into the limiter. Panned content
+            // crosses to the other ear and stays louder on its own side.
             let cross = self.level * (delayed_r - delayed_l);
             samples[li] = (left + cross) as f32;
             samples[ri] = (right - cross) as f32;
@@ -280,13 +316,47 @@ mod crossfeed_tests {
     }
 
     #[test]
-    fn hard_panned_bass_still_crosses_to_the_other_ear() {
+    fn hard_panned_bass_crosses_but_stays_on_its_own_side() {
+        // Both ears, every preset: the difference mix at full level moved a
+        // hard-left bass note to the RIGHT (Strong: 0.29 left, 0.71 right) —
+        // a test that looked only at the right channel passed.
         let sr = 48000.0;
         let tone = |i: usize| 0.5 * (2.0 * std::f32::consts::PI * 100.0 * i as f32 / sr).sin();
-        let out = run(strong(), sr, tone, |_| 0.0, 9600);
-        let peak_r = (4800..9600).map(|i| out[i * 2 + 1].abs()).fold(0.0f32, f32::max);
-        // Strong is -3 dB: about 0.7 of the low-passed left reaches the right.
-        assert!(peak_r > 0.25 && peak_r < 0.4, "right peak {peak_r}");
+        for preset in builtin_presets().into_iter().skip(1) {
+            let g = 10f32.powf(preset.level_db / 20.0);
+            let name = preset.name.clone();
+            let out = run(preset, sr, tone, |_| 0.0, 9600);
+            let peak = |ch: usize| (4800..9600).map(|i| out[i * 2 + ch].abs()).fold(0.0f32, f32::max);
+            let (l, r) = (peak(0), peak(1));
+            assert!(l > r, "{name}: left {l} must stay louder than right {r}");
+            assert!(r > 0.05, "{name}: nothing crossed ({r})");
+            // The crossed share is g/(1+g) of the (low-passed) signal.
+            let want = 0.5 * g / (1.0 + g);
+            assert!((r - want).abs() < 0.02, "{name}: right {r}, expected about {want}");
+        }
+    }
+
+    #[test]
+    fn switching_preset_mid_signal_fades_instead_of_stepping() {
+        // Turning crossfeed off used to stop it between two samples: a step
+        // as big as the crossed signal.
+        let sr = 48000.0;
+        let tone = |i: usize| 0.5 * (2.0 * std::f32::consts::PI * 100.0 * i as f32 / sr).sin();
+        let mut cf = CrossfeedFilter::new();
+        cf.load_preset(&strong(), sr);
+        let mut buf: Vec<f32> = (0..4800).flat_map(|i| [tone(i), 0.0]).collect();
+        cf.process_stereo(&mut buf);
+        let before = buf[buf.len() - 1];
+        cf.load_preset(&builtin_presets()[0], sr); // Off
+        assert!(cf.is_active(), "still running while it fades out");
+        let mut next: Vec<f32> = (4800..4810).flat_map(|i| [tone(i), 0.0]).collect();
+        cf.process_stereo(&mut next);
+        let step = (next[1] - before).abs();
+        assert!(step < 0.01, "right channel jumped by {step}");
+        // And after the fade it is really off.
+        let mut tail: Vec<f32> = (0..4800).flat_map(|i| [tone(i), 0.0]).collect();
+        cf.process_stereo(&mut tail);
+        assert!(!cf.is_active());
     }
 
     #[test]

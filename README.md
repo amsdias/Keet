@@ -121,7 +121,7 @@ keet ~/Music/favorites.m3u
 | `T` | Cycle UI theme (Classic → Minimal → Hi-Fi) |
 | `V` | Cycle visualization modes |
 | `B` | Toggle visualization style (bars/dots) |
-| `Shift+F` | Toggle full-window visualization (drops the banner, gives the viz every spare row) |
+| `Shift+F` | Toggle full-window visualization (drops the header, gives the viz every spare row) |
 | `Shift+L` | Toggle per-visualization detail: level history on the VU meter, frequency legend on either spectrum |
 | `E` | Open the EQ + FX editor screen |
 | `X` | Cycle effects presets |
@@ -138,7 +138,8 @@ keet ~/Music/favorites.m3u
 | `]` | Balance right (5% steps) |
 | `+` / `=` | Volume up (5%) |
 | `-` | Volume down (5%) |
-| `Q` / `Esc` | Quit |
+| `?` | Every key, by view (also closes it; so does `Esc`) |
+| `Q` | Quit (`Esc` asks first; a second `Esc` within 2 s quits) |
 
 ### Library View Controls
 
@@ -182,7 +183,8 @@ Press `Y` to open the lyrics view. Synced lyrics auto-scroll to the current line
 | Key | Action |
 |-----|--------|
 | `W` / `S` | Scroll up/down (disables auto-scroll for synced lyrics) |
-| `A` / `D` | Adjust sync offset -/+0.5s (synced lyrics only) |
+| `A` / `D` | Adjust sync offset -/+0.5s (synced lyrics only; remembered for each track) |
+| `0` | Reset the sync offset |
 | `Up` / `Down` | Next/previous track (global) |
 | `Left` / `Right` | Seek +/-10s (global) |
 | `Esc` / `Y` | Close lyrics view |
@@ -229,6 +231,8 @@ For a *persistent* default that applies on every launch (including with explicit
 | `classic_use_truecolor` | `false` (default: Classic uses the terminal's ANSI green / yellow / red, which follow its colour scheme) \| `true` (use `classic_colors`) |
 | `classic_colors` | `{"highlight": "#7DD3B8", "warning": "#E9B65C", "error": "#F07A78"}` — any left out keep these defaults |
 
+A value of the wrong type is ignored on its own (and named on the status line at startup); the other keys still apply.
+
 ## EQ + FX Editor
 
 Press `E` to open the EQ + FX editor — a full-screen **10-band parametric EQ**, with the current effects / crossfeed / balance / ReplayGain shown beneath. Every band has four parameters:
@@ -240,9 +244,9 @@ Press `E` to open the EQ + FX editor — a full-screen **10-band parametric EQ**
 | Frequency | 20 Hz – 20 kHz, ⅓-octave steps | `<` / `>` |
 | Q (bandwidth) | 0.3 – 10, √2 steps | `,` / `.` |
 
-Plus: `←` / `→` select a band, `[` / `]` cycle presets, `0` reset the selected band to its graphic default, `E` / `L` / `Esc` close. All changes apply live, delayed by the audio buffer depth (a few seconds).
+Plus: `←` / `→` select a band, `[` / `]` cycle presets, `0` reset the selected band to its graphic default, `a` set the preamp the headroom row suggests, `E` / `L` / `Esc` close. All changes apply live, delayed by the audio buffer depth (a few seconds).
 
-Bands start out as the classic graphic-EQ layout — peaking filters at the ISO octave centres (31 62 125 250 500 1k 2k 4k 8k 16k Hz) — so until you reach for the parametric keys it behaves exactly like a 10-band graphic EQ. The filters are standard RBJ-cookbook biquads. **Low Cut** (high-pass) and **High Cut** (low-pass) ignore gain: they filter by frequency and resonance (Q above 0.7 adds a resonant bump at the corner — a Low Cut at 20–30 Hz makes a clean subsonic/rumble filter). The response curve drawn in the editor and the player banner is the exact summed magnitude response of the active filters, so shelves and cuts render truthfully.
+Bands start out as the classic graphic-EQ layout — peaking filters at the ISO octave centres (31 62 125 250 500 1k 2k 4k 8k 16k Hz) — so until you reach for the parametric keys it behaves exactly like a 10-band graphic EQ. The filters are standard RBJ-cookbook biquads. **Low Cut** (high-pass) and **High Cut** (low-pass) ignore gain: they filter by frequency and resonance (Q above 0.7 adds a resonant bump at the corner — a Low Cut at 20–30 Hz makes a clean subsonic/rumble filter). The response curve drawn in the editor is the exact summed magnitude response of the active filters, so shelves and cuts render truthfully.
 
 Editing any band switches the EQ to **Custom** (starting from the active preset); a Custom EQ persists across sessions, parametric settings included.
 
@@ -470,27 +474,37 @@ Playback position is tracked on the consumer side (audio callback) for accurate 
 
 ```
 src/
-├── main.rs        Entry point, CLI args, playlist loop, lyrics loading
-├── state.rs       PlayerState, UiState, ViewMode, constants, ANSI colors
-├── theme.rs       Theme palettes (Classic/Minimal/Hi-Fi), theme resolution
-├── config.rs      User preferences from config.json (default theme, …)
-├── audio.rs       Audio stream, sample rate switching, CoreAudio FFI
-├── decode.rs      Continuous decoder thread, gapless playback, ReplayGain, resampling
-├── eq.rs          10-band parametric EQ (RBJ biquads: peak/shelf/cut), exact response curve, JSON presets
-├── eq_ui.rs       EQ + FX editor screen renderer (shared across themes)
-├── effects.rs     Reverb, chorus, delay effects with preset loading
-├── playlist.rs    Playlist builder, M3U parser, shuffle
-├── library.rs     Artist→album→track tree (build/filter/navigation) + shared renderer
-├── crossfeed.rs   Meier-style headphone crossfeed (level/cutoff/ITD, JSON presets)
-├── metadata.rs    Tag reading (artist, title, album, track #, lyrics, ReplayGain), background scan
-├── lyrics.rs      LRC parser, LRCLIB API client, synced/plain lyrics state
-├── cover.rs       Album cover decoding, Kitty/iTerm2/Sixel/half-block rendering
-├── resume.rs      Resume state persistence (save/restore sessions)
-├── viz.rs         VizAnalyser, StatsMonitor, spectrum/oscilloscope/lissajous/spectrogram rendering
-├── media_keys.rs  OS media transport controls (souvlaki)
-├── ui.rs          Terminal UI, keyboard input, the Classic renderer + dispatch
-├── ui_minimal.rs  Minimal theme renderers (Player/Library/Lyrics)
-└── ui_hifi.rs     Hi-Fi theme renderers (Player/Library/Lyrics)
+├── main.rs         Entry point, startup (device, first stream), shared output helpers
+├── player.rs       The playback loop (track starts, transitions, recovery, frames)
+├── cli.rs          Command-line parsing, --help, the key list (also the ? screen)
+├── state.rs        PlayerState, UiState, ViewMode, constants, ANSI colors
+├── theme.rs        Theme palettes (Classic/Minimal/Hi-Fi), theme resolution
+├── config.rs       User preferences from config.json, read key by key
+├── audio.rs        Audio stream, sample rate switching, CoreAudio FFI
+├── wasapi_out.rs   Windows exclusive-mode output (WASAPI)
+├── wasapi_logic.rs Its decisions (layouts, error codes), tested on every OS
+├── decode.rs       Continuous decoder thread, gapless playback, ReplayGain, resampling
+├── gapless.rs      AAC-in-MP4 encoder delay and padding (iTunSMPB, edit list)
+├── signal.rs       The bit-perfect verdict (which stages alter the samples)
+├── eq.rs           10-band parametric EQ (RBJ biquads: peak/shelf/cut), response curve, headroom
+├── eq_ui.rs        EQ + FX editor screen renderer (shared across themes)
+├── effects.rs      Reverb, chorus, delay effects with preset loading
+├── crossfeed.rs    Meier-style headphone crossfeed (level/cutoff/ITD, JSON presets)
+├── fade.rs         Click-free preset changes for the DSP stages
+├── playlist.rs     Playlist builder, M3U reader/writer, rescan, shuffle
+├── library.rs      Artist→album→track tree (build/filter/navigation) + shared renderer
+├── metadata.rs     Tag reading (artist, title, album, track #, lyrics, ReplayGain), background scan
+├── lyrics.rs       LRC parser, LRCLIB API client, per-track sync offsets
+├── cover.rs        Album cover decoding, Kitty/iTerm2/Sixel/half-block rendering
+├── resume.rs       Resume state persistence (save/restore sessions)
+├── viz.rs          VizAnalyser, StatsMonitor, spectrum/oscilloscope/lissajous/spectrogram rendering
+├── media_keys.rs   OS media transport controls (souvlaki)
+├── term.rs         Batched terminal output (one write per frame), NO_COLOR
+├── ansi.rs         Display width, cutting and fitting lines, sanitising text
+├── ui.rs           Render dispatch, FrameWriter, keyboard input, playlist editing, help screen
+├── ui_classic.rs   Classic theme renderers (Player/Playlist/Lyrics)
+├── ui_minimal.rs   Minimal theme renderers (Player/Library/Lyrics)
+└── ui_hifi.rs      Hi-Fi theme renderers (Player/Library/Lyrics)
 ```
 
 ### Resampler Modes

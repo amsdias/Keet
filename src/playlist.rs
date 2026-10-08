@@ -92,28 +92,27 @@ pub fn keet_config_dir() -> Option<PathBuf> {
 
 /// Parse an M3U/M3U8 playlist file into a list of audio file paths.
 pub fn parse_m3u(path: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
-    let content = fs::read_to_string(path)?;
+    // Bytes, not a String: plain .m3u files are often Windows-1252/Latin-1,
+    // and reading them as UTF-8 failed the whole playlist.
+    let bytes = fs::read(path)?;
     // Windows editors commonly prepend a UTF-8 BOM, which would otherwise glue
     // itself to the first entry's path and make it unresolvable.
-    let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
+    let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&bytes);
     let parent = path.parent().unwrap_or(Path::new("."));
     let mut list = Vec::new();
 
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
+    for line in bytes.split(|&b| b == b'\n') {
+        let line = line.trim_ascii();
+        if line.is_empty() || line.starts_with(b"#") {
             continue;
         }
-        let track_path = if Path::new(line).is_absolute() {
-            PathBuf::from(line)
-        } else {
-            parent.join(line)
+        let resolve = |entry: PathBuf| if entry.is_absolute() { entry } else { parent.join(entry) };
+        let Some(track_path) = m3u_entry_candidates(line).into_iter().map(resolve).find(|p| p.is_file()) else {
+            continue;
         };
-        if track_path.is_file() {
-            if let Some(ext) = track_path.extension() {
-                if SUPPORTED_EXTENSIONS.contains(&ext.to_string_lossy().to_lowercase().as_str()) {
-                    list.push(track_path);
-                }
+        if let Some(ext) = track_path.extension() {
+            if SUPPORTED_EXTENSIONS.contains(&ext.to_string_lossy().to_lowercase().as_str()) {
+                list.push(track_path);
             }
         }
     }
@@ -122,6 +121,24 @@ pub fn parse_m3u(path: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>
         return Err("No audio files found in playlist".into());
     }
     Ok(list)
+}
+
+/// The paths an M3U line may name, best guess first: the line as UTF-8; or,
+/// when it is not valid UTF-8, its raw bytes as the path (Unix stores names
+/// as bytes, so this is exact for a playlist written on the same system) and
+/// then the line read as Latin-1 (what older Windows tools write).
+fn m3u_entry_candidates(line: &[u8]) -> Vec<PathBuf> {
+    if let Ok(s) = std::str::from_utf8(line) {
+        return vec![PathBuf::from(s)];
+    }
+    let latin1 = PathBuf::from(line.iter().map(|&b| b as char).collect::<String>());
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        vec![PathBuf::from(std::ffi::OsStr::from_bytes(line)), latin1]
+    }
+    #[cfg(not(unix))]
+    vec![latin1]
 }
 
 /// Save a playlist as an M3U file.
@@ -153,12 +170,25 @@ pub fn save_m3u(playlist: &[PathBuf], name: &str) -> Result<PathBuf, Box<dyn std
         fs::create_dir_all(parent)?;
     }
 
-    let mut content = String::from("#EXTM3U\n");
+    let mut content: Vec<u8> = b"#EXTM3U\n".to_vec();
     for track in playlist {
-        content.push_str(&track.to_string_lossy());
-        content.push('\n');
+        // Unix paths are bytes: written as they are, a name that is not valid
+        // UTF-8 still resolves when the playlist is read back.
+        #[cfg(unix)]
+        content.extend_from_slice(std::os::unix::ffi::OsStrExt::as_bytes(track.as_os_str()));
+        #[cfg(not(unix))]
+        content.extend_from_slice(track.to_string_lossy().as_bytes());
+        content.push(b'\n');
     }
-    fs::write(&path, &content)?;
+    // A temporary file beside the target, renamed over it: writing in place
+    // left a truncated playlist if the write failed half-way (a full disk, a
+    // network share dropping out).
+    let tmp = path.with_extension("m3u.keet-tmp");
+    fs::write(&tmp, &content)?;
+    if let Err(e) = fs::rename(&tmp, &path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     Ok(path)
 }
 
@@ -351,5 +381,33 @@ mod m3u_tests {
         assert_eq!(parsed, vec![track.clone()]);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_latin1_playlist_still_finds_its_tracks() {
+        let dir = std::env::temp_dir().join(format!("keet_m3u_latin1_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let track = dir.join("café.mp3"); // UTF-8 on disk
+        fs::write(&track, b"").unwrap();
+        let m3u = dir.join("old.m3u");
+        // "café.mp3" in Latin-1: é is the single byte 0xE9, not valid UTF-8.
+        fs::write(&m3u, b"#EXTM3U\r\ncaf\xE9.mp3\r\n").unwrap();
+        let parsed = parse_m3u(&m3u).expect("a Latin-1 playlist used to fail as a whole");
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(parsed, vec![track]);
+    }
+
+    #[test]
+    fn saving_replaces_the_file_whole_and_leaves_no_temporary_behind() {
+        let dir = std::env::temp_dir().join(format!("keet_m3u_save_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("mix.m3u");
+        fs::write(&target, b"old contents that are longer than the new ones").unwrap();
+        let saved = save_m3u(&[PathBuf::from("/music/a.flac")], target.to_str().unwrap()).unwrap();
+        let text = fs::read_to_string(&saved).unwrap();
+        let leftovers = fs::read_dir(&dir).unwrap().count();
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(text, "#EXTM3U\n/music/a.flac\n");
+        assert_eq!(leftovers, 1, "only the playlist itself");
     }
 }

@@ -188,6 +188,11 @@ fn rate_of(format: &dyn FormatReader) -> Option<u32> {
 /// 30-character ID3v1 title, no lyrics, no ReplayGain and no cover. Callers
 /// fill each field from the first block that has it, so newest-first makes the
 /// richer, more specific block win and older ones only fill its gaps.
+///
+/// ID3v1 always goes last, whatever its place in the log: its fields are cut
+/// to 30 characters, so it is only ever a fallback. Read before APE (which
+/// sits just ahead of it at the end of the file) it gave truncated titles to
+/// files carrying a full APE tag.
 pub(crate) fn revisions_newest_first(format: &mut dyn FormatReader) -> Vec<MetadataRevision> {
     let mut md = format.metadata();
     let mut older = Vec::new();
@@ -196,7 +201,14 @@ pub(crate) fn revisions_newest_first(format: &mut dyn FormatReader) -> Vec<Metad
     }
     let mut out: Vec<MetadataRevision> = md.current().cloned().into_iter().collect();
     out.extend(older.into_iter().rev());
-    out
+    id3v1_last(out, |r| r.info.short_name)
+}
+
+/// `revs` with every ID3v1 block moved to the end, the rest in order.
+fn id3v1_last<T>(revs: Vec<T>, name: impl Fn(&T) -> &str) -> Vec<T> {
+    let (v1, mut rest): (Vec<T>, Vec<T>) = revs.into_iter().partition(|r| name(r) == "id3v1");
+    rest.extend(v1);
+    rest
 }
 
 /// A tag's number, read leniently: surrounding space and a decimal comma
@@ -212,10 +224,12 @@ fn parse_tag_number(s: &str) -> Option<f32> {
 /// value. The unit is matched case-insensitively ("DB" occurs).
 pub fn parse_rg_gain_value(s: &str) -> Option<f32> {
     let s = s.trim();
-    let num = if s.len() >= 2 && s[s.len() - 2..].eq_ignore_ascii_case("db") {
-        &s[..s.len() - 2]
-    } else {
-        s
+    // `get`, not slicing: a tag ending in a multi-byte character ("-6 €")
+    // put the cut inside it, and the slice panicked — in the metadata scan
+    // that killed the scan thread.
+    let num = match s.len().checked_sub(2).and_then(|i| s.get(i..)) {
+        Some(unit) if unit.eq_ignore_ascii_case("db") => &s[..s.len() - 2],
+        _ => s,
     };
     parse_tag_number(num)
 }
@@ -352,9 +366,11 @@ fn read_metadata_full(path: &Path) -> Option<CachedMeta> {
     // AAC in MP4: the container's length includes the encoder's priming and
     // padding; the real length is in iTunSMPB or the edit list.
     let revisions = revisions_newest_first(format.as_mut());
-    let duration_secs = match (crate::gapless::for_mp4(path, &revisions).and_then(|g| g.length), rate_of(format.as_ref())) {
-        (Some(len), Some(rate)) if rate > 0 => Some(len as f64 / rate as f64),
-        _ => duration_secs,
+    let duration_secs = match rate_of(format.as_ref()).filter(|&r| r > 0) {
+        Some(rate) => crate::gapless::for_mp4(path, &revisions, rate)
+            .and_then(|g| g.length)
+            .map_or(duration_secs, |len| Some(len as f64 / rate as f64)),
+        None => duration_secs,
     };
 
     let mut fields = TagFields::default();
@@ -480,6 +496,24 @@ pub fn spawn_metadata_scan(
 #[cfg(test)]
 mod real_file_tests {
     use super::*;
+
+    #[test]
+    fn id3v1_is_only_ever_the_fallback() {
+        let order = |names: &[&'static str]| id3v1_last(names.to_vec(), |n| n);
+        assert_eq!(order(&["id3v2", "id3v1", "apev2"]), ["id3v2", "apev2", "id3v1"]);
+        assert_eq!(order(&["id3v1", "apev2"]), ["apev2", "id3v1"]);
+        assert_eq!(order(&["id3v1"]), ["id3v1"]);
+        assert_eq!(order(&["vorbis", "flac"]), ["vorbis", "flac"], "others keep their order");
+    }
+
+    #[test]
+    fn a_gain_tag_ending_in_a_multibyte_character_is_refused_not_a_panic() {
+        assert_eq!(parse_rg_gain_value("-6 €"), None);
+        assert_eq!(parse_rg_gain_value("€"), None);
+        assert_eq!(parse_rg_gain_value("ü"), None);
+        assert_eq!(parse_rg_gain_value("-6.5 dB"), Some(-6.5));
+        assert_eq!(parse_rg_gain_value("-6,5DB"), Some(-6.5));
+    }
 
     #[test]
     fn replaygain_values_parse_leniently_but_never_to_a_non_finite_gain() {

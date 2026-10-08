@@ -113,6 +113,68 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
     Ok(o)
 }
 
+/// Every key, by view: the one list `--help` prints and the `?` screen shows,
+/// so the two cannot drift apart (the help said `E` cycled EQ presets long
+/// after it had come to open the EQ editor).
+pub const KEYS: &[(&str, &[(&str, &str)])] = &[
+    ("PLAYER", &[
+        ("Space", "Pause / resume"),
+        ("Up / Down", "Next / previous track"),
+        ("Right / Left", "Seek forward / backward 10 s"),
+        ("+ / -", "Volume up / down (5% steps, 0–150%)"),
+        ("v", "Next visualization"),
+        ("b", "Visualization style (dots / bars)"),
+        ("Shift+F", "Full-window visualization"),
+        ("Shift+L", "More detail (VU history, legend)"),
+        ("f", "Pre/post-fader metering"),
+        ("e", "EQ editor"),
+        ("x", "Next effects preset"),
+        ("c", "Next crossfeed preset"),
+        ("[ / ]", "Balance left / right (5% steps)"),
+        ("l", "Playlist"),
+        ("y", "Lyrics"),
+        ("?", "This list"),
+        ("z", "Shuffle on / off"),
+        ("Shift+R", "Repeat (off → all → one)"),
+        ("s", "Save the playlist as M3U"),
+        ("r", "Rescan the folders for new files"),
+        ("o", "Open a new source (type a path)"),
+        ("p", "Pick a source (folder dialog)"),
+        ("t", "Next theme"),
+        ("i", "CPU / memory stats"),
+        ("q", "Quit (or Esc twice)"),
+    ]),
+    ("PLAYLIST  (l)", &[
+        ("Up / Down", "Move the cursor"),
+        ("Home / End", "Top / bottom (also g / G)"),
+        ("PgUp / PgDn", "Page up / down (also Ctrl+U/D)"),
+        ("Enter", "Play the selected track"),
+        ("a", "Queue it (plays next)"),
+        ("d / Delete", "Remove the selected track"),
+        ("/", "Search"),
+        ("Shift+S", "Sort by artist, album, track"),
+        ("Tab", "Artist / album tree"),
+        ("Esc / l", "Close"),
+    ]),
+    ("LYRICS  (y)", &[
+        ("w / s", "Scroll (stops following the song)"),
+        ("a / d", "Sync −/+ 0.5 s (kept per track)"),
+        ("0", "Reset the sync offset"),
+        ("Esc / y", "Close"),
+    ]),
+    ("EQ EDITOR  (e)", &[
+        ("Left / Right", "Select a band"),
+        ("Up / Down", "Gain ±0.5 dB (Shift: ±0.1 dB)"),
+        ("t / T", "Filter type"),
+        (", / .", "Q broader / narrower"),
+        ("< / >", "Frequency down / up"),
+        ("[ / ]", "Previous / next preset"),
+        ("0", "Reset the band"),
+        ("a", "Preamp the headroom row suggests"),
+        ("Esc / e", "Close"),
+    ]),
+];
+
 /// The `--help` text.
 pub fn print_help() {
     println!("\x1B[1mKeet\x1B[0m — Terminal audio player with real-time visualization and parametric EQ");
@@ -140,47 +202,13 @@ pub fn print_help() {
     println!();
     println!("\x1B[1mFORMATS\x1B[0m  MP3, FLAC, WAV, OGG, AAC/M4A, ALAC, AIFF");
     println!();
-    println!("\x1B[1mKEYBOARD\x1B[0m");
-    println!("  Space        Pause / resume");
-    println!("  Up / Down    Next / previous track");
-    println!("  Right / Left Seek forward / backward 10s");
-    println!("  + / -        Volume up / down (5% steps, 0–150%)");
-    println!("  V            Cycle visualization (off → VU → spectrum H/V → scope → vector → spectrogram)");
-    println!("  B            Toggle viz style (dots / bars)");
-    println!("  F            Toggle pre/post-fader metering");
-    println!("  E            Cycle EQ presets");
-    println!("  X            Cycle effects presets");
-    println!("  C            Cycle crossfeed (Off → Light → Medium → Strong + custom)");
-    println!("  [ / ]        Balance left / right (5% steps)");
-    println!("  L            Toggle playlist view");
-    println!("  Y            Toggle lyrics view (synced LRC auto-scrolls)");
-    println!("  S            Save playlist as M3U");
-    println!("  R            Rescan folders for new files");
-    println!("  Z            Toggle shuffle");
-    println!("  Shift+R      Toggle repeat (Off → All → One)");
-    println!("  T            Cycle UI theme (Classic → Minimal → HiFi)");
-    println!("  O            Open a new source (type a path)");
-    println!("  P            Pick a new source (native folder dialog)");
-    println!("  I            Toggle CPU/memory stats");
-    println!("  Q / Esc      Quit");
-    println!();
-    println!("\x1B[1mPLAYLIST VIEW\x1B[0m  (press L)");
-    println!("  Up / Down       Move cursor");
-    println!("  Home / End      Jump to top / bottom              (also: g / G)");
-    println!("  PgUp / PgDn     Page up / down                    (also: Ctrl+U / Ctrl+D)");
-    println!("  Enter           Jump to selected track");
-    println!("  A               Enqueue selected track (play next)");
-    println!("  Shift+S         Sort by tags (artist → album → disc → track → title)");
-    println!("  /               Search / filter by filename");
-    println!("  D / Delete      Remove selected track");
-    println!("  Esc / L         Close playlist view");
-    println!();
-    println!("\x1B[1mLYRICS VIEW\x1B[0m  (press Y)");
-    println!("  W / S        Scroll up / down (disables auto-scroll)");
-    println!("  A / D        Adjust sync offset −/+ 0.5s (remembered for each track)");
-    println!("  0            Reset sync offset");
-    println!("  Esc / Y      Close lyrics view");
-    println!();
+    for (title, keys) in KEYS {
+        println!("\x1B[1m{title}\x1B[0m");
+        for (key, what) in *keys {
+            println!("  {key:<14} {what}");
+        }
+        println!();
+    }
     println!("\x1B[1mCUSTOM PRESETS\x1B[0m");
     println!("  EQ:      ~/.config/keet/eq/*.json");
     println!("  Effects: ~/.config/keet/effects/*.json");

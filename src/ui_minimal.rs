@@ -227,7 +227,8 @@ pub fn print_status_minimal(
     // of eq/fx/cf, so it is the last thing truncation removes.
     let mut segments = vec![
         format!("track {track_n} of {track_total}"),
-        format!("{bits}-bit {ch_label}"),
+        // 0 = a lossy codec: no bit depth.
+        if bits > 0 { format!("{bits}-bit {ch_label}") } else { ch_label.to_string() },
         rate_label,
     ];
     // Exclusive mode: the DAC's format, as on Classic's track info line. It

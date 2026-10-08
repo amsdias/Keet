@@ -378,6 +378,9 @@ pub struct PlayerState {
 
     // Decode error from producer thread (None = no error)
     pub(crate) decode_error: Mutex<Option<String>>,
+    /// A non-fatal decode notice ("damaged audio skipped"), shown once on the
+    /// status line by the UI thread.
+    pub(crate) decode_notice: Mutex<Option<String>>,
 
     // Track transition signaling (gapless playback)
     pub(crate) track_transition_count: AtomicUsize,
@@ -487,6 +490,7 @@ impl PlayerState {
             viz_fullscreen: AtomicBool::new(false),
             viz_extras: AtomicBool::new(false),
             decode_error: Mutex::new(None),
+            decode_notice: Mutex::new(None),
             track_transition_count: AtomicUsize::new(0),
             producer_track_index: AtomicUsize::new(0),
             rg_mode: AtomicU8::new(RgMode::Track as u8),
@@ -559,6 +563,11 @@ impl PlayerState {
     // must accumulate — a store made the second press overwrite the first.
     pub fn seek(&self, secs: i64) { self.seek_request.fetch_add(secs, Ordering::Relaxed); }
     pub fn take_seek(&self) -> i64 { self.seek_request.swap(0, Ordering::Relaxed) }
+    /// A seek to an absolute position, given as its offset from the clock
+    /// now: it REPLACES any seek still pending. The OS seek bar sends
+    /// positions; added up like relative seeks, two quick drags measured from
+    /// the same clock overshot by the first one's distance.
+    pub fn seek_to_offset(&self, secs: i64) { self.seek_request.store(secs, Ordering::Relaxed); }
 
     pub fn volume_up(&self) {
         let cur = self.volume.load(Ordering::Relaxed);
@@ -916,6 +925,8 @@ pub enum ViewMode {
     Playlist,
     Lyrics,
     Eq,
+    /// Every key, by view (`?`).
+    Help,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -979,7 +990,9 @@ pub struct UiState {
     /// Active tree filter (from `/`). Empty = show the full fold-based tree.
     pub tree_filter: String,
     /// A pending bulk remove awaiting `[y/n]` confirmation: (label, playlist indices).
-    pub tree_pending_remove: Option<(String, Vec<usize>)>,
+    /// Held as PATHS: the tag scan can re-sort the list while the prompt is up,
+    /// and positions staged before that pointed at other tracks.
+    pub tree_pending_remove: Option<(String, Vec<PathBuf>)>,
     pub removed_paths: std::collections::HashSet<PathBuf>,
     pub playlist_dirty: bool,
     /// The playing track was removed: where its successor now sits (may be
@@ -1006,6 +1019,9 @@ pub struct UiState {
     pub lyrics_source: Option<crate::lyrics::LyricsSource>,
     /// The window is below ui::MIN_WINDOW and shows the too-small screen.
     pub too_small: bool,
+    /// A first Esc in the player view asked "press Esc again to quit" and
+    /// waits until then for the second.
+    pub esc_quit_until: Option<Instant>,
     /// The output device's name, for Classic's header (kept current by
     /// recovery and the default-device poll).
     pub device_name: String,
@@ -1020,6 +1036,9 @@ pub struct UiState {
     pub cover_misses: crate::lyrics::LookupCache<()>,
     /// After a failed attempt to open the output, the next try waits until then.
     pub recovery_retry_at: Option<Instant>,
+    /// Failed attempts to open the output since the last success (the
+    /// retry backoff, see main::recovery_backoff).
+    pub recovery_failures: u32,
     /// A rescan in progress on a worker thread (see `ui::poll_rescan`).
     pub rescan_receiver: Option<std::sync::mpsc::Receiver<crate::playlist::RescanResult>>,
     pub lyrics_scroll: usize,
@@ -1090,11 +1109,13 @@ impl UiState {
             lyrics_receiver: None,
             lyrics_source: None,
             too_small: false,
+            esc_quit_until: None,
             device_name: String::new(),
             hq_resampler: false,
             lyrics_offsets: Default::default(),
             rescan_receiver: None,
             recovery_retry_at: None,
+            recovery_failures: 0,
             lyrics_lookups: Default::default(),
             cover_misses: Default::default(),
             lyrics_scroll: 0,

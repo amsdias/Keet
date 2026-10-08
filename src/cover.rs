@@ -287,11 +287,30 @@ pub fn resolve_local(
         legacy_cache_path_for(track_path, artist, album),
     ];
     for p in candidates.into_iter().flatten() {
-        if let Ok(bytes) = std::fs::read(&p) {
+        if let Some(bytes) = read_cover_file(&p) {
             return decode_and_resize(&bytes, size);
         }
     }
     None
+}
+
+/// The largest cover file read from disk (a sidecar or the cache): room for a
+/// 3000-px PNG scan, far short of trouble. A folder can hold anything called
+/// `cover.png`; read whole, a multi-gigabyte one went straight into memory
+/// before the decoder's own limit ever saw it.
+const COVER_MAX_FILE: u64 = 32 * 1024 * 1024;
+
+/// A cover file's bytes, or None if it is missing or over `COVER_MAX_FILE`.
+fn read_cover_file(path: &std::path::Path) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+    let f = std::fs::File::open(path).ok()?;
+    if f.metadata().ok()?.len() > COVER_MAX_FILE {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    // `take` as well: the file can grow between the size check and the read.
+    f.take(COVER_MAX_FILE + 1).read_to_end(&mut bytes).ok()?;
+    (bytes.len() as u64 <= COVER_MAX_FILE).then_some(bytes)
 }
 
 /// Fetch a cover from iTunes Search and persist it to the on-disk cache for
@@ -347,7 +366,7 @@ fn read_sidecar(track_path: &Path) -> Option<Vec<u8>> {
     ];
     for name in NAMES {
         let candidate = parent.join(name);
-        if let Ok(bytes) = std::fs::read(&candidate) {
+        if let Some(bytes) = read_cover_file(&candidate) {
             return Some(bytes);
         }
     }
@@ -1028,6 +1047,21 @@ mod protocol_tests {
 #[cfg(test)]
 mod viz_sixel_tests {
     use super::*;
+
+    #[test]
+    fn an_oversized_cover_file_is_refused_not_read_whole() {
+        let dir = std::env::temp_dir().join(format!("keet-cover-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let small = dir.join("small.jpg");
+        std::fs::write(&small, b"jpeg bytes").unwrap();
+        let big = dir.join("big.png");
+        let f = std::fs::File::create(&big).unwrap();
+        f.set_len(COVER_MAX_FILE + 1).unwrap(); // sparse: no real disk use
+        let (s, b) = (read_cover_file(&small), read_cover_file(&big));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(s.as_deref(), Some(&b"jpeg bytes"[..]));
+        assert_eq!(b, None);
+    }
 
     #[test]
     fn viz_sixel_first_line_erases_whole_block_before_painting() {

@@ -33,6 +33,10 @@ pub struct Config {
     pub classic_use_truecolor: bool,
     #[serde(default)]
     pub classic_colors: ClassicColors,
+    /// Keys that were present but unreadable (wrong type), skipped one by
+    /// one; shown on the status line at startup.
+    #[serde(skip)]
+    pub problems: Vec<String>,
 }
 
 /// Classic's three truecolor roles as `#RRGGBB`; any left out (or unreadable)
@@ -72,10 +76,55 @@ impl ClassicColors {
 // Each field applies on every launch, overriding the resumed last-session value;
 // an explicit CLI flag for that setting still wins. See main.rs.
 
-/// Parse config JSON, falling back to defaults on any error (malformed JSON, a
-/// broken config never blocks startup). Unknown keys are ignored.
+/// Parse config JSON key by key. A value of the wrong type costs only that
+/// key (named in `problems`): parsed as one struct, a single bad value failed
+/// the whole file and every setting silently went back to its default. A file
+/// that is not JSON at all gives the defaults. Unknown keys are ignored. A
+/// broken config never blocks startup.
 fn parse(contents: &str) -> Config {
-    serde_json::from_str(contents).unwrap_or_default()
+    let mut c = Config::default();
+    let Ok(serde_json::Value::Object(obj)) = serde_json::from_str::<serde_json::Value>(contents) else {
+        c.problems.push("the whole file (not valid JSON)".into());
+        return c;
+    };
+    let mut problems = Vec::new();
+    c.theme = field(&obj, "theme", "", &mut problems);
+    c.viz = field(&obj, "viz", "", &mut problems);
+    c.rg_mode = field(&obj, "rg_mode", "", &mut problems);
+    c.eq = field(&obj, "eq", "", &mut problems);
+    c.crossfeed = field(&obj, "crossfeed", "", &mut problems);
+    c.classic_use_truecolor = field(&obj, "classic_use_truecolor", "", &mut problems).unwrap_or(false);
+    match obj.get("classic_colors") {
+        Some(serde_json::Value::Object(colors)) => {
+            c.classic_colors = ClassicColors {
+                highlight: field(colors, "highlight", "classic_colors.", &mut problems),
+                warning: field(colors, "warning", "classic_colors.", &mut problems),
+                error: field(colors, "error", "classic_colors.", &mut problems),
+            };
+        }
+        Some(_) => problems.push("classic_colors (wrong type)".into()),
+        None => {}
+    }
+    c.problems = problems;
+    c
+}
+
+/// One key of an object: its value, or None when absent; a value of the wrong
+/// type is None too, and its name (with `prefix`) goes in `problems`.
+fn field<T: serde::de::DeserializeOwned>(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    prefix: &str,
+    problems: &mut Vec<String>,
+) -> Option<T> {
+    let v = obj.get(key)?;
+    match serde_json::from_value(v.clone()) {
+        Ok(t) => Some(t),
+        Err(_) => {
+            problems.push(format!("{prefix}{key} (wrong type)"));
+            None
+        }
+    }
 }
 
 /// Load `config.json` from the keet config dir. Returns defaults if the file is
@@ -130,6 +179,23 @@ mod tests {
         assert_eq!(parse(r#"{"theme": "hifi", "future": 1}"#).theme.as_deref(), Some("hifi"));
         // Malformed JSON → defaults, never a panic.
         assert_eq!(parse("not json").theme, None);
+    }
+
+    #[test]
+    fn one_wrongly_typed_value_costs_only_itself() {
+        // serde rejected the whole file over one bad value, and every setting
+        // silently went back to its default.
+        let c = parse(r#"{"theme": "minimal", "classic_use_truecolor": "yes", "rg_mode": 3, "eq": "Vocal"}"#);
+        assert_eq!(c.theme.as_deref(), Some("minimal"));
+        assert_eq!(c.eq.as_deref(), Some("Vocal"));
+        assert!(!c.classic_use_truecolor);
+        assert_eq!(c.rg_mode, None);
+        assert_eq!(c.problems, ["rg_mode (wrong type)", "classic_use_truecolor (wrong type)"]);
+        let c = parse(r##"{"classic_colors": {"highlight": 7, "error": "#F07A78"}}"##);
+        assert_eq!(c.classic_colors.error.as_deref(), Some("#F07A78"));
+        assert_eq!(c.problems, ["classic_colors.highlight (wrong type)"]);
+        assert_eq!(parse("not json").problems, ["the whole file (not valid JSON)"]);
+        assert!(parse(r#"{"future": 1}"#).problems.is_empty(), "unknown keys are fine");
     }
 
     #[test]

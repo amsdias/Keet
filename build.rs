@@ -10,9 +10,24 @@ fn main() {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| format!("v{}", env!("CARGO_PKG_VERSION")));
     println!("cargo:rustc-env=GIT_VERSION={version}");
-    // Re-run if HEAD or any tag changes.
+    // Re-run when the version can change: HEAD moving to another branch or
+    // commit, the current branch getting a new commit (its ref file — HEAD
+    // itself does not change on a commit, so watching only HEAD left a stale
+    // version in every local build), a tag, or refs being packed.
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/refs/tags");
+    if let Some(branch) = std::fs::read_to_string(".git/HEAD")
+        .ok()
+        .and_then(|h| h.strip_prefix("ref: ").map(|r| r.trim().to_string()))
+    {
+        let ref_file = format!(".git/{branch}");
+        if std::path::Path::new(&ref_file).exists() {
+            println!("cargo:rerun-if-changed={ref_file}");
+        }
+    }
+    if std::path::Path::new(".git/packed-refs").exists() {
+        println!("cargo:rerun-if-changed=.git/packed-refs");
+    }
 
     #[cfg(target_os = "windows")]
     {

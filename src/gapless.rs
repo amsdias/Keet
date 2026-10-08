@@ -19,12 +19,16 @@ pub struct Gapless {
     pub length: Option<u64>,
 }
 
-/// Encoder delay and padding for an MP4 file, in units of the audio track's
-/// timescale (its sample rate): Apple's iTunSMPB tag first, then the edit
-/// list. None for any other container.
+/// Encoder delay and padding for an MP4 file, in frames at `sample_rate`:
+/// Apple's iTunSMPB tag first (already in frames), then the edit list
+/// (converted from the track's media timescale). None for any other
+/// container. The two came back in different units and were both converted
+/// from the timescale, which trimmed iTunSMPB files wrongly whenever the
+/// timescale was not the sample rate.
 pub fn for_mp4(
     path: &std::path::Path,
     revisions: &[symphonia::core::meta::MetadataRevision],
+    sample_rate: u32,
 ) -> Option<Gapless> {
     let ext = path.extension()?.to_string_lossy().to_ascii_lowercase();
     if !matches!(ext.as_str(), "m4a" | "m4b" | "mp4" | "m4p") {
@@ -38,7 +42,7 @@ pub fn for_mp4(
             symphonia::core::meta::RawValue::String(s) => from_itunsmpb(s),
             _ => None,
         })
-        .or_else(|| from_mp4_edit_list(path))
+        .or_else(|| from_mp4_edit_list(path, sample_rate))
 }
 
 /// Parse an iTunSMPB value. None for a malformed one or one saying nothing.
@@ -55,11 +59,12 @@ pub fn from_itunsmpb(value: &str) -> Option<Gapless> {
     Some(Gapless { delay, length: (length > 0).then_some(length) })
 }
 
-/// Read the first audio track's edit list from an MP4 file, in frames at the
-/// track's media timescale (the sample rate, for audio). Only the common
-/// single-segment form is used: an empty edit (a leading gap) or several
-/// segments are left alone rather than half-applied.
-pub fn from_mp4_edit_list(path: &std::path::Path) -> Option<Gapless> {
+/// Read the first audio track's edit list from an MP4 file, in frames at
+/// `sample_rate` (the edit list counts in the track's media timescale, which
+/// is usually but not always the sample rate). Only the common single-segment
+/// form is used: an empty edit (a leading gap) or several segments are left
+/// alone rather than half-applied.
+pub fn from_mp4_edit_list(path: &std::path::Path, sample_rate: u32) -> Option<Gapless> {
     let mut f = std::fs::File::open(path).ok()?;
     let len = f.metadata().ok()?.len();
     let moov = find(&mut f, 0, len, b"moov")?;
@@ -92,9 +97,13 @@ pub fn from_mp4_edit_list(path: &std::path::Path) -> Option<Gapless> {
             return None; // an empty edit: a gap before the audio, not a trim
         }
         // The segment's duration is in the MOVIE's timescale, the start in
-        // the media's.
-        let length = (segment as u128 * media_ts as u128 / movie_ts as u128) as u64;
-        return Some(Gapless { delay: media_time as u64, length: (length > 0).then_some(length) });
+        // the media's; both become frames at the sample rate.
+        if media_ts == 0 {
+            return None;
+        }
+        let frames = |units: u128, ts: u32| (units * sample_rate as u128 / ts as u128) as u64;
+        let length = frames(segment as u128, movie_ts);
+        return Some(Gapless { delay: frames(media_time as u128, media_ts), length: (length > 0).then_some(length) });
     }
     None
 }
@@ -166,10 +175,15 @@ mod tests {
     fn edit_list_gives_delay_and_length() {
         // ffmpeg's AAC: 1024 priming frames, 1 s at 44.1 kHz.
         assert_eq!(
-            from_mp4_edit_list(&fixture("sine_aac_editlist.m4a")),
+            from_mp4_edit_list(&fixture("sine_aac_editlist.m4a"), 44_100),
             Some(Gapless { delay: 1024, length: Some(44100) })
         );
-        // Apple's file carries iTunSMPB and no usable edit list.
-        assert_eq!(from_mp4_edit_list(&fixture("sine_lr.flac")), None, "not an MP4");
+        // The list counts in the file's own timescale (44.1 kHz here), so a
+        // decoder running at another rate gets it converted.
+        assert_eq!(
+            from_mp4_edit_list(&fixture("sine_aac_editlist.m4a"), 88_200),
+            Some(Gapless { delay: 2048, length: Some(88200) })
+        );
+        assert_eq!(from_mp4_edit_list(&fixture("sine_lr.flac"), 44_100), None, "not an MP4");
     }
 }

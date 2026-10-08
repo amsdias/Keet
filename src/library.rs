@@ -264,9 +264,11 @@ pub fn render_library_tree(
     p: &crate::theme::Palette,
     now_playing: Option<usize>,
 ) -> Vec<String> {
+    // Saturating: a scroll past the end (the list shrank under it) draws
+    // nothing instead of underflowing.
     let end = (scroll + height).min(visible.len());
     let mut out = Vec::with_capacity(end.saturating_sub(scroll));
-    for (vi, &vrow) in visible.iter().enumerate().skip(scroll).take(end - scroll) {
+    for (vi, &vrow) in visible.iter().enumerate().skip(scroll).take(end.saturating_sub(scroll)) {
         // Two forms per row: `plain` (no color, for the highlighted cursor row —
         // inner color/reset codes would cancel the highlight) and `colored`.
         let (plain, colored) = match vrow {
@@ -475,6 +477,9 @@ mod tests {
         // differ in length per theme, so raw byte positions mean nothing).
         let plain = |s: &str| crate::ansi::strip_ansi(s);
         assert!(plain(&lines[1]).find("AM").unwrap() > plain(&lines[0]).find("Arctic Monkeys").unwrap());
+
+        // A scroll past the end draws nothing (it used to underflow).
+        assert!(render_library_tree(&tree, &fold, &vis, 0, 99, 10, 40, p, None).is_empty());
 
         // Windowing: height 1 from scroll 1 yields just the album row.
         let one = render_library_tree(&tree, &fold, &vis, 1, 1, 1, 40, p, None);

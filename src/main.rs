@@ -32,6 +32,7 @@ mod metadata;
 mod lyrics;
 mod cover;
 mod gapless;
+mod fade;
 mod signal;
 mod term;
 #[cfg(target_os = "windows")]
@@ -86,16 +87,22 @@ fn apply_exclusive_bit_depth(state: &PlayerState, device: &cpal::Device, rate: u
 
 /// The output device chosen by `--device` (an exact id, then an exact name,
 /// then a substring — see audio::find_device_by_name), or the default. A name
-/// that matches nothing falls back to the default with a warning. It used to
-/// be looked up twice at startup, warning twice.
-fn select_device(host: &cpal::Host, wanted: Option<&str>) -> Result<cpal::Device, Box<dyn std::error::Error>> {
+/// that matches nothing falls back to the default with a warning, returned
+/// for the status line: printed to stderr it was wiped by the UI's first
+/// frame before anyone could read it. It used to be looked up twice at
+/// startup, warning twice.
+fn select_device(
+    host: &cpal::Host,
+    wanted: Option<&str>,
+) -> Result<(cpal::Device, Option<String>), Box<dyn std::error::Error>> {
+    let mut warning = None;
     if let Some(name) = wanted {
         if let Some(d) = audio::find_device_by_name(host, name) {
-            return Ok(d);
+            return Ok((d, None));
         }
-        eprintln!("Warning: Device '{}' not found, using default", name);
+        warning = Some(format!("device \"{name}\" not found — playing on the default output"));
     }
-    Ok(host.default_output_device().ok_or("No output device")?)
+    Ok((host.default_output_device().ok_or("No output device")?, warning))
 }
 
 /// The output as startup opened it.
@@ -285,6 +292,11 @@ fn install_panic_hook() {
         // broke the terminal for the rest of the session. It is still logged.
         let ends_program = thread::current().name() == Some("main");
         if ends_program {
+            // The frame being built when the panic hit is half a frame: drop
+            // it (TerminalGuard would flush it on the way down), close a
+            // synchronized update it may have opened, and start a clean line.
+            term::discard();
+            let _ = io::stdout().write_all(b"\x1B[?2026l\x1B[0m\r\n");
             let _ = terminal::disable_raw_mode();
             restore_cursor(&mut io::stdout());
         }
@@ -347,11 +359,15 @@ fn load_initial_playlist(source_paths: &[PathBuf], shuffle: bool) -> Result<Vec<
 
 /// `--eq`/`--fx`: a preset by name (any case), or else a JSON preset file at
 /// that path, which joins the list. Its index; None when neither works.
-fn pick_preset<T: serde::de::DeserializeOwned>(presets: &mut Vec<T>, wanted: &str, name: fn(&T) -> &str) -> Option<usize> {
-    if let Some(i) = presets.iter().position(|p| name(p).eq_ignore_ascii_case(wanted)) {
+fn pick_preset<T: serde::de::DeserializeOwned>(presets: &mut Vec<T>, wanted: &str, name: fn(&mut T) -> &mut String) -> Option<usize> {
+    if let Some(i) = presets.iter_mut().position(|p| name(p).eq_ignore_ascii_case(wanted)) {
         return Some(i);
     }
-    let preset = serde_json::from_str::<T>(&std::fs::read_to_string(wanted).ok()?).ok()?;
+    let mut preset = serde_json::from_str::<T>(&std::fs::read_to_string(wanted).ok()?).ok()?;
+    // Shown on screen like any preset name: cleaned the same way as the ones
+    // loaded from the preset folders (an ESC in it would be executed).
+    let n = name(&mut preset);
+    *n = crate::ansi::sanitize_display(n);
     presets.push(preset);
     Some(presets.len() - 1)
 }
@@ -487,12 +503,22 @@ fn open_output(
 }
 
 /// No output could be opened. Say so and hand over to the recovery block,
-/// which retries once a second (input keeps working, so quit stays possible).
+/// which retries with a backoff (input keeps working, so quit stays possible).
 /// It used to quit the app — leaving the terminal in raw mode.
 fn output_failed(ui: &mut state::UiState, state: &PlayerState, e: &dyn std::error::Error) {
-    ui.set_status_for(format!("can't open the output: {e} — retrying"), Duration::from_secs(3));
+    let wait = recovery_backoff(ui.recovery_failures);
+    ui.recovery_failures = ui.recovery_failures.saturating_add(1);
+    ui.set_status_for(format!("can't open the output: {e} — retrying in {} s", wait.as_secs()), Duration::from_secs(3));
     state.stream_error.store(true, Ordering::Relaxed);
-    ui.recovery_retry_at = Some(Instant::now() + Duration::from_secs(1));
+    ui.recovery_retry_at = Some(Instant::now() + wait);
+}
+
+/// How long to wait before the next attempt after `failures` failed ones:
+/// 1, 2, 4, then 8 s. Each attempt opens (and in exclusive mode can probe) a
+/// device on the UI thread; a fixed second hammered a device that stays
+/// unavailable and stalled the UI each time.
+fn recovery_backoff(failures: u32) -> Duration {
+    Duration::from_secs(1 << failures.min(3))
 }
 
 /// "44100Hz", "44100→48000Hz" when resampling, plus the DAC's format in
@@ -749,8 +775,10 @@ fn rebuild_stream(
     buffer_size: cpal::BufferSize,
     state: &Arc<PlayerState>,
 ) -> Result<StreamParts, Box<dyn std::error::Error>> {
+    // `state.ring_capacity` (the UI's buffer gauge) is stored only once a
+    // stream has opened: a failed open keeps the old ring, and the size has
+    // to stay the old ring's. The producer reads the size from its own ring.
     let ring_cap = ring_capacity_for(stream_rate);
-    state.ring_capacity.store(ring_cap, Ordering::Relaxed);
     let (prod, cons) = RingBuffer::<f32>::new(ring_cap);
     let (viz_prod, viz_cons) = RingBuffer::<f32>::new(VIZ_BUFFER_SIZE);
 
@@ -779,6 +807,7 @@ fn rebuild_stream(
             }
         })?;
         state.output_bits.store(layout.1 as u32, Ordering::Relaxed);
+        state.ring_capacity.store(ring_cap, Ordering::Relaxed);
         return Ok((prod, viz_cons, audio::Output::Wasapi(out), stream_rate));
     }
 
@@ -847,7 +876,6 @@ fn rebuild_stream(
             }
             let rate = fallback.sample_rate();
             let ring_cap = ring_capacity_for(rate);
-            state.ring_capacity.store(ring_cap, Ordering::Relaxed);
             state.output_rate.store(rate as u64, Ordering::Relaxed);
             let (p, c) = RingBuffer::<f32>::new(ring_cap);
             let (vp, vc) = RingBuffer::<f32>::new(VIZ_BUFFER_SIZE);
@@ -857,9 +885,11 @@ fn rebuild_stream(
                 buffer_size: cpal::BufferSize::Default,
             };
             let s = build_stream(device, &cfg, cpal::SampleFormat::F32, c, vp, Arc::clone(state))?;
+            state.ring_capacity.store(ring_cap, Ordering::Relaxed);
             return Ok((p, vc, audio::Output::Cpal(s), rate));
         }
     };
+    state.ring_capacity.store(ring_cap, Ordering::Relaxed);
     Ok((prod, viz_cons, audio::Output::Cpal(stream), stream_rate))
 }
 
@@ -978,7 +1008,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     state.eq_preset_count.store(eq_presets.len(), Ordering::Relaxed);
 
     // Set initial EQ preset from --eq argument
-    if let Some(idx) = eq_arg.as_deref().and_then(|n| pick_preset(&mut eq_presets, n, |p| &p.name)) {
+    if let Some(idx) = eq_arg.as_deref().and_then(|n| pick_preset(&mut eq_presets, n, |p| &mut p.name)) {
         state.eq_preset_count.store(eq_presets.len(), Ordering::Relaxed);
         state.eq_preset_index.store(idx, Ordering::Relaxed);
     }
@@ -988,7 +1018,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fx_presets.extend(effects::load_custom_presets());
     state.effects_preset_count.store(fx_presets.len(), Ordering::Relaxed);
 
-    if let Some(idx) = fx_arg.as_deref().and_then(|n| pick_preset(&mut fx_presets, n, |p| &p.name)) {
+    if let Some(idx) = fx_arg.as_deref().and_then(|n| pick_preset(&mut fx_presets, n, |p| &mut p.name)) {
         state.effects_preset_count.store(fx_presets.len(), Ordering::Relaxed);
         state.effects_preset_index.store(idx, Ordering::Relaxed);
     }
@@ -1066,7 +1096,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ui.shuffle = shuffle;
     ui.repeat_mode = repeat_mode;
     ui.hq_resampler = hq_resampler;
-    if !classic_colour_problems.is_empty() {
+    // Unreadable config values: each was skipped on its own (config::parse).
+    if !app_config.problems.is_empty() {
+        ui.set_status_for(
+            format!("config.json: ignored {}", app_config.problems.join(", ")),
+            std::time::Duration::from_secs(8),
+        );
+    } else if !classic_colour_problems.is_empty() {
         ui.set_status_for(
             format!("config.json: classic_colors.{} is not a #RRGGBB colour — using the default", classic_colour_problems.join(", ")),
             std::time::Duration::from_secs(8),
@@ -1076,7 +1112,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Audio setup
     let host = cpal::default_host();
-    let device = select_device(&host, device_arg.as_deref())?;
+    let (device, device_warning) = select_device(&host, device_arg.as_deref())?;
+    if let Some(w) = device_warning {
+        ui.set_status_for(w, std::time::Duration::from_secs(8));
+    }
     let current_output_rate = {
         let device_name = device.description()
             .map(|d| d.name().to_string())
@@ -1212,6 +1251,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod main_tests {
     use super::*;
 
+    #[test]
+    fn output_retries_back_off_to_eight_seconds() {
+        let secs: Vec<u64> = (0..6).map(|n| recovery_backoff(n).as_secs()).collect();
+        assert_eq!(secs, [1, 2, 4, 8, 8, 8]);
+    }
+
     /// A stdout whose every write fails, like the read end of a pipe that the
     /// other process already closed (`keet --help | head`).
     struct DeadPipe;
@@ -1239,14 +1284,20 @@ mod main_tests {
         let mut presets = eq::builtin_presets();
         let n = presets.len();
         let bass = presets.iter().position(|p| p.name == "Bass Boost").unwrap();
-        assert_eq!(pick_preset(&mut presets, "bass BOOST", |p| &p.name), Some(bass), "any case");
+        assert_eq!(pick_preset(&mut presets, "bass BOOST", |p| &mut p.name), Some(bass), "any case");
         let file = std::env::temp_dir().join(format!("keet_pick_{}.json", std::process::id()));
         std::fs::write(&file, r#"{"name":"Mine","gains":[1,2,3,4,5,6,7,8,9,10]}"#).unwrap();
-        let got = pick_preset(&mut presets, file.to_str().unwrap(), |p| &p.name);
+        let got = pick_preset(&mut presets, file.to_str().unwrap(), |p| &mut p.name);
         let _ = std::fs::remove_file(&file);
         assert_eq!(got, Some(n), "a file joins the list");
         assert_eq!(presets[n].name, "Mine");
-        assert_eq!(pick_preset(&mut presets, "no-such-preset", |p| &p.name), None);
+        assert_eq!(pick_preset(&mut presets, "no-such-preset", |p| &mut p.name), None);
+        // A name from a file is shown on screen: control characters go.
+        let file = std::env::temp_dir().join(format!("keet_pick_esc_{}.json", std::process::id()));
+        std::fs::write(&file, "{\"name\":\"Bad\\u001b[2Jname\",\"gains\":[0]}").unwrap();
+        let got = pick_preset(&mut presets, file.to_str().unwrap(), |p| &mut p.name).unwrap();
+        let _ = std::fs::remove_file(&file);
+        assert!(!presets[got].name.contains('\x1B'), "{:?}", presets[got].name);
     }
 
     #[test]

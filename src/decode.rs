@@ -291,6 +291,28 @@ impl ChainBufs {
     }
 }
 
+/// Damaged packets in a row a track survives before it is ended: past this
+/// the stream is unreadable from here on, not just a bad frame.
+const MAX_BAD_PACKETS: usize = 64;
+
+/// Whether a packet-read error is a damaged packet to skip (true) or the end
+/// of what can be read (false): a malformed packet is skipped while fewer
+/// than `MAX_BAD_PACKETS` have failed in a row; I/O errors and anything else
+/// end the track.
+fn skip_bad_packet(e: &symphonia::core::errors::Error, bad_in_a_row: usize) -> bool {
+    matches!(e, symphonia::core::errors::Error::DecodeError(_)) && bad_in_a_row < MAX_BAD_PACKETS
+}
+
+/// The chunk's peak for the clip flag and the limiter. A non-finite sample
+/// counts as infinitely loud: `f32::max` skips NaN, so a NaN chunk read as
+/// quiet, the limiter (which zeroes non-finite samples) never engaged, and
+/// the NaN went on to the output.
+fn chain_peak(samples: &[f32]) -> f32 {
+    samples
+        .iter()
+        .fold(0.0f32, |m, &s| if s.is_finite() { m.max(s.abs()) } else { f32::INFINITY })
+}
+
 /// Everything downstream of decode+resample for one stereo chunk:
 /// EQ → effects → ReplayGain → crossfeed → balance → crossfade mix →
 /// clipping flag → ring push (+ crossfade tail capture).
@@ -406,10 +428,7 @@ fn apply_chain_and_push(
     // callback still clamps post-gain, since volume can change between this
     // scan and consumption (~ring-buffer-depth latency).
     let vol = state.volume.load(Ordering::Relaxed) as f32 / 100.0;
-    let peak = {
-        let out: &[f32] = if using_final_buf { &bufs.final_buf } else { bal_output };
-        out.iter().fold(0.0f32, |m, &s| m.max(s.abs()))
-    };
+    let peak = chain_peak(if using_final_buf { &bufs.final_buf } else { bal_output });
     if peak * vol > 1.0 {
         state.clipping.store(true, Ordering::Relaxed);
     }
@@ -769,9 +788,11 @@ pub fn decode_playlist(
     // to apply when a track is reopened (see `drain_or_seek`).
     let mut last_track: Option<usize> = None;
     let mut initial_seek: Option<f64> = None;
-    // Ring capacity is sized per output rate in main.rs and stored on state before
-    // the producer is spawned, so it's stable for the lifetime of this call.
-    let ring_capacity = state.ring_capacity.load(Ordering::Relaxed);
+    // The size of the ring this producer actually writes to, read from the
+    // ring itself: `state.ring_capacity` can describe a different ring (a
+    // reopen at another rate that failed kept the old one), and then
+    // `ring_capacity - producer.slots()` underflowed.
+    let ring_capacity = producer.buffer().capacity();
 
     while track_index < playlist.len() {
         // Non-destructive peek: main.rs is the single consumer of skip_prev / jump_to_track
@@ -858,7 +879,9 @@ pub fn decode_playlist(
         // interleaved_to_stereo converts right after each packet is decoded.
         let src_channels = audio_params.channels.as_ref().map(|c| c.count()).unwrap_or(2);
         let channels = 2usize;
-        let bits_per_sample = audio_params.bits_per_sample.unwrap_or(16);
+        // 0 = no bit depth: lossy codecs (AAC, MP3, Vorbis, Opus) have none,
+        // and showing "16-bit" for them (a guess) put it on every .m4a.
+        let bits_per_sample = audio_params.bits_per_sample.unwrap_or(0);
         let total = track.num_frames.unwrap_or(0);
 
         let mut decoder = match symphonia::default::get_codecs()
@@ -888,16 +911,9 @@ pub fn decode_playlist(
         }
         let rg_linear = compute_rg_gain(state.rg_mode(), &rg_tags);
 
-        // AAC in MP4: the real audio inside the decoded stream (see gapless.rs).
-        // Converted from the track's timescale to frames at its sample rate.
-        let gapless = crate::gapless::for_mp4(path, &revisions).map(|g| {
-            let units_per_sec = track
-                .time_base
-                .map(|tb| tb.denom.get() as f64 / tb.numer.get() as f64)
-                .unwrap_or(sample_rate as f64);
-            let to_frames = |u: u64| (u as f64 * sample_rate as f64 / units_per_sec).round() as u64;
-            crate::gapless::Gapless { delay: to_frames(g.delay), length: g.length.map(to_frames) }
-        });
+        // AAC in MP4: the real audio inside the decoded stream, in frames at
+        // the track's sample rate (see gapless.rs).
+        let gapless = crate::gapless::for_mp4(path, &revisions, sample_rate);
         let total = gapless.and_then(|g| g.length).unwrap_or(total);
         // Priming frames are not part of the track's time: the clock and seek
         // targets are shifted by them.
@@ -1079,6 +1095,19 @@ pub fn decode_playlist(
         // Start time of the last decoded packet — where decoding resumes if a
         // seek fails after the ring has been drained.
         let mut decode_pos_secs = 0.0f64;
+        // Damaged packets: skipped, said once per track, and only a long run
+        // of them (the stream is unreadable from here) ends the track.
+        let mut bad_in_a_row = 0usize;
+        let mut damage_reported = false;
+        let mut report_damage = |state: &PlayerState| {
+            if !damage_reported {
+                damage_reported = true;
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                if let Ok(mut n) = state.decode_notice.lock() {
+                    *n = Some(format!("{name}: damaged audio skipped"));
+                }
+            }
+        };
         // Where playback is in a chained stream (concatenated Ogg).
         let mut links = Links::default();
         let chained_capable = path
@@ -1289,7 +1318,14 @@ pub fn decode_playlist(
                     track_id = track.id;
                     continue;
                 }
-                Err(_) => break,    // read error
+                // A malformed packet: the demuxer can carry on past it. Ending
+                // the track here cut it short at the first damaged frame.
+                Err(e) if skip_bad_packet(&e, bad_in_a_row) => {
+                    bad_in_a_row += 1;
+                    report_damage(state);
+                    continue;
+                }
+                Err(_) => break,    // I/O error, or too much damage in a row
             };
 
             if packet.track_id != track_id { continue; }
@@ -1299,8 +1335,15 @@ pub fn decode_playlist(
             }
 
             let decoded = match decoder.decode(&packet) {
-                Ok(d) => d,
-                Err(_) => continue,
+                Ok(d) => {
+                    bad_in_a_row = 0;
+                    d
+                }
+                Err(_) => {
+                    // Skipped as before, but no longer silently.
+                    report_damage(state);
+                    continue;
+                }
             };
 
             // 0.6's generic audio buffer converts and interleaves in one call,
@@ -2010,6 +2053,73 @@ mod chain_tests {
         assert!(tone_amplitude(&l, 44100.0, 440.0) > 0.35, "L tone survived encoding");
         assert!(tone_amplitude(&l, 44100.0, 1000.0) < 0.1, "stereo separation");
         assert!(tone_amplitude(&r, 44100.0, 1000.0) > 0.35, "R tone survived encoding");
+    }
+
+    #[test]
+    fn a_damaged_packet_is_skipped_and_only_a_long_run_ends_the_track() {
+        use symphonia::core::errors::Error;
+        // symphonia's readers resync past most damage on their own (FLAC
+        // drops the frame, MP3 decodes through it), so this is the rule for
+        // the errors that do surface.
+        assert!(skip_bad_packet(&Error::DecodeError("bad frame"), 0));
+        assert!(skip_bad_packet(&Error::DecodeError("bad frame"), MAX_BAD_PACKETS - 1));
+        assert!(!skip_bad_packet(&Error::DecodeError("bad frame"), MAX_BAD_PACKETS));
+        let io = Error::IoError(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "eof"));
+        assert!(!skip_bad_packet(&io, 0), "an I/O error is the end, not damage");
+    }
+
+    #[test]
+    fn lossy_tracks_report_no_bit_depth() {
+        let (_, aac) = run_chain_state(&[fixture("sine_aac_editlist.m4a")], 44100, RgMode::Off, 0, false, None);
+        assert_eq!(aac.bits_per_sample.load(Ordering::Relaxed), 0, "AAC has no bit depth");
+        let (_, flac) = run_chain_state(&[fixture("sine_lr.flac")], 44100, RgMode::Off, 0, false, None);
+        assert_eq!(flac.bits_per_sample.load(Ordering::Relaxed), 16);
+    }
+
+    #[test]
+    fn a_nan_sample_engages_the_limiter_instead_of_reading_as_silence() {
+        assert_eq!(chain_peak(&[0.1, -0.2]), 0.2);
+        assert!(chain_peak(&[0.1, f32::NAN, 0.0]).is_infinite());
+        assert!(chain_peak(&[f32::INFINITY]).is_infinite());
+        let fx = crate::effects::EffectsChain::new(48000.0);
+        assert!(fx.limiter_engaged(chain_peak(&[0.0, f32::NAN])));
+    }
+
+    #[test]
+    fn the_producer_sizes_the_ring_from_the_ring_not_from_state() {
+        // A reopen at another rate that FAILED stored the new rate's size on
+        // state but kept the old ring; with a smaller size on state,
+        // `ring_capacity - producer.slots()` underflowed (a panic in debug, a
+        // wrapped clock and buffer level in release).
+        let state = Arc::new(PlayerState::new());
+        state.ring_capacity.store(1024, Ordering::Relaxed); // the lie
+        state.rg_mode.store(RgMode::Off as u8, Ordering::Relaxed);
+        let (mut producer, mut consumer) = rtrb::RingBuffer::<f32>::new(1 << 16);
+        let st = Arc::clone(&state);
+        let list = vec![fixture("sine_lr.flac")];
+        let handle = thread::spawn(move || {
+            let (mut eq, mut fx, mut cf) = (
+                crate::eq::EqChain::new(),
+                crate::effects::EffectsChain::new(44100.0),
+                crate::crossfeed::CrossfeedFilter::new(),
+            );
+            decode_playlist(
+                &list, 0, &mut producer, &st, 44100, false,
+                &mut eq, &crate::eq::builtin_presets(), &mut fx, &crate::effects::builtin_presets(),
+                0, &mut cf, &crate::crossfeed::builtin_presets(),
+            );
+        });
+        let mut got = 0usize;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !(state.producer_done.load(Ordering::Relaxed) && consumer.slots() == 0) && Instant::now() < deadline {
+            while consumer.pop().is_ok() {
+                got += 1;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        state.quit();
+        assert!(handle.join().is_ok(), "the producer panicked");
+        assert!(got > 44100, "only {got} samples came out");
     }
 
     #[test]

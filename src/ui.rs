@@ -173,7 +173,7 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
     // pixels really were overwritten while away.
     // Classic keeps its cover (in the header) on every view but the EQ editor.
     let cover_view = match state.theme_kind() {
-        ThemeKind::Classic => ui.view_mode != ViewMode::Eq,
+        ThemeKind::Classic => matches!(ui.view_mode, ViewMode::Player | ViewMode::Playlist | ViewMode::Lyrics),
         ThemeKind::Minimal => ui.view_mode == ViewMode::Player,
         ThemeKind::HiFi => false,
     };
@@ -189,6 +189,10 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
     if ui.view_mode == ViewMode::Eq {
         return print_status_eq_view(state, ui, eq_preset, fx_name, cf_name, prev_frame_lines);
     }
+    // The key list is one shared, palette-driven screen too.
+    if ui.view_mode == ViewMode::Help {
+        return print_status_help_view(state, prev_frame_lines);
+    }
     if state.theme_kind() == ThemeKind::Minimal {
         match ui.view_mode {
             ViewMode::Player => {
@@ -200,7 +204,7 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
             ViewMode::Lyrics => {
                 return crate::ui_minimal::print_status_minimal_lyrics(state, ui, name, prev_frame_lines);
             }
-            ViewMode::Eq => unreachable!("EQ view handled above"),
+            ViewMode::Eq | ViewMode::Help => unreachable!("EQ and help views handled above"),
         }
     }
     if state.theme_kind() == ThemeKind::HiFi {
@@ -214,7 +218,7 @@ pub fn print_status(state: &PlayerState, ui: &mut UiState, name: &str, track_inf
             ViewMode::Lyrics => {
                 return crate::ui_hifi::print_status_hifi_lyrics(state, ui, name, prev_frame_lines);
             }
-            ViewMode::Eq => unreachable!("EQ view handled above"),
+            ViewMode::Eq | ViewMode::Help => unreachable!("EQ and help views handled above"),
         }
     }
     crate::ui_classic::print_status_classic(state, ui, name, track_info, ext, eq_preset, fx_name, cf_name, stats, prev_frame_lines, playlist, analyser)
@@ -346,7 +350,7 @@ fn print_status_eq_view(
     let headroom = crate::eq::headroom(&bands, pre_db, out_rate);
     body.push(crate::eq_ui::headroom_line(&headroom, pre_db, p));
     let footer_full = format!(
-        "  {dim}[←→] band  [↑↓] gain (⇧ fine)  [t] type  [,.] Q  [<>] freq  [[]] preset  [0] reset  [E/Esc] close{rst}",
+        "  {dim}[←→] band  [↑↓] gain (⇧ fine)  [t] type  [,.] Q  [<>] freq  [[]] preset  [0] reset  [e/Esc] close{rst}",
         dim = p.dim, rst = p.reset,
     );
     let footer_short = format!(
@@ -372,6 +376,79 @@ fn print_status_eq_view(
 }
 
 
+/// The `?` screen: every key (`cli::KEYS`), sections flowed into as many
+/// columns as the window holds, cut to its height.
+pub(crate) fn help_lines(p: &crate::theme::Palette, term_w: usize, term_h: usize) -> Vec<String> {
+    const KEY_W: usize = 12;
+    const GAP: usize = 2;
+    let rst = p.reset;
+    let widest = crate::cli::KEYS
+        .iter()
+        .flat_map(|(_, keys)| keys.iter())
+        .map(|(_, what)| KEY_W + 1 + visible_len(what))
+        .max()
+        .unwrap_or(40);
+    // Each section as its lines: title, then one row per key.
+    let sections: Vec<Vec<String>> = crate::cli::KEYS
+        .iter()
+        .map(|(title, keys)| {
+            let mut v = vec![format!("{}{}{title}{rst}", p.accent, p.bold)];
+            v.extend(keys.iter().map(|(k, what)| format!("{}{k:<KEY_W$}{rst} {}{what}{rst}", p.fg, p.dim)));
+            v.push(String::new());
+            v
+        })
+        .collect();
+    let body_h = term_h.saturating_sub(3).max(1); // title row, footer, slack
+    // As many columns as fit side by side, `GAP` apart.
+    let cols = ((term_w.saturating_sub(2) + GAP) / (widest + GAP)).max(1);
+    let col_w = widest + GAP;
+    // Fill columns top to bottom, a section kept whole where it fits.
+    let mut columns: Vec<Vec<String>> = vec![Vec::new()];
+    for sec in sections {
+        let last = columns.last_mut().expect("one column");
+        if !last.is_empty() && last.len() + sec.len() > body_h && columns.len() < cols {
+            columns.push(Vec::new());
+        }
+        columns.last_mut().expect("one column").extend(sec);
+    }
+    // Say so when the window cuts the list short, rather than hiding keys.
+    let cut = columns.iter().any(|c| c.iter().skip(body_h).any(|l| !l.is_empty()));
+    let more = if cut { "  ·  widen the window for the rest" } else { "" };
+    let title = format!("  {}{}K E Y S{rst}   {}? or Esc closes{more}{rst}", p.accent, p.bold, p.dim);
+    let mut out = vec![truncate_ansi(&title, term_w)];
+    for row in 0..body_h {
+        let mut line = String::from("  ");
+        for (c, col) in columns.iter().enumerate() {
+            let cell = col.get(row).map(String::as_str).unwrap_or("");
+            line.push_str(cell);
+            if c + 1 < columns.len() {
+                let pad = col_w.saturating_sub(visible_len(cell));
+                line.push_str(&" ".repeat(pad));
+            }
+        }
+        out.push(truncate_ansi(line.trim_end(), term_w));
+    }
+    while out.last().is_some_and(|l| l.trim().is_empty()) {
+        out.pop();
+    }
+    out
+}
+
+fn print_status_help_view(state: &PlayerState, prev_frame_lines: usize) -> usize {
+    let p = crate::theme::palette(state.theme_kind());
+    let (term_w, term_h) = terminal::size().map(|(w, h)| (w as usize, h as usize)).unwrap_or((120, 40));
+    if prev_frame_lines != usize::MAX && prev_frame_lines > 0 {
+        crate::term::out!("\x1B[{}F", prev_frame_lines);
+    }
+    let mut w = FrameWriter::fitted();
+    for (i, line) in help_lines(p, term_w, term_h).iter().enumerate() {
+        if i == 0 { w.first_line(line) } else { w.line(line) }
+    }
+    crate::term::out!("\x1B[J");
+    crate::term::flush();
+    w.count()
+}
+
 /// Fit the EQ editor into `avail` rows of `term_w` columns: every line cut to
 /// the width (the 99-column footer wrapped on an 80-column terminal, the frame
 /// landed a row low every frame and then scrolled the screen at 20 fps), the
@@ -396,6 +473,14 @@ fn fit_eq_screen(
     out.push(truncate_ansi(footer, term_w));
     out
 }
+/// How long a first Esc in the player waits for the second that quits.
+const ESC_QUIT_WINDOW: Duration = Duration::from_secs(2);
+
+/// Whether an Esc at `now` is the confirming second press.
+fn esc_confirms_quit(armed_until: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    armed_until.is_some_and(|t| now < t)
+}
+
 /// Whether the event right behind a bare Esc means the Esc was the first
 /// byte of an escape sequence (macOS Cmd+Arrow arrives as ESC + another key
 /// press), rather than a real Esc tap.
@@ -489,6 +574,19 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
                     }
                     _ => {} // Fall through to global keys
                 }
+            }
+
+            // `?` opens the key list from any view, and closes it; Esc closes
+            // it too. Everything else still works underneath (space pauses).
+            if matches!(k, KeyEvent { code: KeyCode::Char('?'), .. }) {
+                ui.view_mode = if ui.view_mode == ViewMode::Help { ViewMode::Player } else { ViewMode::Help };
+                ui.terminal_resized = true;
+                continue;
+            }
+            if ui.view_mode == ViewMode::Help && matches!(k, KeyEvent { code: KeyCode::Esc, .. }) {
+                ui.view_mode = ViewMode::Player;
+                ui.terminal_resized = true;
+                continue;
             }
 
             // EQ editor keys: arrows select/adjust bands; t / , . / < > edit the
@@ -588,8 +686,9 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
                 if ui.library_tree_mode {
                     // A staged bulk remove is awaiting confirmation: `y` removes,
                     // any other key cancels.
-                    if let Some((label, indices)) = ui.tree_pending_remove.take() {
+                    if let Some((label, paths)) = ui.tree_pending_remove.take() {
                         if matches!(k, KeyEvent { code: KeyCode::Char('y'), .. }) {
+                            let indices = indices_of(playlist, &paths);
                             tree_remove_indices(state, ui, playlist, &indices);
                         } else {
                             ui.set_status(format!("cancelled removing {label}"));
@@ -781,7 +880,7 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
                 }
                 KeyEvent { code: KeyCode::Char('l'), .. } => {
                     ui.view_mode = match ui.view_mode {
-                        ViewMode::Player | ViewMode::Lyrics | ViewMode::Eq => {
+                        ViewMode::Player | ViewMode::Lyrics | ViewMode::Eq | ViewMode::Help => {
                             ui.cursor = ui.current;
                             ensure_cursor_visible(ui, playlist);
                             ViewMode::Playlist
@@ -791,7 +890,7 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
                 }
                 KeyEvent { code: KeyCode::Char('y'), .. } => {
                     ui.view_mode = match ui.view_mode {
-                        ViewMode::Player | ViewMode::Playlist | ViewMode::Eq => {
+                        ViewMode::Player | ViewMode::Playlist | ViewMode::Eq | ViewMode::Help => {
                             ui.lyrics_scroll = 0;
                             ui.lyrics_auto_scroll = true;
                             ViewMode::Lyrics
@@ -812,7 +911,7 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
                     rescan(ui, playlist);
                 }
                 KeyEvent { code: KeyCode::Char('z'), .. } => {
-                    toggle_shuffle(ui, playlist);
+                    toggle_shuffle(state, ui, playlist);
                 }
                 KeyEvent { code: KeyCode::Char('o'), .. } => {
                     let picked = prompt_path_line();
@@ -836,8 +935,19 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
                         ui.set_status("Native picker unavailable; press O to type a path".to_string());
                     }
                 }
-                KeyEvent { code: KeyCode::Char('q'), .. } |
-                KeyEvent { code: KeyCode::Esc, .. } => { state.quit(); return true; }
+                KeyEvent { code: KeyCode::Char('q'), .. } => { state.quit(); return true; }
+                // Esc closes every other view, so in the player a stray one
+                // (meant for a view already closed) quit without warning: it
+                // now asks once, and a second Esc within ESC_QUIT_WINDOW quits.
+                KeyEvent { code: KeyCode::Esc, .. } => {
+                    let now = std::time::Instant::now();
+                    if esc_confirms_quit(ui.esc_quit_until, now) {
+                        state.quit();
+                        return true;
+                    }
+                    ui.esc_quit_until = Some(now + ESC_QUIT_WINDOW);
+                    ui.set_status_for("press Esc again to quit (or q)".to_string(), ESC_QUIT_WINDOW);
+                }
                 KeyEvent { code: KeyCode::Char('c'), modifiers: KeyModifiers::CONTROL, .. } => {
                     state.quit(); return true;
                 }
@@ -1519,14 +1629,25 @@ fn tree_remove_under_cursor(state: &PlayerState, ui: &mut UiState, playlist: &mu
         crate::library::VisibleRow::Album { artist, album } => {
             let label = format!("album {}", ui.library_tree.artists[artist].albums[album].name);
             ui.set_status(format!("remove {label} — {} tracks?  [y/n]", indices.len()));
-            ui.tree_pending_remove = Some((label, indices));
+            ui.tree_pending_remove = Some((label, paths_at(playlist, &indices)));
         }
         crate::library::VisibleRow::Artist { artist } => {
             let label = format!("artist {}", ui.library_tree.artists[artist].name);
             ui.set_status(format!("remove {label} — {} tracks?  [y/n]", indices.len()));
-            ui.tree_pending_remove = Some((label, indices));
+            ui.tree_pending_remove = Some((label, paths_at(playlist, &indices)));
         }
     }
+}
+
+/// The paths at `indices` (a staged removal outlives the positions).
+fn paths_at(playlist: &[PathBuf], indices: &[usize]) -> Vec<PathBuf> {
+    indices.iter().filter_map(|&i| playlist.get(i).cloned()).collect()
+}
+
+/// Where `paths` sit in the playlist NOW (any that left it are skipped).
+fn indices_of(playlist: &[PathBuf], paths: &[PathBuf]) -> Vec<usize> {
+    let wanted: std::collections::HashSet<&PathBuf> = paths.iter().collect();
+    (0..playlist.len()).filter(|&i| wanted.contains(&playlist[i])).collect()
 }
 
 /// Remove a library-tree selection (an artist, album or track) through the
@@ -1623,7 +1744,7 @@ fn sort_playlist_by_tags(state: &PlayerState, ui: &mut UiState, playlist: &mut V
 /// interrupted). When turning OFF, restores the snapshotted order — sorting
 /// would destroy an M3U's curated order — falling back to a path sort when no
 /// snapshot exists (e.g. the session started with --shuffle).
-fn toggle_shuffle(ui: &mut UiState, playlist: &mut [PathBuf]) {
+fn toggle_shuffle(state: &PlayerState, ui: &mut UiState, playlist: &mut [PathBuf]) {
     let old_playlist = playlist.to_vec();
     // The queued tracks are part of the tail being reordered.
     ui.enqueue_count = 0;
@@ -1663,9 +1784,28 @@ fn toggle_shuffle(ui: &mut UiState, playlist: &mut [PathBuf]) {
         }
         ui.set_status("Shuffle OFF".to_string());
     }
+    // Every header reads the playing track's index from state: it named the
+    // track now at the OLD position until the next track change.
+    state.current_track.store(ui.current, Ordering::Relaxed);
     // Cached metadata is indexed by position — remap it to match the reordered paths.
     reindex_and_restart_scan(ui, playlist, &old_playlist);
     ui.playlist_dirty = true;
+}
+
+/// The queue after the playing track moves from `old` to `new`: one fewer
+/// when the next track starts (the first queued one, while there is a
+/// queue), unchanged when the same track restarts (repeat-one), and gone after
+/// any other move, which leaves the queued tracks somewhere else entirely. It
+/// used to be emptied on every track change, so tracks queued later jumped
+/// ahead of ones still waiting.
+pub(crate) fn queue_after_advance(count: usize, old: usize, new: usize) -> usize {
+    if new == old + 1 {
+        count.saturating_sub(1)
+    } else if new == old {
+        count
+    } else {
+        0
+    }
 }
 
 fn toggle_repeat(ui: &mut UiState, state: &PlayerState) {
@@ -1689,6 +1829,12 @@ fn enqueue_track(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<PathB
         }
     };
     if track_idx >= playlist.len() || track_idx == ui.current { return; }
+    // Already in the queue: queueing it again only grew the count, and the
+    // next track queued then landed past a track that was never queued.
+    if track_idx > ui.current && track_idx <= ui.current + ui.enqueue_count {
+        ui.set_status("Already queued".to_string());
+        return;
+    }
 
     // Target position: right after current + any previously enqueued tracks
     let target = ui.current + 1 + ui.enqueue_count;
@@ -1726,6 +1872,7 @@ fn enqueue_track(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<PathB
     ui.enqueue_count += 1;
     ui.playlist_dirty = true;
     state.total_tracks.store(playlist.len(), Ordering::Relaxed);
+    state.current_track.store(ui.current, Ordering::Relaxed);
     reindex_and_restart_scan(ui, playlist, &old_playlist);
     ui.set_status(format!("Queued: {}", name));
 }
@@ -1757,6 +1904,9 @@ fn switch_source_paths(
 
     let old_playlist = std::mem::replace(playlist, new_list);
     ui.source_paths = vec![new_path.clone()];
+    // A rescan still running describes the OLD sources: landing afterwards,
+    // its result replaced the new playlist. Dropping the receiver discards it.
+    ui.rescan_receiver = None;
     ui.pre_shuffle_order = None; // snapshot belongs to the previous source
     ui.current = 0;
     ui.cursor = 0;
@@ -1997,6 +2147,67 @@ mod ui_tests {
     use super::*;
 
     #[test]
+    fn the_key_list_fits_the_window_and_lists_every_key() {
+        let p = crate::theme::palette(crate::theme::ThemeKind::Minimal);
+        for (w, h) in [(40, 10), (80, 24), (120, 40), (200, 60)] {
+            let lines = help_lines(p, w, h);
+            assert!(lines.len() < h, "{w}×{h}: {} rows", lines.len());
+            assert!(lines.iter().all(|l| visible_len(l) <= w), "{w}×{h}: a line overflows");
+        }
+        // A 100-column window holds two columns.
+        let two = help_lines(p, 100, 30);
+        assert!(two.iter().any(|l| crate::ansi::strip_ansi(l).contains("PLAYLIST")), "{two:#?}");
+        // Wide and tall enough: every key is there.
+        let text = help_lines(p, 200, 60).iter().map(|l| crate::ansi::strip_ansi(l)).collect::<Vec<_>>().join("\n");
+        for (_, keys) in crate::cli::KEYS {
+            for (_, what) in *keys {
+                assert!(text.contains(what), "missing {what:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn esc_in_the_player_quits_only_when_pressed_twice() {
+        let now = std::time::Instant::now();
+        assert!(!esc_confirms_quit(None, now), "a first Esc only asks");
+        assert!(esc_confirms_quit(Some(now + ESC_QUIT_WINDOW), now), "the second within the window quits");
+        assert!(!esc_confirms_quit(Some(now), now + Duration::from_millis(1)), "too late: it asks again");
+    }
+
+    #[test]
+    fn a_new_source_discards_a_rescan_of_the_old_one() {
+        let dir = std::env::temp_dir().join(format!("keet-src-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("x.mp3"), b"").unwrap();
+        let state = PlayerState::new();
+        let mut ui = test_ui(1);
+        let mut playlist = vec![p("/old/a.mp3")];
+        let (_tx, rx) = std::sync::mpsc::channel();
+        ui.rescan_receiver = Some(rx);
+        switch_source_paths(&state, &mut ui, &mut playlist, dir.clone());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(ui.rescan_receiver.is_none(), "the old folders' result would replace the new list");
+    }
+
+    #[test]
+    fn a_staged_removal_follows_its_tracks_through_a_resort() {
+        let before = vec![p("/a.mp3"), p("/b.mp3"), p("/c.mp3"), p("/d.mp3")];
+        let staged = paths_at(&before, &[1, 2]); // b and c
+        let after = vec![p("/d.mp3"), p("/c.mp3"), p("/a.mp3"), p("/b.mp3")]; // re-sorted meanwhile
+        assert_eq!(indices_of(&after, &staged), [1, 3], "still b and c, not a and d");
+        assert_eq!(indices_of(&after[..2], &staged), [1], "a track gone meanwhile is skipped");
+    }
+
+    #[test]
+    fn the_queue_survives_the_next_track_starting() {
+        assert_eq!(queue_after_advance(3, 4, 5), 2, "the first queued track started");
+        assert_eq!(queue_after_advance(0, 4, 5), 0);
+        assert_eq!(queue_after_advance(2, 4, 4), 2, "repeat-one: same track again");
+        assert_eq!(queue_after_advance(2, 4, 9), 0, "a jump leaves the queue behind");
+        assert_eq!(queue_after_advance(2, 4, 3), 0, "skip back");
+    }
+
+    #[test]
     fn too_small_is_below_either_minimum_and_unknown_is_never_small() {
         assert!(!window_too_small(40, 10));
         assert!(window_too_small(39, 40));
@@ -2160,7 +2371,7 @@ mod ui_tests {
         ui.pre_shuffle_order = Some(vec![p("/a.mp3")]);
         let mut playlist = vec![p("/b.mp3"), p("/a.mp3"), p("/a.mp3")];
 
-        toggle_shuffle(&mut ui, &mut playlist);
+        toggle_shuffle(&PlayerState::new(), &mut ui, &mut playlist);
 
         assert!(!ui.shuffle);
         assert_eq!(playlist.len(), 3, "fallback must keep every track");
@@ -2251,6 +2462,37 @@ mod ui_tests {
     }
 
     #[test]
+    fn queueing_keeps_the_header_on_the_playing_track_and_ignores_requeues() {
+        let state = PlayerState::new();
+        let mut ui = test_ui(5);
+        let mut playlist = vec![p("/a.mp3"), p("/b.mp3"), p("/c.mp3"), p("/d.mp3"), p("/e.mp3")];
+        ui.current = 3; // d plays
+        state.current_track.store(3, Ordering::Relaxed);
+        ui.cursor = 0;
+        enqueue_track(&state, &mut ui, &mut playlist); // a moves behind d
+        assert_eq!(playlist[ui.current], p("/d.mp3"));
+        assert_eq!(state.current_track.load(Ordering::Relaxed), ui.current, "the header followed d");
+        assert_eq!(ui.enqueue_count, 1);
+        ui.cursor = ui.current + 1; // a again
+        enqueue_track(&state, &mut ui, &mut playlist);
+        assert_eq!(ui.enqueue_count, 1, "a re-queue is not a second queued track");
+    }
+
+    #[test]
+    fn shuffle_off_keeps_the_header_on_the_playing_track() {
+        let state = PlayerState::new();
+        let mut ui = test_ui(4);
+        let mut playlist = vec![p("/a.mp3"), p("/b.mp3"), p("/c.mp3"), p("/d.mp3")];
+        ui.shuffle = true;
+        ui.pre_shuffle_order = Some(playlist.clone());
+        playlist.swap(0, 2); // c a b d → c plays at 0
+        ui.current = 0;
+        toggle_shuffle(&state, &mut ui, &mut playlist); // off: back to a b c d
+        assert_eq!(playlist[ui.current], p("/c.mp3"));
+        assert_eq!(state.current_track.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
     fn the_queue_count_follows_removals_and_reorders() {
         let state = PlayerState::new();
         let mut ui = test_ui(5);
@@ -2260,7 +2502,7 @@ mod ui_tests {
         ui.cursor = 1;
         remove_track(&state, &mut ui, &mut playlist); // remove queued b
         assert_eq!(ui.enqueue_count, 1, "one queued track left");
-        toggle_shuffle(&mut ui, &mut playlist);
+        toggle_shuffle(&state, &mut ui, &mut playlist);
         assert_eq!(ui.enqueue_count, 0, "a shuffle scatters the queue");
     }
 
@@ -2335,7 +2577,7 @@ mod ui_tests {
         let bands = st.eq_bands_array();
         let p = crate::theme::palette(crate::theme::ThemeKind::Classic);
         let readouts = [("FX", "None"), ("XFEED", "Off"), ("BAL", "centred"), ("RG", "off")];
-        let full = "  [←→] band  [↑↓] gain (⇧ fine)  [t] type  [,.] Q  [<>] freq  [[]] preset  [0] reset  [E/Esc] close";
+        let full = "  [←→] band  [↑↓] gain (⇧ fine)  [t] type  [,.] Q  [<>] freq  [[]] preset  [0] reset  [e/Esc] close";
         let short = "  ←→ band ↑↓ gain t type ,. Q <> freq E close";
         for term_w in 10usize..130 {
             for avail in 0usize..45 {

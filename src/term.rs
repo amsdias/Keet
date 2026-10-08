@@ -27,6 +27,12 @@ pub fn push(args: std::fmt::Arguments) {
     });
 }
 
+/// Throw away everything queued (a frame a panic interrupted half-built:
+/// written out on the way down, it left a garbled screen under the message).
+pub fn discard() {
+    BUF.with(|b| b.borrow_mut().clear());
+}
+
 /// Write everything queued in one go, then flush the terminal.
 pub fn flush() {
     BUF.with(|b| {
@@ -130,6 +136,13 @@ mod tests {
         assert_eq!(strip_colour("\x1B[32m▶\x1B[0m \x1B[2mdim\x1B[m"), "▶\x1B[0m \x1B[2mdim\x1B[m");
         assert_eq!(strip_colour("\x1B[48;5;17;7mx"), "\x1B[7mx");
         assert_eq!(strip_colour("\x1B[2;90m─"), "\x1B[2m─");
+    }
+
+    #[test]
+    fn discard_drops_a_half_built_frame() {
+        BUF.with(|b| b.borrow_mut().push_str("half a frame"));
+        discard();
+        assert!(BUF.with(|b| b.borrow().is_empty()));
     }
 
     #[test]

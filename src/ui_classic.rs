@@ -24,9 +24,30 @@ use crate::viz::{
 
 /// Columns the cover needs beside a readable info column (2 + 20 + 2 + 36).
 const COVER_MIN_W: usize = 60;
-/// Rows the window needs before the 10-row cover is shown: an image taller
-/// than the space left scrolls the screen.
-const COVER_MIN_H: usize = 18;
+/// Rows a view's body needs below the header before the header may grow:
+/// the player's transport + status + rule, four rows of visualisation and the
+/// footer; the playlist and lyrics also want ten rows of list.
+const PLAYER_BODY_MIN: usize = 2 + 1 + 4 + FOOTER_ROWS;
+const LIST_BODY_MIN: usize = 2 + 1 + 1 + FOOTER_ROWS + 10;
+/// Below this height the gap row under the header goes too.
+const GAP_MIN_H: usize = 16;
+
+/// Which info lines survive a header of `budget` rows without the cover, by
+/// their index in `info_lines`: the title always; then, dropped first to
+/// last, the next track, the play modes, the device, the format, the verdict
+/// and the artist. Shown in their own order.
+fn compact_info(info: Vec<String>, budget: usize) -> Vec<String> {
+    const DROP_ORDER: [usize; 6] = [9, 7, 6, 3, 4, 1];
+    let mut keep: Vec<bool> = info.iter().map(|l| !l.is_empty()).collect();
+    keep[0] = true;
+    for &i in &DROP_ORDER {
+        if keep.iter().filter(|&&k| k).count() <= budget.max(1) {
+            break;
+        }
+        keep[i] = false;
+    }
+    info.into_iter().zip(keep).filter(|(_, k)| *k).map(|(l, _)| l).collect()
+}
 /// Rows kept below a body: message line, key bar, one row of slack (a frame
 /// ending on the window's last row scrolls on the next write).
 const FOOTER_ROWS: usize = 3;
@@ -59,11 +80,6 @@ fn emit(w: &mut FrameWriter, rows: Vec<Row>) {
 fn khz(rate: u32) -> String {
     let k = rate as f32 / 1000.0;
     if k.fract() == 0.0 { format!("{k:.0} kHz") } else { format!("{k:.1} kHz") }
-}
-
-/// Lossy codecs have no bit depth of their own; the decoder's figure is noise.
-fn shows_bit_depth(ext: &str) -> bool {
-    !matches!(ext, "mp3" | "ogg" | "oga" | "opus" | "aac")
 }
 
 /// "label value" with the label dim; the value dim too when it reads "off".
@@ -150,7 +166,8 @@ fn info_lines(
     let out_rate = state.output_rate.load(Ordering::Relaxed) as u32;
     let bits = state.bits_per_sample.load(Ordering::Relaxed);
     let ext_up = ext.to_uppercase();
-    let codec = if shows_bit_depth(ext) { format!("{ext_up} {bits}-bit") } else { ext_up };
+    // 0 = a lossy codec (AAC in .m4a included): no bit depth to show.
+    let codec = if bits > 0 { format!("{ext_up} {bits}-bit") } else { ext_up };
     let rate = if src_rate == out_rate || out_rate == 0 {
         khz(src_rate)
     } else {
@@ -325,9 +342,13 @@ fn top_rows(
     playlist: &[PathBuf],
     p: &Palette,
     (term_w, term_h): (usize, usize),
+    budget: usize,
 ) -> Vec<Row> {
     let size = crate::cover::CoverSize::CLASSIC;
-    let cover_on = ui.cover_enabled && term_w >= COVER_MIN_W && term_h >= COVER_MIN_H;
+    // The cover comes with its full ten rows or not at all: an image taller
+    // than the space left scrolls the screen, and in a short window it pushed
+    // the list and the key bar off the bottom.
+    let cover_on = ui.cover_enabled && term_w >= COVER_MIN_W && budget >= size.rows as usize;
     let mut rows = Vec::with_capacity(16);
 
     if cover_on {
@@ -369,14 +390,16 @@ fn top_rows(
         }
         ui.cover_block_intact = false;
         let info_w = term_w.saturating_sub(3);
-        // Without the cover's height to fill, the spacing rows go.
-        for line in info_lines(state, ui, name, ext, fx_name, cf_name, playlist, p, info_w) {
-            if !line.is_empty() {
-                rows.push(Row::text(format!("  {line}")));
-            }
+        // Without the cover's height to fill, the spacing rows go, and a
+        // short window keeps only what fits (compact_info).
+        let info = info_lines(state, ui, name, ext, fx_name, cf_name, playlist, p, info_w);
+        for line in compact_info(info, budget) {
+            rows.push(Row::text(format!("  {line}")));
         }
     }
-    rows.push(Row::text(String::new()));
+    if term_h >= GAP_MIN_H {
+        rows.push(Row::text(String::new()));
+    }
     rows.push(Row::text(transport_line(state, p, term_w)));
     rows.push(Row::text(status_line(state, p, eq_preset, fx_name, cf_name, stats, term_w)));
     rows
@@ -407,9 +430,12 @@ fn viz_next_name(mode: VizMode) -> &'static str {
     }
 }
 
+/// Most used first: a narrow window drops keys from the end. The play modes
+/// and presets the header and status row show are all here.
 const PLAYER_KEYS: &[(&str, &str)] = &[
-    ("␣", "pause"), ("←→", "seek"), ("↑↓", "track"), ("+−", "vol"), ("e", "eq"),
-    ("v", "viz"), ("l", "list"), ("y", "lyrics"), ("t", "theme"), ("q", "quit"),
+    ("␣", "pause"), ("←→", "seek"), ("↑↓", "track"), ("+−", "vol"), ("q", "quit"),
+    ("?", "keys"), ("v", "viz"), ("e", "eq"), ("l", "list"), ("y", "lyrics"), ("z", "shuffle"),
+    ("⇧R", "repeat"), ("x", "fx"), ("c", "xfeed"), ("⇧F", "full"), ("t", "theme"),
 ];
 
 /// The message line: the active status, else empty (it keeps its row, so the
@@ -479,9 +505,13 @@ pub fn print_status_classic(
         );
         vec![Row::text(format!("{head}{}{items}{}", p.dim, p.reset))]
     } else {
+        // The header takes what the view's body leaves (see PLAYER_BODY_MIN).
+        let gap = usize::from(term_h >= GAP_MIN_H);
+        let body_min = if ui.view_mode == ViewMode::Player { PLAYER_BODY_MIN } else { LIST_BODY_MIN };
+        let budget = term_h.saturating_sub(body_min + gap);
         top_rows(
             state, ui, name, ext, eq_preset, fx_name, cf_name, stats, prev_frame_lines,
-            playlist, p, (term_w, term_h),
+            playlist, p, (term_w, term_h), budget,
         )
     };
     let top_n = top.len();
@@ -638,7 +668,13 @@ fn playlist_body(
     } else {
         // Columns: marker · number · title · album · time.
         let num_w = playlist.len().to_string().len().max(2);
-        let time_w = 7;
+        // Wide enough for the longest duration listed (10 h+ is "10:00:00").
+        let time_w = 1 + (0..playlist.len())
+            .filter_map(|i| ui.metadata_cache.duration(i))
+            .map(|d| format_time(d).len())
+            .max()
+            .unwrap_or(5)
+            .max(5);
         let content = term_w.saturating_sub(2 + 1 + 3 + num_w + 3 + time_w + 1);
         let album_w = if content >= 50 { (content * 30 / 100).clamp(12, 32) } else { 0 };
         let title_w = content.saturating_sub(album_w);
@@ -851,6 +887,21 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_short_header_keeps_the_title_and_drops_the_rest_in_order() {
+        let info: Vec<String> = ["title", "artist", "", "format", "verdict", "", "device", "modes", "", "next"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(compact_info(info.clone(), 10), ["title", "artist", "format", "verdict", "device", "modes", "next"]);
+        assert_eq!(compact_info(info.clone(), 5), ["title", "artist", "format", "verdict", "device"]);
+        assert_eq!(compact_info(info.clone(), 2), ["title", "artist"]);
+        assert_eq!(compact_info(info.clone(), 0), ["title"], "the title always stays");
+        // Shared mode has no verdict: one fewer line to begin with.
+        let mut shared = info;
+        shared[4].clear();
+        assert_eq!(compact_info(shared, 4), ["title", "artist", "format", "device"]);
     }
 
     #[test]

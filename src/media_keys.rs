@@ -47,10 +47,10 @@ fn handle_event(state: &PlayerState, event: MediaControlEvent) {
                 SeekDirection::Backward => -secs,
             });
         }
-        // Player seeks are relative; translate the absolute target.
+        // A position is absolute: it replaces any seek still pending.
         MediaControlEvent::SetPosition(pos) => {
             let delta = pos.0.as_secs_f64() - state.time_secs();
-            state.seek(delta.round() as i64);
+            state.seek_to_offset(delta.round() as i64);
         }
         _ => {}
     }
@@ -272,5 +272,10 @@ mod tests {
         // An absolute position becomes a seek relative to the clock (0 here).
         handle_event(&st, MediaControlEvent::SetPosition(MediaPosition(Duration::from_secs_f64(42.4))));
         assert_eq!(st.take_seek(), 42);
+        // Two drags before the first lands: the second position wins, it is
+        // not added to the first (that overshot to 72 s).
+        handle_event(&st, MediaControlEvent::SetPosition(MediaPosition(Duration::from_secs(42))));
+        handle_event(&st, MediaControlEvent::SetPosition(MediaPosition(Duration::from_secs(30))));
+        assert_eq!(st.take_seek(), 30);
     }
 }
