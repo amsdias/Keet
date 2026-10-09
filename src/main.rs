@@ -143,9 +143,8 @@ fn open_startup_output(
         match audio::prepare_exclusive_device(host, &device) {
             Ok(d) => device = d,
             Err(e) => {
-                eprintln!("Note: {e}. Playing in normal mode.");
-                // The stderr note is wiped when the UI takes the screen; show
-                // it where it can be read (set just before playback starts).
+                // On the status line (set just before playback starts), not
+                // stderr: the first frame wipes stderr.
                 startup_note = Some(format!("exclusive mode off: {e}"));
                 exclusive = false;
                 state.exclusive.store(false, Ordering::Relaxed);
@@ -254,13 +253,14 @@ fn open_startup_output(
                     crate::term::out!("Exclusive mode: raw hardware device + per-track rate switching\r\n");
                 }
             }
+            // On the status line, not stderr: the first frame wipes stderr.
             Err(e) => {
                 if cfg!(target_os = "macos") {
                     // macOS: hog mode failed but rate switching still works via CoreAudio
-                    eprintln!("Note: Hog mode unavailable ({}). Per-track rate switching is still active.", e);
+                    startup_note = Some(format!("hog mode unavailable ({e}) — per-track rate switching still on"));
                 } else {
                     // Other platforms: exclusive mode is not supported at all
-                    eprintln!("Note: {}", e);
+                    startup_note = Some(format!("exclusive mode off: {e}"));
                     state.exclusive.store(false, Ordering::Relaxed);
                 }
             }
@@ -330,9 +330,13 @@ fn install_panic_hook() {
 
 /// The tracks of every source (folders, files, M3U), deduplicated by
 /// canonical path, shuffled if asked. One unreadable source among several is
-/// skipped with a warning; a lone one is an error.
-fn load_initial_playlist(source_paths: &[PathBuf], shuffle: bool) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+/// skipped with a warning (returned, for the status line: printed to stderr
+/// it was wiped by the first frame); a lone one is an error.
+fn load_initial_playlist(source_paths: &[PathBuf], shuffle: bool)
+    -> Result<(Vec<PathBuf>, Option<String>), Box<dyn std::error::Error>>
+{
     let mut combined = Vec::new();
+    let mut skipped = Vec::new();
     for src in source_paths {
         match build_playlist(src, false) {
             Ok(tracks) => combined.extend(tracks),
@@ -340,7 +344,7 @@ fn load_initial_playlist(source_paths: &[PathBuf], shuffle: bool) -> Result<Vec<
                 if source_paths.len() == 1 {
                     return Err(e);
                 }
-                eprintln!("Skipping {}: {}", src.display(), e);
+                skipped.push(format!("{}: {}", src.display(), e));
             }
         }
     }
@@ -354,7 +358,8 @@ fn load_initial_playlist(source_paths: &[PathBuf], shuffle: bool) -> Result<Vec<
         seen.insert(key)
     });
     if shuffle { shuffle_list(&mut combined); }
-    Ok(combined)
+    let note = (!skipped.is_empty()).then(|| format!("skipped {}", skipped.join("; ")));
+    Ok((combined, note))
 }
 
 /// `--eq`/`--fx`: a preset by name (any case), or else a JSON preset file at
@@ -363,7 +368,7 @@ fn pick_preset<T: serde::de::DeserializeOwned>(presets: &mut Vec<T>, wanted: &st
     if let Some(i) = presets.iter_mut().position(|p| name(p).eq_ignore_ascii_case(wanted)) {
         return Some(i);
     }
-    let mut preset = serde_json::from_str::<T>(&std::fs::read_to_string(wanted).ok()?).ok()?;
+    let mut preset = serde_json::from_str::<T>(&config::read_json_text(wanted.as_ref())?).ok()?;
     // Shown on screen like any preset name: cleaned the same way as the ones
     // loaded from the preset folders (an ESC in it would be executed).
     let n = name(&mut preset);
@@ -680,6 +685,11 @@ fn spawn_cover_worker(ui: &mut state::UiState, path: std::path::PathBuf, size: c
                             misses.remember(key, None);
                             None
                         }
+                        // A FAILED lookup (offline, a timeout, an HTTP error)
+                        // is deliberately not remembered: it says nothing
+                        // about the album, and remembering it would keep the
+                        // cover away for the session after the network came
+                        // back. The next play of the album simply asks again.
                         lyrics::Lookup::Failed => None,
                     }
                 }
@@ -804,6 +814,13 @@ fn rebuild_stream(
         // No layout found usually means another program holds the device (the
         // probe cannot tell); opening anyway reports THAT, or the device's own
         // reason if the rate really is unsupported.
+        //
+        // `set_output_sample_rate` already ran this probe for the same rate
+        // a moment ago (on a rate switch). Probing again is deliberate: it is
+        // a handful of IsFormatSupported calls, once per stream open, and a
+        // layout carried over from that call would be one more piece of
+        // state to go stale between the two (another program can take the
+        // device in between, which this probe is there to notice).
         let layout = crate::wasapi_out::best_layout(&id, stream_rate, channels).unwrap_or((32, 24));
         let out = crate::wasapi_out::WasapiOutput::start(
             &id, stream_rate, channels, layout, cons, viz_prod, Arc::clone(state),
@@ -848,8 +865,8 @@ fn rebuild_stream(
             // cpal cannot open packed 24-bit (S24_3LE), so a DAC offering only
             // that and 16-bit is left with 16: say so rather than truncate
             // 24-bit files in silence.
-            if let Ok(mut err) = state.decode_error.lock() {
-                *err = Some("device accepts only 16-bit here — 24-bit files are rounded to 16".to_string());
+            if let Ok(mut n) = state.decode_notice.lock() {
+                *n = Some("device accepts only 16-bit here — 24-bit files are rounded to 16".to_string());
             }
         }
     }
@@ -877,12 +894,12 @@ fn rebuild_stream(
                 "audio config {}ch/{}Hz rejected ({}) — fell back to {}ch/{}Hz",
                 channels, stream_rate, e, fallback.channels(), fallback.sample_rate()
             );
-            // Status line AND stderr: the status line is painted over within a
-            // frame or two at startup, so `keet ... 2>log.txt` is the only way
-            // to actually catch this after the fact.
-            eprintln!("keet: {note}");
-            if let Ok(mut err) = state.decode_error.lock() {
-                *err = Some(note);
+            // On the status line, held for seconds (decode_notice). Not on
+            // stderr: this also runs during playback (recovery, rate
+            // switches), where stderr lands on top of the frame. It used to
+            // go through decode_error too, which is shown as "Skip: …".
+            if let Ok(mut n) = state.decode_notice.lock() {
+                *n = Some(note);
             }
             if fallback.channels() == channels && fallback.sample_rate() == stream_rate {
                 return Err(e);
@@ -956,6 +973,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Loaded once and reused for the volume/EQ/device restore further down.
     let resume_state_loaded = if opts.resume { load_state() } else { None };
+    // Saved sources gone from disk: said on the status line once the UI runs
+    // (stderr printed here is wiped by the first frame).
+    let mut missing_saved: Vec<String> = Vec::new();
     let (source_paths, shuffle, repeat_mode) = if opts.resume {
         // Try resume from saved state
         match resume_state_loaded.as_ref() {
@@ -964,12 +984,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .filter_map(|s| {
                         let p = PathBuf::from(s);
                         if p.exists() { Some(p) } else {
-                            eprintln!("Saved path not found, skipping: {}", s);
+                            missing_saved.push(s.clone());
                             None
                         }
                     })
                     .collect();
                 if paths.is_empty() {
+                    // Before the UI: stderr is where this belongs, and Keet exits.
+                    for s in &missing_saved {
+                        eprintln!("Saved path not found: {s}");
+                    }
                     eprintln!("No saved paths found");
                     std::process::exit(1);
                 }
@@ -1011,7 +1035,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Persistent user preferences (config.json) — applies on every launch.
     let app_config = config::load();
 
-    let playlist = load_initial_playlist(&source_paths, shuffle)?;
+    let (playlist, skipped_sources) = load_initial_playlist(&source_paths, shuffle)?;
     let state = Arc::new(PlayerState::new());
     state.total_tracks.store(playlist.len(), Ordering::Relaxed);
 
@@ -1109,6 +1133,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ui.shuffle = shuffle;
     ui.repeat_mode = repeat_mode;
     ui.hq_resampler = hq_resampler;
+    let skipped_sources = skipped_sources.or_else(|| {
+        (!missing_saved.is_empty()).then(|| format!("saved source not found: {}", missing_saved.join("; ")))
+    });
+    if let Some(note) = skipped_sources {
+        ui.set_status_for(note, Duration::from_secs(10));
+    }
     // Unreadable config values: each was skipped on its own (config::parse).
     if !app_config.problems.is_empty() {
         ui.set_status_for(

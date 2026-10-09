@@ -191,7 +191,8 @@ pub fn print_help() {
     println!("      --fx <name|path>   Start with effects preset by name or JSON file path");
     println!("  -x, --crossfade <secs> Crossfade duration between tracks (0 = disabled)");
     println!("      --rg-mode <mode>   ReplayGain: track (default), album, or off");
-    println!("      --device <name>    Output device (substring match)");
+    println!("      --device <name>    Output device: its id (--list-devices), else its name");
+    println!("                         (exact before part of it, any case)");
     println!("      --exclusive        Exclusive mode: bit-perfect, per-track sample rate, device lock");
     println!("                         (macOS: any device; Linux: a card's hw: device, see --list-devices)");
     println!("      --no-cover         Disable album cover display");

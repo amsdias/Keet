@@ -61,6 +61,9 @@ pub fn save_state(state: &ResumeState) {
         }
         if let Ok(json) = serde_json::to_string_pretty(state) {
             // A crash mid-write must not leave a truncated state.json behind.
+            // A failure is not reported: this runs at every track change and
+            // on quit, so the next save writes the same (newer) state, and
+            // the status line has nothing useful to say about it.
             let _ = crate::playlist::write_atomic(&path, json.as_bytes());
         }
     }
@@ -68,7 +71,7 @@ pub fn save_state(state: &ResumeState) {
 
 pub fn load_state() -> Option<ResumeState> {
     let path = state_file_path()?;
-    let content = std::fs::read_to_string(&path).ok()?;
+    let content = crate::config::read_json_text(&path)?;
     serde_json::from_str(&content).ok()
 }
 

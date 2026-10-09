@@ -100,6 +100,12 @@ impl Flags {
 /// 2-column emoji (❤ + VS16 = ❤️), anything after a zero-width joiner merges
 /// into the preceding emoji (👨‍👩‍👧 is one glyph), and a skin-tone modifier
 /// colours the emoji before it rather than adding one.
+///
+/// Variation selector 15 (text presentation, ⌚ + VS15) is deliberately NOT
+/// counted as narrowing: terminals disagree (most draw the emoji 2 columns
+/// wide regardless, a few switch to a 1-column glyph), and measuring 2 where
+/// the glyph is 1 leaves a blank cell, while measuring 1 where it is 2 wraps
+/// the row and drifts the frame. The safe error is the one kept.
 fn cluster_width(prev: Option<char>, c: char) -> usize {
     match (prev, c) {
         (Some('\u{200D}'), _) => 0,
@@ -223,8 +229,21 @@ pub(crate) fn fit_segments(segments: &[String], sep: &str, width: usize) -> Stri
 /// executed by the terminal: LRCLIB lyrics are user-submitted remote content,
 /// and a query sequence smuggled in there has its reply delivered on stdin as
 /// keystrokes (the exact hazard behind CLAUDE.md's "never query the terminal").
+///
+/// Bidirectional controls (embeddings, overrides, isolates, LRM/RLM) are
+/// dropped: they take no column, but in a bidi-aware terminal an override in
+/// a title (U+202E) reverses everything after it on the row — the separators,
+/// the time, the next column — and an unclosed one runs to the end of the line.
+/// Right-to-left SCRIPT is left alone; the terminal orders it itself.
 pub(crate) fn sanitize_display(s: &str) -> String {
-    s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
+    s.chars()
+        .filter(|c| !is_bidi_control(*c))
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
+fn is_bidi_control(c: char) -> bool {
+    matches!(c, '\u{200E}' | '\u{200F}' | '\u{061C}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
 }
 
 #[cfg(test)]
@@ -241,6 +260,13 @@ mod tests {
         // Even the first does not fit: it is cut (with an ellipsis).
         assert_eq!(fit_segments(&segs, "  ·  ", 8), "track 1…");
         assert_eq!(fit_segments(&segs, "  ·  ", 0), "");
+    }
+
+    #[test]
+    fn bidi_controls_are_dropped_from_untrusted_text() {
+        assert_eq!(sanitize_display("ab\u{202E}cd\u{202C}"), "abcd");
+        assert_eq!(sanitize_display("\u{2067}x\u{2069}\u{200F}"), "x");
+        assert_eq!(sanitize_display("שלום"), "שלום", "right-to-left script stays");
     }
 
     #[test]

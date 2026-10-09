@@ -24,8 +24,16 @@ pub(crate) struct Crossfade<T> {
     mix: Vec<f32>,
 }
 
-/// Retired copies kept at most: a burst of key presses faster than the fade
-/// drops the faintest one beyond this (a tiny step, on a nearly silent part).
+/// Retired copies kept at most. Deliberate, both halves of it:
+/// - up to this many copies plus the live stage run at once, i.e. five
+///   reverbs during a burst of effects-preset presses. That lasts one fade
+///   (300 ms after the last press) on the producer thread, which runs ~4 s
+///   ahead of playback, so the extra work never reaches the audio callback.
+/// - a press beyond this drops the copy with the smallest weight, and its
+///   share of the blend vanishes in one sample: a step of at most that weight
+///   times its difference from the rest. With five presses inside one fade
+///   the faintest share is small, and the alternative (an unbounded list)
+///   lets a held key grow the work without limit.
 const MAX_RETIRED: usize = 4;
 
 impl<T> Default for Crossfade<T> {

@@ -1334,6 +1334,11 @@ fn remove_indices(
         // stays a valid index for the display meanwhile.
         let next = ui.current - removed_before_current;
         ui.removed_current_next = Some(next);
+        // The first queued track (if any) now sits at `next` and is the one
+        // about to play: it leaves the queue now. The jump that starts it
+        // goes from `next` to `next`, which the queue rule reads as a
+        // restart and would keep it counted.
+        ui.enqueue_count = ui.enqueue_count.saturating_sub(1);
         ui.current = next.min(playlist.len() - 1);
         state.next(); // skip the removed track now
     } else {
@@ -1365,6 +1370,42 @@ fn remove_indices(
 /// playing track's successor sits. `len` means past the end: the playlist
 /// loop turns it into the repeat-all cycle or the end of playback, exactly as
 /// when the last track finishes.
+/// The track that follows the one ending, given the index the producer
+/// reports. The producer works from its own copy of the playlist, so after
+/// an edit its index means nothing in the real list: the edit is consumed
+/// here and `track_after_edit` decides. Every handler that moves on from a
+/// producer's report goes through this (the transition, the rate change, the
+/// end of the producer's list) — the natural advance used to be the only one
+/// that checked, so a track queued during the last track was dropped and a
+/// rate change after a removal played the wrong track.
+pub(crate) fn next_after_producer(ui: &mut UiState, producer_index: usize, len: usize) -> usize {
+    if std::mem::take(&mut ui.playlist_dirty) {
+        track_after_edit(ui.current, ui.removed_current_next.take(), len, ui.repeat_mode)
+    } else {
+        producer_index
+    }
+}
+
+/// A producer is starting from the list as it is now, so any edit is
+/// already in its copy and nothing is left to re-resolve. Left set, the next
+/// NATURAL track change took the jump path: a drained ring, ~0.5 s cut off the
+/// track's end, no gapless join or crossfade.
+pub(crate) fn producer_started(ui: &mut UiState) {
+    ui.playlist_dirty = false;
+    ui.removed_current_next = None;
+}
+
+/// The repeat-all wrap, for tracks queued while its rebuild ran: with the
+/// list over, "after the playing track" was the end of the list, so that is
+/// where they went (in order), and the new cycle starting at 0 played them
+/// last. They move to the front: the first starts the cycle, the rest stay
+/// queued behind it. Returns the new cycle's queue count.
+pub(crate) fn queued_to_front(list: &mut [PathBuf], queued: usize) -> usize {
+    let queued = queued.min(list.len());
+    list.rotate_right(queued);
+    queued.saturating_sub(1)
+}
+
 pub(crate) fn track_after_edit(
     current: usize,
     removed_next: Option<usize>,
@@ -1869,6 +1910,12 @@ fn toggle_repeat(ui: &mut UiState, state: &PlayerState) {
     ui.set_status(msg.to_string());
 }
 
+/// Only reachable with the flat list's search CLOSED: while a search is open
+/// every letter (`a` included) goes into the query, and Enter/Esc clear
+/// `filtered_indices`. So `ui.cursor` is a playlist position by the time the
+/// move below adjusts it; the filtered lookup just above is the general
+/// cursor-to-track rule shared with `remove_track`. (The library tree keeps
+/// its own filter and queues through its own path.)
 fn enqueue_track(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<PathBuf>) {
     let track_idx = if ui.filtered_indices.is_empty() {
         ui.cursor
@@ -2237,15 +2284,126 @@ mod ui_tests {
         assert!(ui.tree_pending_remove.is_none(), "a later y must not remove anything");
     }
 
-    /// One track change as the player makes it: after a playlist edit (a
-    /// queue is one) through the jump path, otherwise a natural advance.
+    /// One track change as the player makes it: the producer reports the
+    /// index of the next track in ITS copy of the list (`stale`, which after
+    /// an edit is meaningless), the handler resolves it with
+    /// `next_after_producer` and moves there with `advance_to`, then a
+    /// producer starts from the list as it is. Returns the index moved to.
+    fn change_track(state: &PlayerState, ui: &mut UiState, playlist: &[PathBuf], stale: usize) -> usize {
+        let target = next_after_producer(ui, stale, playlist.len());
+        if target < playlist.len() {
+            advance_to(ui, state, target);
+            producer_started(ui);
+        }
+        target
+    }
+
+    /// A natural track change: the producer, unaware of edits, reports the
+    /// track after the current one.
     fn play_next(state: &PlayerState, ui: &mut UiState, playlist: &[PathBuf]) {
-        let target = if std::mem::take(&mut ui.playlist_dirty) {
-            track_after_edit(ui.current, ui.removed_current_next.take(), playlist.len(), ui.repeat_mode)
-        } else {
-            ui.current + 1
-        };
-        advance_to(ui, state, target);
+        let stale = ui.current + 1;
+        change_track(state, ui, playlist, stale);
+    }
+
+    fn names(playlist: &[PathBuf]) -> Vec<String> {
+        playlist.iter().map(|x| x.file_stem().unwrap().to_string_lossy().into_owned()).collect()
+    }
+
+    fn list_of(names: &[&str]) -> Vec<PathBuf> {
+        names.iter().map(|n| p(&format!("/{n}.mp3"))).collect()
+    }
+
+    fn queue_named(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<PathBuf>, name: &str) {
+        ui.cursor = playlist.iter().position(|x| x == &p(&format!("/{name}.mp3"))).unwrap();
+        enqueue_track(state, ui, playlist);
+    }
+
+    #[test]
+    fn a_track_queued_during_the_last_track_plays_when_the_producer_runs_out() {
+        // The producer's copy ends at c; it reports "past the end" (len of
+        // ITS list). The handler must continue at the queued a, not end.
+        let state = PlayerState::new();
+        let mut ui = test_ui(3);
+        let mut playlist = list_of(&["a", "b", "c"]);
+        ui.current = 2;
+        queue_named(&state, &mut ui, &mut playlist, "a");
+        assert_eq!(names(&playlist), ["b", "c", "a"]);
+        let stale_len = 3;
+        let next = change_track(&state, &mut ui, &playlist, stale_len);
+        assert_eq!(next, 2, "the queued track, not the end of the list");
+        assert_eq!(playlist[ui.current], p("/a.mp3"));
+        assert_eq!(ui.enqueue_count, 0);
+        // Without an edit, running out is the end.
+        let next = change_track(&state, &mut ui, &playlist, playlist.len());
+        assert_eq!(next, playlist.len());
+    }
+
+    #[test]
+    fn removing_the_playing_track_starts_the_first_queued_one_and_dequeues_it() {
+        let state = PlayerState::new();
+        let mut ui = test_ui(5);
+        let mut playlist = list_of(&["a", "b", "c", "d", "e"]);
+        ui.current = 0;
+        queue_named(&state, &mut ui, &mut playlist, "d");
+        queue_named(&state, &mut ui, &mut playlist, "e");
+        assert_eq!(names(&playlist), ["a", "d", "e", "b", "c"]);
+        assert!(remove_indices(&state, &mut ui, &mut playlist, &[0]));
+        // The producer skips a and reports its own next track (index 1 in
+        // its copy: d, but stale all the same).
+        change_track(&state, &mut ui, &playlist, 1);
+        assert_eq!(playlist[ui.current], p("/d.mp3"));
+        assert_eq!(ui.enqueue_count, 1, "only e is still queued");
+        queue_named(&state, &mut ui, &mut playlist, "c");
+        assert_eq!(names(&playlist), ["d", "e", "c", "b"], "c lands after e, not after a phantom");
+    }
+
+    #[test]
+    fn a_rate_change_after_removing_the_playing_track_plays_its_successor() {
+        // Remove a (playing); b needs another rate. The producer, working
+        // from [a, b, c], skips a and reports b at ITS index 1 — which is c
+        // in the edited list. The handler must start b, and c's end must
+        // then be a natural advance, not a jump back to b.
+        let state = PlayerState::new();
+        let mut ui = test_ui(3);
+        let mut playlist = list_of(&["a", "b", "c"]);
+        ui.current = 0;
+        assert!(remove_indices(&state, &mut ui, &mut playlist, &[0]));
+        change_track(&state, &mut ui, &playlist, 1);
+        assert_eq!(playlist[ui.current], p("/b.mp3"));
+        assert!(!ui.playlist_dirty, "consumed, so the next change is natural");
+        play_next(&state, &mut ui, &playlist);
+        assert_eq!(playlist[ui.current], p("/c.mp3"));
+    }
+
+    #[test]
+    fn a_new_producer_clears_the_edit_so_the_next_change_is_natural() {
+        // An edit followed by a respawn (a jump, recovery, a rate change):
+        // the new producer has the edited list, so its next report is right
+        // and must not be re-resolved (that drained the ring and broke
+        // gapless at every following track change).
+        let mut ui = test_ui(3);
+        ui.playlist_dirty = true;
+        ui.removed_current_next = Some(1);
+        producer_started(&mut ui);
+        assert_eq!(next_after_producer(&mut ui, 2, 3), 2);
+    }
+
+    #[test]
+    fn tracks_queued_during_the_repeat_all_rebuild_start_the_next_cycle() {
+        // The list is over (current = len) while the rebuild runs; queued
+        // tracks go to the end, in order. The new cycle starts with them.
+        let state = PlayerState::new();
+        let mut ui = test_ui(4);
+        let mut playlist = list_of(&["a", "b", "c", "d"]);
+        ui.current = playlist.len();
+        queue_named(&state, &mut ui, &mut playlist, "b");
+        queue_named(&state, &mut ui, &mut playlist, "a");
+        assert_eq!(names(&playlist), ["c", "d", "b", "a"]);
+        let count = queued_to_front(&mut playlist, ui.enqueue_count);
+        assert_eq!(names(&playlist), ["b", "a", "c", "d"]);
+        assert_eq!(count, 1, "b plays first, a stays queued behind it");
+        assert_eq!(queued_to_front(&mut playlist, 0), 0);
+        assert_eq!(names(&playlist), ["b", "a", "c", "d"], "nothing queued: untouched");
     }
 
     #[test]

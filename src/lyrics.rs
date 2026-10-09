@@ -375,7 +375,7 @@ impl OffsetStore {
     fn map(&mut self) -> &mut std::collections::HashMap<String, f64> {
         self.map.get_or_insert_with(|| {
             Self::file()
-                .and_then(|f| std::fs::read_to_string(f).ok())
+                .and_then(|f| crate::config::read_json_text(&f))
                 .and_then(|t| serde_json::from_str(&t).ok())
                 .unwrap_or_default()
         })
@@ -394,6 +394,8 @@ impl OffsetStore {
                 let _ = std::fs::create_dir_all(dir);
             }
             if let Ok(json) = serde_json::to_string_pretty(map) {
+                // Not reported on failure: the whole map is written again at
+                // the next offset change, and the offset still applies now.
                 let _ = crate::playlist::write_atomic(&f, json.as_bytes());
             }
         }

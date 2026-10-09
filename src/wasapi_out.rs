@@ -10,7 +10,7 @@
 //! `OutputRenderer` the cpal callback uses — ring buffer, drain protocol,
 //! volume, position counting and viz tap are one implementation.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -137,6 +137,11 @@ pub fn exclusive_report(device_id: &str, channels: u16) -> Vec<String> {
 
 /// A running exclusive-mode stream. Stopped (and its thread joined) by
 /// `stop` or on drop.
+/// `WasapiOutput::start`'s open handshake (see `fate` there).
+const PENDING: u8 = 0;
+const CLAIMED: u8 = 1;
+const ABANDONED: u8 = 2;
+
 pub struct WasapiOutput {
     stop: Arc<AtomicBool>,
     thread: Mutex<Option<JoinHandle<()>>>,
@@ -169,6 +174,13 @@ impl WasapiOutput {
         let id = device_id.to_string();
         let busy = Arc::new(AtomicBool::new(false));
         let busy_thread = Arc::clone(&busy);
+        // Who decided the open's fate first: the render thread claiming a
+        // finished open, or the caller giving up after 5 s. One atomic swap
+        // each, so there is no window where both think they won (a plain
+        // `stop` check left one: the open finishing just as the wait ran out
+        // started a stream nobody owned, or dropped one the caller kept).
+        let fate = Arc::new(AtomicU8::new(PENDING));
+        let fate_thread = Arc::clone(&fate);
         let handle = std::thread::Builder::new()
             .name("keet-wasapi".into())
             .spawn(move || {
@@ -184,7 +196,9 @@ impl WasapiOutput {
                     // finally succeeds must let the device go at once — it used
                     // to fill the buffer and START the stream (a burst of audio,
                     // the device held) before the loop first looked at `stop`.
-                    Ok(o) if stop_thread.load(Ordering::Relaxed) => drop(o),
+                    Ok(o) if fate_thread
+                        .compare_exchange(PENDING, CLAIMED, Ordering::AcqRel, Ordering::Acquire)
+                        .is_err() => drop(o),
                     Ok(o) => {
                         let _ = tx.send(Ok(()));
                         // The render loop ending for ANY reason but `stop` is a
@@ -210,6 +224,13 @@ impl WasapiOutput {
                 }
             }
             Err(_) => {
+                if fate.compare_exchange(PENDING, ABANDONED, Ordering::AcqRel, Ordering::Acquire).is_err() {
+                    // The thread claimed the open in the same instant: its
+                    // Ok is sent right after the claim, so take the stream.
+                    if let Ok(Ok(())) = rx.recv() {
+                        return Ok(Self { stop, thread: Mutex::new(Some(handle)) });
+                    }
+                }
                 stop.store(true, Ordering::Relaxed);
                 Err("timed out opening the device in exclusive mode".into())
             }

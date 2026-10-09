@@ -108,6 +108,10 @@ pub fn from_mp4_edit_list(path: &std::path::Path, sample_rate: u32, track_id: Op
         }
         let mdhd = find(&mut f, mdia.0, mdia.1, b"mdhd")?;
         let media_ts = timescale(&mut f, mdhd)?;
+        // No edit list on THIS track ends the search on purpose (`?`, not
+        // `continue`): this is the played track (or, with no id, the first
+        // audio track — the one played), and another track's edit list is
+        // not its trim. That mix-up is the bug the track-ID match fixed.
         let edts = find(&mut f, start, end, b"edts")?;
         let elst = find(&mut f, edts.0, edts.1, b"elst")?;
         let head = read_at(&mut f, elst.0, 8)?;

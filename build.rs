@@ -26,15 +26,32 @@ fn main() {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
     };
+    //
+    // A path that does not exist is not watched (cargo would rerun the
+    // script on every build), with one exception: the branch's loose ref is
+    // missing while the branch lives only in packed-refs (a fresh clone, a
+    // `git gc`), or before its first commit — and the next commit CREATES
+    // it. Its nearest existing directory is watched instead (refs/heads at
+    // worst), so that creation is seen. A missing packed-refs needs nothing:
+    // packing refs moves them, it never changes which commit is checked out.
     let mut watch = vec!["HEAD".to_string(), "refs/tags".to_string(), "packed-refs".to_string()];
-    if let Some(branch) = git(&["symbolic-ref", "-q", "HEAD"]) {
-        watch.push(branch);
+    let branch = git(&["symbolic-ref", "-q", "HEAD"]);
+    if let Some(b) = &branch {
+        watch.push(b.clone());
     }
     for item in watch {
-        if let Some(path) = git(&["rev-parse", "--git-path", &item]) {
-            if std::path::Path::new(&path).exists() {
-                println!("cargo:rerun-if-changed={path}");
+        let Some(path) = git(&["rev-parse", "--git-path", &item]) else { continue };
+        let mut path = std::path::PathBuf::from(path);
+        if branch.as_deref() == Some(item.as_str()) {
+            let heads = git(&["rev-parse", "--git-path", "refs/heads"]).map(std::path::PathBuf::from);
+            while !path.exists() && Some(&path) != heads.as_ref() {
+                if !path.pop() {
+                    break;
+                }
             }
+        }
+        if path.exists() {
+            println!("cargo:rerun-if-changed={}", path.display());
         }
     }
 

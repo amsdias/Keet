@@ -9,11 +9,11 @@ dest="${2:-docs/reference-sheet.html}"
 python3 - "$src" "$dest" <<'PY'
 import sys, re
 src, dest = sys.argv[1], sys.argv[2]
-body = open(src).read()
+body = open(src, encoding='utf-8').read()
 m = re.search(r'<title>(.*?)</title>\s*', body)
 title = m.group(1) if m else "Keet — Reference Sheet"
 body = re.sub(r'<title>.*?</title>\s*', '', body, count=1)
-open(dest, 'w').write(f"""<!doctype html>
+open(dest, 'w', encoding='utf-8').write(f"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">

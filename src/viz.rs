@@ -984,6 +984,13 @@ fn vu_dot(level: f32, hold: &mut f32, timer: &mut f32, steps: f32) {
         *timer = HOLD_TIME as f32 * VU_FRAME_SECS;
     } else if *timer > 0.0 {
         *timer -= steps * VU_FRAME_SECS;
+        // The hold ran out partway through this call: the rest of it is
+        // falling time (dropping it delayed every fall by up to one call).
+        if *timer < 0.0 {
+            let fall_steps = -*timer / VU_FRAME_SECS;
+            *timer = 0.0;
+            *hold = (*hold - DOT_GRAVITY * fall_steps).max(0.0);
+        }
     } else {
         *hold = (*hold - DOT_GRAVITY * steps).max(0.0);
     }
@@ -2714,7 +2721,12 @@ mod analysis_tests {
             }
             hold
         };
-        assert!((dot(40) - dot(100)).abs() < 0.03, "dot after 2 s: {} vs {}", dot(40), dot(100));
+        // The hold ending partway through a call used to drop the rest of
+        // that call's time, so coarser calls fell later (the tolerance was
+        // 0.03 to cover it).
+        for calls in [7, 33] {
+            assert!((dot(calls) - dot(100)).abs() < 1e-3, "dot after 2 s: {} vs {}", dot(calls), dot(100));
+        }
     }
 
     #[test]

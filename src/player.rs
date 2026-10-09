@@ -397,7 +397,10 @@ impl Player {
             if let Some(msg) = err_msg {
                 self.ui.set_status(format!("Skip: {}", msg));
             }
-            self.ui.current += 1;
+            // Through advance_to: when the failed track was the first queued
+            // one, the next queued track starts and leaves the queue.
+            let next = self.ui.current + 1;
+            ui::advance_to(&mut self.ui, &state, next);
             // Force a full redraw so the next track's status line starts clean
             // instead of leaving orphan lines from the previous render.
             self.ui.terminal_resized = true;
@@ -470,6 +473,9 @@ impl Player {
         if self.ui.repeat_mode == state::RepeatMode::Off {
             return false;
         }
+        // The queue belonged to the list that just ended; what is queued from
+        // here on is queued during the rebuild (see below).
+        self.ui.enqueue_count = 0;
         let (sources, current, removed) =
             (self.ui.source_paths.clone(), self.playlist.clone(), self.ui.removed_paths.clone());
         let (sources_then, playlist_then, removed_then) = (sources.clone(), current.clone(), removed.len());
@@ -501,10 +507,16 @@ impl Player {
         // user's list wins, as it is — replacing or reshuffling it threw the
         // edits away and sent the jump to whatever track took that index.
         // Only a new removal costs a lookup per path, and only then.
-        let user_acted = self.playlist != playlist_then
-            || self.state.jump_to_track.load(Ordering::Relaxed) >= 0;
+        let jump_pending = self.state.jump_to_track.load(Ordering::Relaxed) >= 0;
+        let user_acted = self.playlist != playlist_then || jump_pending;
+        // Tracks queued during the wait start the new cycle (queued_to_front).
+        // Not with a jump pending: it is an index into the list as it is.
+        let mut queued = 0;
         if user_acted {
             next = self.playlist.clone();
+            if !jump_pending {
+                queued = ui::queued_to_front(&mut next, self.ui.enqueue_count);
+            }
         } else if self.ui.removed_paths.len() != removed_then {
             next.retain(|p| {
                 let key = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
@@ -528,12 +540,18 @@ impl Player {
         ui::reindex_and_restart_scan(&mut self.ui, &self.playlist, &old_playlist);
         // Re-arm the artist→album auto-sort: the rebuild above is
         // path-ordered, so without this a folder played on repeat-all
-        // reverts to filename order instead of staying tag-sorted.
-        arm_auto_sort(&mut self.ui);
+        // reverts to filename order instead of staying tag-sorted. Not for
+        // the user's own list (no rebuild happened): sorting it would undo
+        // their edits and scatter the tracks just moved to the front.
+        if !user_acted {
+            arm_auto_sort(&mut self.ui);
+        }
 
-        // A new cycle: the queue belonged to the list that just ended.
+        // A new cycle: the queue belonged to the list that just ended, except
+        // for tracks queued during the rebuild (moved to the front above:
+        // the first plays now, `queued` is the rest).
         self.ui.current = 0;
-        self.ui.enqueue_count = 0;
+        self.ui.enqueue_count = queued;
         true
     }
 
@@ -553,20 +571,26 @@ impl Player {
             // Stream first, then the rate (see handle_rate_change): no stream
             // may be alive while the rate changes.
             self.stream = None;
-            self.reopen_output(self.stream_rate, target);
+            self.reopen_output(self.stream_rate, target, false);
         }
     }
 
     /// Open the output at `target` (see `open_output`); on failure say so and
-    /// leave recovery to retry.
-    fn reopen_output(&mut self, current_rate: u32, target: u32) {
+    /// leave recovery to retry. `by_recovery`: this open replaces an output
+    /// that failed, so it is on probation (OUTPUT_PROVEN_AFTER) — dying at
+    /// once counts as a failed attempt. A rate switch reopens a device that
+    /// was working: an unplug right after it is an ordinary loss, recovered
+    /// at once, not a failed open retried after a backoff.
+    fn reopen_output(&mut self, current_rate: u32, target: u32, by_recovery: bool) {
         match open_output(&self.device, current_rate, target, self.out_channels, self.buffer_size, &self.state) {
             Ok((p, v, s, rate)) => {
                 self.prod = Some(p);
                 self.viz_cons = v;
                 self.stream = Some(s);
                 self.stream_rate = rate;
-                self.ui.output_opened_at = Some(Instant::now());
+                if by_recovery {
+                    self.ui.output_opened_at = Some(Instant::now());
+                }
             }
             Err(e) => output_failed(&mut self.ui, &self.state, e.as_ref()),
         }
@@ -574,6 +598,7 @@ impl Player {
 
     /// Spawn the producer thread (continuous — decodes multiple tracks).
     fn spawn_producer(&mut self) {
+        ui::producer_started(&mut self.ui);
         let playlist_snapshot = self.playlist.clone();
         let start_idx = self.ui.current;
         let state_clone = Arc::clone(&self.state);
@@ -739,13 +764,7 @@ impl Player {
         // don't display/fetch-lyrics for the wrong file. The jump_to_track check on the
         // next loop iteration will respawn the producer with the fresh playlist.
         if self.ui.playlist_dirty {
-            self.ui.playlist_dirty = false;
-            let target = ui::track_after_edit(
-                self.ui.current,
-                self.ui.removed_current_next.take(),
-                self.playlist.len(),
-                self.ui.repeat_mode,
-            );
+            let target = ui::next_after_producer(&mut self.ui, new_index, self.playlist.len());
             state.jump_to(target);
         } else if new_index < self.playlist.len() {
             ui::advance_to(&mut self.ui, &state, new_index);
@@ -854,12 +873,18 @@ impl Player {
         // device maximum (352.8k -> 192k).
         let new_rate = state.next_track_rate.load(Ordering::Relaxed);
         let target_rate = state.exclusive_target_rate(new_rate, self.stream_rate);
-        self.reopen_output(self.stream_rate, target_rate);
+        self.reopen_output(self.stream_rate, target_rate, false);
 
-        // Continue the playlist from the track that needs the new rate.
-        let new_idx = state.producer_track_index.load(Ordering::Relaxed);
+        // Continue the playlist from the track that needs the new rate — or,
+        // after an edit, from the track the edit leaves next (the producer's
+        // index is into its old copy; start_track then matches the rate to
+        // whichever track that is).
+        let reported = state.producer_track_index.load(Ordering::Relaxed);
+        let new_idx = ui::next_after_producer(&mut self.ui, reported, self.playlist.len());
         if new_idx < self.playlist.len() {
             ui::advance_to(&mut self.ui, &state, new_idx);
+        } else {
+            self.ui.current = self.playlist.len(); // the repeat cycle or the end
         }
         Flow::NextTrack
     }
@@ -990,7 +1015,7 @@ impl Player {
             device_rate
         };
 
-        self.reopen_output(device_rate, target_rate);
+        self.reopen_output(device_rate, target_rate, true);
         // Resume the current track where it left off. After a failed attempt
         // nothing plays, so the clock stays here and the next attempt resumes
         // at the same point.
@@ -1010,7 +1035,16 @@ impl Player {
             return Flow::Quit;
         }
         self.save();
-        self.ui.current = self.playlist.len(); // Will trigger repeat-cycle or exit
+        // The producer ran out of ITS copy of the list. A track queued (or a
+        // list edited) while the last track played is not in that copy:
+        // continue there instead of ending or starting the repeat cycle.
+        let len = self.playlist.len();
+        let next = ui::next_after_producer(&mut self.ui, len, len);
+        if next < len {
+            ui::advance_to(&mut self.ui, &self.state, next);
+        } else {
+            self.ui.current = len; // Will trigger repeat-cycle or exit
+        }
         Flow::NextTrack
     }
 

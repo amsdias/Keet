@@ -147,6 +147,17 @@ pub fn load() -> Config {
 /// effects and crossfeed presets — each kept its own copy, two of them
 /// building the config path by hand. Names are shown on screen, so they are
 /// sanitised like any other untrusted text (an ESC in one would be executed).
+/// A JSON file Keet reads (presets, state.json, lyrics offsets) as text,
+/// without the UTF-8 byte-order mark Windows editors (Notepad) put in front:
+/// serde rejects it, and the file read as not JSON at all.
+pub(crate) fn read_json_text(path: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    Some(match text.strip_prefix('\u{feff}') {
+        Some(rest) => rest.to_string(),
+        None => text,
+    })
+}
+
 pub fn load_presets<T: serde::de::DeserializeOwned>(subdir: &str, name: fn(&mut T) -> &mut String) -> Vec<T> {
     let Some(dir) = crate::playlist::keet_config_dir().map(|d| d.join(subdir)) else {
         return Vec::new();
@@ -157,7 +168,7 @@ pub fn load_presets<T: serde::de::DeserializeOwned>(subdir: &str, name: fn(&mut 
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|e| e == "json"))
-        .filter_map(|p| std::fs::read_to_string(p).ok())
+        .filter_map(|p| read_json_text(&p))
         .filter_map(|text| serde_json::from_str::<T>(&text).ok())
         .map(|mut p| {
             let n = name(&mut p);
@@ -172,6 +183,17 @@ pub fn load_presets<T: serde::de::DeserializeOwned>(subdir: &str, name: fn(&mut 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_files_load_with_a_byte_order_mark() {
+        let dir = std::env::temp_dir().join(format!("keet-bom-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("p.json");
+        std::fs::write(&f, "\u{feff}{\"name\": \"x\"}").unwrap();
+        let text = read_json_text(&f).unwrap();
+        assert!(serde_json::from_str::<serde_json::Value>(&text).is_ok(), "{text:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn parse_reads_theme_and_tolerates_junk() {

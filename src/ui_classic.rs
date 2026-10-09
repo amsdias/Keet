@@ -201,12 +201,15 @@ fn info_lines(
         (false, _) => format!("shared · {}", khz(out_rate)),
     };
     let device = if ui.device_name.is_empty() { "output" } else { ui.device_name.as_str() };
-    let device_line = format!(
-        "{}●{rst} {}{} · {mode}{rst}",
-        p.accent,
-        truncate_plain(device, width.saturating_sub(4 + visible_len(&mode) + 3)),
-        p.dim,
-    );
+    // The mode goes whole or not at all: when it would leave the device name
+    // under 8 columns, the line is the name alone (the window edge used to
+    // cut the mode text mid-word instead).
+    let name_room = width.saturating_sub(4 + visible_len(&mode) + 3);
+    let device_line = if name_room >= 8.min(visible_len(device)) && name_room > 0 {
+        format!("{}●{rst} {}{} · {mode}{rst}", p.accent, truncate_plain(device, name_room), p.dim)
+    } else {
+        format!("{}●{rst} {}", p.accent, truncate_plain(device, width.saturating_sub(4)))
+    };
 
     // shuffle ○ off   repeat ● all   xfade 4 s   rg album   hq
     let lamp = |on: bool| if on { format!("{}●{rst}", p.accent) } else { format!("{}○{rst}", p.dim) };
@@ -903,6 +906,24 @@ mod tests {
         let mut shared = info;
         shared[4].clear();
         assert_eq!(compact_info(shared, 4), ["title", "artist", "format", "device"]);
+    }
+
+    #[test]
+    fn the_device_line_shows_its_mode_whole_or_not_at_all() {
+        let st = PlayerState::new();
+        st.exclusive.store(true, Ordering::Relaxed);
+        st.output_bits.store(24, Ordering::Relaxed);
+        let mut ui = UiState::new(Vec::new(), crate::metadata::MetadataCache::new(1));
+        ui.device_name = "FiiO KA17 USB Audio Device".to_string();
+        let playlist = [PathBuf::from("/a.flac")];
+        for w in [20, 30, 40, 45, 60, 100] {
+            let lines = info_lines(&st, &ui, "a", "flac", "", "", &playlist, pal(), w);
+            let device = lines.iter().map(|l| crate::ansi::strip_ansi(l)).find(|l| l.contains("FiiO")).unwrap();
+            assert!(visible_len(&device) <= w, "{w}: {device:?}");
+            if device.contains("exclusive") {
+                assert!(device.ends_with("-bit"), "{w}: the mode cut short: {device:?}");
+            }
+        }
     }
 
     #[test]

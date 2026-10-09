@@ -101,6 +101,16 @@ pub fn verdict(i: &PathInputs) -> Verdict {
     }
     // The f32 path is exact up to 24 bits; a 32-bit integer source loses its
     // low bits, and a DAC format narrower than the file drops them too.
+    //
+    // A 32-bit FLOAT source (float WAV) is also reported, deliberately: it
+    // passes the f32 path untouched, but its values are not on any integer
+    // grid (a float carries 24 significant bits at every level, so quiet
+    // samples hold detail below a 24-bit DAC's last step), and every integer
+    // DAC format rounds it. Only a float source into a float device format is
+    // bit-perfect, and nothing here knows either side is float: `src_bits`
+    // and `out_bits` are 32 and 24 for both kinds. Saying "bit-perfect" for
+    // it would be wrong on every integer DAC, so the verdict stays
+    // conservative until both formats are tracked.
     if i.src_bits > 24 {
         why.push(format!("{}-bit source", i.src_bits));
     } else if i.out_bits != 0 && i.out_bits < i.src_bits {

@@ -127,6 +127,15 @@ pub fn parse_m3u(path: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>
 /// when it is not valid UTF-8, its raw bytes as the path (Unix stores names
 /// as bytes, so this is exact for a playlist written on the same system) and
 /// then the line read as Windows-1252 (what Windows tools write in "ANSI").
+///
+/// Only 1252 among the ANSI code pages, deliberately. "ANSI" is whatever the
+/// writing PC's locale was (1250 Central European, 1251 Cyrillic, 932
+/// Japanese …), and the file does not say which. 1252 is a 32-entry table
+/// here; the others need full code-page tables (932 alone is thousands of
+/// entries — in practice the `encoding_rs` crate, a sizeable share of a
+/// binary kept small on purpose, see native-tls in CLAUDE.md) for playlists
+/// that are rarer every year: Windows tools write `.m3u8`/UTF-8 now. 1252
+/// covers the Western-European playlists that were the common case.
 fn m3u_entry_candidates(line: &[u8]) -> Vec<PathBuf> {
     if let Ok(s) = std::str::from_utf8(line) {
         return vec![PathBuf::from(s)];
@@ -171,7 +180,27 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         SEQ.fetch_add(1, Ordering::Relaxed)
     ));
     fs::write(&tmp, bytes)?;
-    fs::rename(&tmp, path).inspect_err(|_| {
+    // On Windows a rename over a file that another process has open (a
+    // virus scanner or the search indexer reading the file just written)
+    // fails with "access denied" for a moment; a few short retries ride
+    // that out. Elsewhere a rename replaces an open file, so one try.
+    let tries = if cfg!(windows) { 5 } else { 1 };
+    let mut result = fs::rename(&tmp, path);
+    for _ in 1..tries {
+        match &result {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                result = fs::rename(&tmp, path);
+            }
+            _ => break,
+        }
+    }
+    // A temp file is left behind only if the process dies between the write
+    // and the rename (a crash or power loss mid-save). It is a dot-file next
+    // to the target, a few KB, and the next save of that file does not need
+    // it; scanning for and deleting such leftovers at startup would be more
+    // code (and more deleting of files) than the rare leftover is worth.
+    result.inspect_err(|_| {
         let _ = fs::remove_file(&tmp);
     })
 }
@@ -180,9 +209,15 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// If `name` contains a path separator, treat it as a full path.
 /// Otherwise, save to ~/.config/keet/playlists/<name>.m3u.
 pub fn save_m3u(playlist: &[PathBuf], name: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    // ".M3U" is an M3U too: a case-sensitive check made "Mix.M3U" into
+    // "Mix.m3u" beside it (on a case-sensitive file system) or "Mix.M3U.m3u".
+    let is_m3u = |n: &str| {
+        let lower = n.to_ascii_lowercase();
+        lower.ends_with(".m3u") || lower.ends_with(".m3u8")
+    };
     let path = if name.contains('/') || name.contains('\\') {
         let p = PathBuf::from(name);
-        if !p.to_string_lossy().ends_with(".m3u") && !p.to_string_lossy().ends_with(".m3u8") {
+        if !is_m3u(&p.to_string_lossy()) {
             p.with_extension("m3u")
         } else {
             p
@@ -192,7 +227,7 @@ pub fn save_m3u(playlist: &[PathBuf], name: &str) -> Result<PathBuf, Box<dyn std
             .ok_or("Could not determine config directory")?
             .join("playlists");
         fs::create_dir_all(&dir)?;
-        let filename = if name.ends_with(".m3u") || name.ends_with(".m3u8") {
+        let filename = if is_m3u(name) {
             name.to_string()
         } else {
             format!("{}.m3u", name)
