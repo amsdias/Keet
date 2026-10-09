@@ -959,6 +959,9 @@ pub struct UiState {
     pub status_message: Option<(String, Instant)>,
     /// How long `status_message` stays up (2 s unless set_status_for).
     pub status_hold: std::time::Duration,
+    /// Notices waiting for the one held one on screen to expire
+    /// (`queue_notice`), each with its own hold.
+    pub notice_queue: std::collections::VecDeque<(String, std::time::Duration)>,
     pub metadata_cache: std::sync::Arc<crate::metadata::MetadataCache>,
     pub scan_handle: Option<JoinHandle<()>>,
     /// One-shot flag: when the background scan finishes and we're not shuffling,
@@ -1091,6 +1094,7 @@ impl UiState {
             repeat_mode: RepeatMode::Off,
             enqueue_count: 0,
             status_message: None,
+            notice_queue: std::collections::VecDeque::new(),
             status_hold: std::time::Duration::from_secs(2),
             metadata_cache,
             scan_handle: None,
@@ -1169,6 +1173,25 @@ impl UiState {
         self.status_hold = hold;
     }
 
+    /// A notice that must be read but must not wipe another one still up:
+    /// it waits its turn. Startup produces several at once (a skipped source,
+    /// a config problem, a device warning, exclusive mode refused …) and the
+    /// first audio notice lands on the first frame; with one slot, each
+    /// replaced the last and only the final one was ever seen.
+    pub fn queue_notice(&mut self, msg: String, hold: std::time::Duration) {
+        let routine = std::time::Duration::from_secs(2);
+        let held = matches!(self.status_message, Some((_, when)) if self.status_hold > routine && when.elapsed() < self.status_hold);
+        if held || !self.notice_queue.is_empty() {
+            let msg = crate::ansi::sanitize_display(&msg);
+            let shown = matches!(&self.status_message, Some((m, _)) if *m == msg);
+            if !shown && !self.notice_queue.iter().any(|(m, _)| *m == msg) {
+                self.notice_queue.push_back((msg, hold));
+            }
+        } else {
+            self.set_status_for(msg, hold);
+        }
+    }
+
     /// The status message, cut to fit the window. Every theme prints it after
     /// a 2-column indent on a single frame line; a longer one (a device name
     /// plus an explanation) wrapped into a row the frame never counted.
@@ -1181,6 +1204,11 @@ impl UiState {
                 });
             }
             self.status_message = None;
+        }
+        // The next waiting notice, timed from now (when it first shows).
+        if let Some((msg, hold)) = self.notice_queue.pop_front() {
+            self.set_status_for(msg, hold);
+            return self.active_status();
         }
         None
     }
@@ -1203,6 +1231,20 @@ mod state_tests {
         ui.set_status("Shuffle ON".into());
         ui.set_status("Shuffle OFF".into());
         assert_eq!(ui.active_status().as_deref(), Some("Shuffle OFF"));
+    }
+
+    #[test]
+    fn startup_notices_wait_their_turn_instead_of_replacing_each_other() {
+        let mut ui = UiState::new(Vec::new(), crate::metadata::MetadataCache::new(0));
+        ui.queue_notice("skipped /x".into(), std::time::Duration::from_secs(10));
+        ui.queue_notice("exclusive mode off".into(), std::time::Duration::from_millis(1));
+        ui.queue_notice("exclusive mode off".into(), std::time::Duration::from_millis(1));
+        assert_eq!(ui.active_status().as_deref(), Some("skipped /x"), "the first stays up");
+        assert_eq!(ui.notice_queue.len(), 1, "the same notice is queued once");
+        // The first one's time runs out: the next shows, timed from then.
+        ui.status_message = Some(("skipped /x".into(), Instant::now() - std::time::Duration::from_secs(11)));
+        assert_eq!(ui.active_status().as_deref(), Some("exclusive mode off"));
+        assert!(ui.notice_queue.is_empty());
     }
 
     #[test]

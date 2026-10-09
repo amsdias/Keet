@@ -2404,6 +2404,15 @@ mod ui_tests {
         assert_eq!(count, 1, "b plays first, a stays queued behind it");
         assert_eq!(queued_to_front(&mut playlist, 0), 0);
         assert_eq!(names(&playlist), ["b", "a", "c", "d"], "nothing queued: untouched");
+        // Queueing the track already last: the order does not change (so the
+        // rebuild must go by the count), and it still starts the cycle.
+        let mut ui = test_ui(3);
+        let mut playlist = list_of(&["a", "b", "c"]);
+        ui.current = playlist.len();
+        queue_named(&state, &mut ui, &mut playlist, "c");
+        assert_eq!((names(&playlist), ui.enqueue_count), (vec!["a".to_string(), "b".into(), "c".into()], 1));
+        assert_eq!(queued_to_front(&mut playlist, ui.enqueue_count), 0);
+        assert_eq!(names(&playlist), ["c", "a", "b"]);
     }
 
     #[test]

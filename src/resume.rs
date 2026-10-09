@@ -4,18 +4,29 @@ use serde::{Deserialize, Serialize};
 
 use crate::playlist::keet_config_dir;
 
+/// Every field has a default: a state.json missing one (hand-edited, or
+/// written by an older Keet) loses only that field, not the whole session.
+/// No sources at all still ends in "No saved paths found".
 #[derive(Serialize, Deserialize)]
 pub struct ResumeState {
+    #[serde(default)]
     pub source_paths: Vec<String>,
+    #[serde(default)]
     pub track_path: String,
+    #[serde(default)]
     pub position_secs: f64,
+    #[serde(default)]
     pub shuffle: bool,
     /// Legacy field: older state files stored a bool before `repeat_mode` was added.
     /// Read-only for back-compat; no longer written. Use `repeat_mode` instead.
     #[serde(default, skip_serializing)]
     pub repeat: bool,
+    /// Missing: full volume (the player's own default), never silence.
+    #[serde(default = "full_volume")]
     pub volume: u32,
+    #[serde(default)]
     pub eq_preset: String,
+    #[serde(default)]
     pub effects_preset: String,
     #[serde(default)]
     pub repeat_mode: Option<String>,
@@ -52,6 +63,10 @@ pub struct ResumeState {
 
 fn state_file_path() -> Option<PathBuf> {
     keet_config_dir().map(|d| d.join("state.json"))
+}
+
+fn full_volume() -> u32 {
+    100
 }
 
 pub fn save_state(state: &ResumeState) {
@@ -111,5 +126,15 @@ mod resume_tests {
         assert_eq!(back.eq_qs, Some(vec![0.71, 2.0]));
         assert_eq!(back.eq_preamp, Some(-6.4));
         assert_eq!(back.eq_gains, Some(vec![1.0, -2.0]));
+    }
+
+    #[test]
+    fn a_state_file_missing_fields_keeps_the_rest() {
+        let rs: ResumeState = serde_json::from_str(r#"{"source_paths": ["/music"], "shuffle": true}"#)
+            .expect("missing fields take their defaults");
+        assert_eq!(rs.source_paths, ["/music"]);
+        assert!(rs.shuffle);
+        assert_eq!(rs.volume, 100, "never silence");
+        assert_eq!(rs.eq_preset, "");
     }
 }

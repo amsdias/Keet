@@ -1133,20 +1133,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ui.shuffle = shuffle;
     ui.repeat_mode = repeat_mode;
     ui.hq_resampler = hq_resampler;
-    let skipped_sources = skipped_sources.or_else(|| {
-        (!missing_saved.is_empty()).then(|| format!("saved source not found: {}", missing_saved.join("; ")))
-    });
+    // Startup notices queue (queue_notice): there are several at once, and
+    // with set_status_for each replaced the one before.
+    if !missing_saved.is_empty() {
+        ui.queue_notice(format!("saved source not found: {}", missing_saved.join("; ")), Duration::from_secs(10));
+    }
     if let Some(note) = skipped_sources {
-        ui.set_status_for(note, Duration::from_secs(10));
+        ui.queue_notice(note, Duration::from_secs(10));
     }
     // Unreadable config values: each was skipped on its own (config::parse).
     if !app_config.problems.is_empty() {
-        ui.set_status_for(
+        ui.queue_notice(
             format!("config.json: ignored {}", app_config.problems.join(", ")),
             std::time::Duration::from_secs(8),
         );
     } else if !classic_colour_problems.is_empty() {
-        ui.set_status_for(
+        ui.queue_notice(
             format!("config.json: classic_colors.{} is not a #RRGGBB colour — using the default", classic_colour_problems.join(", ")),
             std::time::Duration::from_secs(8),
         );
@@ -1157,7 +1159,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let host = cpal::default_host();
     let (device, device_warning) = select_device(&host, device_arg.as_deref())?;
     if let Some(w) = device_warning {
-        ui.set_status_for(w, std::time::Duration::from_secs(8));
+        ui.queue_notice(w, std::time::Duration::from_secs(8));
     }
     let current_output_rate = {
         let device_name = device.description()
@@ -1170,7 +1172,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Fix stale sample rate on Bluetooth devices (CoreAudio can get stuck at wrong rate)
         let bt_rate = fix_bluetooth_sample_rate(&device);
         if let Some(rate) = bt_rate {
-            ui.set_status_for(
+            ui.queue_notice(
                 format!("Bluetooth device: using its native {rate} Hz"),
                 std::time::Duration::from_secs(5),
             );
@@ -1233,7 +1235,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     if let Some(note) = startup_note.take() {
-        ui.set_status_for(note, Duration::from_secs(10));
+        ui.queue_notice(note, Duration::from_secs(10));
     }
 
     let mut player = player::Player::new(player::PlayerSetup {

@@ -142,11 +142,6 @@ pub fn load() -> Config {
     }
 }
 
-/// Every `*.json` in `~/.config/keet/<subdir>/` (`%APPDATA%\keet\<subdir>\`
-/// on Windows) that parses as a preset, sorted by name. The one loader for EQ,
-/// effects and crossfeed presets — each kept its own copy, two of them
-/// building the config path by hand. Names are shown on screen, so they are
-/// sanitised like any other untrusted text (an ESC in one would be executed).
 /// A JSON file Keet reads (presets, state.json, lyrics offsets) as text,
 /// without the UTF-8 byte-order mark Windows editors (Notepad) put in front:
 /// serde rejects it, and the file read as not JSON at all.
@@ -158,6 +153,11 @@ pub(crate) fn read_json_text(path: &std::path::Path) -> Option<String> {
     })
 }
 
+/// Every `*.json` in `~/.config/keet/<subdir>/` (`%APPDATA%\keet\<subdir>\`
+/// on Windows) that parses as a preset, sorted by name. The one loader for EQ,
+/// effects and crossfeed presets — each kept its own copy, two of them
+/// building the config path by hand. Names are shown on screen, so they are
+/// sanitised like any other untrusted text (an ESC in one would be executed).
 pub fn load_presets<T: serde::de::DeserializeOwned>(subdir: &str, name: fn(&mut T) -> &mut String) -> Vec<T> {
     let Some(dir) = crate::playlist::keet_config_dir().map(|d| d.join(subdir)) else {
         return Vec::new();
@@ -167,7 +167,7 @@ pub fn load_presets<T: serde::de::DeserializeOwned>(subdir: &str, name: fn(&mut 
         .flatten()
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "json"))
+        .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("json")))
         .filter_map(|p| read_json_text(&p))
         .filter_map(|text| serde_json::from_str::<T>(&text).ok())
         .map(|mut p| {

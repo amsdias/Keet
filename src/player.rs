@@ -508,7 +508,9 @@ impl Player {
         // edits away and sent the jump to whatever track took that index.
         // Only a new removal costs a lookup per path, and only then.
         let jump_pending = self.state.jump_to_track.load(Ordering::Relaxed) >= 0;
-        let user_acted = self.playlist != playlist_then || jump_pending;
+        // A queued track counts even when the list did not change: queueing
+        // the track already last leaves the order as it was.
+        let user_acted = self.playlist != playlist_then || jump_pending || self.ui.enqueue_count > 0;
         // Tracks queued during the wait start the new cycle (queued_to_front).
         // Not with a jump pending: it is an index into the list as it is.
         let mut queued = 0;
@@ -1081,11 +1083,12 @@ impl Player {
         self.follow_default_device();
 
         // A damaged stretch the producer skipped, or a device note.
+        // Queued: on the first frame these meet the startup notices.
         if let Some(msg) = self.state.decode_notice.lock().ok().and_then(|mut n| n.take()) {
-            self.ui.set_status_for(msg, Duration::from_secs(4));
+            self.ui.queue_notice(msg, Duration::from_secs(4));
         }
         if let Some(msg) = audio::take_notice() {
-            self.ui.set_status_for(msg, Duration::from_secs(5));
+            self.ui.queue_notice(msg, Duration::from_secs(5));
         }
 
         // Check if background lyrics fetch has completed

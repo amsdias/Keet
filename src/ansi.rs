@@ -24,11 +24,18 @@ fn escape_len(chars: &[char], i: usize) -> usize {
     };
     match next {
         '[' => {
+            // Parameter and intermediate bytes are 0x20..=0x3F; anything else
+            // ends the sequence. A broken one (no final byte) then stops
+            // before the next ESC or control character instead of swallowing
+            // the text after it, up to whatever letter came next.
             let mut j = i + 2;
-            while j < chars.len() && !matches!(chars[j], '@'..='~') {
+            while j < chars.len() && matches!(chars[j], ' '..='?') {
                 j += 1;
             }
-            (j + 1).min(chars.len()) - i
+            match chars.get(j) {
+                Some('@'..='~') => j + 1 - i,
+                _ => j - i,
+            }
         }
         ']' | '_' | 'P' | '^' => {
             let mut j = i + 2;
@@ -181,6 +188,9 @@ pub(crate) fn truncate_visible(s: &str, max: usize) -> String {
     if visible_len(s) <= max {
         return s.to_string();
     }
+    if max == 0 {
+        return String::new(); // not even the ellipsis fits
+    }
     let mut out = cut_to_width(s, max.saturating_sub(1)).0; // room for the ellipsis
     out.push('…');
     out
@@ -260,6 +270,15 @@ mod tests {
         // Even the first does not fit: it is cut (with an ellipsis).
         assert_eq!(fit_segments(&segs, "  ·  ", 8), "track 1…");
         assert_eq!(fit_segments(&segs, "  ·  ", 0), "");
+    }
+
+    #[test]
+    fn a_broken_csi_stops_at_the_next_escape_and_zero_columns_is_empty() {
+        // "ESC [ 3" never finished: the next sequence and the text stay.
+        assert_eq!(strip_ansi("\x1B[3\x1B[1mhello"), "hello");
+        assert_eq!(strip_ansi("\x1B[31mred\x1B[0m"), "red");
+        assert_eq!(truncate_visible("hello", 0), "");
+        assert_eq!(truncate_visible("hello", 1), "…");
     }
 
     #[test]

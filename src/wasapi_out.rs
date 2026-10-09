@@ -135,13 +135,13 @@ pub fn exclusive_report(device_id: &str, channels: u16) -> Vec<String> {
     .unwrap_or_default()
 }
 
-/// A running exclusive-mode stream. Stopped (and its thread joined) by
-/// `stop` or on drop.
 /// `WasapiOutput::start`'s open handshake (see `fate` there).
 const PENDING: u8 = 0;
 const CLAIMED: u8 = 1;
 const ABANDONED: u8 = 2;
 
+/// A running exclusive-mode stream. Stopped (and its thread joined) by
+/// `stop` or on drop.
 pub struct WasapiOutput {
     stop: Arc<AtomicBool>,
     thread: Mutex<Option<JoinHandle<()>>>,

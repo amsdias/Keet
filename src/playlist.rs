@@ -182,13 +182,15 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     fs::write(&tmp, bytes)?;
     // On Windows a rename over a file that another process has open (a
     // virus scanner or the search indexer reading the file just written)
-    // fails with "access denied" for a moment; a few short retries ride
+    // fails for a moment; a few short retries ride
     // that out. Elsewhere a rename replaces an open file, so one try.
     let tries = if cfg!(windows) { 5 } else { 1 };
     let mut result = fs::rename(&tmp, path);
     for _ in 1..tries {
         match &result {
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            // Access denied (os error 5), or a sharing violation (32: the
+            // file open without delete sharing), which is not PermissionDenied.
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(32) => {
                 std::thread::sleep(std::time::Duration::from_millis(20));
                 result = fs::rename(&tmp, path);
             }

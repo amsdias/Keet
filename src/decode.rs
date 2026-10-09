@@ -2377,7 +2377,10 @@ mod chain_tests {
             // (a loaded CI runner) the catch-up ran straight through it, and
             // the seek went in late — past the end of the track it was for.
             if let Some(&(at, _)) = seeks.get(next_seek) {
-                let seek_frame = (at * rate as f64) as usize;
+                // Rounded UP, as the trigger above compares: rounded down,
+                // 0.7 s at 44.1 kHz (30869.999… frames) capped play one frame
+                // short of the trigger and the test stalled to its timeout.
+                let seek_frame = (at * rate as f64).ceil() as usize;
                 frames = frames.min(seek_frame.saturating_sub(played_frames));
             }
             state.buffer_level.store(consumer.slots(), Ordering::Relaxed);

@@ -39,6 +39,10 @@ fn main() {
     if let Some(b) = &branch {
         watch.push(b.clone());
     }
+    // Always: with no git (a source tarball) nothing below is printed, and a
+    // build script that names no file is rerun on ANY change in the package.
+    // The version then comes from Cargo.toml, which cargo tracks itself.
+    println!("cargo:rerun-if-changed=build.rs");
     for item in watch {
         let Some(path) = git(&["rev-parse", "--git-path", &item]) else { continue };
         let mut path = std::path::PathBuf::from(path);

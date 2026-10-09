@@ -180,6 +180,10 @@ fn timescale(f: &mut std::fs::File, body: (u64, u64)) -> Option<u32> {
     Some(u32::from_be_bytes(b[..].try_into().ok()?))
 }
 
+/// `n` bytes at `pos`. Unbuffered on purpose: the walk reads a few 8-byte headers per level
+/// (moov, its traks, their mdia/edts) — a few dozen small reads once per
+/// track open, and each read SEEKS, which would throw a BufReader's buffer
+/// away every time anyway. The large atoms (mdat) are skipped, never read.
 fn read_at(f: &mut std::fs::File, pos: u64, n: usize) -> Option<Vec<u8>> {
     use std::io::{Read, Seek, SeekFrom};
     f.seek(SeekFrom::Start(pos)).ok()?;
