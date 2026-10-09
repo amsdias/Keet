@@ -204,19 +204,19 @@ impl Player {
         if self.heard_any || self.state.samples_played.load(Ordering::Relaxed) > 0 {
             return None;
         }
-        if let Some(msg) = self.state.decode_error.lock().ok().and_then(|mut e| e.take()) {
-            self.skipped.push(msg);
+        if let Some(err) = self.state.decode_error.lock().ok().and_then(|mut e| e.take()) {
+            self.skipped.push(err.full());
         }
         (!self.skipped.is_empty()).then(|| self.skipped.join("; "))
     }
 
     /// Show a skipped file on the status line, and keep it for the exit note.
-    fn report_skip(&mut self, msg: String) {
+    fn report_skip(&mut self, err: state::SkipError) {
         // Queued, not a routine status: "Sorted by tags" replaced that within
         // 2 s, and a startup notice on screen kept it from showing at all.
-        self.ui.queue_notice(format!("Skip: {msg}"), Duration::from_secs(4));
+        self.ui.queue_notice(format!("Skip: {}", err.short()), Duration::from_secs(4));
         if !self.heard_any && self.skipped.len() < 5 {
-            self.skipped.push(msg);
+            self.skipped.push(err.full());
         }
     }
 
@@ -688,13 +688,8 @@ impl Player {
             }));
             if run.is_err() {
                 let crashed = state_clone.producer_decoding.lock().ok().and_then(|d| d.clone());
-                let name = crashed
-                    .as_ref()
-                    .and_then(|c| c.path.file_name())
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                if let Ok(mut err) = state_clone.decode_error.lock() {
-                    *err = Some(format!("{name}: decoder crashed, skipped"));
+                if let Some(c) = &crashed {
+                    state_clone.report_skip_error(&c.path, "decoder crashed, skipped");
                 }
                 // Main names the track after it, as for any other boundary.
                 let next = crashed.and_then(|c| decode::MainLineup.next_after(&state_clone, &c));

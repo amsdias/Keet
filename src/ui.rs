@@ -1397,9 +1397,10 @@ fn locate(playlist: &[PathBuf], path: &std::path::Path, hint: usize) -> Option<u
 ///
 /// Files already found unplayable are passed over: they would only fail
 /// again, with the same "Skip:" message. And when nothing has produced audio
-/// yet and an unplayable `after` has nothing after it (an auto-sort moved a
-/// broken first file to the end, before the producer asked), the answer is
-/// the first playable track: "past the end" ended the session unheard.
+/// yet and an unplayable `after` that an edit moved has nothing after it (an
+/// auto-sort moved a broken first file to the end, before the producer
+/// asked), the answer is the first playable track: "past the end" ended the
+/// session unheard.
 pub(crate) fn next_pick(state: &PlayerState, ui: &UiState, playlist: &[PathBuf], after: &Pick) -> Option<Pick> {
     let len = playlist.len();
     let skip = |i: usize| state.is_unplayable(&playlist[i]);
@@ -1421,8 +1422,13 @@ pub(crate) fn next_pick(state: &PlayerState, ui: &UiState, playlist: &[PathBuf],
             },
         },
     };
+    // Only when the list was edited since `after` was named: a broken last
+    // track with no edit is genuinely the end (with repeat off, starting
+    // again from the top would be wrong).
     let next = first_playable_from(next).or_else(|| {
-        let unheard = !state.produced_audio.load(Ordering::Relaxed) && state.is_unplayable(&after.path);
+        let unheard = !state.produced_audio.load(Ordering::Relaxed)
+            && state.is_unplayable(&after.path)
+            && after.gen != ui.playlist_gen;
         if unheard { first_playable_from(0) } else { None }
     })?;
     Some(Pick { index: next, path: playlist[next].clone(), gen: ui.playlist_gen })
@@ -2114,6 +2120,7 @@ fn switch_source_paths(
 
     state.total_tracks.store(playlist.len(), Ordering::Relaxed);
     state.current_track.store(0, Ordering::Relaxed);
+    state.forget_unplayable(true);
 
     reindex_and_restart_scan(ui, playlist, &old_playlist);
     arm_auto_sort(ui); // new folder source → auto-sort once its tags load
@@ -2169,6 +2176,8 @@ fn finish_rescan(
 
     let old_playlist = playlist.clone();
     let current_track_path = playlist.get(ui.current).cloned();
+    // A rescan is how a repaired file comes back: it is tried again.
+    state.forget_unplayable(false);
     let (total_added, total_removed) = crate::playlist::apply_rescan(
         playlist,
         result,

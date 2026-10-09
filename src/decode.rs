@@ -907,13 +907,29 @@ pub fn decode_playlist(
     macro_rules! skip_track {
         () => {
             state.mark_unplayable(&pick.path, first_iteration);
-            match lineup.next_after(state, &pick) {
+            // Asked after the last track that played, not the broken one: a
+            // track queued after the playing one meanwhile sits before the
+            // broken file, and "what follows the broken file" passed it by
+            // for good. (Main skips the broken file in its answer.) The
+            // producer's first track has nothing before it to ask after.
+            let after = match &asked_after {
+                Some(prev) if !first_iteration => prev.clone(),
+                _ => pick.clone(),
+            };
+            match lineup.next_after(state, &after) {
                 Some(next) => {
                     signal_unplayable(state, first_iteration, &next);
-                    // Not asked again after an edit: "what follows a track
-                    // that never played" means nothing once the list is
-                    // reordered. The transition check covers edits.
-                    asked_after = None;
+                    // What the next track is asked again after, on an edit:
+                    // the last track that played, kept as it was (main skips
+                    // the broken file in its answer) — dropped, an edit during
+                    // the hand-over became a jump that cut that track's end.
+                    // Not when the broken file is the one shown as playing:
+                    // "what follows a track that never played" means nothing
+                    // once the list is reordered (the transition check covers
+                    // edits there).
+                    if first_iteration {
+                        asked_after = None;
+                    }
                     pick = next;
                     continue;
                 }
@@ -943,9 +959,7 @@ pub fn decode_playlist(
         let file = match File::open(path) {
             Ok(f) => f,
             Err(e) => {
-                if let Ok(mut err) = state.decode_error.lock() {
-                    *err = Some(format!("{}: {}", path.display(), e));
-                }
+                state.report_skip_error(path, &e);
                 skip_track!();
             }
         };
@@ -967,9 +981,7 @@ pub fn decode_playlist(
         {
             Ok(p) => p,
             Err(e) => {
-                if let Ok(mut err) = state.decode_error.lock() {
-                    *err = Some(format!("{}: {}", path.display(), e));
-                }
+                state.report_skip_error(path, &e);
                 skip_track!();
             }
         };
@@ -977,9 +989,7 @@ pub fn decode_playlist(
         let mut track = match format.default_track(TrackType::Audio) {
             Some(t) => t.clone(),
             None => {
-                if let Ok(mut err) = state.decode_error.lock() {
-                    *err = Some(format!("{}: No audio track", path.display()));
-                }
+                state.report_skip_error(path, "No audio track");
                 skip_track!();
             }
         };
@@ -990,9 +1000,7 @@ pub fn decode_playlist(
         let audio_params = match track.codec_params.as_ref().and_then(|c| c.audio()) {
             Some(a) => a.clone(),
             None => {
-                if let Ok(mut err) = state.decode_error.lock() {
-                    *err = Some(format!("{}: No audio codec parameters", path.display()));
-                }
+                state.report_skip_error(path, "No audio codec parameters");
                 skip_track!();
             }
         };
@@ -1012,9 +1020,7 @@ pub fn decode_playlist(
         {
             Ok(d) => d,
             Err(e) => {
-                if let Ok(mut err) = state.decode_error.lock() {
-                    *err = Some(format!("{}: {}", path.display(), e));
-                }
+                state.report_skip_error(path, &e);
                 skip_track!();
             }
         };
@@ -1171,9 +1177,7 @@ pub fn decode_playlist(
             ) {
                 Ok(r) => Some(r),
                 Err(e) => {
-                    if let Ok(mut err) = state.decode_error.lock() {
-                        *err = Some(format!("{}: resampler: {}", path.display(), e));
-                    }
+                    state.report_skip_error(path, format!("resampler: {}", e));
                     skip_track!();
                 }
             }
@@ -1230,10 +1234,10 @@ pub fn decode_playlist(
         // Damaged packets: skipped, said once per track, and only a long run
         // of them (the stream is unreadable from here) ends the track.
         let mut bad_in_a_row = 0usize;
-        // Whether the track gave any audio at all, and whether it was sought
-        // in (see the end of the track).
+        // Whether the track gave any audio at all, and whether it was reopened
+        // at a seek target (see the end of the track).
         let mut had_audio = false;
-        let mut seeked = false;
+        let mut reopened = false;
         // Packets after the track start or a seek during which a decode error
         // is expected, not damage: a decoder restarting mid-stream (an MP3's
         // bit reservoir) fails its first frames on an intact file.
@@ -1304,12 +1308,14 @@ pub fn decode_playlist(
             // reopen; relative requests made meanwhile stack on top of it.
             let rel = state.take_seek();
             let seek_to = match initial_seek.take() {
-                Some(t) => Some((t + rel).max(0.0)),
+                Some(t) => {
+                    reopened = true;
+                    Some((t + rel).max(0.0))
+                }
                 None if rel != 0.0 => Some((state.time_secs() + rel).max(0.0)),
                 None => None,
             };
             if let Some(new_time) = seek_to {
-                seeked = true;
                 // A chained stream's demuxer seeks within ONE link: bring the
                 // reader to the link that holds the target first. Before the
                 // current link, start over from the first; past it, skip
@@ -1582,16 +1588,15 @@ pub fn decode_playlist(
         // as named (see `PlayerState::mark_unplayable`) — not checked against
         // this one, which an auto-sort may have moved since (to the end of
         // the list, which ended playback). Never repeated, either.
-        // Only a track decoded from its start counts: a seek near the end of a
-        // good one can leave nothing but packets that fail.
-        if !had_audio && !seeked && !skipped && !broke_for_skip {
-            if let Ok(mut err) = state.decode_error.lock() {
-                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                *err = Some(format!("{name}: no audio"));
-            }
+        // Only a track decoded from its start counts: reopened at a seek near
+        // the end, a good one can give nothing but packets that fail. (A seek
+        // during the track does not count: a track that played before it has
+        // audio, and a broken one stays broken whatever is pressed.)
+        if !had_audio && !reopened && !skipped && !broke_for_skip {
+            state.report_skip_error(path, "no audio");
             state.mark_unplayable(path, true);
         }
-        let repeat_one = state.repeat_mode() == crate::state::RepeatMode::One && !skipped && (had_audio || seeked);
+        let repeat_one = state.repeat_mode() == crate::state::RepeatMode::One && !skipped && (had_audio || reopened);
         let next: Option<Pick> = if broke_for_skip || repeat_one {
             None
         } else {
@@ -2148,8 +2153,8 @@ mod chain_tests {
         }
         let _ = handle.join();
         if let Ok(mut e) = state.decode_error.lock() {
-            if let Some(msg) = e.take() {
-                panic!("decode error: {}", msg);
+            if let Some(err) = e.take() {
+                panic!("decode error: {}", err.full());
             }
         }
         (out, state)
@@ -2577,9 +2582,10 @@ mod chain_tests {
     fn run_chain_paced(paths: &[PathBuf], rate: u32, seeks: &[(f64, i64)]) -> Vec<f32> {
         // Faster than real time, but not by so much that the producer's own
         // real-time waits (its 20 ms full-ring sleep, the 250 ms drain wait)
-        // turn into seconds of audio: at 10x a CI runner's oversleeping
-        // decided the outcome.
-        const SPEEDUP: f64 = 4.0;
+        // turn into seconds of audio, or that a slow runner's debug build
+        // (what CI runs) falls behind: at 10x a CI runner's oversleeping
+        // decided the outcome, and 4x still failed now and then on slow cores.
+        const SPEEDUP: f64 = 2.0;
         let state = Arc::new(PlayerState::new());
         let cap = crate::state::ring_capacity_for(rate);
         state.ring_capacity.store(cap, Ordering::Relaxed);
@@ -3061,8 +3067,12 @@ mod chain_tests {
         mut edits: Vec<(f64, Edit)>,
         setup: Setup,
     ) -> PlayerRun {
-        const SPEEDUP: f64 = 4.0;
         let Setup { file_rate, out_rate: rate, crossfade_secs } = setup;
+        // Real time, as a listener hears it. Faster, a debug build (what
+        // `cargo test` and CI run) on a slow runner could not keep ahead of
+        // the consumer: gaps no listener would hear, and drains landing late
+        // enough to eat the next track's start.
+        let speedup = 1.0;
         let paths: Vec<PathBuf> = tracks
             .iter()
             .enumerate()
@@ -3147,11 +3157,18 @@ mod chain_tests {
             if state.reset_consumer_counter.swap(false, Ordering::AcqRel) {
                 while consumer.pop().is_ok() {}
             }
+            // ...and, with an edit due right after the producer's first answer,
+            // once that edit is in: the scenario is "queued while the last
+            // track still has most of its audio to play", which a slow build
+            // otherwise only reaches with the ring already near empty (the
+            // CI failure: a debug build on Windows queued past the hold).
             if !started {
-                started = consumer.slots() >= rate as usize || state.producer_done.load(Ordering::Relaxed);
+                let edit_pending = edits.iter().any(|(at, _)| *at < 0.0);
+                started = !edit_pending
+                    && (consumer.slots() >= rate as usize || state.producer_done.load(Ordering::Relaxed));
                 begin = Instant::now();
             }
-            let due = if started { (begin.elapsed().as_secs_f64() * rate as f64 * SPEEDUP) as usize } else { 0 };
+            let due = if started { (begin.elapsed().as_secs_f64() * rate as f64 * speedup) as usize } else { 0 };
             let mut frames = due.saturating_sub(played + silent + starved);
             state.buffer_level.store(consumer.slots(), Ordering::Relaxed);
             while frames > 0 {
@@ -3310,5 +3327,21 @@ mod chain_tests {
         assert_eq!(run.played, ["b", "a"], "{run:?}");
         assert_eq!(run.jumps, 0);
         assert!((run.secs - 2.0).abs() < 0.02, "overlapped by the crossfade: {run:?}");
+    }
+
+    #[test]
+    fn a_track_queued_while_a_broken_file_is_skipped_still_plays_next() {
+        // a plays; the producer was told b (broken) comes next, and d is
+        // queued meanwhile: d now sits right after a, before b. Asked "what
+        // follows b?", the producer was sent on to c and d never played.
+        let run = run_player(
+            "brokenqueue",
+            &[("a", 1.0), ("b", -1.0), ("c", 1.0), ("d", 1.0)],
+            0,
+            vec![(-1.0, Edit::Queue("d"))],
+        );
+        assert_eq!(run.jumps, 0, "{run:?}");
+        assert_eq!(run.played, ["a", "d", "c"], "{run:?}");
+        assert!((run.secs - 3.0).abs() < 0.01, "{run:?}");
     }
 }

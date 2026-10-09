@@ -276,6 +276,26 @@ impl RateCaps {
     }
 }
 
+/// Why the producer skipped a file. Shown on the status line by file name
+/// (the full path pushed the reason off the end of the line), and in full in
+/// the note printed when nothing could be played.
+#[derive(Clone, Debug)]
+pub(crate) struct SkipError {
+    pub path: PathBuf,
+    pub reason: String,
+}
+
+impl SkipError {
+    pub(crate) fn short(&self) -> String {
+        let name = self.path.file_name().map_or_else(|| self.path.display().to_string(), |n| n.to_string_lossy().into_owned());
+        format!("{name}: {}", self.reason)
+    }
+
+    pub(crate) fn full(&self) -> String {
+        format!("{}: {}", self.path.display(), self.reason)
+    }
+}
+
 /// A track as main named it to the producer: its position in the playlist at
 /// edit generation `gen`, and its path (which survives an edit; the index may
 /// not). See `decode::Lineup`.
@@ -394,7 +414,7 @@ pub struct PlayerState {
     pub(crate) viz_extras: AtomicBool,
 
     // Decode error from producer thread (None = no error)
-    pub(crate) decode_error: Mutex<Option<String>>,
+    pub(crate) decode_error: Mutex<Option<SkipError>>,
     /// A non-fatal decode notice ("damaged audio skipped"), shown once on the
     /// status line by the UI thread.
     pub(crate) decode_notice: Mutex<Option<String>>,
@@ -881,8 +901,28 @@ impl PlayerState {
         }
     }
 
+    /// Forget which files were unplayable (a rescan: a repaired file plays
+    /// again) and, with `new_source`, that anything has played: the "nothing
+    /// heard yet" rule then holds for the new source's first file as it did
+    /// for the session's first.
+    pub(crate) fn forget_unplayable(&self, new_source: bool) {
+        if let Ok(mut u) = self.unplayable.lock() {
+            u.clear();
+        }
+        if new_source {
+            self.produced_audio.store(false, Ordering::Relaxed);
+        }
+    }
+
     pub(crate) fn is_unplayable(&self, path: &std::path::Path) -> bool {
         self.unplayable.lock().is_ok_and(|u| u.contains(path))
+    }
+
+    /// Producer: `path` was skipped, for `reason` (shown by main).
+    pub(crate) fn report_skip_error(&self, path: &std::path::Path, reason: impl std::fmt::Display) {
+        if let Ok(mut err) = self.decode_error.lock() {
+            *err = Some(SkipError { path: path.to_path_buf(), reason: reason.to_string() });
+        }
     }
 
     /// The track the producer last reported (see `producer_pick`).
