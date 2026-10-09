@@ -412,6 +412,8 @@ pub struct PlayerState {
     /// playing was one — the next report is then taken as named.
     pub(crate) unplayable: Mutex<std::collections::HashSet<PathBuf>>,
     pub(crate) shown_track_unplayable: AtomicBool,
+    /// Some track has produced audio this session (set by the producer).
+    pub(crate) produced_audio: AtomicBool,
     /// The playlist's edit generation, published by the UI thread
     /// (`ui::serve_producer`): a pick made at an older one may be stale.
     pub(crate) playlist_gen: AtomicU64,
@@ -526,6 +528,7 @@ impl PlayerState {
             next_slot: Mutex::new(NextSlot::Idle),
             unplayable: Mutex::new(std::collections::HashSet::new()),
             shown_track_unplayable: AtomicBool::new(false),
+            produced_audio: AtomicBool::new(false),
             playlist_gen: AtomicU64::new(0),
             rg_mode: AtomicU8::new(RgMode::Track as u8),
             rg_gain_db: AtomicU32::new(0f32.to_bits()),

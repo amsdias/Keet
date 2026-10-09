@@ -1387,32 +1387,45 @@ fn locate(playlist: &[PathBuf], path: &std::path::Path, hint: usize) -> Option<u
 }
 
 /// Main's answer to the producer's "what comes after `after`?", from the list
-/// as it is now. After the playing track: the next one (the queue sits right
-/// after it), or — when it was removed — its successor. After a track further
-/// ahead (several short tracks in the ring): the one after that. None where
-/// the list ends; the repeat-all wrap and the end of playback are main's.
-/// Files already found unplayable (`skip`) are passed over: they would only
-/// fail again, with the same "Skip:" message.
-pub(crate) fn next_pick(
-    ui: &UiState,
-    playlist: &[PathBuf],
-    after: &Pick,
-    skip: impl Fn(&std::path::Path) -> bool,
-) -> Option<Pick> {
+/// as it is now. With no edit since `after` was named, the one after its
+/// index (by path, a file listed twice would send it back to the first
+/// copy). After an edit: after the playing track, the next one (the queue
+/// sits right after it), or — when it was removed — its successor; after a
+/// track further ahead (several short tracks in the ring), the one after
+/// that. None where the list ends; the repeat-all wrap and the end of
+/// playback are main's.
+///
+/// Files already found unplayable are passed over: they would only fail
+/// again, with the same "Skip:" message. And when nothing has produced audio
+/// yet and an unplayable `after` has nothing after it (an auto-sort moved a
+/// broken first file to the end, before the producer asked), the answer is
+/// the first playable track: "past the end" ended the session unheard.
+pub(crate) fn next_pick(state: &PlayerState, ui: &UiState, playlist: &[PathBuf], after: &Pick) -> Option<Pick> {
     let len = playlist.len();
-    let mut next = if playlist.get(ui.current).is_some_and(|p| *p == after.path) {
-        ui.current + 1
-    } else if let Some(n) = ui.removed_current_next.filter(|_| !playlist.contains(&after.path)) {
-        n
-    } else if let Some(i) = locate(playlist, &after.path, after.index) {
-        i + 1
+    let skip = |i: usize| state.is_unplayable(&playlist[i]);
+    let first_playable_from = |from: usize| (from..len).find(|&i| !skip(i));
+    let after_index = if after.gen == ui.playlist_gen && playlist.get(after.index).is_some_and(|p| *p == after.path) {
+        Some(after.index)
+    } else if playlist.get(ui.current).is_some_and(|p| *p == after.path) {
+        Some(ui.current)
     } else {
-        ui.current + 1 // a track ahead was removed: carry on from the playing one
+        None
     };
-    while next < len && skip(&playlist[next]) {
-        next += 1;
-    }
-    (next < len).then(|| Pick { index: next, path: playlist[next].clone(), gen: ui.playlist_gen })
+    let next = match after_index {
+        Some(i) => i + 1,
+        None => match ui.removed_current_next.filter(|_| !playlist.contains(&after.path)) {
+            Some(n) => n,
+            None => match locate(playlist, &after.path, after.index) {
+                Some(i) => i + 1,
+                None => ui.current + 1, // a track ahead was removed: carry on from the playing one
+            },
+        },
+    };
+    let next = first_playable_from(next).or_else(|| {
+        let unheard = !state.produced_audio.load(Ordering::Relaxed) && state.is_unplayable(&after.path);
+        if unheard { first_playable_from(0) } else { None }
+    })?;
+    Some(Pick { index: next, path: playlist[next].clone(), gen: ui.playlist_gen })
 }
 
 /// Answer the producer's question, if it has one, and publish the playlist's
@@ -1421,7 +1434,7 @@ pub(crate) fn next_pick(
 pub(crate) fn serve_producer(state: &PlayerState, ui: &UiState, playlist: &[PathBuf]) {
     state.playlist_gen.store(ui.playlist_gen, Ordering::Release);
     if let Some(question) = state.next_question() {
-        state.answer_next(&question, next_pick(ui, playlist, &question, |p| state.is_unplayable(p)));
+        state.answer_next(&question, next_pick(state, ui, playlist, &question));
     }
 }
 
@@ -1435,7 +1448,7 @@ pub(crate) fn next_after_end(state: &PlayerState, ui: &UiState, playlist: &[Path
     }
     let path = playlist.get(ui.current)?;
     let playing = Pick { index: ui.current, path: path.clone(), gen: ui.playlist_gen };
-    next_pick(ui, playlist, &playing, |p| state.is_unplayable(p)).map(|p| p.index)
+    next_pick(state, ui, playlist, &playing).map(|p| p.index)
 }
 
 /// What the player does with the track the producer reports (a transition,
@@ -1459,7 +1472,7 @@ pub(crate) enum Move {
 /// auto-sort can move it anywhere, to the end of the list included, which
 /// ended playback with a broken first file. The report is taken as named,
 /// wherever its track sits now.
-pub(crate) fn resolve_report(ui: &UiState, playlist: &[PathBuf], pick: &Pick, after_unplayable: bool) -> Move {
+pub(crate) fn resolve_report(state: &PlayerState, ui: &UiState, playlist: &[PathBuf], pick: &Pick, after_unplayable: bool) -> Move {
     if pick.gen == ui.playlist_gen && playlist.get(pick.index).is_some_and(|p| *p == pick.path) {
         return Move::Advance(pick.index);
     }
@@ -1468,7 +1481,12 @@ pub(crate) fn resolve_report(ui: &UiState, playlist: &[PathBuf], pick: &Pick, af
             return Move::Advance(i);
         }
     }
-    let expected = track_after_edit(ui.current, ui.removed_current_next, playlist.len(), ui.repeat_mode);
+    // Never a file already found unplayable: jumping to one cut the playing
+    // track's end for a file that only fails again.
+    let mut expected = track_after_edit(ui.current, ui.removed_current_next, playlist.len(), ui.repeat_mode);
+    while expected < playlist.len() && state.is_unplayable(&playlist[expected]) {
+        expected += 1;
+    }
     if playlist.get(expected).is_some_and(|p| *p == pick.path) {
         Move::Advance(expected)
     } else {
@@ -2376,7 +2394,7 @@ mod ui_tests {
     /// check, then the move (a jump also ends in advance_to, after the
     /// respawn).
     fn report(state: &PlayerState, ui: &mut UiState, playlist: &[PathBuf], pick: &Pick) -> Move {
-        let m = resolve_report(ui, playlist, pick, false);
+        let m = resolve_report(state, ui, playlist, pick, false);
         let (Move::Advance(i) | Move::Jump(i)) = m;
         if i < playlist.len() {
             advance_to(ui, state, i);
@@ -2497,6 +2515,32 @@ mod ui_tests {
         assert_eq!(ask(&state, &ui, &playlist, &b).map(|n| n.path), Some(p("/c.mp3")));
         let c = Pick { index: 2, path: p("/c.mp3"), gen: ui.playlist_gen };
         assert_eq!(ask(&state, &ui, &playlist, &c), None);
+    }
+
+    #[test]
+    fn a_file_listed_twice_is_followed_by_what_follows_that_copy() {
+        // a, b, a, c with several short tracks in the ring: the producer asks
+        // after the SECOND a while the first still plays. Matched by path
+        // against the playing track, the answer was b again — a loop.
+        let state = PlayerState::new();
+        let ui = test_ui(4);
+        let playlist = list_of(&["a", "b", "a", "c"]);
+        let second_a = Pick { index: 2, path: p("/a.mp3"), gen: ui.playlist_gen };
+        assert_eq!(ask(&state, &ui, &playlist, &second_a).map(|n| n.index), Some(3));
+    }
+
+    #[test]
+    fn known_unplayable_files_are_passed_over_after_an_edit_too() {
+        // b failed before; after an edit the report check must not send the
+        // player back to it (a jump that cut the playing track's end).
+        let state = PlayerState::new();
+        let mut ui = test_ui(4);
+        let mut playlist = list_of(&["a", "b", "c", "d"]);
+        state.mark_unplayable(&p("/b.mp3"), false);
+        let c = ask(&state, &ui, &playlist, &playing(&ui, &playlist)).unwrap();
+        assert_eq!(c.path, p("/c.mp3"), "the answer skips b");
+        assert!(remove_indices(&state, &mut ui, &mut playlist, &[3]), "an edit: the pick is now stale");
+        assert_eq!(report(&state, &mut ui, &playlist, &c), Move::Advance(2), "c still follows (b is skipped)");
     }
 
     #[test]

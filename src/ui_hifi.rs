@@ -61,7 +61,7 @@ pub fn print_status_hifi(
     let top = format!("╔{}╗", "═".repeat(inner_w));
     w.first_line(&format!("  {fg}{bar}{rst}", fg = p.fg, rst = p.reset, bar = top));
 
-    // === Header strip content row: K E E T │ ▶ PLAY · SHUFFLE · RPT-ALL  ...  TRACK 05 / 34 ===
+    // === Header strip content row: K E E T │ ▶ PLAY · SHUF-ON · RPT-ALL  ...  TRACK 05 / 34 ===
     let track_n = state.current_track.load(Ordering::Relaxed) + 1;
     let track_total = state.total_tracks.load(Ordering::Relaxed);
     let shuffle_on = ui.shuffle;
@@ -79,9 +79,11 @@ pub fn print_status_hifi(
         accent = p.accent, rst = p.reset, play = play_label,
     ));
     header_left.push_str(&format!("  {dim}·{rst}  ", dim = p.dim, rst = p.reset));
+    // Spelled out, like RPT-OFF/ALL/ONE: brightness alone is colour alone.
     header_left.push_str(&format!(
-        "{c}SHUFFLE{rst}",
+        "{c}{label}{rst}",
         c = if shuffle_on { p.fg } else { p.dim }, rst = p.reset,
+        label = if shuffle_on { "SHUF-ON" } else { "SHUF-OFF" },
     ));
     header_left.push_str(&format!("  {dim}·{rst}  ", dim = p.dim, rst = p.reset));
     header_left.push_str(&format!(

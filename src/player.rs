@@ -212,7 +212,9 @@ impl Player {
 
     /// Show a skipped file on the status line, and keep it for the exit note.
     fn report_skip(&mut self, msg: String) {
-        self.ui.set_status(format!("Skip: {msg}"));
+        // Queued, not a routine status: "Sorted by tags" replaced that within
+        // 2 s, and a startup notice on screen kept it from showing at all.
+        self.ui.queue_notice(format!("Skip: {msg}"), Duration::from_secs(4));
         if !self.heard_any && self.skipped.len() < 5 {
             self.skipped.push(msg);
         }
@@ -424,8 +426,12 @@ impl Player {
                 self.report_skip(msg);
             }
             // Through advance_to: when the failed track was the first queued
-            // one, the next queued track starts and leaves the queue.
-            let next = self.ui.current + 1;
+            // one, the next queued track starts and leaves the queue. Past
+            // the files this producer already found unplayable: it tried
+            // them all before giving up, and a new one would only fail again.
+            let next = (self.ui.current + 1..self.playlist.len())
+                .find(|&i| !state.is_unplayable(&self.playlist[i]))
+                .unwrap_or(self.playlist.len());
             ui::advance_to(&mut self.ui, &state, next);
             // Force a full redraw so the next track's status line starts clean
             // instead of leaving orphan lines from the previous render.
@@ -813,7 +819,7 @@ impl Player {
         // Rare: the producer asks again after any edit while it waits for the
         // ring (decode::Lineup), so this is an edit in the last moment.
         let after_unplayable = state.shown_track_unplayable.swap(false, Ordering::AcqRel);
-        let new_index = match ui::resolve_report(&self.ui, &self.playlist, &pick, after_unplayable) {
+        let new_index = match ui::resolve_report(&state, &self.ui, &self.playlist, &pick, after_unplayable) {
             ui::Move::Jump(target) => {
                 state.jump_to(target);
                 return;
@@ -931,7 +937,7 @@ impl Player {
         // then matches the rate to whichever track that is). The ring is
         // drained either way, so a jump and an advance are the same here.
         let new_idx = match state.reported_pick() {
-            Some(pick) => match ui::resolve_report(&self.ui, &self.playlist, &pick,
+            Some(pick) => match ui::resolve_report(&state, &self.ui, &self.playlist, &pick,
                 state.shown_track_unplayable.swap(false, Ordering::AcqRel)) {
                 ui::Move::Advance(i) | ui::Move::Jump(i) => i,
             },

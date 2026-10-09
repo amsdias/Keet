@@ -1323,10 +1323,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     leave_alternate_screen(&mut io::stdout());
     // Nothing was heard (every file unplayable): say why, on the user's own
     // screen. A lone broken file used to open the UI and leave with "Done".
-    match player.nothing_played_note() {
-        Some(note) => println!("keet: nothing could be played — {note}"),
-        None => println!("✓ Done"),
-    }
+    let exit_code = match player.nothing_played_note() {
+        Some(note) => {
+            println!("keet: nothing could be played — {note}");
+            1
+        }
+        None => {
+            println!("✓ Done");
+            0
+        }
+    };
 
     // Release exclusive mode and restore the DAC's format. Normally already
     // done (and taken) by the quit key, which silences the stream first; this
@@ -1336,7 +1342,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Exit immediately — implicit drops of cpal::Stream (ALSA backend) and
     // souvlaki::MediaControls (D-Bus) can block indefinitely on Linux, hanging
     // the process after the user presses Q.
-    std::process::exit(0);
+    std::process::exit(exit_code);
 }
 
 #[cfg(test)]
