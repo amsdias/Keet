@@ -28,7 +28,7 @@ A high-performance, low-CPU terminal audio player with real-time spectrum visual
 - **Clipping indicator**: Persistent dot that turns red when signal exceeds 0dBFS, with peak safety limiter
 - **Smart audio processing**: Automatic sample rate switching (macOS), Bluetooth detection, conditional resampling, seamless device switching
 - **Volume control**: Adjustable 0-150% with per-sample gain
-- **Library browser**: The library view (`L`) has a flat track list *and* an artist → album → track **tree** (`Tab` to switch) with live filtering (`/`), play-node (`Enter` plays a track / album / artist), and remove; folder sources auto-sort into artist → album order once tags load (when not shuffling)
+- **Library browser**: The library view (`L`) has a flat track list *and* an artist → album → track **tree** (`Tab` to switch) with live filtering (`/`), play-node (`Enter` plays a track / album / artist), and remove; folder sources auto-sort into artist → album order once tags load (when not shuffling; files you list keep your order)
 - **Playlist features**: Shuffle (toggling off restores the previous order — M3U order survives), repeat (all/one), recursive folder scanning, playlist view with search/sort/track durations/album column, page navigation (Home/End/PgUp/PgDn + vim `g`/`G`/Ctrl+U/D), tag-based sort (artist → album → disc → track), play queue (enqueue tracks after current), M3U import/export, folder rescan, multiple source paths with deduplication
 - **Resume playback**: Save and restore last session (track, position, volume, EQ — including an edited Custom parametric EQ, effects, crossfeed, balance, theme, device, exclusive) automatically
 - **HQ resampler mode**: Optional `--quality` flag for audiophile-grade resampling
@@ -98,8 +98,9 @@ keet --list-devices
 # Play on a specific device with exclusive mode
 keet ~/Music/ --device "USB Audio DAC" --exclusive
 
-# Resume last session (no arguments)
+# Resume last session (no files or folders; options given win over the saved ones)
 keet
+keet --theme hifi
 
 # Play an M3U playlist
 keet ~/Music/favorites.m3u
@@ -161,7 +162,7 @@ Press `L` to open the library, which replaces the visualization area with the tr
 | `S` | Save playlist as M3U |
 | `Esc` / `L` | Close library |
 
-Album and track durations are shown in right-aligned columns. The cursor follows the currently playing track on transitions. Folder sources auto-sort into artist → album order once tags load (unless shuffling); `Shift+S` re-sorts on demand. Sorting turns shuffle off. Untagged tracks fall to the bottom.
+Album and track durations are shown in right-aligned columns. The cursor follows the currently playing track on transitions. Folder sources auto-sort into artist → album order once tags load (unless shuffling; files listed by hand and M3U playlists keep their order); `Shift+S` re-sorts on demand. Sorting turns shuffle off. Untagged tracks fall to the bottom.
 
 **Tree** (`Tab`): the same tracks grouped by artist → album, independent of the play-queue order (so shuffle doesn't scramble it).
 

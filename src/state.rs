@@ -237,10 +237,10 @@ impl RateCaps {
     }
 
     /// The rate a track at `desired` should play at on this device. Chosen from
-    /// the device's rates alone — never from what played before: keeping the
-    /// current rate whenever the file's was not offered made the result depend
-    /// on history (an HDA played 44.1 kHz at 48 until a 96 kHz track came
-    /// along, then at 96 for good).
+    /// the device's rates alone — never from what played before, or the result
+    /// would depend on history (keeping the current rate when the file's is not
+    /// offered plays 44.1 kHz at 48 on an HDA until a 96 kHz track comes along,
+    /// then at 96 for good).
     pub fn resolve(&self, desired: u32, current: u32) -> u32 {
         if self.fixed {
             return current;
@@ -274,6 +274,23 @@ impl RateCaps {
         let offered = self.ranges.iter().flat_map(|&(lo, hi)| [lo, hi]);
         offered.clone().filter(|&r| r > desired).min().or_else(|| offered.max())
     }
+}
+
+/// A track as main named it to the producer: its position in the playlist at
+/// edit generation `gen`, and its path (which survives an edit; the index may
+/// not). See `decode::Lineup`.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Pick {
+    pub index: usize,
+    pub path: PathBuf,
+    pub gen: u64,
+}
+
+/// The producer's next-track question and main's answer.
+enum NextSlot {
+    Idle,
+    Asked(Pick),
+    Answered(Option<Pick>),
 }
 
 pub struct PlayerState {
@@ -384,7 +401,20 @@ pub struct PlayerState {
 
     // Track transition signaling (gapless playback)
     pub(crate) track_transition_count: AtomicUsize,
-    pub(crate) producer_track_index: AtomicUsize,
+    /// The track the producer last reported: the one now starting (with a
+    /// transition), or the one an exclusive-mode rate switch is for.
+    pub(crate) producer_pick: Mutex<Option<Pick>>,
+    /// The producer's question for its next track, and main's answer (see
+    /// `decode::Lineup`).
+    next_slot: Mutex<NextSlot>,
+    /// Files the producer found unplayable (would not open, or gave no
+    /// audio), for the "next" line; and whether the track main shows as
+    /// playing was one — the next report is then taken as named.
+    pub(crate) unplayable: Mutex<std::collections::HashSet<PathBuf>>,
+    pub(crate) shown_track_unplayable: AtomicBool,
+    /// The playlist's edit generation, published by the UI thread
+    /// (`ui::serve_producer`): a pick made at an older one may be stale.
+    pub(crate) playlist_gen: AtomicU64,
 
     // ReplayGain mode
     pub(crate) rg_mode: AtomicU8,
@@ -409,10 +439,10 @@ pub struct PlayerState {
     /// Set by main (which owns the device); read by the producer at a track
     /// boundary to decide whether a stream rebuild would change anything.
     pub(crate) exclusive_caps: Mutex<Option<RateCaps>>,
-    /// Index of the track the producer is opening/decoding right now. Unlike
-    /// producer_track_index (updated once a track's audio is about to play),
-    /// this is current the moment decoding starts — what a crash report needs.
-    pub(crate) producer_decoding: AtomicUsize,
+    /// The track the producer is opening/decoding right now. Unlike
+    /// producer_pick (updated once a track's audio is about to play), this is
+    /// current the moment decoding starts — what a crash report needs.
+    pub(crate) producer_decoding: Mutex<Option<Pick>>,
     /// Buffer underruns/overruns the output stream reported (cpal ErrorKind::Xrun),
     /// cumulative for the session. Shown in the stats so real dropouts are
     /// visible; they are glitches, never a reason to rebuild the stream.
@@ -492,7 +522,11 @@ impl PlayerState {
             decode_error: Mutex::new(None),
             decode_notice: Mutex::new(None),
             track_transition_count: AtomicUsize::new(0),
-            producer_track_index: AtomicUsize::new(0),
+            producer_pick: Mutex::new(None),
+            next_slot: Mutex::new(NextSlot::Idle),
+            unplayable: Mutex::new(std::collections::HashSet::new()),
+            shown_track_unplayable: AtomicBool::new(false),
+            playlist_gen: AtomicU64::new(0),
             rg_mode: AtomicU8::new(RgMode::Track as u8),
             rg_gain_db: AtomicU32::new(0f32.to_bits()),
             clipping: AtomicBool::new(false),
@@ -502,7 +536,7 @@ impl PlayerState {
             balance: AtomicI32::new(0),
             exclusive: AtomicBool::new(false),
             exclusive_caps: Mutex::new(None),
-            producer_decoding: AtomicUsize::new(0),
+            producer_decoding: Mutex::new(None),
             xrun_count: AtomicU64::new(0),
             device_rerouted: AtomicBool::new(false),
             output_bits: AtomicU32::new(0),
@@ -560,9 +594,9 @@ impl PlayerState {
     pub fn take_skip_next(&self) -> bool { self.skip_next.swap(false, Ordering::Relaxed) }
     pub fn take_skip_prev(&self) -> bool { self.skip_prev.swap(false, Ordering::Relaxed) }
     // fetch_add, not store: rapid presses inside one producer-loop iteration
-    // must accumulate — a store made the second press overwrite the first.
-    // Kept in MILLISECONDS: an OS seek-bar position is fractional, and whole
-    // seconds rounded it by up to half a second. Keys seek in whole seconds.
+    // must accumulate (a store would let the second press overwrite the
+    // first). Kept in MILLISECONDS: an OS seek-bar position is fractional,
+    // and whole seconds would round it by up to half a second. Keys seek in whole seconds.
     pub fn seek(&self, secs: i64) { self.seek_request.fetch_add(secs * 1000, Ordering::Relaxed); }
     /// The pending relative seek, in seconds (0 = none), and clear it.
     pub fn take_seek(&self) -> f64 { self.seek_request.swap(0, Ordering::Relaxed) as f64 / 1000.0 }
@@ -588,7 +622,7 @@ impl PlayerState {
 
     /// The rate an exclusive-mode switch toward `desired` would actually land
     /// on, starting from `current`. Without captured caps, assume the switch
-    /// succeeds (the old behaviour).
+    /// succeeds.
     pub fn exclusive_target_rate(&self, desired: u32, current: u32) -> u32 {
         self.exclusive_caps
             .lock()
@@ -824,9 +858,77 @@ impl PlayerState {
         self.viz_style.store(if cur == 0 { 1 } else { 0 }, Ordering::Relaxed);
     }
 
-    pub fn signal_next_track(&self, index: usize) {
-        self.producer_track_index.store(index, Ordering::Relaxed);
+    pub fn signal_next_track(&self, pick: &Pick) {
+        if let Ok(mut p) = self.producer_pick.lock() {
+            *p = Some(pick.clone());
+        }
         self.track_transition_count.fetch_add(1, Ordering::Release);
+    }
+
+    /// Producer: `path` cannot be played. `shown`: it is the track main
+    /// shows as playing (the producer's first, or one that opened but gave no
+    /// audio) — never heard, so the report that follows is not checked
+    /// against it.
+    pub(crate) fn mark_unplayable(&self, path: &std::path::Path, shown: bool) {
+        if let Ok(mut u) = self.unplayable.lock() {
+            u.insert(path.to_path_buf());
+        }
+        if shown {
+            self.shown_track_unplayable.store(true, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn is_unplayable(&self, path: &std::path::Path) -> bool {
+        self.unplayable.lock().is_ok_and(|u| u.contains(path))
+    }
+
+    /// The track the producer last reported (see `producer_pick`).
+    pub(crate) fn reported_pick(&self) -> Option<Pick> {
+        self.producer_pick.lock().ok().and_then(|p| p.clone())
+    }
+
+    /// Producer: ask for the track after `after` (answered by main).
+    pub(crate) fn ask_next(&self, after: Pick) {
+        if let Ok(mut slot) = self.next_slot.lock() {
+            *slot = NextSlot::Asked(after);
+        }
+    }
+
+    /// Producer: main's answer, once there is one.
+    pub(crate) fn take_next_answer(&self) -> Option<Option<Pick>> {
+        let mut slot = self.next_slot.lock().ok()?;
+        match std::mem::replace(&mut *slot, NextSlot::Idle) {
+            NextSlot::Answered(a) => Some(a),
+            other => {
+                *slot = other;
+                None
+            }
+        }
+    }
+
+    /// Producer: it is unwinding and will not read an answer; and main,
+    /// before a new producer starts (an old question or answer is not its).
+    pub(crate) fn cancel_next_question(&self) {
+        if let Ok(mut slot) = self.next_slot.lock() {
+            *slot = NextSlot::Idle;
+        }
+    }
+
+    /// Main: the producer's open question, if any.
+    pub(crate) fn next_question(&self) -> Option<Pick> {
+        match &*self.next_slot.lock().ok()? {
+            NextSlot::Asked(after) => Some(after.clone()),
+            _ => None,
+        }
+    }
+
+    /// Main: answer `question` — only if it is still the one asked.
+    pub(crate) fn answer_next(&self, question: &Pick, answer: Option<Pick>) {
+        if let Ok(mut slot) = self.next_slot.lock() {
+            if matches!(&*slot, NextSlot::Asked(q) if q == question) {
+                *slot = NextSlot::Answered(answer);
+            }
+        }
     }
 
     pub fn rg_mode(&self) -> RgMode {
@@ -962,6 +1064,10 @@ pub struct UiState {
     /// Notices waiting for the one held one on screen to expire
     /// (`queue_notice`), each with its own hold.
     pub notice_queue: std::collections::VecDeque<(String, std::time::Duration)>,
+    /// The message up is a routine one (`set_status`): anything replaces it.
+    /// Told apart by this flag, not by its length, so a notice held 2 s or
+    /// less is still protected.
+    pub status_routine: bool,
     pub metadata_cache: std::sync::Arc<crate::metadata::MetadataCache>,
     pub scan_handle: Option<JoinHandle<()>>,
     /// One-shot flag: when the background scan finishes and we're not shuffling,
@@ -1002,9 +1108,12 @@ pub struct UiState {
     /// and positions staged before that pointed at other tracks.
     pub tree_pending_remove: Option<(String, Vec<PathBuf>)>,
     pub removed_paths: std::collections::HashSet<PathBuf>,
-    pub playlist_dirty: bool,
+    /// Bumped by every playlist edit (`ui::reindex_and_restart_scan`, the
+    /// one path they all take). The producer's picks carry the generation
+    /// they were made at; a different one means the list moved under them.
+    pub playlist_gen: u64,
     /// The playing track was removed: where its successor now sits (may be
-    /// the playlist length = past the end). Read by the transition handler.
+    /// the playlist length = past the end). Cleared by the next track change.
     pub removed_current_next: Option<usize>,
     pub terminal_resized: bool,
     /// Whether the previous frame left the analysis-spectrogram sixel block on
@@ -1016,10 +1125,9 @@ pub struct UiState {
     /// (first row, body height) of the viz block the last frame drew, the row
     /// counted in frame lines below the anchor (so it includes the top padding
     /// AND everything above the block). A change in EITHER means the block
-    /// moved or resized, so a Sixel image must be re-emitted. Keying on the
-    /// padding alone missed moves caused by rows above it — a status line
-    /// replacing the 4-row command tray moved the block up 2 rows and left the
-    /// old image stranded (clipped by the trailing erase).
+    /// moved or resized, so a Sixel image must be re-emitted. The padding
+    /// alone misses moves caused by rows above it (a status line replacing
+    /// the 4-row command tray moves the block up 2 rows, stranding the image).
     pub last_viz_block: (usize, usize),
     pub lyrics: Option<crate::lyrics::Lyrics>,
     pub lyrics_receiver: Option<std::sync::mpsc::Receiver<Option<(crate::lyrics::Lyrics, crate::lyrics::LyricsSource)>>>,
@@ -1095,6 +1203,7 @@ impl UiState {
             enqueue_count: 0,
             status_message: None,
             notice_queue: std::collections::VecDeque::new(),
+            status_routine: false,
             status_hold: std::time::Duration::from_secs(2),
             metadata_cache,
             scan_handle: None,
@@ -1113,7 +1222,7 @@ impl UiState {
             tree_filter: String::new(),
             tree_pending_remove: None,
             removed_paths: std::collections::HashSet::new(),
-            playlist_dirty: false,
+            playlist_gen: 0,
             removed_current_next: None,
             terminal_resized: false,
             spectro_block_intact: false,
@@ -1155,15 +1264,19 @@ impl UiState {
     /// keystrokes).
     /// A routine message (a key's confirmation, "Sorted by tags"), up for 2 s.
     /// It does not replace a held notice that is still up: there is one
-    /// status slot, and the folder auto-sort's message used to wipe a notice
-    /// meant to be read (exclusive mode falling back, a bad config colour)
-    /// before the first frame was even drawn.
+    /// status slot, and the folder auto-sort's message would otherwise wipe
+    /// a notice meant to be read (exclusive mode falling back, a bad config
+    /// colour) before the first frame is even drawn.
     pub fn set_status(&mut self, msg: String) {
-        let routine = std::time::Duration::from_secs(2);
-        let held = matches!(self.status_message, Some((_, when)) if self.status_hold > routine && when.elapsed() < self.status_hold);
-        if !held {
-            self.set_status_for(msg, routine);
+        if !self.notice_up() {
+            self.set_status_for(msg, std::time::Duration::from_secs(2));
+            self.status_routine = true;
         }
+    }
+
+    /// A notice (not a routine message) is on screen and has time left.
+    fn notice_up(&self) -> bool {
+        !self.status_routine && matches!(self.status_message, Some((_, when)) if when.elapsed() < self.status_hold)
     }
 
     /// A status message that stays up for `hold` — for notices that matter
@@ -1171,6 +1284,7 @@ impl UiState {
     pub fn set_status_for(&mut self, msg: String, hold: std::time::Duration) {
         self.status_message = Some((crate::ansi::sanitize_display(&msg), Instant::now()));
         self.status_hold = hold;
+        self.status_routine = false;
     }
 
     /// A notice that must be read but must not wipe another one still up:
@@ -1179,9 +1293,11 @@ impl UiState {
     /// first audio notice lands on the first frame; with one slot, each
     /// replaced the last and only the final one was ever seen.
     pub fn queue_notice(&mut self, msg: String, hold: std::time::Duration) {
-        let routine = std::time::Duration::from_secs(2);
-        let held = matches!(self.status_message, Some((_, when)) if self.status_hold > routine && when.elapsed() < self.status_hold);
-        if held || !self.notice_queue.is_empty() {
+        // No size limit needed: repeats are dropped, and only a handful of
+        // kinds exist. A queued notice can show late (behind a 10 s startup
+        // one); each names what it is about (a file, the device), so it
+        // still reads right after the track has changed.
+        if self.notice_up() || !self.notice_queue.is_empty() {
             let msg = crate::ansi::sanitize_display(&msg);
             let shown = matches!(&self.status_message, Some((m, _)) if *m == msg);
             if !shown && !self.notice_queue.iter().any(|(m, _)| *m == msg) {
@@ -1245,6 +1361,14 @@ mod state_tests {
         ui.status_message = Some(("skipped /x".into(), Instant::now() - std::time::Duration::from_secs(11)));
         assert_eq!(ui.active_status().as_deref(), Some("exclusive mode off"));
         assert!(ui.notice_queue.is_empty());
+        // A short notice is still a notice: the next one waits for it, and
+        // a routine message does not replace it.
+        let mut ui = UiState::new(Vec::new(), crate::metadata::MetadataCache::new(0));
+        ui.queue_notice("short".into(), std::time::Duration::from_secs(1));
+        ui.queue_notice("next".into(), std::time::Duration::from_secs(5));
+        ui.set_status("Shuffle ON".into());
+        assert_eq!(ui.active_status().as_deref(), Some("short"));
+        assert_eq!(ui.notice_queue.len(), 1);
     }
 
     #[test]

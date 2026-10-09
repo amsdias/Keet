@@ -77,8 +77,8 @@ impl ClassicColors {
 // an explicit CLI flag for that setting still wins. See main.rs.
 
 /// Parse config JSON key by key. A value of the wrong type costs only that
-/// key (named in `problems`): parsed as one struct, a single bad value failed
-/// the whole file and every setting silently went back to its default. A file
+/// key (named in `problems`); parsed as one struct, a single bad value would
+/// fail the whole file and silently reset every setting. A file
 /// that is not JSON at all gives the defaults. Unknown keys are ignored. A
 /// broken config never blocks startup.
 fn parse(contents: &str) -> Config {

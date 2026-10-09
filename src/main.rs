@@ -75,8 +75,8 @@ fn locked_rate_note(state: &PlayerState, device: &cpal::Device) -> Option<String
 }
 
 /// Exclusive mode: put the DAC at its most precise physical format for `rate`
-/// (Keet otherwise set only the rate, so a DAC left at 16-bit in Audio MIDI
-/// Setup truncated 24-bit files) and record the result for display. Must run
+/// (setting only the rate would leave a DAC at 16-bit in Audio MIDI Setup
+/// truncating 24-bit files) and record the result for display. Must run
 /// with no stream open, like the rate change it follows.
 fn apply_exclusive_bit_depth(state: &PlayerState, device: &cpal::Device, rate: u32) {
     if state.exclusive.load(Ordering::Relaxed) {
@@ -88,9 +88,8 @@ fn apply_exclusive_bit_depth(state: &PlayerState, device: &cpal::Device, rate: u
 /// The output device chosen by `--device` (an exact id, then an exact name,
 /// then a substring — see audio::find_device_by_name), or the default. A name
 /// that matches nothing falls back to the default with a warning, returned
-/// for the status line: printed to stderr it was wiped by the UI's first
-/// frame before anyone could read it. It used to be looked up twice at
-/// startup, warning twice.
+/// for the status line (printed to stderr, the UI's first frame would wipe
+/// it before anyone could read it). Called once at startup.
 fn select_device(
     host: &cpal::Host,
     wanted: Option<&str>,
@@ -157,12 +156,10 @@ fn open_startup_output(
     if exclusive {
         restore.capture(&device);
     }
-    // Only exclusive mode may change the device. Normal mode used to switch the
-    // DAC's system-wide rate to the first track's here (macOS; the other
-    // platforms' set_output_sample_rate never touches the device): that spared
-    // one track from resampling, resampled every other app on the DAC, never
-    // switched again, and was never put back. Normal mode now plays at whatever
-    // rate the device is set to and resamples every track the same way.
+    // Only exclusive mode may change the device. Normal mode plays at whatever
+    // rate the device is set to and resamples every track the same way:
+    // switching the DAC's system-wide rate to the first track's would spare
+    // one track, resample every other app on the DAC, and never be undone.
     // Exclusive mode's rate capabilities are read first — before the startup
     // rate is chosen (it goes through the same rule as every later switch)
     // and BEFORE any stream opens: a Linux raw hw: device admits a single
@@ -296,8 +293,10 @@ fn install_panic_hook() {
             // it (TerminalGuard would flush it on the way down), close a
             // synchronized update it may have opened, and start a clean line.
             term::discard();
-            let _ = io::stdout().write_all(b"\x1B[?2026l\x1B[0m\r\n");
+            let _ = io::stdout().write_all(b"\x1B[?2026l");
             let _ = terminal::disable_raw_mode();
+            // Back on the user's screen, where the panic message stays.
+            leave_alternate_screen(&mut io::stdout());
             restore_cursor(&mut io::stdout());
         }
 
@@ -331,7 +330,7 @@ fn install_panic_hook() {
 /// The tracks of every source (folders, files, M3U), deduplicated by
 /// canonical path, shuffled if asked. One unreadable source among several is
 /// skipped with a warning (returned, for the status line: printed to stderr
-/// it was wiped by the first frame); a lone one is an error.
+/// the first frame would wipe it); a lone one is an error.
 fn load_initial_playlist(source_paths: &[PathBuf], shuffle: bool)
     -> Result<(Vec<PathBuf>, Option<String>), Box<dyn std::error::Error>>
 {
@@ -509,7 +508,7 @@ fn open_output(
 
 /// No output could be opened. Say so and hand over to the recovery block,
 /// which retries with a backoff (input keeps working, so quit stays possible).
-/// It used to quit the app — leaving the terminal in raw mode.
+/// Never a quit: that would leave the terminal in raw mode.
 fn output_failed(ui: &mut state::UiState, state: &PlayerState, e: &dyn std::error::Error) {
     let wait = schedule_retry(ui, state);
     ui.set_status_for(format!("can't open the output: {e} — retrying in {} s", wait.as_secs()), Duration::from_secs(3));
@@ -533,8 +532,8 @@ const OUTPUT_PROVEN_AFTER: Duration = Duration::from_secs(5);
 
 /// How long to wait before the next attempt after `failures` failed ones:
 /// 1, 2, 4, then 8 s. Each attempt opens (and in exclusive mode can probe) a
-/// device on the UI thread; a fixed second hammered a device that stays
-/// unavailable and stalled the UI each time.
+/// device on the UI thread; a fixed second would hammer a device that stays
+/// unavailable and stall the UI each time.
 fn recovery_backoff(failures: u32) -> Duration {
     Duration::from_secs(1 << failures.min(3))
 }
@@ -563,9 +562,8 @@ const PRODUCER_THREAD: &str = "keet-producer";
 /// image gone). Must run after the DEC 2026 sync-begin.
 ///
 /// Every loop that draws frames calls this — the steady-state loop, the
-/// start-of-track buffering wait and the exclusive-mode rate-change wait. The
-/// buffering wait used to render without it, so a Shift+F or resize pressed in
-/// the ~1 s after a track change drew the new layout over the old one.
+/// start-of-track buffering wait and the exclusive-mode rate-change wait —
+/// one without it draws a Shift+F or resize in that time over the old layout.
 fn repaint_if_needed(ui: &mut state::UiState) -> bool {
     if !ui.terminal_resized {
         return false;
@@ -700,6 +698,42 @@ fn spawn_cover_worker(ui: &mut state::UiState, path: std::path::PathBuf, size: c
     });
 }
 
+/// Restores the terminal when dropped (see its use in main): cooked mode,
+/// the cursor, and the screen the user had before Keet started.
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        crate::term::flush();
+        let _ = terminal::disable_raw_mode();
+        leave_alternate_screen(&mut io::stdout());
+        restore_cursor(&mut io::stdout());
+    }
+}
+
+/// The TUI draws on the terminal's alternate screen (like vim or htop): the
+/// user's shell screen and scrollback are left as they were, and come back on
+/// exit. Entering also resets what a crashed run may have left (attributes,
+/// an unfinished synchronized update) without the full terminal reset (ESC c)
+/// that wiped the user's screen.
+fn enter_alternate_screen(w: &mut impl Write) {
+    crate::term::flush();
+    let _ = w.write_all(b"\x1B[?1049h\x1B[?2026l\x1B[0m\x1B[H\x1B[J");
+    let _ = w.flush();
+    ON_ALTERNATE_SCREEN.store(true, Ordering::Relaxed);
+}
+
+/// Leave it only when in it: `?1049l` also restores a cursor position saved
+/// on entry, and with none saved some terminals jump to the top left.
+fn leave_alternate_screen(w: &mut impl Write) {
+    if ON_ALTERNATE_SCREEN.swap(false, Ordering::Relaxed) {
+        let _ = w.write_all(b"\x1B[0m\x1B[?1049l");
+        let _ = w.flush();
+    }
+}
+
+static ON_ALTERNATE_SCREEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Show the terminal cursor again, ignoring write errors.
 ///
 /// **Must not panic.** The panic hook calls this, and `print!` panics when the
@@ -707,17 +741,6 @@ fn spawn_cover_worker(ui: &mut state::UiState, path: std::path::PathBuf, size: c
 /// original panic would trigger a second panic here — and panicking while
 /// panicking aborts the process instead of exiting cleanly. Writing through a
 /// handle and discarding the `Result` keeps this total.
-/// Restores the terminal when dropped (see its use in main).
-struct TerminalGuard;
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        crate::term::flush();
-        let _ = terminal::disable_raw_mode();
-        restore_cursor(&mut io::stdout());
-    }
-}
-
 fn restore_cursor(w: &mut impl Write) {
     let _ = w.write_all(b"\x1B[?25h");
     let _ = w.flush();
@@ -845,11 +868,10 @@ fn rebuild_stream(
     // always stereo; the audio callback fans it out to however many channels
     // the device wants (mono duplicates, >2 leaves the extras silent).
     //
-    // Hardcoding 2 here broke Windows: WASAPI shared mode only accepts the
-    // mixer's own format, so a device whose shared format isn't stereo made
-    // `IsFormatSupported` return S_FALSE → "Stream configuration is not
-    // supported in shared mode". cpal 0.17 never noticed (its check was a stub
-    // returning true); 0.18 actually calls IsFormatSupported and rejects.
+    // Not a hardcoded 2: WASAPI shared mode only accepts the mixer's own
+    // format, so on a device whose shared format isn't stereo
+    // `IsFormatSupported` returns S_FALSE → "Stream configuration is not
+    // supported in shared mode" (cpal 0.18 checks; 0.17's check was a stub).
     let config = StreamConfig {
         channels,
         sample_rate: stream_rate,
@@ -896,8 +918,8 @@ fn rebuild_stream(
             );
             // On the status line, held for seconds (decode_notice). Not on
             // stderr: this also runs during playback (recovery, rate
-            // switches), where stderr lands on top of the frame. It used to
-            // go through decode_error too, which is shown as "Skip: …".
+            // switches), where stderr lands on top of the frame. Not
+            // decode_error either: that one is shown as "Skip: …".
             if let Ok(mut n) = state.decode_notice.lock() {
                 *n = Some(note);
             }
@@ -923,7 +945,17 @@ fn rebuild_stream(
     Ok((prod, viz_cons, audio::Output::Cpal(stream), stream_rate))
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// Errors that end startup are printed plainly (`keet: No audio files
+/// found`) with exit code 1 — returned from `main` they came out in Debug
+/// form, quotes and all.
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("keet: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Ensure terminal is in normal mode (cleanup from previous crashed runs)
     let _ = terminal::disable_raw_mode();
     // On Windows, legacy conhost/cmd.exe don't enable VT processing by default, which
@@ -933,10 +965,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let _ = crossterm::ansi_support::supports_ansi();
     }
-    // NOTE: the startup terminal reset lives further down, after the --help /
-    // --list-devices early exits — those just print to stdout and return, so
-    // resetting here would wipe the screen (and emit a stray ESC c into the
-    // output when piped) for commands that never draw the TUI.
 
     install_panic_hook();
 
@@ -963,13 +991,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(name) = &opts.unknown_theme {
         eprintln!("Unknown theme '{}' (expected: classic, minimal, hifi)", name);
     }
-
-    // Full terminal reset in case a previous run crashed mid-draw.
-    // \x1Bc = RIS (Reset to Initial State) - clears screen, resets charset,
-    // tab stops, modes. Deliberately AFTER the print-and-exit flags above so
-    // it only fires on the path that actually draws the TUI.
-    crate::term::out!("\x1Bc");
-    crate::term::flush();
 
     // Loaded once and reused for the volume/EQ/device restore further down.
     let resume_state_loaded = if opts.resume { load_state() } else { None };
@@ -1003,7 +1024,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Some("off") => state::RepeatMode::Off,
                     _ => if rs.repeat { state::RepeatMode::All } else { state::RepeatMode::Off },
                 };
-                (paths, rs.shuffle, rm)
+                // Typed --shuffle / --repeat win over the session's.
+                let rm = if opts.repeat { state::RepeatMode::All } else { rm };
+                (paths, rs.shuffle || opts.shuffle, rm)
             }
             None => {
                 match ui::run_first_launch_picker() {
@@ -1045,7 +1068,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     state.eq_preset_count.store(eq_presets.len(), Ordering::Relaxed);
 
     // Set initial EQ preset from --eq argument
-    if let Some(idx) = eq_arg.as_deref().and_then(|n| pick_preset(&mut eq_presets, n, |p| &mut p.name)) {
+    let eq_arg_index = eq_arg.as_deref().and_then(|n| pick_preset(&mut eq_presets, n, |p| &mut p.name));
+    if let Some(idx) = eq_arg_index {
         state.eq_preset_count.store(eq_presets.len(), Ordering::Relaxed);
         state.eq_preset_index.store(idx, Ordering::Relaxed);
     }
@@ -1055,7 +1079,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fx_presets.extend(effects::load_custom_presets());
     state.effects_preset_count.store(fx_presets.len(), Ordering::Relaxed);
 
-    if let Some(idx) = fx_arg.as_deref().and_then(|n| pick_preset(&mut fx_presets, n, |p| &mut p.name)) {
+    let fx_arg_index = fx_arg.as_deref().and_then(|n| pick_preset(&mut fx_presets, n, |p| &mut p.name));
+    if let Some(idx) = fx_arg_index {
         state.effects_preset_count.store(fx_presets.len(), Ordering::Relaxed);
         state.effects_preset_index.store(idx, Ordering::Relaxed);
     }
@@ -1093,15 +1118,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Apply remaining config.json defaults. Each overrides the resumed value but
-    // yields to an explicit CLI flag for the same setting. (CLI flags only occur
-    // with explicit paths, and resume only on a bare launch, so checking flag
-    // presence gives the right priority in both modes.)
-    apply_config(&state, &app_config, args.iter().any(|a| a == "--rg-mode"), eq_arg.is_some(), &eq_presets, &cf_presets);
+    // yields to an explicit CLI flag for the same setting.
+    let rg_flag = args.iter().any(|a| a == "--rg-mode");
+    apply_config(&state, &app_config, rg_flag, eq_arg.is_some(), &eq_presets, &cf_presets);
+    // An option typed with a resume (`keet --eq Rock`) wins over the saved
+    // session, which apply_resume_state just restored over it.
+    if resume_state_loaded.is_some() {
+        if let Some(idx) = eq_arg_index {
+            state.eq_preset_index.store(idx, Ordering::Relaxed);
+            state.eq_custom.store(false, Ordering::Relaxed);
+        }
+        if let Some(idx) = fx_arg_index {
+            state.effects_preset_index.store(idx, Ordering::Relaxed);
+        }
+        if rg_flag {
+            state.rg_mode.store(rg_mode as u8, Ordering::Relaxed);
+        }
+    }
 
-    // Override device/exclusive from resume state when resuming with no args
+    // Device and exclusive mode from the resumed session, unless typed.
     let mut device_arg = device_arg;
     let mut exclusive = exclusive;
-    if args.len() < 2 {
+    if opts.resume {
         if let Some(ref rs) = resume_state_loaded {
             if device_arg.is_none() {
                 device_arg = rs.device.clone();
@@ -1190,6 +1228,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // device busy at startup), a panic on this thread — must hand the terminal
     // back: raw mode left on eats Ctrl+C and echo in the user's shell.
     let _terminal_guard = TerminalGuard;
+    // Only now, with every startup check done: a missing source, a busy
+    // device or a bad option is reported on the user's own screen, which
+    // nothing has touched.
+    enter_alternate_screen(&mut io::stdout());
 
     // Hide cursor to prevent flickering
     crate::term::out!("\x1B[?25l");
@@ -1277,10 +1319,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if matches!(cover::detect_protocol(), cover::GraphicsProtocol::Kitty) {
         crate::term::out!("{}{}", cover::kitty_clear_escape(), cover::viz_image_clear_escape());
     }
-    // Home + erase-down, not ED2 — see the resize repaint above (ConPTY turns
-    // 2J into a scrollback push on Windows Terminal).
-    crate::term::out!("\x1B[H\x1B[J✓ Done\n");
     crate::term::flush();
+    leave_alternate_screen(&mut io::stdout());
+    // Nothing was heard (every file unplayable): say why, on the user's own
+    // screen. A lone broken file used to open the UI and leave with "Done".
+    match player.nothing_played_note() {
+        Some(note) => println!("keet: nothing could be played — {note}"),
+        None => println!("✓ Done"),
+    }
 
     // Release exclusive mode and restore the DAC's format. Normally already
     // done (and taken) by the quit key, which silences the stream first; this

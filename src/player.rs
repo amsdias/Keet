@@ -16,7 +16,7 @@ use cpal::traits::{DeviceTrait, HostTrait};
 use crate::audio;
 use crate::cover;
 use crate::crossfeed::{self, CrossfeedPreset};
-use crate::decode::{await_consumer_drain, decode_playlist};
+use crate::decode::{self, await_consumer_drain, decode_playlist, Lineup as _};
 use crate::effects::{self, EffectsPreset};
 use crate::eq::{self, EqPreset};
 use crate::media_keys;
@@ -80,6 +80,10 @@ pub struct Player {
     /// Where to start the next track (seconds): a resumed session, or the
     /// point a device recovery interrupted.
     pub resume_position: i64,
+    /// Whether any audio has played, and the files skipped as unplayable —
+    /// for the line printed on exit when nothing could be played.
+    heard_any: bool,
+    skipped: Vec<String>,
 
     // --- frame state ---
     pub prev_frame_lines: usize,
@@ -157,6 +161,8 @@ impl Player {
             media_controls: s.media_controls,
             stats: StatsMonitor::new(),
             resume_position: s.resume_position,
+            heard_any: false,
+            skipped: Vec::new(),
             prev_frame_lines: usize::MAX,
             prev_viz_image_shown: false,
             last_transition_count: 0,
@@ -189,6 +195,26 @@ impl Player {
                     Flow::Quit => break 'playlist,
                 }
             }
+        }
+    }
+
+    /// Why nothing played, when nothing did: the files skipped as unplayable
+    /// (the error the producer left last included). None once anything played.
+    pub fn nothing_played_note(&mut self) -> Option<String> {
+        if self.heard_any || self.state.samples_played.load(Ordering::Relaxed) > 0 {
+            return None;
+        }
+        if let Some(msg) = self.state.decode_error.lock().ok().and_then(|mut e| e.take()) {
+            self.skipped.push(msg);
+        }
+        (!self.skipped.is_empty()).then(|| self.skipped.join("; "))
+    }
+
+    /// Show a skipped file on the status line, and keep it for the exit note.
+    fn report_skip(&mut self, msg: String) {
+        self.ui.set_status(format!("Skip: {msg}"));
+        if !self.heard_any && self.skipped.len() < 5 {
+            self.skipped.push(msg);
         }
     }
 
@@ -279,9 +305,9 @@ impl Player {
     /// update (DEC mode 2026: presented atomically, so terminals — notably
     /// Windows Terminal — don't show the erase-then-repaint as flicker).
     fn paint_wait_frame(&mut self) {
-        // Media keys are pumped here too: the waits (start-of-track buffering,
-        // a rate change, the repeat-all rebuild) used to leave them queued, so
-        // a pause pressed just before a rate switch landed after it.
+        // Media keys are pumped here too, so a pause pressed during a wait
+        // (start-of-track buffering, a rate change, the repeat-all rebuild)
+        // takes effect then, not after it.
         media_keys::poll();
         crate::term::out!("\x1B[?2026h");
         self.repaint_screen();
@@ -395,7 +421,7 @@ impl Player {
             }
             let err_msg = state.decode_error.lock().ok().and_then(|mut e| e.take());
             if let Some(msg) = err_msg {
-                self.ui.set_status(format!("Skip: {}", msg));
+                self.report_skip(msg);
             }
             // Through advance_to: when the failed track was the first queued
             // one, the next queued track starts and leaves the queue.
@@ -441,10 +467,10 @@ impl Player {
         let startup_threshold = self.stream_rate as usize * 2;
         // Also stop on a rate-change request: that exit does not set
         // producer_done, so a track shorter than the 1 s threshold followed
-        // by one at another rate never filled the ring and stalled here —
+        // by one at another rate never fills the ring and would stall here —
         // the loop that acts on the request is the one this wait gates.
         // And on a stream error: a dead (or unopened) output never drains
-        // the ring, so the buffer level never rises and this waited
+        // the ring, so the buffer level never rises and this would wait
         // forever — the recovery block that acts on it is below.
         while state.buffer_level.load(Ordering::Relaxed) < startup_threshold
               && !state.producer_done.load(Ordering::Relaxed)
@@ -504,8 +530,8 @@ impl Player {
         };
         // Edited while the rebuild ran (a reorder, a queued track, a removal),
         // or a track picked (a pending jump is an index into THIS list): the
-        // user's list wins, as it is — replacing or reshuffling it threw the
-        // edits away and sent the jump to whatever track took that index.
+        // user's list wins, as it is — replacing or reshuffling it would
+        // throw the edits away and send the jump to another track.
         // Only a new removal costs a lookup per path, and only then.
         let jump_pending = self.state.jump_to_track.load(Ordering::Relaxed) >= 0;
         // A queued track counts even when the list did not change: queueing
@@ -600,9 +626,25 @@ impl Player {
 
     /// Spawn the producer thread (continuous — decodes multiple tracks).
     fn spawn_producer(&mut self) {
-        ui::producer_started(&mut self.ui);
-        let playlist_snapshot = self.playlist.clone();
-        let start_idx = self.ui.current;
+        // The producer asks main for each track after this one (see
+        // decode::Lineup); a question or answer left by the last producer is
+        // not this one's.
+        self.state.cancel_next_question();
+        self.state.shown_track_unplayable.store(false, Ordering::Relaxed);
+        // It starts at ui.current, which is already a removed playing track's
+        // successor: that successor is reached. Left set, it would outlive
+        // the repeat-all wrap and send a later stale report past the end.
+        self.ui.removed_current_next = None;
+        let start = state::Pick {
+            index: self.ui.current,
+            path: self.playlist[self.ui.current].clone(),
+            gen: self.ui.playlist_gen,
+        };
+        // What it reports is about its own tracks; until its first report,
+        // the track it starts with (named at this generation).
+        if let Ok(mut p) = self.state.producer_pick.lock() {
+            *p = Some(start.clone());
+        }
         let state_clone = Arc::clone(&self.state);
         let eq_presets_clone = Arc::clone(&self.eq_presets);
         let fx_presets_clone = Arc::clone(&self.fx_presets);
@@ -630,7 +672,7 @@ impl Player {
             // the next track (main's jump handler respawns the producer there).
             let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 decode_playlist(
-                    &playlist_snapshot, start_idx,
+                    start, &mut decode::MainLineup,
                     &mut prod_for_thread, &state_clone, sr, hq,
                     &mut eq_chain, &eq_presets_clone,
                     &mut fx_chain, &fx_presets_clone,
@@ -639,19 +681,20 @@ impl Player {
                 );
             }));
             if run.is_err() {
-                let idx = state_clone.producer_decoding.load(Ordering::Relaxed);
-                let name = playlist_snapshot
-                    .get(idx)
-                    .and_then(|p| p.file_name())
+                let crashed = state_clone.producer_decoding.lock().ok().and_then(|d| d.clone());
+                let name = crashed
+                    .as_ref()
+                    .and_then(|c| c.path.file_name())
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
                 if let Ok(mut err) = state_clone.decode_error.lock() {
                     *err = Some(format!("{name}: decoder crashed, skipped"));
                 }
-                if idx + 1 < playlist_snapshot.len() {
-                    state_clone.jump_to(idx + 1);
-                } else {
-                    state_clone.producer_done.store(true, Ordering::Relaxed);
+                // Main names the track after it, as for any other boundary.
+                let next = crashed.and_then(|c| decode::MainLineup.next_after(&state_clone, &c));
+                match next {
+                    Some(next) => state_clone.jump_to(next.index),
+                    None => state_clone.producer_done.store(true, Ordering::Relaxed),
                 }
             }
             prod_for_thread // Return producer ownership
@@ -675,6 +718,8 @@ impl Player {
             return Flow::Quit;
         }
 
+        self.heard_any |= self.state.samples_played.load(Ordering::Relaxed) > 0;
+
         // Fire the one-shot artist→album auto-sort once the metadata scan
         // has loaded tags (no-op until armed + scan finished + not shuffling).
         poll_auto_sort(&self.state, &mut self.ui, &mut self.playlist);
@@ -696,7 +741,7 @@ impl Player {
         // mode; match the render cadence to its (sample-rate-adaptive) column
         // rate so it advances one column per frame, evenly. Other modes stay at
         // 20fps. The loop sleep below uses the SAME value, which keeps the cadence
-        // even — an unequal sleep/interval is what made it judder before.
+        // even (an unequal sleep and interval make it judder).
         let analysis_viz = self.state.viz_mode() == VizMode::SpectrogramAnalysis;
         let frame_ms: u64 = if analysis_viz {
             state::spectro_frame_ms(self.state.output_rate.load(Ordering::Relaxed))
@@ -750,49 +795,54 @@ impl Player {
         if current_count == self.last_transition_count {
             return;
         }
-        let new_index = state.producer_track_index.load(Ordering::Relaxed);
         self.last_transition_count = current_count;
+        let Some(pick) = state.reported_pick() else { return };
 
         // Surface mid-playlist decode failures. The producer skips a
-        // bad file and signals the next track; without this the error
-        // text it stored was never shown anywhere.
+        // bad file and signals the next track; this is where the error it
+        // stored is shown.
         let skip_err = state.decode_error.lock().ok().and_then(|mut e| e.take());
         if let Some(msg) = skip_err {
-            self.ui.set_status(format!("Skip: {}", msg));
+            self.report_skip(msg);
         }
 
-        // Playlist was modified — producer's new_index is from the stale snapshot.
-        // Schedule a jump to the right track; skip the rest of this transition so we
-        // don't display/fetch-lyrics for the wrong file. The jump_to_track check on the
-        // next loop iteration will respawn the producer with the fresh playlist.
-        if self.ui.playlist_dirty {
-            let target = ui::next_after_producer(&mut self.ui, new_index, self.playlist.len());
-            state.jump_to(target);
-        } else if new_index < self.playlist.len() {
-            ui::advance_to(&mut self.ui, &state, new_index);
-            let ui = &mut self.ui;
-
-            if ui.view_mode == state::ViewMode::Playlist && ui.filtered_indices.is_empty() {
-                ui.cursor = ui.current;
+        // The producer started the track main named, but main named it
+        // before the list was last edited and it is no longer the one that
+        // follows: jump there instead (the jump handler respawns the producer
+        // and drains what it queued), and show nothing for the wrong file.
+        // Rare: the producer asks again after any edit while it waits for the
+        // ring (decode::Lineup), so this is an edit in the last moment.
+        let after_unplayable = state.shown_track_unplayable.swap(false, Ordering::AcqRel);
+        let new_index = match ui::resolve_report(&self.ui, &self.playlist, &pick, after_unplayable) {
+            ui::Move::Jump(target) => {
+                state.jump_to(target);
+                return;
             }
+            ui::Move::Advance(i) => i,
+        };
+        ui::advance_to(&mut self.ui, &state, new_index);
+        let ui = &mut self.ui;
 
-            // Update display info for new track
-            let new_path = self.playlist[ui.current].clone();
-            self.filename = ui.metadata_cache.display_name(ui.current, &new_path);
-            self.track_ext = new_path.extension()
-                .map(|e| e.to_string_lossy().to_lowercase())
-                .unwrap_or_default();
-
-            ui.lyrics_scroll = 0;
-            ui.lyrics_auto_scroll = true;
-            let dur = { let t = state.total_secs(); if t > 0.0 { Some(t as u32) } else { None } };
-            spawn_lyrics_worker(ui, new_path.clone(), dur);
-            spawn_cover_worker(ui, new_path, cover::CoverSize::for_theme(state.theme_kind()));
-
-            self.track_info = self.build_track_info();
-            self.publish_now_playing();
-            self.save();
+        if ui.view_mode == state::ViewMode::Playlist && ui.filtered_indices.is_empty() {
+            ui.cursor = ui.current;
         }
+
+        // Update display info for new track
+        let new_path = self.playlist[ui.current].clone();
+        self.filename = ui.metadata_cache.display_name(ui.current, &new_path);
+        self.track_ext = new_path.extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+
+        ui.lyrics_scroll = 0;
+        ui.lyrics_auto_scroll = true;
+        let dur = { let t = state.total_secs(); if t > 0.0 { Some(t as u32) } else { None } };
+        spawn_lyrics_worker(ui, new_path.clone(), dur);
+        spawn_cover_worker(ui, new_path, cover::CoverSize::for_theme(state.theme_kind()));
+
+        self.track_info = self.build_track_info();
+        self.publish_now_playing();
+        self.save();
     }
 
     /// Skip-prev or jump: join the producer, drain the ring, restart there.
@@ -816,7 +866,7 @@ impl Player {
         // The respawn clears decode_error, so show it first — a producer that
         // caught a decoder crash jumps here to skip.
         if let Some(msg) = state.decode_error.lock().ok().and_then(|mut e| e.take()) {
-            self.ui.set_status(format!("Skip: {msg}"));
+            self.report_skip(msg);
         }
         if let Some(target) = state.take_jump() {
             ui::advance_to(&mut self.ui, &state, target);
@@ -839,11 +889,10 @@ impl Player {
         // tail and click. The rate switch simply defers until playback resumes.
         //
         // The wait keeps the UI alive: it polls input (so pause/unpause
-        // and quit work — a paused wait used to be unbreakable from the
-        // keyboard, and raw mode swallows Ctrl+C) and keeps painting.
+        // and quit work; raw mode swallows Ctrl+C) and keeps painting.
         // It also bails on a stream error: a dead callback never drains
-        // the ring, so an unplug during the tail used to hang here
-        // forever. Either bail falls through WITHOUT the rate switch —
+        // the ring, so an unplug during the tail would hang here forever.
+        // Either bail falls through WITHOUT the rate switch —
         // quit is handled at the top of the next pass, and the stream
         // error by the recovery handler, which restarts the current track
         // where it was.
@@ -878,11 +927,16 @@ impl Player {
         self.reopen_output(self.stream_rate, target_rate, false);
 
         // Continue the playlist from the track that needs the new rate — or,
-        // after an edit, from the track the edit leaves next (the producer's
-        // index is into its old copy; start_track then matches the rate to
-        // whichever track that is).
-        let reported = state.producer_track_index.load(Ordering::Relaxed);
-        let new_idx = ui::next_after_producer(&mut self.ui, reported, self.playlist.len());
+        // after a late edit, from the track the edit leaves next (start_track
+        // then matches the rate to whichever track that is). The ring is
+        // drained either way, so a jump and an advance are the same here.
+        let new_idx = match state.reported_pick() {
+            Some(pick) => match ui::resolve_report(&self.ui, &self.playlist, &pick,
+                state.shown_track_unplayable.swap(false, Ordering::AcqRel)) {
+                ui::Move::Advance(i) | ui::Move::Jump(i) => i,
+            },
+            None => self.ui.current,
+        };
         if new_idx < self.playlist.len() {
             ui::advance_to(&mut self.ui, &state, new_idx);
         } else {
@@ -969,8 +1023,8 @@ impl Player {
                 self.ui.set_status(format!("output moved to {new_name}"));
             }
         }
-        // The new device's own channel count: carrying the old one over made
-        // a shared-mode WASAPI stream on a device with another layout fail to
+        // The new device's own channel count: the old one's can make a
+        // shared-mode WASAPI stream on a device with another layout fail to
         // open.
         self.out_channels = self.device
             .default_output_config()
@@ -1037,15 +1091,9 @@ impl Player {
             return Flow::Quit;
         }
         self.save();
-        // The producer ran out of ITS copy of the list. A track queued (or a
-        // list edited) while the last track played is not in that copy:
-        // continue there instead of ending or starting the repeat cycle.
-        let len = self.playlist.len();
-        let next = ui::next_after_producer(&mut self.ui, len, len);
-        if next < len {
-            ui::advance_to(&mut self.ui, &self.state, next);
-        } else {
-            self.ui.current = len; // Will trigger repeat-cycle or exit
+        match ui::next_after_end(&self.state, &self.ui, &self.playlist, self.state.reported_pick().as_ref()) {
+            Some(next) => ui::advance_to(&mut self.ui, &self.state, next),
+            None => self.ui.current = self.playlist.len(), // Will trigger repeat-cycle or exit
         }
         Flow::NextTrack
     }
@@ -1176,8 +1224,8 @@ impl Player {
     fn follow_default_device(&mut self) {
         // The OS rerouted our default-device stream (cpal DeviceChanged, e.g.
         // AirPods connecting). The stream is STILL PLAYING on the new output
-        // — rebuilding it (the old behaviour) restarted the track at the last
-        // whole second. Only our device handle and the header's label follow;
+        // — rebuilding it would restart the track at the last whole second.
+        // Only our device handle and the header's label follow;
         // the poll below runs now rather than after its 1 s throttle.
         // Exclusive mode never gets here: its reroutes are classified as a
         // rebuild (see classify_stream_error).

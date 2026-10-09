@@ -13,7 +13,8 @@ pub struct Options {
     /// `--list-devices` (with `--verbose`): print the output devices and exit.
     pub list_devices: bool,
     pub verbose: bool,
-    /// No arguments at all: resume the saved session (or ask for a source).
+    /// No files or folders given: resume the saved session (or ask for a
+    /// source). Options still apply, and win over the session's settings.
     pub resume: bool,
     /// Files, folders and M3U playlists to play.
     pub sources: Vec<PathBuf>,
@@ -65,10 +66,9 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
         help: rest.iter().any(|a| a == "--help" || a == "-h"),
         list_devices: rest.iter().any(|a| a == "--list-devices"),
         verbose: rest.iter().any(|a| a == "--verbose"),
-        resume: rest.is_empty(),
         ..Options::default()
     };
-    if o.help || o.list_devices || o.resume {
+    if o.help || o.list_devices {
         return Ok(o);
     }
 
@@ -107,9 +107,7 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
             a => o.sources.push(PathBuf::from(a)),
         }
     }
-    if o.sources.is_empty() {
-        return Err("No input files or folders specified".into());
-    }
+    o.resume = o.sources.is_empty();
     Ok(o)
 }
 
@@ -181,7 +179,7 @@ pub fn print_help() {
     println!();
     println!("\x1B[1mUSAGE\x1B[0m");
     println!("  keet <file|folder|playlist>... [options]");
-    println!("  keet                              Resume last session");
+    println!("  keet [options]                    Resume last session (options given win)");
     println!();
     println!("\x1B[1mOPTIONS\x1B[0m");
     println!("  -s, --shuffle          Randomize playlist order (re-shuffles on each repeat)");
@@ -240,6 +238,15 @@ mod tests {
     }
 
     #[test]
+    fn options_without_sources_resume_with_those_options() {
+        let o = opts("--theme hifi --no-cover").unwrap();
+        assert!(o.resume, "no sources: resume");
+        assert_eq!(o.theme, Some(ThemeKind::HiFi));
+        assert!(!o.cover);
+        assert!(!opts("--exclusive a.mp3").unwrap().resume);
+    }
+
+    #[test]
     fn sources_and_flags_in_any_order() {
         let o = opts("~/A -s --exclusive ~/B list.m3u --repeat -q --no-cover").unwrap();
         assert_eq!(o.sources, ["~/A", "~/B", "list.m3u"].map(PathBuf::from));
@@ -281,7 +288,6 @@ mod tests {
     fn mistakes_are_reported() {
         assert_eq!(opts("--shufle a.mp3").unwrap_err(), "Unknown option: --shufle");
         assert_eq!(opts("-z a.mp3").unwrap_err(), "Unknown option: -z");
-        assert_eq!(opts("--exclusive").unwrap_err(), "No input files or folders specified");
         // A trailing option with its value missing is not a source.
         assert_eq!(opts("a.mp3 --eq").unwrap().eq, None);
     }

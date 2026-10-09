@@ -512,9 +512,9 @@ impl VizAnalyser {
         }
 
         // The meter's motion follows the AUDIO's time, not the UI's frame
-        // count: these constants were tuned per 50 ms frame, and stepping them
-        // once per call made the meter fall faster or slower with the frame
-        // rate (the waits paint at another pace than the main loop).
+        // count: these constants are tuned per 50 ms frame, and stepping them
+        // once per call would make the meter fall faster or slower with the
+        // frame rate (the waits paint at another pace than the main loop).
         let steps = frames as f32 / self.sample_rate.max(1) as f32 / VU_FRAME_SECS;
         let (l, r) = (self.smoothed_peak_l, self.smoothed_peak_r);
         self.smoothed_peak_l = vu_smooth(l, peak_l, steps);
@@ -648,9 +648,9 @@ impl VizAnalyser {
             return [0.0; SPECTRUM_BANDS];
         }
 
-        // Bin k is CENTRED on k·fs/N and spans half a bin either side. The
-        // width used to be Nyquist / (N/2 + 1) with bin k spanning [k, k+1):
-        // half a bin high, which put the 20 Hz band inside bin 0 — DC.
+        // Bin k is CENTRED on k·fs/N and spans half a bin either side. Taking
+        // bin k as [k, k+1) is half a bin high, and puts the 20 Hz band
+        // inside bin 0 — DC.
         let n_bins = fft_output.len();
         let bin_hz = sample_rate as f32 / FFT_SIZE as f32;
         let n = FFT_SIZE as f32;

@@ -243,8 +243,7 @@ pub fn print_status_minimal(
     if cf_name != "Off"  { segments.push(format!("cf {}", cf_name)); }
     // The clip lamp ends the line, always: it is a status light, not one more
     // item, so no separator before it, and a narrow window drops whole items
-    // from the end instead (the lamp used to be cut first, leaving a "·"
-    // dangling at the edge).
+    // from the end before it (never the lamp, nor a "·" left dangling).
     // Shape as well as colour: ● clipping, ○ idle (NO_COLOR, colour blindness).
     let (clip_color, clip_glyph) = if state.is_clipping() { (p.danger, '●') } else { (p.good, '○') };
     let lamp = format!("  {c}{clip_glyph}{rst}", c = clip_color, rst = p.reset);
@@ -554,9 +553,9 @@ fn truncate_plain_ansi_aware(s: &str, max_width: usize) -> String {
 /// The three rows of the footer command box, as `[top, content, bottom]`.
 ///
 /// Kept together (and width-tested) because the borders and the content row
-/// derive their width separately, and they drifted: the row adds four columns
-/// of chrome (`│` + space on each side) but the padding only subtracted two,
-/// so the right-hand bar sat two columns past the box edge.
+/// derive their width separately: the row adds four columns of chrome (`│` +
+/// space on each side), and the padding must subtract all four or the
+/// right-hand bar sits past the box edge.
 fn slim_cmd_box(p: &crate::theme::Palette, term_w: usize) -> [String; 3] {
     let inner_w = term_w.saturating_sub(4);
     let h_w = inner_w.saturating_sub(2);
@@ -582,11 +581,11 @@ fn slim_cmd_bar_inner(p: &crate::theme::Palette) -> String {
         ("␣", "play"),
         ("←→", "seek"),
         ("↑↓", "track"),
-        ("V", "viz"),
-        ("L", "library"),
-        ("Y", "lyrics"),
-        ("E", "eq"),
-        ("T", "theme"),
+        ("v", "viz"),
+        ("l", "library"),
+        ("y", "lyrics"),
+        ("e", "eq"),
+        ("t", "theme"),
     ];
     let mut s = String::with_capacity(160);
     for (i, (k, label)) in pairs.iter().enumerate() {
@@ -616,8 +615,7 @@ fn viz_section_label(mode: VizMode) -> &'static str {
     }
 }
 
-// The one clock format (h:mm:ss past an hour); this theme's own copy had
-// drifted and printed 75:00.
+// The one clock format (h:mm:ss past an hour), shared by every theme.
 use crate::ui::format_time;
 
 /// Editorial progress bar: solid accent fill + 1/8 partial + dotted rule rail.
@@ -892,10 +890,10 @@ fn library_hint_bar(p: &crate::theme::Palette, term_w: usize) -> String {
         ("↵", "play"),
         ("↑↓", "nav"),
         ("/", "search"),
-        ("A", "queue"),
-        ("D", "remove"),
-        ("S", "save"),
-        ("L", "close"),
+        ("a", "queue"),
+        ("d", "remove"),
+        ("s", "save"),
+        ("l", "close"),
     ];
     let mut left = String::with_capacity(160);
     for (i, (k, label)) in pairs.iter().enumerate() {

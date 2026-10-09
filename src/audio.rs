@@ -57,7 +57,7 @@ fn coreaudio_device_id(device: &cpal::Device) -> Option<u32> {
 /// DefaultOutput unit and FOLLOWS the system default; one from
 /// `output_devices()` stays on its hardware. Exclusive mode must be pinned:
 /// hogging the default makes macOS move the system default elsewhere, and a
-/// default-following stream then drifted off the device Keet had hogged —
+/// default-following stream would drift off the device Keet hogged —
 /// audio on one device, hog mode and rate switches on another.
 pub fn pin_device(host: &cpal::Host, device: &cpal::Device) -> Option<cpal::Device> {
     let want = device.id().ok()?;
@@ -93,8 +93,8 @@ pub fn probe_sample_rate(path: &Path) -> Option<u32> {
     let format = symphonia::default::get_probe()
         .probe(&hint, mss, FormatOptions::default(), MetadataOptions::default())
         .ok()?;
-    // 0.6: codec_params is Option (None = unplayable track) and carries a
-    // per-media-type payload, so audio() replaces the old CODEC_TYPE_NULL check.
+    // codec_params is an Option (None = unplayable track) with a
+    // per-media-type payload: no audio() = nothing to play.
     let track = format.default_track(TrackType::Audio)?;
     track.codec_params.as_ref()?.audio()?.sample_rate
 }
@@ -608,9 +608,9 @@ mod macos_audio {
             }
         }
         // The change is asynchronous: wait until the device REPORTS the new
-        // rate. A fixed 50 ms was too short for a USB DAC (FiiO KA17): the
-        // read-back still showed the old rate, Keet concluded the switch had
-        // failed and resampled — while the DAC had in fact switched.
+        // rate. A fixed 50 ms is too short for a USB DAC (measured: FiiO
+        // KA17): the read-back still shows the old rate, so the switch looks
+        // failed and Keet would resample while the DAC has in fact switched.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
             if get_device_sample_rate_for_id(device_id).ok() == Some(rate) {
@@ -726,10 +726,9 @@ pub fn set_output_sample_rate(desired_rate: u32, current_rate: u32, device: &cpa
         // Bluetooth devices (like AirPods) operate at a fixed rate (typically 48kHz).
         // CoreAudio lies about rate changes succeeding, causing sped-up audio and
         // buffer underruns. Skip rate switching entirely for Bluetooth.
-        // Everything below acts on THIS device's CoreAudio id. The helpers
-        // used to target the system default output, so with `--device DAC`
-        // while the default was the built-in speakers, the speakers' rate was
-        // changed and then "verified" — the DAC never moved.
+        // Everything below acts on THIS device's CoreAudio id, never the
+        // system default output: with `--device DAC` and the speakers as the
+        // default, that would change and "verify" the speakers' rate.
         let Some(device_id) = coreaudio_device_id(device) else {
             return current_rate;
         };
@@ -1035,8 +1034,8 @@ fn usable_bits(f: &PhysFormat) -> u32 {
 
 /// The linear-PCM format at `rate` with `channels` channels that carries the
 /// most bits exactly, or None. Ranked by usable precision, so 32-bit float
-/// (24 exact bits) beats 16-bit integer — an integer-only rule truncated
-/// 24-bit files there — and a float-only device (MacBook speakers) keeps its
+/// (24 exact bits) beats 16-bit integer — an integer-only rule would
+/// truncate 24-bit files there — and a float-only device (MacBook speakers) keeps its
 /// float format. On a tie integer wins (the DAC's native format), then the
 /// MIXABLE variant: devices like the FiiO KA17 list each integer format twice,
 /// and the non-mixable one can be refused before hog mode is held.
@@ -1057,9 +1056,8 @@ pub(crate) fn pick_max_bit_format(avail: &[PhysFormat], rate: u32, channels: u32
 /// Exclusive mode: set the device's physical format to the one carrying the
 /// most bits exactly at `rate` (see `pick_max_bit_format`), and wait until the
 /// device reports it. Returns the bits it carries exactly (None where
-/// unsupported or unreadable). Keet
-/// otherwise set only the RATE, so a DAC left at 16-bit in Audio MIDI Setup
-/// truncated every 24-bit file. Like a rate change, call it with no stream
+/// unsupported or unreadable). Setting only the RATE would leave a DAC that
+/// sits at 16-bit in Audio MIDI Setup truncating every 24-bit file. Like a rate change, call it with no stream
 /// open, and re-apply after every rate switch (a new rate can come with a
 /// different default format).
 pub fn set_max_bit_depth(device: &cpal::Device, rate: u32) -> Option<u32> {
@@ -1146,9 +1144,8 @@ pub fn restore_format(saved: &SavedFormat) -> Result<(), String> {
 /// stream is what StreamInvalidated reports, and releasing hog mode under
 /// running IO buzzed.
 ///
-/// It holds every device whose format was changed, not just the first: after
-/// a recovery onto another device, that one's format used to be changed and
-/// never put back.
+/// It holds every device whose format was changed, not just the first: a
+/// recovery onto another device changes that one's format too.
 #[derive(Default)]
 pub struct DeviceRestore {
     formats: Vec<SavedFormat>,

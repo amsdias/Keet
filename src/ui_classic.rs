@@ -115,12 +115,19 @@ fn titled_rule(p: &Palette, title: &str, hint: &str, width: usize) -> String {
 }
 
 /// The track after the current one, as the playlist loop will pick it.
-fn next_index(ui: &UiState, state: &PlayerState, len: usize) -> Option<usize> {
-    match state.repeat_mode() {
-        RepeatMode::One => Some(ui.current),
-        _ if ui.current + 1 < len => Some(ui.current + 1),
-        RepeatMode::All if len > 0 => Some(0),
-        _ => None,
+/// The track that plays next, as the producer will be told (`ui::next_pick`):
+/// files already found unplayable are passed over, so the line never names
+/// one that has been reported as skipped.
+fn next_index(ui: &UiState, state: &PlayerState, playlist: &[PathBuf]) -> Option<usize> {
+    let len = playlist.len();
+    if state.repeat_mode() == RepeatMode::One {
+        return Some(ui.current);
+    }
+    let after = (ui.current + 1..len).find(|&i| !state.is_unplayable(&playlist[i]));
+    match after {
+        Some(i) => Some(i),
+        None if state.repeat_mode() == RepeatMode::All => (0..len).find(|&i| !state.is_unplayable(&playlist[i])),
+        None => None,
     }
 }
 
@@ -202,8 +209,8 @@ fn info_lines(
     };
     let device = if ui.device_name.is_empty() { "output" } else { ui.device_name.as_str() };
     // The mode goes whole or not at all: when it would leave the device name
-    // under 8 columns, the line is the name alone (the window edge used to
-    // cut the mode text mid-word instead).
+    // under 8 columns, the line is the name alone (the window edge would
+    // otherwise cut the mode text mid-word).
     let name_room = width.saturating_sub(4 + visible_len(&mode) + 3);
     let device_line = if name_room >= 8.min(visible_len(device)) && name_room > 0 {
         format!("{}●{rst} {}{} · {mode}{rst}", p.accent, truncate_plain(device, name_room), p.dim)
@@ -234,7 +241,7 @@ fn info_lines(
     // track 4 of 11 · next Glasswork — Ines Varela
     let total = state.total_tracks.load(Ordering::Relaxed);
     let mut next_items = vec![format!("{}track {} of {total}{rst}", p.dim, idx + 1)];
-    match next_index(ui, state, playlist.len()) {
+    match next_index(ui, state, playlist) {
         Some(n) => {
             let t = track_title(ui, n, playlist, "");
             let by = ui.metadata_cache.artist_album(n).0.map(|a| format!("{} — {a}{rst}", p.dim)).unwrap_or_default();
@@ -560,11 +567,12 @@ fn player_body(
     let below = if fullscreen { 2 } else { FOOTER_ROWS };
     let avail = viz_rows_available(term_h, rows_above, below);
     let body = viz_body_rows(viz_mode, avail, fullscreen, extras);
-    // Outside full window the block gets a fixed slot: the height of the
-    // tallest mode in this window, each mode centred in it, so the message
-    // line and key bar stay put as `v` cycles (they used to jump with every
-    // mode's own height). Full window centres in the whole space instead.
-    let slot = if fullscreen { body } else { viz_slot_rows(avail, extras) };
+    // Outside full window the block gets every row the window has spare,
+    // each mode centred in it: the message line and key bar sit at the
+    // window's bottom (as in the other themes) and stay put as `v` cycles.
+    // Sized to the tallest mode instead, a tall window kept rows empty below
+    // the key bar. Full window centres in the whole space instead.
+    let slot = if fullscreen { body } else { avail };
     let pad = if fullscreen { viz_top_pad(avail, body, true) } else { slot.saturating_sub(body) / 2 };
 
     if ruled && viz_mode == VizMode::None {
@@ -624,17 +632,6 @@ fn player_body(
     }
     w.line(&message_line(ui, p));
     w.line(&key_bar(p, PLAYER_KEYS, term_w));
-}
-
-/// Every visualisation mode, for sizing the shared slot.
-const VIZ_MODES: [VizMode; 7] = [
-    VizMode::VuMeter, VizMode::SpectrumHorizontal, VizMode::SpectrumVertical, VizMode::Oscilloscope,
-    VizMode::Lissajous, VizMode::Spectrogram, VizMode::SpectrogramAnalysis,
-];
-
-/// Rows of the visualisation slot: what the tallest mode takes in `avail`.
-fn viz_slot_rows(avail: usize, extras: bool) -> usize {
-    VIZ_MODES.iter().map(|&m| viz_body_rows(m, avail, false, extras)).max().unwrap_or(0)
 }
 
 fn format_total(secs: f64) -> String {
@@ -880,14 +877,17 @@ mod tests {
         }
     }
 
+    const VIZ_MODES: [VizMode; 7] = [
+        VizMode::VuMeter, VizMode::SpectrumHorizontal, VizMode::SpectrumVertical, VizMode::Oscilloscope,
+        VizMode::Lissajous, VizMode::Spectrogram, VizMode::SpectrogramAnalysis,
+    ];
+
     #[test]
-    fn the_viz_slot_fits_every_mode_and_never_the_window_twice() {
+    fn every_mode_fits_the_rows_the_window_has_spare() {
         for avail in [0, 3, 10, 20, 40, 80] {
             for extras in [false, true] {
-                let slot = viz_slot_rows(avail, extras);
-                assert!(slot <= avail, "{avail}: slot {slot} past the window");
                 for m in VIZ_MODES {
-                    assert!(viz_body_rows(m, avail, false, extras) <= slot, "{m:?} taller than the slot at {avail}");
+                    assert!(viz_body_rows(m, avail, false, extras) <= avail, "{m:?} past the window at {avail}");
                 }
             }
         }
@@ -930,14 +930,19 @@ mod tests {
     fn the_next_track_follows_the_repeat_mode() {
         let st = PlayerState::new();
         let mut ui = UiState::new(Vec::new(), crate::metadata::MetadataCache::new(3));
+        let three = [PathBuf::from("/a"), PathBuf::from("/b"), PathBuf::from("/c")];
         ui.current = 2;
-        assert_eq!(next_index(&ui, &st, 3), None, "last track, no repeat");
+        assert_eq!(next_index(&ui, &st, &three), None, "last track, no repeat");
         st.repeat_mode.store(RepeatMode::All as u8, Ordering::Relaxed);
-        assert_eq!(next_index(&ui, &st, 3), Some(0));
+        assert_eq!(next_index(&ui, &st, &three), Some(0));
         st.repeat_mode.store(RepeatMode::One as u8, Ordering::Relaxed);
-        assert_eq!(next_index(&ui, &st, 3), Some(2));
+        assert_eq!(next_index(&ui, &st, &three), Some(2));
         ui.current = 0;
         st.repeat_mode.store(RepeatMode::Off as u8, Ordering::Relaxed);
-        assert_eq!(next_index(&ui, &st, 3), Some(1));
+        assert_eq!(next_index(&ui, &st, &three), Some(1));
+        // A file already found unplayable is passed over, as the producer
+        // passes over it.
+        st.mark_unplayable(&three[1], false);
+        assert_eq!(next_index(&ui, &st, &three), Some(2));
     }
 }

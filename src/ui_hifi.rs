@@ -275,7 +275,7 @@ pub fn print_status_hifi(
     ];
     let knob_unit: Vec<&str> = vec!["%", "", "", "", "", "%"];
     // As many knobs as the width holds (minimum cell 8 + 1 gap), in this
-    // order: the sixth used to be cut off at the window edge.
+    // order, rather than one cut at the window edge.
     let fit = ((inner_w + 1) / 9).clamp(1, knobs.len());
     let knobs = &knobs[..fit];
 
@@ -429,12 +429,12 @@ fn hifi_marquee_keys(p: &crate::theme::Palette, term_w: usize) -> String {
         ("←→",  "SEEK"),
         ("↑↓",  "TRACK"),
         ("+/−", "VOL"),
-        ("E",   "EQ"),
-        ("X",   "FX"),
-        ("C",   "XFEED"),
-        ("L",   "LIB"),
-        ("Y",   "LYRICS"),
-        ("T",   "THEME"),
+        ("e",   "EQ"),
+        ("x",   "FX"),
+        ("c",   "XFEED"),
+        ("l",   "LIB"),
+        ("y",   "LYRICS"),
+        ("t",   "THEME"),
     ];
     // As many keys as the window holds: a key cut in half reads as noise.
     let mut s = String::with_capacity(200);
@@ -555,8 +555,7 @@ fn render_solid_bar(progress: f64, width: usize) -> String {
     s
 }
 
-// The one clock format (h:mm:ss past an hour); this theme's own copy had
-// drifted and printed 75:00.
+// The one clock format (h:mm:ss past an hour), shared by every theme.
 use crate::ui::format_time;
 
 /// Pad with spaces to `width` columns (or truncate with ellipsis if too long).
@@ -808,10 +807,10 @@ fn hifi_library_marquee(p: &crate::theme::Palette) -> String {
         ("↵", "PLAY"),
         ("↑↓", "NAV"),
         ("/", "SEARCH"),
-        ("A", "QUEUE"),
-        ("D", "REMOVE"),
-        ("S", "SAVE"),
-        ("L", "CLOSE"),
+        ("a", "QUEUE"),
+        ("d", "REMOVE"),
+        ("s", "SAVE"),
+        ("l", "CLOSE"),
     ];
     let mut s = String::with_capacity(160);
     s.push_str("  ");

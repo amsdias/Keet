@@ -138,8 +138,8 @@ impl CrossfeedFilter {
 
         // Custom presets are user-editable JSON, so every value is clamped. A
         // cutoff at or above half the sample rate (12 kHz at a 22.05 kHz
-        // source in exclusive mode) made the low-pass unstable: inf, then NaN,
-        // which the limiter turns into silence for good.
+        // source in exclusive mode) makes the low-pass unstable: inf, then
+        // NaN, which the limiter turns into silence for good.
         let cutoff = preset.cutoff_hz.min(sample_rate * 0.45).max(20.0);
         let level_db = preset.level_db.clamp(-40.0, 0.0);
         let delay_us = preset.delay_us.clamp(0.0, 2_000.0);

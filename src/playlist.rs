@@ -152,7 +152,7 @@ fn m3u_entry_candidates(line: &[u8]) -> Vec<PathBuf> {
 
 /// One Windows-1252 byte as a char. It is Latin-1 except for 0x80–0x9F,
 /// where it keeps its punctuation (’ “ ” – — … €): read as Latin-1 those
-/// became control characters and the entry silently missed its file. The five
+/// are control characters, and the entry would silently miss its file. The five
 /// unassigned bytes keep their Latin-1 meaning.
 fn windows_1252(b: u8) -> char {
     const HIGH: [char; 32] = [
@@ -167,8 +167,8 @@ fn windows_1252(b: u8) -> char {
 
 /// Write `bytes` to `path` whole or not at all: into a temporary file beside
 /// it, then renamed over it (atomic on the same filesystem, POSIX and
-/// Windows alike). Writing in place left a truncated file behind a failed or
-/// interrupted write. The temporary name is unique per call, so two workers
+/// Windows alike), so a failed or interrupted write never leaves a
+/// truncated file. The temporary name is unique per call, so two workers
 /// saving the same file cannot trample each other's half-written copy.
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -252,8 +252,8 @@ pub fn save_m3u(playlist: &[PathBuf], name: &str) -> Result<PathBuf, Box<dyn std
         content.extend_from_slice(track.to_string_lossy().as_bytes());
         content.push(b'\n');
     }
-    // Whole or not at all: writing in place left a truncated playlist if the
-    // write failed half-way (a full disk, a network share dropping out).
+    // Whole or not at all: a write failing half-way (a full disk, a network
+    // share dropping out) must not leave a truncated playlist.
     write_atomic(&path, &content)?;
     Ok(path)
 }
@@ -263,8 +263,8 @@ pub fn save_m3u(playlist: &[PathBuf], name: &str) -> Result<PathBuf, Box<dyn std
 /// cycle; otherwise (M3U or single files) the current list is kept. Either way
 /// tracks the user removed stay out (`removed` holds canonical paths) and
 /// duplicates collapse. All of it is I/O — directory walks and one path lookup
-/// per track — so it runs off the UI thread; on a big or network library it
-/// froze the UI at every wrap.
+/// per track — so it runs off the UI thread (on a big or network library it
+/// would freeze the UI at every wrap).
 pub fn next_cycle(
     sources: &[PathBuf],
     current: &[PathBuf],
@@ -325,9 +325,9 @@ pub fn scan_sources(sources: &[PathBuf], snapshot: &[PathBuf]) -> RescanResult {
 /// Diff the playlist against what is on disk, across ALL sources at once.
 /// Tracks no longer found are dropped (except the one playing), new ones are
 /// appended in source order, duplicates collapse, and tracks the user removed
-/// (`removed`, canonical paths) are never brought back. Each source used to be
-/// diffed on its own, so with two folders the second pass dropped everything
-/// the first had kept. When a source could not be read nothing is dropped:
+/// (`removed`, canonical paths) are never brought back. One diff for all
+/// sources: diffed one by one, the second folder's pass would drop
+/// everything the first kept. When a source could not be read nothing is dropped:
 /// its tracks are unknown, not gone. Returns (added, removed).
 pub fn apply_rescan(
     playlist: &mut Vec<PathBuf>,

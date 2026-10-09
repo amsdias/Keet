@@ -1,8 +1,7 @@
 //! Shared ANSI-aware string helpers for the terminal renderers.
 //!
-//! One definition per behavior — these used to be copy-pasted across `ui.rs`,
-//! `ui_minimal.rs`, `ui_hifi.rs`, and `library.rs`, and the copies had already
-//! drifted (one terminated escapes on `m` only, the rest on any letter).
+//! One definition per behavior, for every renderer (`ui.rs`, `ui_minimal.rs`,
+//! `ui_hifi.rs`, `library.rs`): separate copies drift apart.
 //!
 //! Terminating on "the first ASCII letter" is right for CSI, but wrong for the
 //! string-terminated families. A Kitty graphics APC — `ESC _ G a=d,… ESC \` —

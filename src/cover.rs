@@ -296,8 +296,8 @@ pub fn resolve_local(
 
 /// The largest cover file read from disk (a sidecar or the cache): room for a
 /// 3000-px PNG scan, far short of trouble. A folder can hold anything called
-/// `cover.png`; read whole, a multi-gigabyte one went straight into memory
-/// before the decoder's own limit ever saw it.
+/// `cover.png`; read whole, a multi-gigabyte one would go straight into
+/// memory before the decoder's own limit sees it.
 const COVER_MAX_FILE: u64 = 32 * 1024 * 1024;
 
 /// A cover file's bytes, or None if it is missing or over `COVER_MAX_FILE`.
@@ -732,9 +732,9 @@ pub(crate) fn render_viz_sixel_indexed(
 }
 
 fn viz_sixel_lines(data: &str, cols: u32, rows: u32, gutter: Gutter<'_>) -> Vec<String> {
-    // Every renderer returns EXACTLY `rows` lines. A zero-row budget (a window
-    // too short for any viz) used to get one line anyway, so the block
-    // alternated between 0 lines (skip-emit frames) and 1 (emit frames).
+    // Every renderer returns EXACTLY `rows` lines, a zero-row budget (a window
+    // too short for any viz) included: one line there would make the block
+    // alternate between 0 lines (skip-emit frames) and 1 (emit frames).
     if rows == 0 {
         return Vec::new();
     }

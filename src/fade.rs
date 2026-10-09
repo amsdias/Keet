@@ -53,8 +53,8 @@ impl<T: Clone> Crossfade<T> {
     /// Start fading away from `current` (the stage as it is, BEFORE the change)
     /// over `frames`. A change during a fade continues from the blend being
     /// heard at that moment: the copies already fading keep their share of it
-    /// and `current` takes the rest. Restarting from the OLDEST copy (the old
-    /// rule) jumped back to it — a click on two quick preset presses.
+    /// and `current` takes the rest. Restarting from the OLDEST copy would
+    /// jump back to it — a click on two quick preset presses.
     pub(crate) fn retire(&mut self, current: T, frames: usize) {
         if !self.live {
             return;

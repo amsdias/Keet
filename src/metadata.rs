@@ -191,8 +191,8 @@ fn rate_of(format: &dyn FormatReader) -> Option<u32> {
 ///
 /// ID3v1 always goes last, whatever its place in the log: its fields are cut
 /// to 30 characters, so it is only ever a fallback. Read before APE (which
-/// sits just ahead of it at the end of the file) it gave truncated titles to
-/// files carrying a full APE tag.
+/// sits just ahead of it at the end of the file) it would give truncated
+/// titles to files carrying a full APE tag.
 pub(crate) fn revisions_newest_first(format: &mut dyn FormatReader) -> Vec<MetadataRevision> {
     let mut md = format.metadata();
     let mut older = Vec::new();
@@ -213,7 +213,7 @@ fn id3v1_last<T>(revs: Vec<T>, name: impl Fn(&T) -> &str) -> Vec<T> {
 
 /// A tag's number, read leniently: surrounding space and a decimal comma
 /// ("-6,50", as some European-locale taggers write it) are accepted. Never a
-/// non-finite value: "nan" and "inf" parse as f32, and a NaN gain made the
+/// non-finite value: "nan" and "inf" parse as f32, and a NaN gain makes the
 /// limiter zero every sample — a silent track.
 fn parse_tag_number(s: &str) -> Option<f32> {
     let v = s.trim().replace(',', ".").parse::<f32>().ok()?;
@@ -225,8 +225,8 @@ fn parse_tag_number(s: &str) -> Option<f32> {
 pub fn parse_rg_gain_value(s: &str) -> Option<f32> {
     let s = s.trim();
     // `get`, not slicing: a tag ending in a multi-byte character ("-6 €")
-    // put the cut inside it, and the slice panicked — in the metadata scan
-    // that killed the scan thread.
+    // puts the cut inside it, and a slice would panic — killing the
+    // metadata scan thread.
     let num = match s.len().checked_sub(2).and_then(|i| s.get(i..)) {
         Some(unit) if unit.eq_ignore_ascii_case("db") => &s[..s.len() - 2],
         _ => s,
@@ -262,8 +262,8 @@ struct TagFields {
 fn merge_metadata_tags(fields: &mut TagFields, tags: &[symphonia::core::meta::Tag]) {
     for tag in tags {
         // Symphonia 0.6 carries the parsed value inside the StandardTag variant
-        // itself, replacing 0.5's (std_key, value) pair — and it now maps
-        // ReplayGain to standard tags, which used to need raw-key matching.
+        // itself, and maps ReplayGain to standard tags (the raw keys are
+        // still read, for readers that leave them unmapped).
         match &tag.std {
             Some(StandardTag::TrackTitle(s)) if fields.title.is_none() => {
                 fields.title = Some(s.to_string());

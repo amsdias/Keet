@@ -31,8 +31,7 @@ pub(crate) fn flush_denormal_f64(x: f64) -> f64 {
 /// 29 more mantissa bits and lands it exactly. Scalar f64 costs the same as
 /// f32 on x86-64/ARM64 for ~1M evals/sec, so this is free.
 ///
-/// Shared by every biquad in Keet (the EQ and the crossfeed low-pass), which
-/// each used to carry their own copy of the types and the recursion.
+/// Shared by every biquad in Keet (the EQ and the crossfeed low-pass).
 #[derive(Clone)]
 pub(crate) struct BiquadState {
     x1: f64, x2: f64,
@@ -207,9 +206,9 @@ impl BiquadCoeffs {
         // far as its bandwidth goes, so it moves onto the limit with its gain
         // scaled by the share of its bell that lies below it — 1 at the limit
         // (continuous with a band just inside), 0 once its lower edge passes
-        // it. Dropping outright made a broad band vanish in one key press;
-        // clamping at full gain stacked a treble preset's bands on the limit
-        // (+18 dB at 3.6 kHz on an 8 kHz stream). A low shelf or high-pass
+        // it. Dropping it outright would make a broad band vanish in one key
+        // press; clamping at full gain would stack a treble preset's bands on
+        // the limit (+18 dB at 3.6 kHz on an 8 kHz stream). A low shelf or high-pass
         // reaches the whole band, so those keep the plain clamp.
         if band.freq > limit {
             match band.kind {
@@ -289,8 +288,8 @@ pub fn headroom(bands: &[BandSettings], preamp_db: f32, sample_rate: f32) -> Hea
     }
     // Rounded UP to 0.1 dB, so following the suggestion never leaves a sliver over.
     // The preamp stops at -12 dB: past that the suggestion is the most it
-    // can do (it used to ask for -13 dB, which `a` could never set, so the
-    // hint stayed up for good). The "over" readout still says what is left.
+    // can do (asking for more, which `a` cannot set, would keep the hint up
+    // for good). The "over" readout still says what is left.
     let cover = (-(max_boost_db * 10.0).ceil() / 10.0).max(-EQ_GAIN_LIMIT) + 0.0; // + 0.0: no "-0.0"
     let suggested_preamp = ((cover - preamp_db).abs() >= 0.05).then_some(cover);
     Headroom { max_boost_db, at_hz, over_db: max_boost_db + preamp_db, suggested_preamp }

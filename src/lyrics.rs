@@ -175,7 +175,7 @@ fn parse_lrc_offset(line: &str) -> Option<f64> {
 /// Parse the inside of an LRC time tag to seconds: `MM:SS`, `MM:SS.xx`,
 /// `MM:SS:xx` (hundredths after a colon, as some editors write them) or
 /// `HH:MM:SS.xx`. A three-part tag is hours only when its seconds carry a
-/// decimal point; `[01:02:50]` used to be read as one HOUR and two minutes.
+/// decimal point (`[01:02:50]` is 1 min 2.5 s, not an hour).
 fn parse_lrc_time(inside: &str) -> Option<f64> {
     let parts: Vec<&str> = inside.split(':').collect();
     let num = |s: &str| -> Option<f64> {
@@ -199,8 +199,8 @@ fn parse_lrc_time(inside: &str) -> Option<f64> {
 
 /// Process-wide HTTP agent shared by every fetch (LRCLIB lyrics, iTunes
 /// covers). One native-TLS context for the process instead of a fresh one per
-/// request — the per-fetch construction showed up as lingering
-/// Security.framework allocations on macOS.
+/// request (one per fetch leaves lingering Security.framework allocations
+/// on macOS).
 ///
 /// Split timeouts, NOT `timeout_global`: in ureq 3.3 the global timer trips
 /// during TCP/TLS setup, failing every HTTPS call before the handshake even
@@ -251,8 +251,8 @@ pub enum Lookup<T> {
 }
 
 /// Session cache of network lookups, keyed by query. Shared with the worker
-/// threads that do the fetching. Each play of a track used to ask LRCLIB (and
-/// iTunes) again — the same answer every time, and up to 15 s of waiting.
+/// threads that do the fetching, so a track played again does not ask LRCLIB
+/// (or iTunes) again — the same answer, and up to 15 s of waiting.
 #[derive(Clone, Default)]
 pub struct LookupCache<T: Clone = String> {
     map: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Option<T>>>>,

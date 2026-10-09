@@ -85,11 +85,11 @@ const COMB_TUNINGS: [usize; 8] = [1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617
 const ALLPASS_TUNINGS: [usize; 4] = [556, 441, 341, 225];
 const STEREO_SPREAD: usize = 23;
 /// Freeverb's `scaledamp`: the damping parameter is scaled by this before it
-/// reaches the combs' low-pass. Applied raw, damping 1.0 froze the low-pass
-/// at zero and cut the comb feedback entirely — no tail.
+/// reaches the combs' low-pass. Applied raw, damping 1.0 freezes the
+/// low-pass at zero and cuts the comb feedback entirely — no tail.
 const DAMP_SCALE: f32 = 0.4;
-/// Limiter release time constant: 2000 samples at 44.1 kHz, now in seconds so
-/// it is the same at every rate (a per-sample step recovered 4.35x faster at
+/// Limiter release time constant: 2000 samples at 44.1 kHz, in seconds so it
+/// is the same at every rate (a per-sample step would recover 4.35x faster at
 /// 192 kHz).
 const LIMITER_RELEASE_SECS: f32 = 2000.0 / 44_100.0;
 

@@ -7,7 +7,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use crossterm::terminal;
 
 use crate::state::{
-    PlayerState, VizMode, RepeatMode,
+    Pick, PlayerState, VizMode, RepeatMode,
     C_RESET, C_BOLD, C_DIM, C_CYAN, C_RED,
     ViewMode, InputMode, UiState,
 };
@@ -35,7 +35,7 @@ use crate::ansi::{truncate_ansi, truncate_plain, visible_len};
 /// wider than the window is cut (a wrapped line takes a row nobody counted,
 /// which smears the layout), and rows that would fall below the bottom edge
 /// are not emitted (a frame taller than the window scrolls the screen on every
-/// redraw). Both used to be each renderer's own job, and several missed it.
+/// redraw). Here, so no renderer has to remember either.
 pub(crate) struct FrameWriter {
     below_first: usize,
     /// Columns per line; None = unlimited.
@@ -133,7 +133,7 @@ pub(crate) fn fullscreen_items(track_info: &str, time_secs: f64, total_secs: f64
 /// The list's scroll offset after the cursor moved, Vim-style: keep a margin
 /// of up to 4 rows (scrolloff) between the cursor and the window's edges, and
 /// never scroll past the end (no empty padding below the last item). Every
-/// theme's list uses it — each used to carry its own copy.
+/// theme's list uses it.
 pub(crate) fn list_scroll(cursor: usize, offset: usize, items_len: usize, visible_rows: usize) -> usize {
     let margin = 4.min(visible_rows / 2);
     let mut offset = offset;
@@ -476,10 +476,9 @@ fn fit_eq_screen(
 /// How long a first Esc in the player waits for the second that quits.
 const ESC_QUIT_WINDOW: Duration = Duration::from_secs(2);
 
-/// Open the key list, or close it back to the view it was opened from (it
-/// always went back to the player). Opening it answers a pending "remove …?
-/// [y/n]" prompt with no — left armed, a `y` long after the prompt had gone
-/// removed a whole artist.
+/// Open the key list, or close it back to the view it was opened from.
+/// Opening it answers a pending "remove …? [y/n]" prompt with no — left
+/// armed, a `y` long after the prompt has gone would remove a whole artist.
 fn toggle_help(ui: &mut UiState) {
     if ui.view_mode == ViewMode::Help {
         ui.view_mode = ui.help_return;
@@ -506,6 +505,7 @@ fn esc_starts_sequence(next: &Event) -> bool {
 }
 
 pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<PathBuf>) -> bool {
+    serve_producer(state, ui, playlist);
     // Drain all pending events for responsive input
     while event::poll(Duration::ZERO).unwrap_or(false) {
         let ev = match event::read() { Ok(e) => e, Err(_) => continue };
@@ -823,8 +823,8 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
                         } else {
                             ui.filtered_indices.get(ui.cursor).copied().unwrap_or(ui.cursor)
                         };
-                        // A jump past the end made the playlist loop see
-                        // current >= len — with repeat off, Keet exited.
+                        // Never a jump past the end: the playlist loop would
+                        // see current >= len, and with repeat off Keet exits.
                         if target < playlist.len() {
                             state.jump_to(target);
                         }
@@ -1283,9 +1283,7 @@ fn remove_track(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<PathBu
 }
 
 /// Remove playlist entries — the one place that does it, for the flat list's
-/// `D` and the library tree alike (the tree's own copy skipped all of this:
-/// a removed playing track went on playing under another track's title, and
-/// removing everything emptied the list and panicked the next frame).
+/// `D` and the library tree alike.
 ///
 /// Drops the entries (descending, so earlier indices don't shift), records
 /// them in `removed_paths` so a rescan or the repeat cycle won't bring them
@@ -1294,7 +1292,7 @@ fn remove_track(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<PathBu
 /// (`removed_current_next`, possibly `len` = past the end). The queue count
 /// loses any queued entries removed. Refuses to empty the playlist. Returns
 /// whether anything was removed.
-fn remove_indices(
+pub(crate) fn remove_indices(
     state: &PlayerState,
     ui: &mut UiState,
     playlist: &mut Vec<PathBuf>,
@@ -1347,7 +1345,6 @@ fn remove_indices(
 
     state.total_tracks.store(playlist.len(), Ordering::Relaxed);
     state.current_track.store(ui.current, Ordering::Relaxed);
-    ui.playlist_dirty = true;
     reindex_and_restart_scan(ui, playlist, &old_playlist);
 
     // Rebuild filter if searching, otherwise just adjust cursor
@@ -1363,38 +1360,6 @@ fn remove_indices(
     true
 }
 
-/// The track to play after the playlist was edited mid-track — the producer's
-/// own idea of "next" came from the old list. Follows the repeat mode like a
-/// natural track change (it used to be current + 1 regardless: repeat-one
-/// moved on, repeat-all never wrapped). `removed_next` is where the removed
-/// playing track's successor sits. `len` means past the end: the playlist
-/// loop turns it into the repeat-all cycle or the end of playback, exactly as
-/// when the last track finishes.
-/// The track that follows the one ending, given the index the producer
-/// reports. The producer works from its own copy of the playlist, so after
-/// an edit its index means nothing in the real list: the edit is consumed
-/// here and `track_after_edit` decides. Every handler that moves on from a
-/// producer's report goes through this (the transition, the rate change, the
-/// end of the producer's list) — the natural advance used to be the only one
-/// that checked, so a track queued during the last track was dropped and a
-/// rate change after a removal played the wrong track.
-pub(crate) fn next_after_producer(ui: &mut UiState, producer_index: usize, len: usize) -> usize {
-    if std::mem::take(&mut ui.playlist_dirty) {
-        track_after_edit(ui.current, ui.removed_current_next.take(), len, ui.repeat_mode)
-    } else {
-        producer_index
-    }
-}
-
-/// A producer is starting from the list as it is now, so any edit is
-/// already in its copy and nothing is left to re-resolve. Left set, the next
-/// NATURAL track change took the jump path: a drained ring, ~0.5 s cut off the
-/// track's end, no gapless join or crossfade.
-pub(crate) fn producer_started(ui: &mut UiState) {
-    ui.playlist_dirty = false;
-    ui.removed_current_next = None;
-}
-
 /// The repeat-all wrap, for tracks queued while its rebuild ran: with the
 /// list over, "after the playing track" was the end of the list, so that is
 /// where they went (in order), and the new cycle starting at 0 played them
@@ -1406,6 +1371,116 @@ pub(crate) fn queued_to_front(list: &mut [PathBuf], queued: usize) -> usize {
     queued.saturating_sub(1)
 }
 
+/// Where `path` sits in the list, looked for at `hint` first (its index when
+/// it was named) and then nearest to it — a path normally appears once, and
+/// the nearest copy is the best guess when it does not.
+fn locate(playlist: &[PathBuf], path: &std::path::Path, hint: usize) -> Option<usize> {
+    if playlist.get(hint).is_some_and(|p| p == path) {
+        return Some(hint);
+    }
+    playlist
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.as_path() == path)
+        .min_by_key(|(i, _)| i.abs_diff(hint))
+        .map(|(i, _)| i)
+}
+
+/// Main's answer to the producer's "what comes after `after`?", from the list
+/// as it is now. After the playing track: the next one (the queue sits right
+/// after it), or — when it was removed — its successor. After a track further
+/// ahead (several short tracks in the ring): the one after that. None where
+/// the list ends; the repeat-all wrap and the end of playback are main's.
+/// Files already found unplayable (`skip`) are passed over: they would only
+/// fail again, with the same "Skip:" message.
+pub(crate) fn next_pick(
+    ui: &UiState,
+    playlist: &[PathBuf],
+    after: &Pick,
+    skip: impl Fn(&std::path::Path) -> bool,
+) -> Option<Pick> {
+    let len = playlist.len();
+    let mut next = if playlist.get(ui.current).is_some_and(|p| *p == after.path) {
+        ui.current + 1
+    } else if let Some(n) = ui.removed_current_next.filter(|_| !playlist.contains(&after.path)) {
+        n
+    } else if let Some(i) = locate(playlist, &after.path, after.index) {
+        i + 1
+    } else {
+        ui.current + 1 // a track ahead was removed: carry on from the playing one
+    };
+    while next < len && skip(&playlist[next]) {
+        next += 1;
+    }
+    (next < len).then(|| Pick { index: next, path: playlist[next].clone(), gen: ui.playlist_gen })
+}
+
+/// Answer the producer's question, if it has one, and publish the playlist's
+/// edit generation for it. Called from `poll_input`, which every main-thread
+/// wait calls, so the producer never waits longer than a UI frame.
+pub(crate) fn serve_producer(state: &PlayerState, ui: &UiState, playlist: &[PathBuf]) {
+    state.playlist_gen.store(ui.playlist_gen, Ordering::Release);
+    if let Some(question) = state.next_question() {
+        state.answer_next(&question, next_pick(ui, playlist, &question, |p| state.is_unplayable(p)));
+    }
+}
+
+/// The producer found nothing after the last track and has finished. It asks
+/// once more after an edit while that track plays out, but an edit in the
+/// very last moment can still have added a track: the same question, asked
+/// here. None = the end of the list (the repeat cycle or the end of playback).
+pub(crate) fn next_after_end(state: &PlayerState, ui: &UiState, playlist: &[PathBuf], reported: Option<&Pick>) -> Option<usize> {
+    if reported.is_some_and(|p| p.gen == ui.playlist_gen) {
+        return None; // no edit since the producer's last answer
+    }
+    let path = playlist.get(ui.current)?;
+    let playing = Pick { index: ui.current, path: path.clone(), gen: ui.playlist_gen };
+    next_pick(ui, playlist, &playing, |p| state.is_unplayable(p)).map(|p| p.index)
+}
+
+/// What the player does with the track the producer reports (a transition,
+/// or the target of a rate switch).
+#[derive(Debug, PartialEq)]
+pub(crate) enum Move {
+    /// Continue: it is the right track; this is its index now.
+    Advance(usize),
+    /// It is not (the list was edited after main named it): go here instead,
+    /// draining what the producer queued. `len` = past the end.
+    Jump(usize),
+}
+
+/// The one check on a producer's report. A pick made at the current edit
+/// generation is right by construction. One made before an edit is right
+/// only if it is still the track that follows now (`track_after_edit`); a
+/// track queued, removed or sorted past in the meantime makes it a jump.
+///
+/// `after_unplayable`: the track shown as playing was never heard (it would
+/// not open, or gave no audio), so "what follows it now" means nothing — an
+/// auto-sort can move it anywhere, to the end of the list included, which
+/// ended playback with a broken first file. The report is taken as named,
+/// wherever its track sits now.
+pub(crate) fn resolve_report(ui: &UiState, playlist: &[PathBuf], pick: &Pick, after_unplayable: bool) -> Move {
+    if pick.gen == ui.playlist_gen && playlist.get(pick.index).is_some_and(|p| *p == pick.path) {
+        return Move::Advance(pick.index);
+    }
+    if after_unplayable {
+        if let Some(i) = locate(playlist, &pick.path, pick.index) {
+            return Move::Advance(i);
+        }
+    }
+    let expected = track_after_edit(ui.current, ui.removed_current_next, playlist.len(), ui.repeat_mode);
+    if playlist.get(expected).is_some_and(|p| *p == pick.path) {
+        Move::Advance(expected)
+    } else {
+        Move::Jump(expected)
+    }
+}
+
+/// The track that follows the playing one in the list as it is now, by the
+/// repeat mode, as a natural track change would. `removed_next` is where the
+/// removed playing track's successor sits. `len` means past the end: the
+/// playlist loop turns it into the repeat-all cycle or the end of playback,
+/// exactly as when the last track finishes.
 pub(crate) fn track_after_edit(
     current: usize,
     removed_next: Option<usize>,
@@ -1429,6 +1504,9 @@ pub(crate) fn reindex_and_restart_scan(
     playlist: &[PathBuf],
     old_playlist: &[PathBuf],
 ) {
+    // Every playlist edit passes here: the producer's picks are checked
+    // against this (see `resolve_report`).
+    ui.playlist_gen += 1;
     ui.metadata_cache.cancel.store(true, Ordering::Relaxed);
     if let Some(h) = ui.scan_handle.take() {
         h.join().ok();
@@ -1442,15 +1520,15 @@ pub(crate) fn reindex_and_restart_scan(
     ui.tree_dirty = true; // playlist reordered/rescanned — the tree needs rebuilding
 }
 
-/// True when the source paths are a folder/file collection we should auto-sort
-/// into artist→album order: non-empty and containing no curated `.m3u`/`.m3u8`
-/// playlist (an M3U's order is the user's curation and must be preserved).
+/// True when the sources should be auto-sorted into artist→album order:
+/// folders, every one of them. Files listed by hand are an order the user
+/// chose, like an M3U playlist's, and keep it; so does a mix of the two.
 fn source_is_sortable(paths: &[PathBuf]) -> bool {
-    !paths.is_empty()
-        && paths.iter().all(|p| {
-            let ext = p.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
-            !matches!(ext.as_deref(), Some("m3u") | Some("m3u8"))
-        })
+    sortable_with(paths, |p| p.is_dir())
+}
+
+fn sortable_with(paths: &[PathBuf], is_dir: impl Fn(&std::path::Path) -> bool) -> bool {
+    !paths.is_empty() && paths.iter().all(|p| is_dir(p))
 }
 
 /// One-shot auto-sort gate: the sort should run only when it's armed, the
@@ -1785,7 +1863,6 @@ fn sort_playlist_by_tags(state: &PlayerState, ui: &mut UiState, playlist: &mut V
         ui.cursor = ui.current;
         ensure_cursor_visible(ui, playlist);
     }
-    ui.playlist_dirty = true;
     let was_shuffled = ui.shuffle;
     ui.shuffle = false;
     // The user picked an explicit new order; the pre-shuffle snapshot is stale.
@@ -1868,27 +1945,26 @@ fn toggle_shuffle(state: &PlayerState, ui: &mut UiState, playlist: &mut [PathBuf
     }
     // Cached metadata is indexed by position — remap it to match the reordered paths.
     reindex_and_restart_scan(ui, playlist, &old_playlist);
-    ui.playlist_dirty = true;
 }
 
-/// The playing track becomes `new`, by any route: a natural advance, the jump
-/// after a playlist edit, a skip, an exclusive-mode rate change. The one
-/// place `current`, the queue count and the headers' track index change
-/// together — the queue rule used to run on the natural advance only, and a
-/// queue edit sends the next track change down the jump path, where the
-/// count was zeroed.
+/// The playing track becomes `new`, by any route: a natural advance, a jump,
+/// a skip, an exclusive-mode rate change. The one place `current`, the queue
+/// count and the headers' track index change together, so no route can skip
+/// the queue rule.
 pub(crate) fn advance_to(ui: &mut UiState, state: &PlayerState, new: usize) {
     ui.enqueue_count = queue_after_advance(ui.enqueue_count, ui.current, new);
     ui.current = new;
+    // The removed track's successor has now been reached (or left behind).
+    ui.removed_current_next = None;
     state.current_track.store(new, Ordering::Relaxed);
 }
 
 /// The queue after the playing track moves from `old` to `new`: one fewer
 /// when the next track starts (the first queued one, while there is a
 /// queue), unchanged when the same track restarts (repeat-one), and gone after
-/// any other move, which leaves the queued tracks somewhere else entirely. It
-/// used to be emptied on every track change, so tracks queued later jumped
-/// ahead of ones still waiting.
+/// any other move, which leaves the queued tracks somewhere else entirely.
+/// (Emptied on every change, a track queued later would jump ahead of ones
+/// still waiting.)
 pub(crate) fn queue_after_advance(count: usize, old: usize, new: usize) -> usize {
     if new == old + 1 {
         count.saturating_sub(1)
@@ -1916,7 +1992,7 @@ fn toggle_repeat(ui: &mut UiState, state: &PlayerState) {
 /// move below adjusts it; the filtered lookup just above is the general
 /// cursor-to-track rule shared with `remove_track`. (The library tree keeps
 /// its own filter and queues through its own path.)
-fn enqueue_track(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<PathBuf>) {
+pub(crate) fn enqueue_track(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<PathBuf>) {
     let track_idx = if ui.filtered_indices.is_empty() {
         ui.cursor
     } else {
@@ -1941,7 +2017,7 @@ fn enqueue_track(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<PathB
     let name = ui.metadata_cache.display_name(track_idx, &playlist[track_idx]);
     if track_idx == target {
         // Already where it would go (the track right after the queue): it is
-        // queued without moving. It used to be ignored, and not counted.
+        // queued without moving, and counted.
         ui.enqueue_count += 1;
         ui.set_status(format!("Queued: {name}"));
         return;
@@ -1973,7 +2049,6 @@ fn enqueue_track(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<PathB
     }
 
     ui.enqueue_count += 1;
-    ui.playlist_dirty = true;
     state.total_tracks.store(playlist.len(), Ordering::Relaxed);
     state.current_track.store(ui.current, Ordering::Relaxed);
     reindex_and_restart_scan(ui, playlist, &old_playlist);
@@ -2012,8 +2087,8 @@ fn switch_source_paths(
     ui.rescan_receiver = None;
     ui.pre_shuffle_order = None; // snapshot belongs to the previous source
     ui.current = 0;
-    // The queue was positions in the old playlist. Relying on the jump to
-    // empty it failed when the old track was also index 0 (advance_to keeps
+    // The queue was positions in the old playlist. Emptied here: the jump
+    // would keep it when the old track was also index 0 (advance_to keeps
     // the queue when the index does not move).
     ui.enqueue_count = 0;
     ui.cursor = 0;
@@ -2036,8 +2111,8 @@ fn switch_source_paths(
 }
 
 /// Start a rescan of every source. The directory walk and path lookups run on
-/// a worker thread — on a large or network library they took seconds, and the
-/// UI froze for all of it; [`poll_rescan`] applies the result when it lands.
+/// a worker thread (on a large or network library they take seconds);
+/// [`poll_rescan`] applies the result when it lands.
 fn rescan(ui: &mut UiState, playlist: &[PathBuf]) {
     if ui.rescan_receiver.is_some() {
         ui.set_status("Rescan already running".to_string());
@@ -2284,25 +2359,36 @@ mod ui_tests {
         assert!(ui.tree_pending_remove.is_none(), "a later y must not remove anything");
     }
 
-    /// One track change as the player makes it: the producer reports the
-    /// index of the next track in ITS copy of the list (`stale`, which after
-    /// an edit is meaningless), the handler resolves it with
-    /// `next_after_producer` and moves there with `advance_to`, then a
-    /// producer starts from the list as it is. Returns the index moved to.
-    fn change_track(state: &PlayerState, ui: &mut UiState, playlist: &[PathBuf], stale: usize) -> usize {
-        let target = next_after_producer(ui, stale, playlist.len());
-        if target < playlist.len() {
-            advance_to(ui, state, target);
-            producer_started(ui);
-        }
-        target
+    /// The producer's question for the track after `after`, through the
+    /// real slot, answered as poll_input answers it (`serve_producer`).
+    fn ask(state: &PlayerState, ui: &UiState, playlist: &[PathBuf], after: &Pick) -> Option<Pick> {
+        state.ask_next(after.clone());
+        serve_producer(state, ui, playlist);
+        state.take_next_answer().expect("main answers in poll_input")
     }
 
-    /// A natural track change: the producer, unaware of edits, reports the
-    /// track after the current one.
+    /// The playing track, as the producer holds it (named at this generation).
+    fn playing(ui: &UiState, playlist: &[PathBuf]) -> Pick {
+        Pick { index: ui.current, path: playlist[ui.current].clone(), gen: ui.playlist_gen }
+    }
+
+    /// The producer reports `pick` as started: the transition handler's
+    /// check, then the move (a jump also ends in advance_to, after the
+    /// respawn).
+    fn report(state: &PlayerState, ui: &mut UiState, playlist: &[PathBuf], pick: &Pick) -> Move {
+        let m = resolve_report(ui, playlist, pick, false);
+        let (Move::Advance(i) | Move::Jump(i)) = m;
+        if i < playlist.len() {
+            advance_to(ui, state, i);
+        }
+        m
+    }
+
+    /// A natural track change, the way the player makes it: the producer
+    /// asks for the track after the playing one and later reports it started.
     fn play_next(state: &PlayerState, ui: &mut UiState, playlist: &[PathBuf]) {
-        let stale = ui.current + 1;
-        change_track(state, ui, playlist, stale);
+        let next = ask(state, ui, playlist, &playing(ui, playlist)).expect("a next track");
+        assert_eq!(report(state, ui, playlist, &next), Move::Advance(next.index), "natural, no jump");
     }
 
     fn names(playlist: &[PathBuf]) -> Vec<String> {
@@ -2319,23 +2405,27 @@ mod ui_tests {
     }
 
     #[test]
-    fn a_track_queued_during_the_last_track_plays_when_the_producer_runs_out() {
-        // The producer's copy ends at c; it reports "past the end" (len of
-        // ITS list). The handler must continue at the queued a, not end.
+    fn a_track_queued_during_the_last_track_plays_next() {
         let state = PlayerState::new();
         let mut ui = test_ui(3);
         let mut playlist = list_of(&["a", "b", "c"]);
         ui.current = 2;
+        // Queued before the producer asks: the answer is the queued track.
         queue_named(&state, &mut ui, &mut playlist, "a");
         assert_eq!(names(&playlist), ["b", "c", "a"]);
-        let stale_len = 3;
-        let next = change_track(&state, &mut ui, &playlist, stale_len);
-        assert_eq!(next, 2, "the queued track, not the end of the list");
-        assert_eq!(playlist[ui.current], p("/a.mp3"));
+        let next = ask(&state, &ui, &playlist, &playing(&ui, &playlist)).expect("the queued track");
+        assert_eq!(next.path, p("/a.mp3"));
+        assert_eq!(report(&state, &mut ui, &playlist, &next), Move::Advance(2));
         assert_eq!(ui.enqueue_count, 0);
-        // Without an edit, running out is the end.
-        let next = change_track(&state, &mut ui, &playlist, playlist.len());
-        assert_eq!(next, playlist.len());
+        // Queued after it asked (the list had ended): the generation moved,
+        // so the producer asks again once the last track has played out.
+        let after = playing(&ui, &playlist);
+        assert_eq!(ask(&state, &ui, &playlist, &after), None, "the end of the list");
+        queue_named(&state, &mut ui, &mut playlist, "b");
+        assert_ne!(state.playlist_gen.load(Ordering::Relaxed), ui.playlist_gen, "not yet published");
+        let next = ask(&state, &ui, &playlist, &after).expect("asked again: the queued track");
+        assert_eq!(state.playlist_gen.load(Ordering::Relaxed), ui.playlist_gen);
+        assert_eq!(next.path, p("/b.mp3"));
     }
 
     #[test]
@@ -2347,45 +2437,79 @@ mod ui_tests {
         queue_named(&state, &mut ui, &mut playlist, "d");
         queue_named(&state, &mut ui, &mut playlist, "e");
         assert_eq!(names(&playlist), ["a", "d", "e", "b", "c"]);
+        let a = playing(&ui, &playlist);
         assert!(remove_indices(&state, &mut ui, &mut playlist, &[0]));
-        // The producer skips a and reports its own next track (index 1 in
-        // its copy: d, but stale all the same).
-        change_track(&state, &mut ui, &playlist, 1);
-        assert_eq!(playlist[ui.current], p("/d.mp3"));
+        // The producer skips a and asks for the track after it.
+        let next = ask(&state, &ui, &playlist, &a).expect("a successor");
+        assert_eq!(next.path, p("/d.mp3"));
+        assert_eq!(report(&state, &mut ui, &playlist, &next), Move::Advance(0));
         assert_eq!(ui.enqueue_count, 1, "only e is still queued");
+        assert_eq!(ui.removed_current_next, None, "reached, so forgotten");
         queue_named(&state, &mut ui, &mut playlist, "c");
         assert_eq!(names(&playlist), ["d", "e", "c", "b"], "c lands after e, not after a phantom");
     }
 
     #[test]
-    fn a_rate_change_after_removing_the_playing_track_plays_its_successor() {
-        // Remove a (playing); b needs another rate. The producer, working
-        // from [a, b, c], skips a and reports b at ITS index 1 — which is c
-        // in the edited list. The handler must start b, and c's end must
-        // then be a natural advance, not a jump back to b.
+    fn after_removing_the_playing_track_its_successor_plays_and_the_next_change_is_natural() {
+        // The rate-change case: the successor is what the producer is told
+        // (and what the stream is rebuilt for), and the change after it is
+        // a plain one — the old stale index played c, then jumped back to b.
         let state = PlayerState::new();
         let mut ui = test_ui(3);
         let mut playlist = list_of(&["a", "b", "c"]);
         ui.current = 0;
+        let a = playing(&ui, &playlist);
         assert!(remove_indices(&state, &mut ui, &mut playlist, &[0]));
-        change_track(&state, &mut ui, &playlist, 1);
+        let next = ask(&state, &ui, &playlist, &a).unwrap();
+        assert_eq!(report(&state, &mut ui, &playlist, &next), Move::Advance(0));
         assert_eq!(playlist[ui.current], p("/b.mp3"));
-        assert!(!ui.playlist_dirty, "consumed, so the next change is natural");
         play_next(&state, &mut ui, &playlist);
         assert_eq!(playlist[ui.current], p("/c.mp3"));
     }
 
     #[test]
-    fn a_new_producer_clears_the_edit_so_the_next_change_is_natural() {
-        // An edit followed by a respawn (a jump, recovery, a rate change):
-        // the new producer has the edited list, so its next report is right
-        // and must not be re-resolved (that drained the ring and broke
-        // gapless at every following track change).
-        let mut ui = test_ui(3);
-        ui.playlist_dirty = true;
-        ui.removed_current_next = Some(1);
-        producer_started(&mut ui);
-        assert_eq!(next_after_producer(&mut ui, 2, 3), 2);
+    fn an_edit_after_the_answer_turns_the_report_into_a_jump_only_if_it_must() {
+        let state = PlayerState::new();
+        let mut ui = test_ui(4);
+        let mut playlist = list_of(&["a", "b", "c", "d"]);
+        ui.current = 0;
+        // b was named; then d is queued: d now follows a, so b is wrong.
+        let b = ask(&state, &ui, &playlist, &playing(&ui, &playlist)).unwrap();
+        queue_named(&state, &mut ui, &mut playlist, "d");
+        assert_eq!(report(&state, &mut ui, &playlist, &b), Move::Jump(1));
+        assert_eq!(playlist[ui.current], p("/d.mp3"));
+        // An edit that leaves the next track where it was costs nothing.
+        let mut ui = test_ui(4);
+        let mut playlist = list_of(&["a", "b", "c", "d"]);
+        let b = ask(&state, &ui, &playlist, &playing(&ui, &playlist)).unwrap();
+        assert!(remove_indices(&state, &mut ui, &mut playlist, &[3]));
+        assert_eq!(report(&state, &mut ui, &playlist, &b), Move::Advance(1), "b still follows a");
+    }
+
+    #[test]
+    fn a_track_further_ahead_is_followed_by_its_own_successor() {
+        // Several short tracks in the ring: the producer asks after b while
+        // a still plays.
+        let state = PlayerState::new();
+        let ui = test_ui(3);
+        let playlist = list_of(&["a", "b", "c"]);
+        let b = Pick { index: 1, path: p("/b.mp3"), gen: ui.playlist_gen };
+        assert_eq!(ask(&state, &ui, &playlist, &b).map(|n| n.path), Some(p("/c.mp3")));
+        let c = Pick { index: 2, path: p("/c.mp3"), gen: ui.playlist_gen };
+        assert_eq!(ask(&state, &ui, &playlist, &c), None);
+    }
+
+    #[test]
+    fn an_answer_nobody_waits_for_is_not_given() {
+        // The producer unwound (a jump, quit) and cancelled its question:
+        // main must not leave an answer for the next producer to read.
+        let state = PlayerState::new();
+        let ui = test_ui(2);
+        let playlist = list_of(&["a", "b"]);
+        state.ask_next(playing(&ui, &playlist));
+        state.cancel_next_question();
+        serve_producer(&state, &ui, &playlist);
+        assert_eq!(state.take_next_answer(), None);
     }
 
     #[test]
@@ -2588,15 +2712,16 @@ mod ui_tests {
     }
 
     #[test]
-    fn source_is_sortable_false_when_any_m3u_present_or_empty() {
+    fn only_folders_are_auto_sorted() {
         let p = |s: &str| PathBuf::from(s);
-        // Folder / file sources are sortable.
-        assert!(source_is_sortable(&[p("/music/rock"), p("/music/song.flac")]));
-        // Any .m3u / .m3u8 source is a curated order — not sortable (case-insensitive).
-        assert!(!source_is_sortable(&[p("/music/mix.m3u")]));
-        assert!(!source_is_sortable(&[p("/music/rock"), p("/lists/set.M3U8")]));
-        // No sources → nothing to auto-sort.
-        assert!(!source_is_sortable(&[]));
+        let is_dir = |q: &std::path::Path| q.extension().is_none();
+        assert!(sortable_with(&[p("/music/rock")], is_dir));
+        assert!(sortable_with(&[p("/music/rock"), p("/music/jazz")], is_dir));
+        // Files listed by hand, an M3U, or a mix: the order given stays.
+        assert!(!sortable_with(&[p("/music/b.flac"), p("/music/a.flac")], is_dir));
+        assert!(!sortable_with(&[p("/music/mix.m3u")], is_dir));
+        assert!(!sortable_with(&[p("/music/rock"), p("/music/song.flac")], is_dir));
+        assert!(!sortable_with(&[], is_dir));
     }
 
     #[test]
@@ -2715,7 +2840,7 @@ mod ui_tests {
         ui.current = 1;
         tree_remove_indices(&state, &mut ui, &mut playlist, &[1, 2]);
         assert_eq!(playlist, vec![p("/a.mp3"), p("/d.mp3")]);
-        assert!(ui.playlist_dirty, "the transition handler must re-resolve the next track");
+        assert_eq!(ui.playlist_gen, 1, "an edit: picks made before it are checked");
         assert!(state.take_skip_next(), "the removed playing track must be skipped");
         assert_eq!(ui.removed_current_next, Some(1), "next is /d.mp3, now at index 1");
         assert_eq!(state.total_tracks.load(Ordering::Relaxed), 2);
@@ -2730,7 +2855,7 @@ mod ui_tests {
         let mut playlist = vec![p("/a.mp3"), p("/b.mp3")];
         tree_remove_indices(&state, &mut ui, &mut playlist, &[0, 1]);
         assert_eq!(playlist.len(), 2);
-        assert!(!ui.playlist_dirty);
+        assert_eq!(ui.playlist_gen, 0, "nothing changed");
     }
 
     #[test]

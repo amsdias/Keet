@@ -231,6 +231,12 @@ impl WasapiOutput {
                         return Ok(Self { stop, thread: Mutex::new(Some(handle)) });
                     }
                 }
+                // The render thread is left to finish on its own (its handle
+                // dropped, so it is detached): it is stuck inside the
+                // driver's open call and cannot be interrupted, and joining
+                // it would hang the UI as long as the driver does. When the
+                // open returns it sees ABANDONED and drops the device at
+                // once; it owns nothing else.
                 stop.store(true, Ordering::Relaxed);
                 Err("timed out opening the device in exclusive mode".into())
             }
@@ -322,10 +328,9 @@ fn open(id: &str, rate: u32, channels: u16, layout: (u16, u16), checked: bool) -
 }
 
 /// The render loop: wait for the device's event, render, pack, write. Ends on
-/// `stop`, or on ANY error, which raises `stream_error` so main's recovery
-/// takes over exactly as for a cpal stream. Only device loss
-/// (AUDCLNT_E_DEVICE_INVALIDATED) used to: any other failure ended the loop
-/// silently, leaving a frozen track with no sound and no recovery.
+/// `stop`, or on ANY error — not only device loss (AUDCLNT_E_DEVICE_INVALIDATED)
+/// — which raises `stream_error` so main's recovery takes over exactly as for
+/// a cpal stream. Ending silently would leave a frozen track with no sound.
 fn run(o: Opened, renderer: &mut OutputRenderer, stop: &AtomicBool, state: &PlayerState) {
     // Real-time scheduling for the render thread (MMCSS "Pro Audio", what
     // audio applications register as): at normal priority a busy machine could
