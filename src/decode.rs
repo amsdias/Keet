@@ -2332,7 +2332,11 @@ mod chain_tests {
     /// in playback), advances `samples_played`, honours drain requests, and
     /// fires `seeks` — (seconds of audio consumed, relative seek) — on cue.
     fn run_chain_paced(paths: &[PathBuf], rate: u32, seeks: &[(f64, i64)]) -> Vec<f32> {
-        const SPEEDUP: f64 = 10.0;
+        // Faster than real time, but not by so much that the producer's own
+        // real-time waits (its 20 ms full-ring sleep, the 250 ms drain wait)
+        // turn into seconds of audio: at 10x a CI runner's oversleeping
+        // decided the outcome.
+        const SPEEDUP: f64 = 4.0;
         let state = Arc::new(PlayerState::new());
         let cap = crate::state::ring_capacity_for(rate);
         state.ring_capacity.store(cap, Ordering::Relaxed);
@@ -2369,6 +2373,13 @@ mod chain_tests {
             }
             let due = (start.elapsed().as_secs_f64() * rate as f64 * SPEEDUP) as usize;
             let mut frames = due.saturating_sub(played_frames);
+            // Never play past the next seek point in one go: after a stall
+            // (a loaded CI runner) the catch-up ran straight through it, and
+            // the seek went in late — past the end of the track it was for.
+            if let Some(&(at, _)) = seeks.get(next_seek) {
+                let seek_frame = (at * rate as f64) as usize;
+                frames = frames.min(seek_frame.saturating_sub(played_frames));
+            }
             state.buffer_level.store(consumer.slots(), Ordering::Relaxed);
             while frames > 0 {
                 let (Ok(l), Ok(r)) = (consumer.pop(), consumer.pop()) else { break };
