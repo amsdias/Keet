@@ -85,7 +85,7 @@ pub fn parse_lyrics(raw: &str) -> Lyrics {
                 // Lyrics are drawn straight into frame lines, and LRCLIB text
                 // is user-submitted: strip control characters (ESC, CR, ...).
                 let time = (time - offset_secs).max(0.0);
-                lines.push(LrcLine { time, text: crate::ansi::sanitize_display(&text) });
+                lines.push(LrcLine { time, text: crate::ansi::sanitize_display(&strip_word_tags(&text)) });
             }
         }
         lines.sort_by(|a, b| a.time.partial_cmp(&b.time).unwrap_or(std::cmp::Ordering::Equal));
@@ -96,6 +96,42 @@ pub fn parse_lyrics(raw: &str) -> Lyrics {
             .collect();
         Lyrics::Plain(lines)
     }
+}
+
+/// Remove enhanced-LRC word timing (`<00:12.34>` before each word): Keet
+/// highlights whole lines, and the tags were shown raw in the text.
+fn strip_word_tags(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    let mut removed = false;
+    while let Some(open) = rest.find('<') {
+        let tag_end = rest[open..].find('>').map(|e| open + e);
+        match tag_end {
+            Some(end) if is_timestamp(&rest[open + 1..end]) => {
+                out.push_str(&rest[..open]);
+                rest = &rest[end + 1..];
+                removed = true;
+            }
+            _ => {
+                out.push_str(&rest[..open + 1]);
+                rest = &rest[open + 1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    if !removed {
+        return out;
+    }
+    // A tag between words leaves its spaces behind: collapse them (only
+    // then — a line's own spacing is left as written).
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// `mm:ss`, `mm:ss.xx` or `mm:ss:xx` — the inside of a word timing tag.
+fn is_timestamp(s: &str) -> bool {
+    !s.is_empty()
+        && s.contains(':')
+        && s.chars().all(|c| c.is_ascii_digit() || c == ':' || c == '.')
 }
 
 /// Parse an LRC line into `(seconds, text)` for each leading timestamp tag.
@@ -358,7 +394,7 @@ impl OffsetStore {
                 let _ = std::fs::create_dir_all(dir);
             }
             if let Ok(json) = serde_json::to_string_pretty(map) {
-                let _ = std::fs::write(f, json);
+                let _ = crate::playlist::write_atomic(&f, json.as_bytes());
             }
         }
     }
@@ -479,6 +515,16 @@ mod tests {
 #[cfg(test)]
 mod network_tests {
     use super::*;
+
+    #[test]
+    fn enhanced_lrc_word_timing_is_not_shown() {
+        let l = parse_lyrics("[00:12.00]<00:12.00> low <00:12.40> tide <00:12.90> at Ferrow");
+        assert_eq!(l.line_text(0), "low tide at Ferrow");
+        // Angle brackets that are not timestamps stay.
+        assert_eq!(strip_word_tags("a <b> c"), "a <b> c");
+        assert_eq!(strip_word_tags("x < 3"), "x < 3");
+        assert_eq!(strip_word_tags("two  spaces"), "two  spaces", "untagged text is left as written");
+    }
 
     /// Live HTTPS check against LRCLIB. Ignored by default (needs network);
     /// run with `cargo test -- --ignored --nocapture`.

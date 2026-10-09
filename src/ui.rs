@@ -354,7 +354,7 @@ fn print_status_eq_view(
         dim = p.dim, rst = p.reset,
     );
     let footer_short = format!(
-        "  {dim}←→ band ↑↓ gain t type ,. Q <> freq E close{rst}",
+        "  {dim}←→ band ↑↓ gain t type ,. Q <> freq e close{rst}",
         dim = p.dim, rst = p.reset,
     );
     let lines = fit_eq_screen(body, &footer_full, &footer_short, term_w, avail);
@@ -476,6 +476,23 @@ fn fit_eq_screen(
 /// How long a first Esc in the player waits for the second that quits.
 const ESC_QUIT_WINDOW: Duration = Duration::from_secs(2);
 
+/// Open the key list, or close it back to the view it was opened from (it
+/// always went back to the player). Opening it answers a pending "remove …?
+/// [y/n]" prompt with no — left armed, a `y` long after the prompt had gone
+/// removed a whole artist.
+fn toggle_help(ui: &mut UiState) {
+    if ui.view_mode == ViewMode::Help {
+        ui.view_mode = ui.help_return;
+    } else {
+        if let Some((label, _)) = ui.tree_pending_remove.take() {
+            ui.set_status(format!("cancelled removing {label}"));
+        }
+        ui.help_return = ui.view_mode;
+        ui.view_mode = ViewMode::Help;
+    }
+    ui.terminal_resized = true;
+}
+
 /// Whether an Esc at `now` is the confirming second press.
 fn esc_confirms_quit(armed_until: Option<std::time::Instant>, now: std::time::Instant) -> bool {
     armed_until.is_some_and(|t| now < t)
@@ -579,13 +596,11 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
             // `?` opens the key list from any view, and closes it; Esc closes
             // it too. Everything else still works underneath (space pauses).
             if matches!(k, KeyEvent { code: KeyCode::Char('?'), .. }) {
-                ui.view_mode = if ui.view_mode == ViewMode::Help { ViewMode::Player } else { ViewMode::Help };
-                ui.terminal_resized = true;
+                toggle_help(ui);
                 continue;
             }
             if ui.view_mode == ViewMode::Help && matches!(k, KeyEvent { code: KeyCode::Esc, .. }) {
-                ui.view_mode = ViewMode::Player;
-                ui.terminal_resized = true;
+                toggle_help(ui);
                 continue;
             }
 
@@ -1746,6 +1761,16 @@ fn sort_playlist_by_tags(state: &PlayerState, ui: &mut UiState, playlist: &mut V
 /// snapshot exists (e.g. the session started with --shuffle).
 fn toggle_shuffle(state: &PlayerState, ui: &mut UiState, playlist: &mut [PathBuf]) {
     let old_playlist = playlist.to_vec();
+    // The cursor's track and the filtered tracks, by path: the reorder moves
+    // them, and the cursor stayed on its ROW (another track) with the search
+    // results pointing at whatever now sat at their old positions.
+    let cursor_track = if ui.filtered_indices.is_empty() {
+        playlist.get(ui.cursor).cloned()
+    } else {
+        ui.filtered_indices.get(ui.cursor).and_then(|&i| playlist.get(i)).cloned()
+    };
+    let filtered: std::collections::HashSet<PathBuf> =
+        ui.filtered_indices.iter().filter_map(|&i| playlist.get(i).cloned()).collect();
     // The queued tracks are part of the tail being reordered.
     ui.enqueue_count = 0;
     ui.shuffle = !ui.shuffle;
@@ -1787,9 +1812,34 @@ fn toggle_shuffle(state: &PlayerState, ui: &mut UiState, playlist: &mut [PathBuf
     // Every header reads the playing track's index from state: it named the
     // track now at the OLD position until the next track change.
     state.current_track.store(ui.current, Ordering::Relaxed);
+    if !filtered.is_empty() {
+        ui.filtered_indices = (0..playlist.len()).filter(|&i| filtered.contains(&playlist[i])).collect();
+    }
+    if let Some(track) = cursor_track {
+        let pos = if ui.filtered_indices.is_empty() {
+            playlist.iter().position(|p| *p == track)
+        } else {
+            ui.filtered_indices.iter().position(|&i| playlist[i] == track)
+        };
+        if let Some(pos) = pos {
+            ui.cursor = pos;
+        }
+    }
     // Cached metadata is indexed by position — remap it to match the reordered paths.
     reindex_and_restart_scan(ui, playlist, &old_playlist);
     ui.playlist_dirty = true;
+}
+
+/// The playing track becomes `new`, by any route: a natural advance, the jump
+/// after a playlist edit, a skip, an exclusive-mode rate change. The one
+/// place `current`, the queue count and the headers' track index change
+/// together — the queue rule used to run on the natural advance only, and a
+/// queue edit sends the next track change down the jump path, where the
+/// count was zeroed.
+pub(crate) fn advance_to(ui: &mut UiState, state: &PlayerState, new: usize) {
+    ui.enqueue_count = queue_after_advance(ui.enqueue_count, ui.current, new);
+    ui.current = new;
+    state.current_track.store(new, Ordering::Relaxed);
 }
 
 /// The queue after the playing track moves from `old` to `new`: one fewer
@@ -1836,13 +1886,19 @@ fn enqueue_track(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<PathB
         return;
     }
 
-    // Target position: right after current + any previously enqueued tracks
-    let target = ui.current + 1 + ui.enqueue_count;
-    let target = target.min(playlist.len().saturating_sub(1));
-
-    if track_idx == target { return; }
+    // Target position: right after current + any previously enqueued tracks.
+    // Clamped to the END (len), not the last index: with the last track
+    // playing, `len - 1` put the queued track before it, never to be played.
+    let target = (ui.current + 1 + ui.enqueue_count).min(playlist.len());
 
     let name = ui.metadata_cache.display_name(track_idx, &playlist[track_idx]);
+    if track_idx == target {
+        // Already where it would go (the track right after the queue): it is
+        // queued without moving. It used to be ignored, and not counted.
+        ui.enqueue_count += 1;
+        ui.set_status(format!("Queued: {name}"));
+        return;
+    }
 
     // Move the track in the playlist, then remap the cache through the
     // scan-safe path below (same hazard as remove_track: a positional
@@ -1909,6 +1965,10 @@ fn switch_source_paths(
     ui.rescan_receiver = None;
     ui.pre_shuffle_order = None; // snapshot belongs to the previous source
     ui.current = 0;
+    // The queue was positions in the old playlist. Relying on the jump to
+    // empty it failed when the old track was also index 0 (advance_to keeps
+    // the queue when the index does not move).
+    ui.enqueue_count = 0;
     ui.cursor = 0;
     ui.scroll_offset = 0;
 
@@ -2147,6 +2207,101 @@ mod ui_tests {
     use super::*;
 
     #[test]
+    fn shuffle_keeps_the_cursor_and_the_search_results_on_their_tracks() {
+        let state = PlayerState::new();
+        let mut ui = test_ui(4);
+        let mut playlist = vec![p("/a.mp3"), p("/b.mp3"), p("/c.mp3"), p("/d.mp3")];
+        ui.shuffle = true;
+        ui.pre_shuffle_order = Some(playlist.clone());
+        playlist = vec![p("/a.mp3"), p("/d.mp3"), p("/c.mp3"), p("/b.mp3")];
+        ui.current = 0;
+        ui.filtered_indices = vec![1, 3]; // d and b match the search
+        ui.cursor = 0; // on d
+        toggle_shuffle(&state, &mut ui, &mut playlist); // off: a b c d
+        let shown: Vec<&PathBuf> = ui.filtered_indices.iter().map(|&i| &playlist[i]).collect();
+        assert_eq!(shown, [&p("/b.mp3"), &p("/d.mp3")], "the results are still b and d");
+        assert_eq!(playlist[ui.filtered_indices[ui.cursor]], p("/d.mp3"), "the cursor is still on d");
+    }
+
+    #[test]
+    fn help_closes_back_to_where_it_opened_and_cancels_a_pending_removal() {
+        let mut ui = test_ui(3);
+        ui.view_mode = ViewMode::Lyrics;
+        toggle_help(&mut ui);
+        assert_eq!(ui.view_mode, ViewMode::Help);
+        toggle_help(&mut ui);
+        assert_eq!(ui.view_mode, ViewMode::Lyrics, "back to lyrics, not the player");
+        ui.view_mode = ViewMode::Playlist;
+        ui.tree_pending_remove = Some(("artist X".into(), vec![p("/a.mp3")]));
+        toggle_help(&mut ui);
+        assert!(ui.tree_pending_remove.is_none(), "a later y must not remove anything");
+    }
+
+    /// One track change as the player makes it: after a playlist edit (a
+    /// queue is one) through the jump path, otherwise a natural advance.
+    fn play_next(state: &PlayerState, ui: &mut UiState, playlist: &[PathBuf]) {
+        let target = if std::mem::take(&mut ui.playlist_dirty) {
+            track_after_edit(ui.current, ui.removed_current_next.take(), playlist.len(), ui.repeat_mode)
+        } else {
+            ui.current + 1
+        };
+        advance_to(ui, state, target);
+    }
+
+    #[test]
+    fn the_queue_keeps_its_order_through_a_real_track_change() {
+        // Queue d and e; when d starts, a newly queued f must land after e.
+        // The count was zeroed on that change (it goes through the jump
+        // path), so f jumped ahead of e and e lost its queued marker.
+        let state = PlayerState::new();
+        let mut ui = test_ui(6);
+        let mut playlist: Vec<PathBuf> = ["a", "b", "c", "d", "e", "f"].iter().map(|n| p(&format!("/{n}.mp3"))).collect();
+        ui.current = 0;
+        let queue = |ui: &mut UiState, playlist: &mut Vec<PathBuf>, name: &str| {
+            ui.cursor = playlist.iter().position(|x| x == &p(&format!("/{name}.mp3"))).unwrap();
+            enqueue_track(&state, ui, playlist);
+        };
+        queue(&mut ui, &mut playlist, "d");
+        queue(&mut ui, &mut playlist, "e");
+        play_next(&state, &mut ui, &playlist);
+        assert_eq!(playlist[ui.current], p("/d.mp3"), "the first queued track plays");
+        assert_eq!(ui.enqueue_count, 1, "e is still queued");
+        queue(&mut ui, &mut playlist, "f");
+        let order: Vec<String> = playlist.iter().map(|x| x.file_stem().unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(order, ["a", "d", "e", "f", "b", "c"]);
+        play_next(&state, &mut ui, &playlist);
+        assert_eq!(playlist[ui.current], p("/e.mp3"));
+        assert_eq!(state.current_track.load(Ordering::Relaxed), ui.current);
+    }
+
+    #[test]
+    fn a_track_queued_during_the_last_one_plays_after_it() {
+        let state = PlayerState::new();
+        let mut ui = test_ui(3);
+        let mut playlist = vec![p("/a.mp3"), p("/b.mp3"), p("/c.mp3")];
+        ui.current = 2; // c, the last
+        ui.cursor = 0;
+        enqueue_track(&state, &mut ui, &mut playlist);
+        assert_eq!(playlist, [p("/b.mp3"), p("/c.mp3"), p("/a.mp3")], "a goes AFTER c");
+        assert_eq!(playlist[ui.current], p("/c.mp3"));
+    }
+
+    #[test]
+    fn queueing_the_track_already_next_counts_it() {
+        let state = PlayerState::new();
+        let mut ui = test_ui(3);
+        let mut playlist = vec![p("/a.mp3"), p("/b.mp3"), p("/c.mp3")];
+        ui.current = 0;
+        ui.cursor = 1; // b is next anyway
+        enqueue_track(&state, &mut ui, &mut playlist);
+        assert_eq!(ui.enqueue_count, 1);
+        ui.cursor = 2;
+        enqueue_track(&state, &mut ui, &mut playlist);
+        assert_eq!(playlist, [p("/a.mp3"), p("/b.mp3"), p("/c.mp3")]);
+        assert_eq!(ui.enqueue_count, 2, "c queued behind b");
+    }
+
+    #[test]
     fn the_key_list_fits_the_window_and_lists_every_key() {
         let p = crate::theme::palette(crate::theme::ThemeKind::Minimal);
         for (w, h) in [(40, 10), (80, 24), (120, 40), (200, 60)] {
@@ -2184,9 +2339,12 @@ mod ui_tests {
         let mut playlist = vec![p("/old/a.mp3")];
         let (_tx, rx) = std::sync::mpsc::channel();
         ui.rescan_receiver = Some(rx);
+        ui.current = 0;
+        ui.enqueue_count = 2; // a queue in the OLD list, playing its first track
         switch_source_paths(&state, &mut ui, &mut playlist, dir.clone());
         let _ = std::fs::remove_dir_all(&dir);
         assert!(ui.rescan_receiver.is_none(), "the old folders' result would replace the new list");
+        assert_eq!(ui.enqueue_count, 0, "the old queue does not carry into the new list");
     }
 
     #[test]
@@ -2578,7 +2736,7 @@ mod ui_tests {
         let p = crate::theme::palette(crate::theme::ThemeKind::Classic);
         let readouts = [("FX", "None"), ("XFEED", "Off"), ("BAL", "centred"), ("RG", "off")];
         let full = "  [←→] band  [↑↓] gain (⇧ fine)  [t] type  [,.] Q  [<>] freq  [[]] preset  [0] reset  [e/Esc] close";
-        let short = "  ←→ band ↑↓ gain t type ,. Q <> freq E close";
+        let short = "  ←→ band ↑↓ gain t type ,. Q <> freq e close";
         for term_w in 10usize..130 {
             for avail in 0usize..45 {
                 let body = crate::eq_ui::render_eq_screen(

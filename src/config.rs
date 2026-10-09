@@ -83,6 +83,9 @@ impl ClassicColors {
 /// broken config never blocks startup.
 fn parse(contents: &str) -> Config {
     let mut c = Config::default();
+    // Windows editors (Notepad) save UTF-8 with a BOM, which serde rejects:
+    // the whole file read as not JSON.
+    let contents = contents.strip_prefix('\u{feff}').unwrap_or(contents);
     let Ok(serde_json::Value::Object(obj)) = serde_json::from_str::<serde_json::Value>(contents) else {
         c.problems.push("the whole file (not valid JSON)".into());
         return c;
@@ -196,6 +199,8 @@ mod tests {
         assert_eq!(c.problems, ["classic_colors.highlight (wrong type)"]);
         assert_eq!(parse("not json").problems, ["the whole file (not valid JSON)"]);
         assert!(parse(r#"{"future": 1}"#).problems.is_empty(), "unknown keys are fine");
+        let bom = parse("\u{feff}{\"theme\": \"hifi\"}");
+        assert_eq!((bom.theme.as_deref(), bom.problems.len()), (Some("hifi"), 0), "a BOM is not an error");
     }
 
     #[test]

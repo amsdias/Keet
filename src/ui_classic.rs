@@ -372,6 +372,9 @@ fn top_rows(
         ui.cover_block_intact = true;
         ui.cover_dirty_frame = false;
         for (i, info_line) in info.into_iter().enumerate() {
+            // Cut to the column: these rows are written raw (the image), so
+            // the frame's own cut at the window edge does not reach them.
+            let info_line = crate::ansi::truncate_ansi(&info_line, info_w);
             let cover = cover_lines.get(i).map(String::as_str).unwrap_or("");
             if sticky {
                 // The image's cells come first: no erase before them, one
@@ -433,8 +436,8 @@ fn viz_next_name(mode: VizMode) -> &'static str {
 /// Most used first: a narrow window drops keys from the end. The play modes
 /// and presets the header and status row show are all here.
 const PLAYER_KEYS: &[(&str, &str)] = &[
-    ("␣", "pause"), ("←→", "seek"), ("↑↓", "track"), ("+−", "vol"), ("q", "quit"),
-    ("?", "keys"), ("v", "viz"), ("e", "eq"), ("l", "list"), ("y", "lyrics"), ("z", "shuffle"),
+    ("␣", "pause"), ("?", "keys"), ("←→", "seek"), ("↑↓", "track"), ("+−", "vol"),
+    ("q", "quit"), ("v", "viz"), ("e", "eq"), ("l", "list"), ("y", "lyrics"), ("z", "shuffle"),
     ("⇧R", "repeat"), ("x", "fx"), ("c", "xfeed"), ("⇧F", "full"), ("t", "theme"),
 ];
 
@@ -648,7 +651,10 @@ fn playlist_body(
 ) {
     let rst = p.reset;
     let tree = ui.library_tree_mode;
-    let total_secs: f64 = (0..playlist.len()).filter_map(|i| ui.metadata_cache.duration(i)).sum();
+    // One pass over the durations for the total and the time column's width.
+    let (total_secs, longest) = (0..playlist.len())
+        .filter_map(|i| ui.metadata_cache.duration(i))
+        .fold((0.0f64, 0.0f64), |(sum, max), d| (sum + d, max.max(d)));
     let hint = if tree {
         format!("{} tracks · {} · Tab list · / filter", playlist.len(), format_total(total_secs))
     } else {
@@ -669,12 +675,7 @@ fn playlist_body(
         // Columns: marker · number · title · album · time.
         let num_w = playlist.len().to_string().len().max(2);
         // Wide enough for the longest duration listed (10 h+ is "10:00:00").
-        let time_w = 1 + (0..playlist.len())
-            .filter_map(|i| ui.metadata_cache.duration(i))
-            .map(|d| format_time(d).len())
-            .max()
-            .unwrap_or(5)
-            .max(5);
+        let time_w = 1 + format_time(longest).len().max(5);
         let content = term_w.saturating_sub(2 + 1 + 3 + num_w + 3 + time_w + 1);
         let album_w = if content >= 50 { (content * 30 / 100).clamp(12, 32) } else { 0 };
         let title_w = content.saturating_sub(album_w);
@@ -748,10 +749,10 @@ fn playlist_body(
     };
     w.line(&message);
     let keys: &[(&str, &str)] = if tree {
-        &[("↵", "play"), ("←→", "fold"), ("/", "filter"), ("d", "remove"), ("Tab", "list"), ("l", "close")]
+        &[("↵", "play"), ("?", "keys"), ("←→", "fold"), ("/", "filter"), ("d", "remove"), ("Tab", "list"), ("l", "close")]
     } else {
         &[
-            ("↵", "play"), ("a", "queue"), ("/", "search"), ("d", "remove"), ("s", "save"),
+            ("↵", "play"), ("?", "keys"), ("a", "queue"), ("/", "search"), ("d", "remove"), ("s", "save"),
             ("⇧s", "sort"), ("Tab", "tree"), ("l", "close"),
         ]
     };

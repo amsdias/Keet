@@ -146,6 +146,13 @@ impl Freeverb {
         for a in self.allpasses_l.iter_mut().chain(self.allpasses_r.iter_mut()) { a.reset(); }
     }
 
+    // Level calibration, deliberately not Jezar's: the reference feeds the
+    // combs (L + R)·0.015 and scales `wet` by 3; this takes the stereo AVERAGE
+    // and no 3× — a given `wet` is about a sixth as loud as in the reference.
+    // The built-in presets are tuned by ear on this scale, and existing custom
+    // presets were written against it, so matching the reference would mean
+    // rescaling every preset value to sound the same. Values copied from
+    // another Freeverb need `wet` ×6 here for the same level.
     fn process_stereo(&mut self, samples: &mut [f32]) {
         let wet1 = self.wet * (1.0 + self.width) / 2.0;
         let wet2 = self.wet * (1.0 - self.width) / 2.0;
@@ -447,6 +454,11 @@ impl EffectsChain {
         if let Some(r) = self.reverb.as_mut() { r.reset(); }
         if let Some(c) = self.chorus.as_mut() { c.reset(); }
         if let Some(d) = self.delay.as_mut() { d.reset(); }
+    }
+
+    /// Audio passed this stage while it was off (see `fade::Crossfade::idle`).
+    pub fn idle(&mut self) {
+        self.xfade.idle();
     }
 
     pub fn is_active(&self) -> bool {

@@ -27,7 +27,8 @@ use crate::theme;
 use crate::ui::{self, arm_auto_sort, format_time, poll_auto_sort, poll_input, poll_library_tree, print_status};
 use crate::viz::{StatsMonitor, VizAnalyser};
 use crate::{
-    build_resume_state, locked_rate_note, open_output, output_failed, rate_label,
+    build_resume_state, locked_rate_note, open_output, output_failed, rate_label, schedule_retry,
+    OUTPUT_PROVEN_AFTER,
     repaint_if_needed, spawn_cover_worker, spawn_lyrics_worker, PRODUCER_THREAD,
 };
 
@@ -381,6 +382,7 @@ impl Player {
               && !state.should_quit()
         {
             poll_input(&state, &mut self.ui, &mut self.playlist);
+            media_keys::poll(); // every wait pumps them (see paint_wait_frame)
             thread::sleep(Duration::from_millis(10));
         }
 
@@ -470,7 +472,7 @@ impl Player {
         }
         let (sources, current, removed) =
             (self.ui.source_paths.clone(), self.playlist.clone(), self.ui.removed_paths.clone());
-        let sources_then = sources.clone();
+        let (sources_then, playlist_then, removed_then) = (sources.clone(), current.clone(), removed.len());
         let (tx, rx) = std::sync::mpsc::channel();
         thread::spawn(move || {
             let _ = tx.send(next_cycle(&sources, &current, &removed));
@@ -494,12 +496,21 @@ impl Player {
                 }
             }
         };
-        // Tracks removed while the rebuild ran: it started from the removals
-        // as they were then, so it would bring these back.
-        next.retain(|p| {
-            let key = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
-            !self.ui.removed_paths.contains(&key)
-        });
+        // Edited while the rebuild ran (a reorder, a queued track, a removal),
+        // or a track picked (a pending jump is an index into THIS list): the
+        // user's list wins, as it is — replacing or reshuffling it threw the
+        // edits away and sent the jump to whatever track took that index.
+        // Only a new removal costs a lookup per path, and only then.
+        let user_acted = self.playlist != playlist_then
+            || self.state.jump_to_track.load(Ordering::Relaxed) >= 0;
+        if user_acted {
+            next = self.playlist.clone();
+        } else if self.ui.removed_paths.len() != removed_then {
+            next.retain(|p| {
+                let key = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+                !self.ui.removed_paths.contains(&key)
+            });
+        }
 
         // Everything gone (in-app removals + files deleted on disk): nothing
         // left to play. Without this guard the track fetch would index into
@@ -507,7 +518,7 @@ impl Player {
         if next.is_empty() {
             return false;
         }
-        if self.ui.shuffle {
+        if self.ui.shuffle && !user_acted {
             shuffle_list(&mut next);
         }
         let old_playlist = std::mem::replace(&mut self.playlist, next);
@@ -520,7 +531,9 @@ impl Player {
         // reverts to filename order instead of staying tag-sorted.
         arm_auto_sort(&mut self.ui);
 
+        // A new cycle: the queue belonged to the list that just ended.
         self.ui.current = 0;
+        self.ui.enqueue_count = 0;
         true
     }
 
@@ -553,7 +566,7 @@ impl Player {
                 self.viz_cons = v;
                 self.stream = Some(s);
                 self.stream_rate = rate;
-                self.ui.recovery_failures = 0;
+                self.ui.output_opened_at = Some(Instant::now());
             }
             Err(e) => output_failed(&mut self.ui, &self.state, e.as_ref()),
         }
@@ -735,10 +748,8 @@ impl Player {
             );
             state.jump_to(target);
         } else if new_index < self.playlist.len() {
+            ui::advance_to(&mut self.ui, &state, new_index);
             let ui = &mut self.ui;
-            ui.enqueue_count = ui::queue_after_advance(ui.enqueue_count, ui.current, new_index);
-            ui.current = new_index;
-            state.current_track.store(ui.current, Ordering::Relaxed);
 
             if ui.view_mode == state::ViewMode::Playlist && ui.filtered_indices.is_empty() {
                 ui.cursor = ui.current;
@@ -787,11 +798,11 @@ impl Player {
             self.ui.set_status(format!("Skip: {msg}"));
         }
         if let Some(target) = state.take_jump() {
-            self.ui.current = target;
+            ui::advance_to(&mut self.ui, &state, target);
         } else if state.take_skip_prev() {
-            self.ui.current = self.ui.current.saturating_sub(1);
+            let back = self.ui.current.saturating_sub(1);
+            ui::advance_to(&mut self.ui, &state, back);
         }
-        self.ui.enqueue_count = 0;
         Flow::NextTrack
     }
 
@@ -848,7 +859,7 @@ impl Player {
         // Continue the playlist from the track that needs the new rate.
         let new_idx = state.producer_track_index.load(Ordering::Relaxed);
         if new_idx < self.playlist.len() {
-            self.ui.current = new_idx;
+            ui::advance_to(&mut self.ui, &state, new_idx);
         }
         Flow::NextTrack
     }
@@ -859,7 +870,20 @@ impl Player {
     fn handle_recovery(&mut self) -> Flow {
         let state = Arc::clone(&self.state);
         let retry_due = self.ui.recovery_retry_at.is_none_or(|t| Instant::now() >= t);
+        let just_opened = self.ui.output_opened_at.is_some_and(|t| t.elapsed() < OUTPUT_PROVEN_AFTER);
         if !(retry_due && state.stream_error.swap(false, Ordering::Relaxed)) {
+            // Playing fine long enough: the device works, the backoff starts over.
+            if !just_opened && !state.stream_error.load(Ordering::Relaxed) {
+                self.ui.recovery_failures = 0;
+            }
+            return Flow::Continue;
+        }
+        // Died right after it opened: a failed attempt, retried after its
+        // backoff — not on the next frame, over and over.
+        if just_opened && self.ui.recovery_retry_at.is_none() {
+            self.ui.output_opened_at = None;
+            let wait = schedule_retry(&mut self.ui, &state);
+            self.ui.set_status_for(format!("the output stopped right after opening — retrying in {} s", wait.as_secs()), Duration::from_secs(3));
             return Flow::Continue;
         }
         self.ui.recovery_retry_at = None;
@@ -881,7 +905,8 @@ impl Player {
             // the flag; put it back so we retry on the next frame instead of
             // abandoning recovery forever. The loop keeps polling input, so
             // quit stays responsive.
-            state.stream_error.store(true, Ordering::Relaxed);
+            // With a backoff: retrying every frame enumerated devices 20×/s.
+            schedule_retry(&mut self.ui, &state);
             self.ui.set_status("audio device lost — waiting for an output device".to_string());
             return Flow::Continue;
         };
@@ -912,7 +937,7 @@ impl Player {
         // endpoint, and it still names the one that was unplugged.
         if let Ok(desc) = self.device.description() {
             let new_name = desc.name().to_string();
-            self.ui.device_name = new_name.clone();
+            self.ui.device_name = crate::ansi::sanitize_display(&new_name);
             if moved {
                 self.ui.set_status(format!("output moved to {new_name}"));
             }
@@ -1140,7 +1165,7 @@ impl Player {
             if let Some(name) = current {
                 if name != self.shown_device_name {
                     self.shown_device_name = name.clone();
-                    self.ui.device_name = name.clone();
+                    self.ui.device_name = crate::ansi::sanitize_display(&name);
                     self.ui.set_status(format!("output now on {name}"));
                 }
             }

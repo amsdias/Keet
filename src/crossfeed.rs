@@ -44,6 +44,11 @@ pub struct CrossfeedPreset {
     /// Inter-channel delay (interaural time difference), in microseconds.
     #[serde(default = "default_delay")]
     pub delay_us: f32,
+    /// The built-in "Off". Not part of the JSON: switching crossfeed off was
+    /// decided by the preset's NAME, so a custom preset called "Off" turned it
+    /// off whatever its values said.
+    #[serde(skip)]
+    pub off: bool,
 }
 
 use crate::eq::{BiquadCoeffs, BiquadState};
@@ -121,7 +126,7 @@ impl CrossfeedFilter {
         let before = self.clone();
         let was_active = before.is_active();
         self.xfade.retire(before, crate::fade::frames(crate::fade::CROSSFEED_FADE_SECS, sample_rate));
-        if preset.name == "Off" {
+        if preset.off {
             self.active = false;
             self.level = 0.0;
             // Off to Off is no change: no fade (see EqChain::load_bands).
@@ -166,6 +171,11 @@ impl CrossfeedFilter {
         self.lpf_state_r.reset();
         self.delay_l.reset();
         self.delay_r.reset();
+    }
+
+    /// Audio passed this stage while it was off (see `fade::Crossfade::idle`).
+    pub fn idle(&mut self) {
+        self.xfade.idle();
     }
 
     pub fn is_active(&self) -> bool {
@@ -222,9 +232,10 @@ pub fn builtin_presets() -> Vec<CrossfeedPreset> {
         level_db,
         cutoff_hz: DEFAULT_CUTOFF_HZ,
         delay_us: DEFAULT_DELAY_US,
+        off: false,
     };
     vec![
-        p("Off", 0.0),
+        CrossfeedPreset { off: true, ..p("Off", 0.0) },
         p("Light", -6.0),
         p("Medium", -4.5),
         p("Strong", -3.0),
@@ -236,7 +247,15 @@ pub fn builtin_presets() -> Vec<CrossfeedPreset> {
 /// preset folders. This is where the depth lives: a preset may set any of
 /// level, cutoff and ITD.
 pub fn load_custom_presets() -> Vec<CrossfeedPreset> {
-    crate::config::load_presets("crossfeed", |p: &mut CrossfeedPreset| &mut p.name)
+    let mut presets = crate::config::load_presets("crossfeed", |p: &mut CrossfeedPreset| &mut p.name);
+    // "Off" is the built-in switch's name, and the screens read it as "no
+    // crossfeed": a custom preset with that name gets another.
+    for p in &mut presets {
+        if p.name.eq_ignore_ascii_case("off") {
+            p.name = format!("{} (custom)", p.name);
+        }
+    }
+    presets
 }
 
 #[cfg(test)]
@@ -272,6 +291,7 @@ mod crossfeed_tests {
                 level_db: 0.0,
                 cutoff_hz: 700.0,
                 delay_us: 1000.0,
+                off: false,
             },
             sr,
         );
@@ -365,10 +385,22 @@ mod crossfeed_tests {
         // the output ran to inf, then NaN, and the limiter turned NaN into
         // silence for good. Custom presets are user-editable JSON.
         let sr = 22050.0;
-        let wild = CrossfeedPreset { name: "wild".into(), level_db: 40.0, cutoff_hz: 12000.0, delay_us: 300.0 };
+        let wild = CrossfeedPreset { name: "wild".into(), level_db: 40.0, cutoff_hz: 12000.0, delay_us: 300.0, off: false };
         let noise = |i: usize| (((i * 7919) % 1000) as f32 / 500.0 - 1.0) * 0.5;
         let out = run(wild, sr, noise, |i| -noise(i), 44100);
         assert!(out.iter().all(|s| s.is_finite() && s.abs() < 4.0), "filter ran away");
+    }
+
+    #[test]
+    fn a_custom_preset_named_off_still_crossfeeds() {
+        let custom: CrossfeedPreset = serde_json::from_str(r#"{"name":"Off","level_db":-4.5}"#).unwrap();
+        assert!(!custom.off, "the JSON cannot claim to be the switch");
+        let mut cf = CrossfeedFilter::new();
+        cf.load_preset(&custom, 48000.0);
+        assert!(cf.is_active());
+        cf.load_preset(&builtin_presets()[0], 48000.0);
+        cf.process_stereo(&mut vec![0.0; 48000 * 2]); // past the fade
+        assert!(!cf.is_active(), "the built-in Off is off");
     }
 
     #[test]

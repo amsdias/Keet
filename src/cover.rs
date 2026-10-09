@@ -328,7 +328,7 @@ pub fn resolve_remote(artist: &str, album: &str, size: CoverSize) -> crate::lyri
         if let Some(dir) = p.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let _ = std::fs::write(&p, &bytes);
+        let _ = crate::playlist::write_atomic(&p, &bytes);
     }
     match decode_and_resize(&bytes, size) {
         Some(img) => Lookup::Found(img),

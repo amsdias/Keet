@@ -341,8 +341,9 @@ pub struct VizAnalyser {
     smoothed_peak_r: f32,
     vu_peak_hold_l: f32,
     vu_peak_hold_r: f32,
-    vu_peak_timer_l: u8,
-    vu_peak_timer_r: u8,
+    /// Seconds each VU dot still hangs before it falls.
+    vu_peak_timer_l: f32,
+    vu_peak_timer_r: f32,
     sample_rate: u32,
     // Spectrum bar/dot ballistics for this rate's hop length.
     ballistics: Ballistics,
@@ -462,8 +463,8 @@ impl VizAnalyser {
             smoothed_peak_r: 0.0,
             vu_peak_hold_l: 0.0,
             vu_peak_hold_r: 0.0,
-            vu_peak_timer_l: 0,
-            vu_peak_timer_r: 0,
+            vu_peak_timer_l: 0.0,
+            vu_peak_timer_r: 0.0,
             sample_rate,
             ballistics: Ballistics::for_rate(sample_rate),
             waveform_buf: VecDeque::with_capacity(WAVEFORM_BUF_SIZE),
@@ -510,43 +511,19 @@ impl VizAnalyser {
             self.waveform_buf.push_back((l_raw, r_raw));
         }
 
-        // Smooth peak levels with fast attack, slow decay (VU meter behavior)
-        const ATTACK_FACTOR: f32 = 0.3;
-        const DECAY_FACTOR: f32 = 0.92;
-
-        if peak_l > self.smoothed_peak_l {
-            self.smoothed_peak_l = self.smoothed_peak_l * ATTACK_FACTOR + peak_l * (1.0 - ATTACK_FACTOR);
-        } else {
-            self.smoothed_peak_l *= DECAY_FACTOR;
-        }
-
-        if peak_r > self.smoothed_peak_r {
-            self.smoothed_peak_r = self.smoothed_peak_r * ATTACK_FACTOR + peak_r * (1.0 - ATTACK_FACTOR);
-        } else {
-            self.smoothed_peak_r *= DECAY_FACTOR;
-        }
-
+        // The meter's motion follows the AUDIO's time, not the UI's frame
+        // count: these constants were tuned per 50 ms frame, and stepping them
+        // once per call made the meter fall faster or slower with the frame
+        // rate (the waits paint at another pace than the main loop).
+        let steps = frames as f32 / self.sample_rate.max(1) as f32 / VU_FRAME_SECS;
+        let (l, r) = (self.smoothed_peak_l, self.smoothed_peak_r);
+        self.smoothed_peak_l = vu_smooth(l, peak_l, steps);
+        self.smoothed_peak_r = vu_smooth(r, peak_r, steps);
         state.set_peaks(self.smoothed_peak_l, self.smoothed_peak_r);
 
-        // VU peak dots
-        if self.smoothed_peak_l >= self.vu_peak_hold_l {
-            self.vu_peak_hold_l = self.smoothed_peak_l;
-            self.vu_peak_timer_l = HOLD_TIME;
-        } else if self.vu_peak_timer_l > 0 {
-            self.vu_peak_timer_l -= 1;
-        } else {
-            self.vu_peak_hold_l = (self.vu_peak_hold_l - DOT_GRAVITY).max(0.0);
-        }
-
-        if self.smoothed_peak_r >= self.vu_peak_hold_r {
-            self.vu_peak_hold_r = self.smoothed_peak_r;
-            self.vu_peak_timer_r = HOLD_TIME;
-        } else if self.vu_peak_timer_r > 0 {
-            self.vu_peak_timer_r -= 1;
-        } else {
-            self.vu_peak_hold_r = (self.vu_peak_hold_r - DOT_GRAVITY).max(0.0);
-        }
-
+        // VU peak dots: hang for HOLD_TIME frames' worth, then fall.
+        vu_dot(self.smoothed_peak_l, &mut self.vu_peak_hold_l, &mut self.vu_peak_timer_l, steps);
+        vu_dot(self.smoothed_peak_r, &mut self.vu_peak_hold_r, &mut self.vu_peak_timer_r, steps);
         state.set_vu_dots(self.vu_peak_hold_l, self.vu_peak_hold_r);
 
         // Process FFT for each channel when enough samples collected
@@ -824,17 +801,31 @@ fn vu_layout(rows: usize, extras: bool) -> VuLayout {
 /// and it is drawn once per UI frame, so the strip advances at a steady ~20 px
 /// per second without another buffer in the analyser.
 fn vu_push_history(l: f32, r: f32, want: bool) -> Vec<(f32, f32)> {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     thread_local! {
         static HIST: RefCell<std::collections::VecDeque<(f32, f32)>> =
             const { RefCell::new(std::collections::VecDeque::new()) };
+        static CLOCK: Cell<Option<(std::time::Instant, f32)>> = const { Cell::new(None) };
     }
+    // One column per VU_FRAME_SECS of real time, not one per render: the
+    // strip moved at whatever pace the UI happened to paint.
+    let now = std::time::Instant::now();
+    let columns = CLOCK.with(|c| {
+        let (n, carry) = match c.get() {
+            None => (1, 0.0),
+            Some((last, carry)) => history_columns(now.duration_since(last).as_secs_f32(), carry),
+        };
+        c.set(Some((now, carry)));
+        n
+    });
     HIST.with(|h| {
         let mut h = h.borrow_mut();
-        if h.len() == VU_HISTORY {
-            h.pop_front();
+        for _ in 0..columns {
+            if h.len() == VU_HISTORY {
+                h.pop_front();
+            }
+            h.push_back((l, r));
         }
-        h.push_back((l, r));
         // Copied out only when the history strip is drawn this frame.
         if want { h.iter().copied().collect() } else { Vec::new() }
     })
@@ -952,6 +943,50 @@ fn fit_width(lines: Vec<String>, width: usize) -> Vec<String> {
             }
         })
         .collect()
+}
+
+/// Columns of history `elapsed` seconds add, carrying the fraction: one per
+/// VU_FRAME_SECS, at most a strip's worth (a long stall does not flood it).
+fn history_columns(elapsed: f32, carry: f32) -> (usize, f32) {
+    // A long gap is the meter coming back into view (or the UI stalled), not
+    // time the strip should fill with one flat level: carry on from here.
+    if elapsed > HISTORY_GAP_SECS {
+        return (1, 0.0);
+    }
+    let t = (elapsed / VU_FRAME_SECS + carry).min(VU_HISTORY as f32);
+    let n = t.floor();
+    (n as usize, t - n)
+}
+
+/// A pause between renders longer than this restarts the history's clock.
+const HISTORY_GAP_SECS: f32 = 0.5;
+
+/// The UI frame the VU constants were tuned for (20 fps).
+const VU_FRAME_SECS: f32 = 0.05;
+
+/// One VU smoothing step over `steps` tuning frames: fast attack, slow decay.
+fn vu_smooth(level: f32, peak: f32, steps: f32) -> f32 {
+    const ATTACK_FACTOR: f32 = 0.3;
+    const DECAY_FACTOR: f32 = 0.92;
+    if peak > level {
+        let a = ATTACK_FACTOR.powf(steps);
+        level * a + peak * (1.0 - a)
+    } else {
+        level * DECAY_FACTOR.powf(steps)
+    }
+}
+
+/// A VU peak dot over `steps` tuning frames: jump to a new peak, hang for
+/// HOLD_TIME frames' worth of seconds, then fall at DOT_GRAVITY per frame.
+fn vu_dot(level: f32, hold: &mut f32, timer: &mut f32, steps: f32) {
+    if level >= *hold {
+        *hold = level;
+        *timer = HOLD_TIME as f32 * VU_FRAME_SECS;
+    } else if *timer > 0.0 {
+        *timer -= steps * VU_FRAME_SECS;
+    } else {
+        *hold = (*hold - DOT_GRAVITY * steps).max(0.0);
+    }
 }
 
 /// See `render_vu_meter_body`; this enforces the width half of the renderer contract
@@ -2642,6 +2677,44 @@ mod analysis_tests {
                 assert_eq!(r[0].1, 2048, "top row reaches Nyquist");
             }
         }
+    }
+
+    #[test]
+    fn the_history_strip_moves_with_time_not_with_renders() {
+        // One second is 20 columns whether it was painted 10 or 40 times.
+        let columns = |renders: usize| {
+            let (mut total, mut carry) = (0usize, 0.0f32);
+            for _ in 0..renders {
+                let (n, c) = history_columns(1.0 / renders as f32, carry);
+                total += n;
+                carry = c;
+            }
+            total
+        };
+        assert!((19..=20).contains(&columns(10)), "{}", columns(10));
+        assert!((19..=20).contains(&columns(40)), "{}", columns(40));
+        assert_eq!(history_columns(1e6, 0.0).0, 1, "after a long gap it carries on, no flat line");
+        assert_eq!(history_columns(0.3, 0.0).0, 6, "a short stall still counts its time");
+    }
+
+    #[test]
+    fn the_vu_meter_falls_at_the_same_speed_whatever_the_frame_rate() {
+        // One second of decay as 20 calls of 50 ms or 50 calls of 20 ms.
+        let fall = |calls: usize| {
+            let steps = 1.0 / calls as f32 / VU_FRAME_SECS;
+            (0..calls).fold(1.0f32, |l, _| vu_smooth(l, 0.0, steps))
+        };
+        assert!((fall(20) - fall(50)).abs() < 1e-4, "{} vs {}", fall(20), fall(50));
+        let dot = |calls: usize| {
+            let steps = 2.0 / calls as f32 / VU_FRAME_SECS;
+            let (mut hold, mut timer) = (1.0f32, 0.0f32);
+            vu_dot(1.0, &mut hold, &mut timer, steps);
+            for _ in 0..calls {
+                vu_dot(0.0, &mut hold, &mut timer, steps);
+            }
+            hold
+        };
+        assert!((dot(40) - dot(100)).abs() < 0.03, "dot after 2 s: {} vs {}", dot(40), dot(100));
     }
 
     #[test]

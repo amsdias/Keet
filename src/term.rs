@@ -29,8 +29,16 @@ pub fn push(args: std::fmt::Arguments) {
 
 /// Throw away everything queued (a frame a panic interrupted half-built:
 /// written out on the way down, it left a garbled screen under the message).
+///
+/// Called from the panic hook, so it must not panic itself: a panic while the
+/// buffer is borrowed (inside `push`) would make `borrow_mut` panic again and
+/// abort with raw mode still on. A busy buffer is left alone.
 pub fn discard() {
-    BUF.with(|b| b.borrow_mut().clear());
+    let _ = BUF.try_with(|b| {
+        if let Ok(mut buf) = b.try_borrow_mut() {
+            buf.clear();
+        }
+    });
 }
 
 /// Write everything queued in one go, then flush the terminal.
@@ -143,6 +151,11 @@ mod tests {
         BUF.with(|b| b.borrow_mut().push_str("half a frame"));
         discard();
         assert!(BUF.with(|b| b.borrow().is_empty()));
+        // With the buffer borrowed (a panic inside `push`), it returns quietly.
+        BUF.with(|b| {
+            let _held = b.borrow_mut();
+            discard();
+        });
     }
 
     #[test]

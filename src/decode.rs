@@ -291,6 +291,10 @@ impl ChainBufs {
     }
 }
 
+/// Packets after a track start or a seek whose decode errors are not
+/// reported as damage (see `settling` in the packet loop).
+const SETTLE_PACKETS: usize = 8;
+
 /// Damaged packets in a row a track survives before it is ended: past this
 /// the stream is unreadable from here on, not just a bad frame.
 const MAX_BAD_PACKETS: usize = 64;
@@ -347,6 +351,8 @@ fn apply_chain_and_push(
         eq.process_stereo(&mut bufs.eq_buf);
         &bufs.eq_buf[..]
     } else {
+        // Off, but the audio flowed: switching it on fades in (fade.rs).
+        eq.idle();
         input
     };
 
@@ -357,6 +363,7 @@ fn apply_chain_and_push(
         effects.process_stereo(&mut bufs.fx_buf);
         &bufs.fx_buf[..]
     } else {
+        effects.idle();
         eq_output
     };
 
@@ -379,6 +386,7 @@ fn apply_chain_and_push(
         crossfeed.process_stereo(&mut bufs.xfeed_buf);
         &bufs.xfeed_buf[..]
     } else {
+        crossfeed.idle();
         rg_output
     };
 
@@ -502,10 +510,10 @@ fn push_held_tail(
 /// lies past its end, so just drop the rest of it.
 fn take_seek_for_finished_track(state: &PlayerState) -> Option<Option<f64>> {
     let rel = state.take_seek();
-    if rel == 0 {
+    if rel == 0.0 {
         return None;
     }
-    let target = (state.time_secs() + rel as f64).max(0.0);
+    let target = (state.time_secs() + rel).max(0.0);
     let len = state.total_secs();
     Some((len <= 0.0 || target < len).then_some(target))
 }
@@ -913,7 +921,7 @@ pub fn decode_playlist(
 
         // AAC in MP4: the real audio inside the decoded stream, in frames at
         // the track's sample rate (see gapless.rs).
-        let gapless = crate::gapless::for_mp4(path, &revisions, sample_rate);
+        let gapless = crate::gapless::for_mp4(path, &revisions, sample_rate, Some(track.id)).map(|g| g.with_length_from(total));
         let total = gapless.and_then(|g| g.length).unwrap_or(total);
         // Priming frames are not part of the track's time: the clock and seek
         // targets are shifted by them.
@@ -1098,6 +1106,10 @@ pub fn decode_playlist(
         // Damaged packets: skipped, said once per track, and only a long run
         // of them (the stream is unreadable from here) ends the track.
         let mut bad_in_a_row = 0usize;
+        // Packets after the track start or a seek during which a decode error
+        // is expected, not damage: a decoder restarting mid-stream (an MP3's
+        // bit reservoir) fails its first frames on an intact file.
+        let mut settling = SETTLE_PACKETS;
         let mut damage_reported = false;
         let mut report_damage = |state: &PlayerState| {
             if !damage_reported {
@@ -1164,8 +1176,8 @@ pub fn decode_playlist(
             // reopen; relative requests made meanwhile stack on top of it.
             let rel = state.take_seek();
             let seek_to = match initial_seek.take() {
-                Some(t) => Some((t + rel as f64).max(0.0)),
-                None if rel != 0 => Some((state.time_secs() + rel as f64).max(0.0)),
+                Some(t) => Some((t + rel).max(0.0)),
+                None if rel != 0.0 => Some((state.time_secs() + rel).max(0.0)),
                 None => None,
             };
             if let Some(new_time) = seek_to {
@@ -1239,6 +1251,7 @@ pub fn decode_playlist(
                         // belongs to the old position; symphonia requires a
                         // reset after a seek.
                         decoder.reset();
+                        settling = SETTLE_PACKETS;
                         // A coarse seek lands at or before the target; clock
                         // the position actually reached (FLAC lands up to
                         // ~80 ms early), not the one asked for.
@@ -1316,13 +1329,16 @@ pub fn decode_playlist(
                         break;
                     }
                     track_id = track.id;
+                    settling = SETTLE_PACKETS; // a fresh decoder, as after a seek
                     continue;
                 }
                 // A malformed packet: the demuxer can carry on past it. Ending
                 // the track here cut it short at the first damaged frame.
                 Err(e) if skip_bad_packet(&e, bad_in_a_row) => {
                     bad_in_a_row += 1;
-                    report_damage(state);
+                    if settling == 0 {
+                        report_damage(state);
+                    }
                     continue;
                 }
                 Err(_) => break,    // I/O error, or too much damage in a row
@@ -1334,14 +1350,18 @@ pub fn decode_playlist(
                 decode_pos_secs = (links.start_secs + t - priming_secs).max(0.0);
             }
 
+            settling = settling.saturating_sub(1);
             let decoded = match decoder.decode(&packet) {
                 Ok(d) => {
                     bad_in_a_row = 0;
                     d
                 }
                 Err(_) => {
-                    // Skipped as before, but no longer silently.
-                    report_damage(state);
+                    // Skipped as before, but no longer silently — unless it
+                    // is the restart right after a seek (see `settling`).
+                    if settling == 0 {
+                        report_damage(state);
+                    }
                     continue;
                 }
             };
@@ -2074,6 +2094,39 @@ mod chain_tests {
         assert_eq!(aac.bits_per_sample.load(Ordering::Relaxed), 0, "AAC has no bit depth");
         let (_, flac) = run_chain_state(&[fixture("sine_lr.flac")], 44100, RgMode::Off, 0, false, None);
         assert_eq!(flac.bits_per_sample.load(Ordering::Relaxed), 16);
+    }
+
+    #[test]
+    fn turning_the_eq_on_mid_signal_fades_in_through_the_real_chain() {
+        // A stage only runs while it is on, so one that was off never became
+        // "live" and switched on with a step — the commonest case (Flat to a
+        // preset) was the one left unfaded. Through apply_chain_and_push, as
+        // the producer runs it.
+        let state = PlayerState::new();
+        let (mut producer, mut consumer) = rtrb::RingBuffer::<f32>::new(1 << 16);
+        let mut eq = crate::eq::EqChain::new();
+        let mut fx = crate::effects::EffectsChain::new(48000.0);
+        let mut cf = crate::crossfeed::CrossfeedFilter::new();
+        let mut bufs = ChainBufs::with_capacity(4096);
+        let mut pos = 0usize;
+        let tone = |i: usize| 0.4 * (2.0 * std::f32::consts::PI * 55.0 * i as f32 / 48000.0).sin();
+        let mut chunk = |eq: &mut crate::eq::EqChain, producer: &mut Producer<f32>, start: usize| {
+            let input: Vec<f32> = (start..start + 1024).flat_map(|i| [tone(i), tone(i)]).collect();
+            apply_chain_and_push(&input, producer, &state, eq, &mut fx, &mut cf, 1.0, None, &mut pos, 0, None, &mut bufs);
+        };
+        chunk(&mut eq, &mut producer, 0); // EQ off: passes untouched
+        let boost = crate::eq::builtin_presets().into_iter().find(|p| p.name == "Bass Boost").unwrap();
+        eq.load_preset(&boost, 48000.0);
+        chunk(&mut eq, &mut producer, 1024);
+        let mut out = Vec::new();
+        while let Ok(s) = consumer.pop() {
+            out.push(s);
+        }
+        // The first sample after the switch is still the dry signal (the fade
+        // starts at the old setting), not the boosted one.
+        let (before, after) = (out[2 * 1023], out[2 * 1024]);
+        assert!((after - tone(1024)).abs() < 1e-3, "jumped to {after}, dry is {}", tone(1024));
+        assert!((after - before).abs() < 0.01, "step of {}", (after - before).abs());
     }
 
     #[test]

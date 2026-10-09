@@ -506,12 +506,25 @@ fn open_output(
 /// which retries with a backoff (input keeps working, so quit stays possible).
 /// It used to quit the app — leaving the terminal in raw mode.
 fn output_failed(ui: &mut state::UiState, state: &PlayerState, e: &dyn std::error::Error) {
+    let wait = schedule_retry(ui, state);
+    ui.set_status_for(format!("can't open the output: {e} — retrying in {} s", wait.as_secs()), Duration::from_secs(3));
+}
+
+/// Count a failed attempt and schedule the next one after its backoff
+/// (recovery picks it up from `stream_error`). Returns the wait.
+fn schedule_retry(ui: &mut state::UiState, state: &PlayerState) -> Duration {
     let wait = recovery_backoff(ui.recovery_failures);
     ui.recovery_failures = ui.recovery_failures.saturating_add(1);
-    ui.set_status_for(format!("can't open the output: {e} — retrying in {} s", wait.as_secs()), Duration::from_secs(3));
     state.stream_error.store(true, Ordering::Relaxed);
     ui.recovery_retry_at = Some(Instant::now() + wait);
+    wait
 }
+
+/// An output that dies within this long of opening counted as working: the
+/// failure count was reset on the open, so a device that opens and fails at
+/// once was retried every frame. It is a failed attempt, and only this long
+/// of healthy playback resets the count.
+const OUTPUT_PROVEN_AFTER: Duration = Duration::from_secs(5);
 
 /// How long to wait before the next attempt after `failures` failed ones:
 /// 1, 2, 4, then 8 s. Each attempt opens (and in exclusive mode can probe) a
@@ -1121,7 +1134,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(|d| d.name().to_string())
             .unwrap_or_else(|_| "Unknown device".to_string());
         shown_device_name = device_name.clone();
-        ui.device_name = device_name;
+        // Device names come from drivers: cleaned like any other outside text.
+        ui.device_name = ansi::sanitize_display(&device_name);
 
         // Fix stale sample rate on Bluetooth devices (CoreAudio can get stuck at wrong rate)
         let bt_rate = fix_bluetooth_sample_rate(&device);

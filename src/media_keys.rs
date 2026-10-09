@@ -49,8 +49,7 @@ fn handle_event(state: &PlayerState, event: MediaControlEvent) {
         }
         // A position is absolute: it replaces any seek still pending.
         MediaControlEvent::SetPosition(pos) => {
-            let delta = pos.0.as_secs_f64() - state.time_secs();
-            state.seek_to_offset(delta.round() as i64);
+            state.seek_to_offset(pos.0.as_secs_f64() - state.time_secs());
         }
         _ => {}
     }
@@ -266,16 +265,16 @@ mod tests {
         handle_event(&st, MediaControlEvent::Seek(SeekDirection::Forward));
         handle_event(&st, MediaControlEvent::Seek(SeekDirection::Backward));
         handle_event(&st, MediaControlEvent::Seek(SeekDirection::Backward));
-        assert_eq!(st.take_seek(), -10);
+        assert_eq!(st.take_seek(), -10.0);
         handle_event(&st, MediaControlEvent::SeekBy(SeekDirection::Forward, Duration::from_secs(25)));
-        assert_eq!(st.take_seek(), 25);
+        assert_eq!(st.take_seek(), 25.0);
         // An absolute position becomes a seek relative to the clock (0 here).
         handle_event(&st, MediaControlEvent::SetPosition(MediaPosition(Duration::from_secs_f64(42.4))));
-        assert_eq!(st.take_seek(), 42);
+        assert_eq!(st.take_seek(), 42.4, "a position keeps its fraction");
         // Two drags before the first lands: the second position wins, it is
         // not added to the first (that overshot to 72 s).
         handle_event(&st, MediaControlEvent::SetPosition(MediaPosition(Duration::from_secs(42))));
         handle_event(&st, MediaControlEvent::SetPosition(MediaPosition(Duration::from_secs(30))));
-        assert_eq!(st.take_seek(), 30);
+        assert_eq!(st.take_seek(), 30.0);
     }
 }

@@ -561,13 +561,18 @@ impl PlayerState {
     pub fn take_skip_prev(&self) -> bool { self.skip_prev.swap(false, Ordering::Relaxed) }
     // fetch_add, not store: rapid presses inside one producer-loop iteration
     // must accumulate — a store made the second press overwrite the first.
-    pub fn seek(&self, secs: i64) { self.seek_request.fetch_add(secs, Ordering::Relaxed); }
-    pub fn take_seek(&self) -> i64 { self.seek_request.swap(0, Ordering::Relaxed) }
+    // Kept in MILLISECONDS: an OS seek-bar position is fractional, and whole
+    // seconds rounded it by up to half a second. Keys seek in whole seconds.
+    pub fn seek(&self, secs: i64) { self.seek_request.fetch_add(secs * 1000, Ordering::Relaxed); }
+    /// The pending relative seek, in seconds (0 = none), and clear it.
+    pub fn take_seek(&self) -> f64 { self.seek_request.swap(0, Ordering::Relaxed) as f64 / 1000.0 }
     /// A seek to an absolute position, given as its offset from the clock
     /// now: it REPLACES any seek still pending. The OS seek bar sends
     /// positions; added up like relative seeks, two quick drags measured from
     /// the same clock overshot by the first one's distance.
-    pub fn seek_to_offset(&self, secs: i64) { self.seek_request.store(secs, Ordering::Relaxed); }
+    pub fn seek_to_offset(&self, secs: f64) {
+        self.seek_request.store((secs * 1000.0).round() as i64, Ordering::Relaxed);
+    }
 
     pub fn volume_up(&self) {
         let cur = self.volume.load(Ordering::Relaxed);
@@ -919,7 +924,7 @@ impl PlayerState {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ViewMode {
     Player,
     Playlist,
@@ -1019,6 +1024,8 @@ pub struct UiState {
     pub lyrics_source: Option<crate::lyrics::LyricsSource>,
     /// The window is below ui::MIN_WINDOW and shows the too-small screen.
     pub too_small: bool,
+    /// The view the key list (`?`) was opened from, and closes back to.
+    pub help_return: ViewMode,
     /// A first Esc in the player view asked "press Esc again to quit" and
     /// waits until then for the second.
     pub esc_quit_until: Option<Instant>,
@@ -1039,6 +1046,8 @@ pub struct UiState {
     /// Failed attempts to open the output since the last success (the
     /// retry backoff, see main::recovery_backoff).
     pub recovery_failures: u32,
+    /// When the output last opened (see main::OUTPUT_PROVEN_AFTER).
+    pub output_opened_at: Option<Instant>,
     /// A rescan in progress on a worker thread (see `ui::poll_rescan`).
     pub rescan_receiver: Option<std::sync::mpsc::Receiver<crate::playlist::RescanResult>>,
     pub lyrics_scroll: usize,
@@ -1110,12 +1119,14 @@ impl UiState {
             lyrics_source: None,
             too_small: false,
             esc_quit_until: None,
+            help_return: ViewMode::Player,
             device_name: String::new(),
             hq_resampler: false,
             lyrics_offsets: Default::default(),
             rescan_receiver: None,
             recovery_retry_at: None,
             recovery_failures: 0,
+            output_opened_at: None,
             lyrics_lookups: Default::default(),
             cover_misses: Default::default(),
             lyrics_scroll: 0,
@@ -1296,8 +1307,8 @@ mod state_tests {
         s.seek(10);
         s.seek(10);
         s.seek(-5);
-        assert_eq!(s.take_seek(), 15, "seeks must accumulate, not overwrite");
-        assert_eq!(s.take_seek(), 0, "take_seek must consume the request");
+        assert_eq!(s.take_seek(), 15.0, "seeks must accumulate, not overwrite");
+        assert_eq!(s.take_seek(), 0.0, "take_seek must consume the request");
     }
 
     #[test]

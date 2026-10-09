@@ -60,17 +60,39 @@ pub(crate) fn visible_len(s: &str) -> usize {
     let chars: Vec<char> = s.chars().collect();
     let mut n = 0usize;
     let mut prev = None;
+    let mut flag = Flags::default();
     let mut i = 0usize;
     while i < chars.len() {
         if chars[i] == '\x1B' {
             i += escape_len(&chars, i);
         } else {
-            n += cluster_width(prev, chars[i]);
+            n += flag.width(prev, chars[i]);
             prev = Some(chars[i]);
             i += 1;
         }
     }
     n
+}
+
+/// Pairs regional indicators into flags: two of them (🇵 + 🇹) draw ONE
+/// 2-column glyph. The first of a pair carries both columns and the second
+/// none, so a cut keeps a flag whole or drops it — counted one column each,
+/// the widths added up but a cut could land between the halves.
+#[derive(Default)]
+struct Flags {
+    open: bool,
+}
+
+impl Flags {
+    fn width(&mut self, prev: Option<char>, c: char) -> usize {
+        if ('\u{1F1E6}'..='\u{1F1FF}').contains(&c) {
+            self.open = !self.open;
+            if self.open { 2 } else { 0 }
+        } else {
+            self.open = false;
+            cluster_width(prev, c)
+        }
+    }
 }
 
 /// Columns `c` adds after `prev`, for the emoji sequences a per-char count
@@ -96,6 +118,7 @@ fn cut_to_width(s: &str, max_cols: usize) -> (String, bool) {
     let mut cols = 0usize;
     let mut out = String::with_capacity(s.len());
     let mut prev = None;
+    let mut flag = Flags::default();
     let mut styled = false;
     let mut i = 0usize;
     while i < chars.len() {
@@ -106,7 +129,7 @@ fn cut_to_width(s: &str, max_cols: usize) -> (String, bool) {
             i += n;
             continue;
         }
-        let w = cluster_width(prev, chars[i]);
+        let w = flag.width(prev, chars[i]);
         if cols + w > max_cols {
             // The cut drops the line's closing reset along with its tail; put
             // one back, or the colour runs on into whatever is drawn next.
@@ -218,6 +241,16 @@ mod tests {
         // Even the first does not fit: it is cut (with an ellipsis).
         assert_eq!(fit_segments(&segs, "  ·  ", 8), "track 1…");
         assert_eq!(fit_segments(&segs, "  ·  ", 0), "");
+    }
+
+    #[test]
+    fn flags_measure_as_one_glyph_and_are_never_split() {
+        // A flag is TWO regional indicators drawn as one 2-column glyph.
+        let pt = "\u{1F1F5}\u{1F1F9}"; // 🇵🇹
+        assert_eq!(visible_len(pt), 2);
+        assert_eq!(visible_len(&format!("{pt}{pt}")), 4, "two flags");
+        assert_eq!(truncate_ansi(&format!("{pt}{pt}"), 3), pt, "the cut never halves a flag");
+        assert_eq!(truncate_ansi(&format!("a{pt}"), 2), "a", "nor leaves half of one");
     }
 
     #[test]

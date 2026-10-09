@@ -12,11 +12,26 @@
 //!   where playback starts, and how long it runs.
 
 /// The real audio inside the decoded stream, in frames at the track's rate:
-/// skip `delay` frames, then play `length` (when known).
+/// skip `delay` frames, then play `length` (when known). `padding` is the
+/// encoder's trailing fill, when the tag says (iTunSMPB does; 0 otherwise).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Gapless {
     pub delay: u64,
     pub length: Option<u64>,
+    pub padding: u64,
+}
+
+impl Gapless {
+    /// With no recorded length, work it out from the container's frame count:
+    /// what is left after the priming and the padding. An iTunSMPB with a
+    /// length field of 0 left the priming inside the track's duration.
+    pub fn with_length_from(self, container_frames: u64) -> Self {
+        let derived = (container_frames > 0)
+            .then(|| container_frames.checked_sub(self.delay + self.padding))
+            .flatten()
+            .filter(|&l| l > 0);
+        Self { length: self.length.or(derived), ..self }
+    }
 }
 
 /// Encoder delay and padding for an MP4 file, in frames at `sample_rate`:
@@ -29,6 +44,7 @@ pub fn for_mp4(
     path: &std::path::Path,
     revisions: &[symphonia::core::meta::MetadataRevision],
     sample_rate: u32,
+    track_id: Option<u32>,
 ) -> Option<Gapless> {
     let ext = path.extension()?.to_string_lossy().to_ascii_lowercase();
     if !matches!(ext.as_str(), "m4a" | "m4b" | "mp4" | "m4p") {
@@ -42,7 +58,7 @@ pub fn for_mp4(
             symphonia::core::meta::RawValue::String(s) => from_itunsmpb(s),
             _ => None,
         })
-        .or_else(|| from_mp4_edit_list(path, sample_rate))
+        .or_else(|| from_mp4_edit_list(path, sample_rate, track_id))
 }
 
 /// Parse an iTunSMPB value. None for a malformed one or one saying nothing.
@@ -52,19 +68,22 @@ pub fn from_itunsmpb(value: &str) -> Option<Gapless> {
         .take(4)
         .map(|f| u64::from_str_radix(f, 16).ok())
         .collect::<Option<_>>()?;
-    let [_, delay, _padding, length] = fields[..] else { return None };
-    if delay == 0 && length == 0 {
+    let [_, delay, padding, length] = fields[..] else { return None };
+    if delay == 0 && length == 0 && padding == 0 {
         return None;
     }
-    Some(Gapless { delay, length: (length > 0).then_some(length) })
+    Some(Gapless { delay, length: (length > 0).then_some(length), padding })
 }
 
 /// Read the first audio track's edit list from an MP4 file, in frames at
 /// `sample_rate` (the edit list counts in the track's media timescale, which
 /// is usually but not always the sample rate). Only the common single-segment
 /// form is used: an empty edit (a leading gap) or several segments are left
-/// alone rather than half-applied.
-pub fn from_mp4_edit_list(path: &std::path::Path, sample_rate: u32) -> Option<Gapless> {
+/// alone rather than half-applied. `track_id` (symphonia's, which is the
+/// `tkhd` track ID) picks the track being played; None takes the first audio
+/// track — it always did, so a file whose played track was not the first got
+/// another track's trim.
+pub fn from_mp4_edit_list(path: &std::path::Path, sample_rate: u32, track_id: Option<u32>) -> Option<Gapless> {
     let mut f = std::fs::File::open(path).ok()?;
     let len = f.metadata().ok()?.len();
     let moov = find(&mut f, 0, len, b"moov")?;
@@ -76,6 +95,16 @@ pub fn from_mp4_edit_list(path: &std::path::Path, sample_rate: u32) -> Option<Ga
         let Some(hdlr) = find(&mut f, mdia.0, mdia.1, b"hdlr") else { continue };
         if read_at(&mut f, hdlr.0 + 8, 4)? != b"soun" {
             continue;
+        }
+        if let Some(wanted) = track_id {
+            // tkhd: version, flags, then two timestamps (4 bytes each in
+            // version 0, 8 in version 1), then the track ID.
+            let Some(tkhd) = find(&mut f, start, end, b"tkhd") else { continue };
+            let version = read_at(&mut f, tkhd.0, 1)?[0];
+            let at = tkhd.0 + if version == 1 { 20 } else { 12 };
+            if u32::from_be_bytes(read_at(&mut f, at, 4)?.try_into().ok()?) != wanted {
+                continue;
+            }
         }
         let mdhd = find(&mut f, mdia.0, mdia.1, b"mdhd")?;
         let media_ts = timescale(&mut f, mdhd)?;
@@ -103,7 +132,7 @@ pub fn from_mp4_edit_list(path: &std::path::Path, sample_rate: u32) -> Option<Ga
         }
         let frames = |units: u128, ts: u32| (units * sample_rate as u128 / ts as u128) as u64;
         let length = frames(segment as u128, movie_ts);
-        return Some(Gapless { delay: frames(media_time as u128, media_ts), length: (length > 0).then_some(length) });
+        return Some(Gapless { delay: frames(media_time as u128, media_ts), length: (length > 0).then_some(length), padding: 0 });
     }
     None
 }
@@ -166,8 +195,14 @@ mod tests {
     #[test]
     fn itunsmpb_gives_delay_and_length() {
         let v = " 00000000 00000840 0000037C 000000000000AC44 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000";
-        assert_eq!(from_itunsmpb(v), Some(Gapless { delay: 2112, length: Some(44100) }));
+        assert_eq!(from_itunsmpb(v), Some(Gapless { delay: 2112, length: Some(44100), padding: 892 }));
         assert_eq!(from_itunsmpb("garbage"), None);
+        // A length field of 0: the length comes from the container, minus
+        // the priming and the padding.
+        let no_len = from_itunsmpb(" 00000000 00000840 0000037C 0000000000000000").unwrap();
+        assert_eq!(no_len.length, None);
+        assert_eq!(no_len.with_length_from(2112 + 44100 + 892).length, Some(44100));
+        assert_eq!(no_len.with_length_from(0).length, None, "no container length: still unknown");
         assert_eq!(from_itunsmpb(" 00000000 00000000 00000000 0000000000000000"), None, "says nothing");
     }
 
@@ -175,15 +210,19 @@ mod tests {
     fn edit_list_gives_delay_and_length() {
         // ffmpeg's AAC: 1024 priming frames, 1 s at 44.1 kHz.
         assert_eq!(
-            from_mp4_edit_list(&fixture("sine_aac_editlist.m4a"), 44_100),
-            Some(Gapless { delay: 1024, length: Some(44100) })
+            from_mp4_edit_list(&fixture("sine_aac_editlist.m4a"), 44_100, None),
+            Some(Gapless { delay: 1024, length: Some(44100), padding: 0 })
         );
         // The list counts in the file's own timescale (44.1 kHz here), so a
         // decoder running at another rate gets it converted.
         assert_eq!(
-            from_mp4_edit_list(&fixture("sine_aac_editlist.m4a"), 88_200),
-            Some(Gapless { delay: 2048, length: Some(88200) })
+            from_mp4_edit_list(&fixture("sine_aac_editlist.m4a"), 88_200, None),
+            Some(Gapless { delay: 2048, length: Some(88200), padding: 0 })
         );
-        assert_eq!(from_mp4_edit_list(&fixture("sine_lr.flac"), 44_100), None, "not an MP4");
+        assert_eq!(from_mp4_edit_list(&fixture("sine_lr.flac"), 44_100, None), None, "not an MP4");
+        // By track: the fixture's one track is ID 1; any other ID matches nothing.
+        let one = from_mp4_edit_list(&fixture("sine_aac_editlist.m4a"), 44_100, Some(1));
+        assert_eq!(one.map(|g| g.delay), Some(1024));
+        assert_eq!(from_mp4_edit_list(&fixture("sine_aac_editlist.m4a"), 44_100, Some(2)), None);
     }
 }

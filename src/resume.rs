@@ -60,13 +60,8 @@ pub fn save_state(state: &ResumeState) {
             let _ = std::fs::create_dir_all(parent);
         }
         if let Ok(json) = serde_json::to_string_pretty(state) {
-            // Write to a sibling temp file then rename, so a crash mid-write
-            // can't leave a truncated state.json behind. fs::rename is atomic
-            // on the same filesystem on both POSIX and Windows.
-            let tmp_path = path.with_extension("json.tmp");
-            if std::fs::write(&tmp_path, json).is_ok() {
-                let _ = std::fs::rename(&tmp_path, &path);
-            }
+            // A crash mid-write must not leave a truncated state.json behind.
+            let _ = crate::playlist::write_atomic(&path, json.as_bytes());
         }
     }
 }

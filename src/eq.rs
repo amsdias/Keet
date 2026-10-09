@@ -595,6 +595,11 @@ impl EqChain {
         self.xfade.clear();
     }
 
+    /// Audio passed this stage while it was off (see `fade::Crossfade::idle`).
+    pub fn idle(&mut self) {
+        self.xfade.idle();
+    }
+
     pub fn is_active(&self) -> bool {
         self.active || self.xfade.running()
     }

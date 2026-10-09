@@ -366,10 +366,14 @@ fn read_metadata_full(path: &Path) -> Option<CachedMeta> {
     // AAC in MP4: the container's length includes the encoder's priming and
     // padding; the real length is in iTunSMPB or the edit list.
     let revisions = revisions_newest_first(format.as_mut());
+    let track_id = format.default_track(TrackType::Audio).map(|t| t.id);
     let duration_secs = match rate_of(format.as_ref()).filter(|&r| r > 0) {
-        Some(rate) => crate::gapless::for_mp4(path, &revisions, rate)
-            .and_then(|g| g.length)
-            .map_or(duration_secs, |len| Some(len as f64 / rate as f64)),
+        Some(rate) => {
+            let container = duration_secs.map_or(0, |d| (d * rate as f64).round() as u64);
+            crate::gapless::for_mp4(path, &revisions, rate, track_id)
+                .and_then(|g| g.with_length_from(container).length)
+                .map_or(duration_secs, |len| Some(len as f64 / rate as f64))
+        }
         None => duration_secs,
     };
 

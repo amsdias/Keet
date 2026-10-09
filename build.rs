@@ -12,25 +12,38 @@ fn main() {
     println!("cargo:rustc-env=GIT_VERSION={version}");
     // Re-run when the version can change: HEAD moving to another branch or
     // commit, the current branch getting a new commit (its ref file — HEAD
-    // itself does not change on a commit, so watching only HEAD left a stale
-    // version in every local build), a tag, or refs being packed.
-    println!("cargo:rerun-if-changed=.git/HEAD");
-    println!("cargo:rerun-if-changed=.git/refs/tags");
-    if let Some(branch) = std::fs::read_to_string(".git/HEAD")
-        .ok()
-        .and_then(|h| h.strip_prefix("ref: ").map(|r| r.trim().to_string()))
-    {
-        let ref_file = format!(".git/{branch}");
-        if std::path::Path::new(&ref_file).exists() {
-            println!("cargo:rerun-if-changed={ref_file}");
+    // itself does not change on a commit), a tag, or refs being packed. Paths
+    // come from git itself (`rev-parse --git-path`): in a worktree or a
+    // submodule `.git` is a file pointing elsewhere, and hard-coded `.git/…`
+    // paths watched nothing there.
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    let mut watch = vec!["HEAD".to_string(), "refs/tags".to_string(), "packed-refs".to_string()];
+    if let Some(branch) = git(&["symbolic-ref", "-q", "HEAD"]) {
+        watch.push(branch);
+    }
+    for item in watch {
+        if let Some(path) = git(&["rev-parse", "--git-path", &item]) {
+            if std::path::Path::new(&path).exists() {
+                println!("cargo:rerun-if-changed={path}");
+            }
         }
     }
-    if std::path::Path::new(".git/packed-refs").exists() {
-        println!("cargo:rerun-if-changed=.git/packed-refs");
-    }
 
+    // The icon and version resource, for a Windows TARGET built on a Windows
+    // host (the resource compiler only runs there). `#[cfg]` alone says what
+    // the build script runs on, not what it builds for: a Windows host
+    // building for another OS embedded a Windows resource anyway.
     #[cfg(target_os = "windows")]
-    {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         let mut res = winresource::WindowsResource::new();
         res.set_icon("assets/icon.ico");
         res.set("ProductName", "Keet");
