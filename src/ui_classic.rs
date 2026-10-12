@@ -425,6 +425,9 @@ fn viz_title(mode: VizMode) -> &'static str {
         VizMode::SpectrumHorizontal | VizMode::SpectrumVertical => "Spectrum",
         VizMode::Oscilloscope => "Oscilloscope",
         VizMode::Lissajous => "Vectorscope",
+        VizMode::Polar => "Polar spectrum",
+        VizMode::Galaxy => "Galaxy",
+        VizMode::Cymatics => "Cymatics",
         VizMode::Spectrogram => "Spectrogram",
         VizMode::SpectrogramAnalysis => "Analysis",
     }
@@ -438,6 +441,9 @@ fn viz_next_name(mode: VizMode) -> &'static str {
         VizMode::SpectrumVertical => "spectrum ↕",
         VizMode::Oscilloscope => "oscilloscope",
         VizMode::Lissajous => "vectorscope",
+        VizMode::Polar => "polar",
+        VizMode::Galaxy => "galaxy",
+        VizMode::Cymatics => "cymatics",
         VizMode::Spectrogram => "spectrogram",
         VizMode::SpectrogramAnalysis => "analysis",
     }
@@ -602,6 +608,17 @@ fn player_body(
         VizMode::Oscilloscope => render_oscilloscope(analyser, viz_style, term_w, body).iter().for_each(|l| w.line(l)),
         VizMode::Lissajous => render_lissajous(analyser, viz_style, term_w, body).iter().for_each(|l| w.line(l)),
         VizMode::Spectrogram => render_spectrogram(analyser, viz_style, term_w, body).iter().for_each(|l| w.line(l)),
+        VizMode::Polar => {
+            crate::viz_polar::render_polar(state, &analyser.polar_trail, viz_style, term_w, body, extras).iter().for_each(|l| w.line(l))
+        }
+        VizMode::Galaxy => crate::viz_galaxy::render_galaxy(&analyser.galaxy, state.theme_kind(), viz_style, term_w, body)
+            .iter()
+            .for_each(|l| w.line(l)),
+        VizMode::Cymatics => {
+            crate::viz_cymatics::render_cymatics(&analyser.cymatics, state.theme_kind(), viz_style, term_w, body, extras)
+                .iter()
+                .for_each(|l| w.line(l))
+        }
         VizMode::SpectrogramAnalysis => {
             // viz_style selects the frequency axis here: Dots = log, Bars = linear.
             let log_axis = matches!(viz_style, VizStyle::Dots);
@@ -877,9 +894,10 @@ mod tests {
         }
     }
 
-    const VIZ_MODES: [VizMode; 7] = [
+    const VIZ_MODES: [VizMode; 10] = [
         VizMode::VuMeter, VizMode::SpectrumHorizontal, VizMode::SpectrumVertical, VizMode::Oscilloscope,
-        VizMode::Lissajous, VizMode::Spectrogram, VizMode::SpectrogramAnalysis,
+        VizMode::Lissajous, VizMode::Polar, VizMode::Spectrogram, VizMode::SpectrogramAnalysis, VizMode::Galaxy,
+        VizMode::Cymatics,
     ];
 
     #[test]

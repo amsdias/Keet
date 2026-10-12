@@ -224,6 +224,43 @@ pub fn borders(kind: ThemeKind) -> Borders {
     }
 }
 
+/// An RGB colour.
+pub type Rgb = (u8, u8, u8);
+
+/// Where a theme sits on the hue wheel (degrees): Classic's green,
+/// Minimal's cyan, HiFi's amber. The truecolor art (the first-launch
+/// ripples, the galaxy) starts from here.
+pub fn base_hue(kind: ThemeKind) -> f32 {
+    match kind {
+        ThemeKind::Classic => 140.0,
+        ThemeKind::Minimal => 175.0,
+        ThemeKind::HiFi => 36.0,
+    }
+}
+
+/// HSV (hue in degrees, saturation and value 0..=1) to RGB.
+pub fn hsv(h: f32, s: f32, v: f32) -> Rgb {
+    let c = v * s;
+    let hp = h.rem_euclid(360.0) / 60.0;
+    let x = c * (1.0 - (hp % 2.0 - 1.0).abs());
+    let (r, g, b) = match hp as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = v - c;
+    let byte = |f: f32| ((f + m) * 255.0).round().clamp(0.0, 255.0) as u8;
+    (byte(r), byte(g), byte(b))
+}
+
+/// The SGR sequence for a truecolor foreground.
+pub fn fg_rgb(c: Rgb) -> String {
+    format!("\x1B[38;2;{};{};{}m", c.0, c.1, c.2)
+}
+
 #[cfg(test)]
 mod theme_tests {
     use super::*;

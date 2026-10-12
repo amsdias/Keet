@@ -17,7 +17,7 @@ A high-performance, low-CPU terminal audio player with real-time spectrum visual
 - **Crossfade**: Smooth equal-power crossfade between tracks (`--crossfade`)
 - **Pre/post-fader metering**: Toggle between raw signal and volume-adjusted visualization
 - **Media controls**: AirPods stalk controls, Bluetooth headphone buttons, keyboard media keys, OS seek bar / skip-by seeking (macOS/Windows/Linux)
-- **Real-time visualizations**: VU meter, horizontal/vertical spectrum, oscilloscope, lissajous (vector scope), spectrogram, and a high-resolution pixel-image analysis spectrogram (Kitty graphics / Sixel) — toggleable bars/dots styles
+- **Real-time visualizations**: VU meter, horizontal/vertical spectrum, oscilloscope, lissajous (vector scope), polar spectrum (each channel's bands round a circle), spectrogram, a high-resolution pixel-image analysis spectrogram (Kitty graphics / Sixel), a galaxy that moves with the music, and cymatics (Chladni sand patterns of the dominant frequency) — toggleable bars/dots styles
 - **Album cover art**: Auto-decoded from embedded tags or sidecar files; rendered via Kitty / iTerm2 / Sixel graphics protocols, with truecolor half-block fallback (used automatically for WezTerm on Windows, where ConPTY drops Kitty graphics)
 - **Metadata display**: Reads artist/title/album/track number from ID3, Vorbis, and MP4 tags
 - **Format-colored icons**: File type indicated by icon color (green=MP3, cyan=FLAC, yellow=WAV, etc.)
@@ -98,7 +98,9 @@ keet --list-devices
 # Play on a specific device with exclusive mode
 keet ~/Music/ --device "USB Audio DAC" --exclusive
 
-# Resume last session (no files or folders; options given win over the saved ones)
+# Resume last session (no files or folders; options given win over the saved ones).
+# With no session yet, a welcome screen asks for a folder: pick it in the system
+# dialog, or type, paste or drop its path
 keet
 keet --theme hifi
 
@@ -225,7 +227,7 @@ For a *persistent* default that applies on every launch (including with explicit
 | Key | Values |
 |-----|--------|
 | `theme` | `classic` \| `minimal` \| `hifi` |
-| `viz` | `none` \| `vu` \| `spectrum` \| `spectrum-vertical` \| `oscilloscope` \| `lissajous` \| `spectrogram` \| `analysis` |
+| `viz` | `none` \| `vu` \| `spectrum` \| `spectrum-vertical` \| `oscilloscope` \| `lissajous` \| `polar` \| `spectrogram` \| `analysis` \| `galaxy` \| `cymatics` |
 | `rg_mode` | `track` \| `album` \| `off` |
 | `eq` | any preset name (built-in or custom) |
 | `crossfeed` | `off` \| `light` \| `medium` \| `strong` \| any custom preset name |
@@ -433,8 +435,11 @@ Press `V` to cycle through:
 4. **Spectrum Vertical** - 31-band analyzer with peak dots and height-based color gradient (green -> yellow -> red)
 5. **Oscilloscope** - Mono waveform; `Bars` style uses quadrant blocks for 2x sub-cell resolution
 6. **Lissajous** - Stereo vector scope (L vs R); detects mono/stereo/anti-phase imbalance
-7. **Spectrogram** - Scrolling time-frequency heatmap, dense colormap palette
-8. **Analysis Spectrogram** - High-resolution time × frequency spectrogram with a magma colormap, rendered as a true pixel image — fine enough to reveal detail like images encoded into audio. On Kitty-protocol terminals (Kitty, Ghostty, WezTerm) it uses Kitty graphics with in-place image replacement; on Windows Terminal it uses a custom fixed-palette Sixel encoder that only re-transmits when the image changes, so scrolling stays smooth and shimmer-free even through ConPTY. Falls back to half-block truecolor elsewhere (iTerm2, WezTerm on Windows, plain terminals). The block auto-sizes to fit the window height. Linear frequency axis by default (`B` toggles linear/log); scroll cadence is matched to the sample rate for smooth motion. A frequency legend runs down the left edge, labelled to suit the axis: octave anchors (C1, C2, … — log spacing puts octaves at even intervals, so pitch can be read straight off the image) on the log axis, and Hz landmarks on the linear one. It is dropped below 60 columns so narrow windows keep their width for the image.
+7. **Polar Spectrum** - The 31 bands round a circle: left channel on the left half, right on the right, bass at the bottom and treble at the top. A mix that leans to one side at some frequencies shows as a lopsided shape there. `Bars` fills each band; `Dots` draws its outline with trails of the last half second inside it, drifting toward the centre as they fade. Both are painted from a palette running from dark blue at the centre through teal and green to a pastel coral at full scale, so a loud band glows at its tip; the faint outer ring is the peak hold; `Shift+L` labels the halves and 100 Hz / 1 kHz / 10 kHz
+8. **Spectrogram** - Scrolling time-frequency heatmap, dense colormap palette
+9. **Analysis Spectrogram** - High-resolution time × frequency spectrogram with a magma colormap, rendered as a true pixel image — fine enough to reveal detail like images encoded into audio. On Kitty-protocol terminals (Kitty, Ghostty, WezTerm) it uses Kitty graphics with in-place image replacement; on Windows Terminal it uses a custom fixed-palette Sixel encoder that only re-transmits when the image changes, so scrolling stays smooth and shimmer-free even through ConPTY. Falls back to half-block truecolor elsewhere (iTerm2, WezTerm on Windows, plain terminals). The block auto-sizes to fit the window height. Linear frequency axis by default (`B` toggles linear/log); scroll cadence is matched to the sample rate for smooth motion. A frequency legend runs down the left edge, labelled to suit the axis: octave anchors (C1, C2, … — log spacing puts octaves at even intervals, so pitch can be read straight off the image) on the log axis, and Hz landmarks on the linear one. It is dropped below 60 columns so narrow windows keep their width for the image.
+10. **Galaxy** - Just for looks: a spiral of dust that turns faster as the music gets louder. The 31 bands are split as an equalizer splits them: every bass hit (20–250 Hz: sub-bass and bass, a kick drum) flashes it and sends a shockwave out from the core, every mid-range hit (250 Hz–4 kHz: low, middle and upper mids — snare, chord, voice) sends a streak of a new colour out along one of its arms, every treble hit (4–20 kHz: presence and brilliance — hi-hat, cymbal) bursts the stars round it (stars come in real star colours: blue, white, yellow, orange, red), and its colours warm as the sound gets brighter. In silence or on pause it keeps turning slowly, dimmed. `Bars` draws dust glyphs, `Dots` finer braille dust. Inspired by the animated splash screen of [nebula](https://github.com/agentSystemLabs/nebula)
+11. **Cymatics** - Sand on a vibrating plate, as in Chladni's experiment — square, or 2:1 or 3:1 when the window is wide enough to show more that way: the loudest frequency picks one of the plate's resonances, low notes drawing a few broad lines and high ones a dense lattice. When the dominant frequency changes (and stays changed for a moment) the pattern morphs into the next, the sand sliding into place. Louder music puts more sand on the plate, makes it shimmer and warms its colours, which also follow the frequency, spread from the plate's centre to its corners and cycle slowly round the colour wheel. `Dots` draws fine braille sand, `Bars` bold shaded lines; `Shift+L` shows the frequency and the mode under the plate
 
 Press `B` to toggle between two visualization styles:
 - **Dots** - Braille characters for sub-cell precision (used by VU/oscilloscope/lissajous/spectrogram)
@@ -498,7 +503,11 @@ src/
 ├── lyrics.rs       LRC parser, LRCLIB API client, per-track sync offsets
 ├── cover.rs        Album cover decoding, Kitty/iTerm2/Sixel/half-block rendering
 ├── resume.rs       Resume state persistence (save/restore sessions)
+├── welcome.rs      First-launch screen (animated ripples, folder prompt)
 ├── viz.rs          VizAnalyser, StatsMonitor, spectrum/oscilloscope/lissajous/spectrogram rendering
+├── viz_polar.rs    Polar spectrum (each channel's bands round a circle)
+├── viz_galaxy.rs   Galaxy visualization (motion driven by loudness, bass, beats)
+├── viz_cymatics.rs Cymatics visualization (Chladni plate patterns of the dominant frequency)
 ├── media_keys.rs   OS media transport controls (souvlaki)
 ├── term.rs         Batched terminal output (one write per frame), NO_COLOR
 ├── ansi.rs         Display width, cutting and fitting lines, sanitising text
@@ -535,7 +544,7 @@ Options:
   --theme <name>    UI theme: classic (default), minimal, hifi
 ```
 
-Multiple files, folders, and M3U playlists can be passed as arguments. Duplicates are removed automatically. Running `keet` with no arguments resumes the last session.
+Multiple files, folders, and M3U playlists can be passed as arguments. Duplicates are removed automatically. Running `keet` with no arguments resumes the last session; on the very first run it opens a welcome screen that asks for a folder (its animation is inspired by [nebula](https://github.com/agentSystemLabs/nebula)'s splash screen).
 
 ## Dependencies
 

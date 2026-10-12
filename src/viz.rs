@@ -25,17 +25,17 @@ use crate::theme::{palette as theme_palette, ThemeKind};
 /// Per-theme color set used by the viz renderers. `low/mid/hot` map onto the
 /// classic green→yellow→red gradient; non-Classic themes collapse them onto
 /// the active palette so the spectrum/VU adopt the theme's identity.
-struct VizPalette {
-    low: &'static str,
-    mid: &'static str,
-    hot: &'static str,
+pub(crate) struct VizPalette {
+    pub(crate) low: &'static str,
+    pub(crate) mid: &'static str,
+    pub(crate) hot: &'static str,
     #[allow(dead_code)]
     accent: &'static str,
-    dim: &'static str,
-    reset: &'static str,
+    pub(crate) dim: &'static str,
+    pub(crate) reset: &'static str,
 }
 
-fn viz_palette(kind: ThemeKind) -> VizPalette {
+pub(crate) fn viz_palette(kind: ThemeKind) -> VizPalette {
     match kind {
         ThemeKind::Classic => {
             // The signal colour for the body, caution for the loud top rows:
@@ -349,6 +349,12 @@ pub struct VizAnalyser {
     ballistics: Ballistics,
     // Recent raw (L, R) samples, newest at back. Used by oscilloscope and lissajous.
     pub(crate) waveform_buf: VecDeque<(f32, f32)>,
+    /// What the music has done to the galaxy (`viz_galaxy`).
+    pub(crate) galaxy: crate::viz_galaxy::GalaxyMotion,
+    /// The polar spectrum's trails (`viz_polar`).
+    pub(crate) polar_trail: crate::viz_polar::PolarTrail,
+    /// What the music has done to the cymatics plate (`viz_cymatics`).
+    pub(crate) cymatics: crate::viz_cymatics::CymaticsMotion,
     // History of mono spectrum frames, newest at back. Used by spectrogram.
     pub(crate) spectrogram_history: VecDeque<[f32; SPECTRUM_BANDS]>,
     // Analysis spectrogram: per-hop dB magnitude columns (one Vec<f32> of length
@@ -468,6 +474,9 @@ impl VizAnalyser {
             sample_rate,
             ballistics: Ballistics::for_rate(sample_rate),
             waveform_buf: VecDeque::with_capacity(WAVEFORM_BUF_SIZE),
+            galaxy: Default::default(),
+            polar_trail: Default::default(),
+            cymatics: Default::default(),
             spectrogram_history: VecDeque::with_capacity(SPECTROGRAM_COLS),
             spectro_raw_history: VecDeque::with_capacity(SPECTRO_ANALYSIS_COLS),
             spectro_mag_l: Vec::new(),
@@ -545,6 +554,12 @@ impl VizAnalyser {
             // Process R channel
             load_frame(&mut self.fft_input, &self.ch_r.sample_buffer, &self.window);
             let r_bands = Self::run_fft_and_compute(&*self.fft, &mut self.fft_input, &mut self.fft_output, &mut self.fft_scratch, self.sample_rate);
+
+            // The galaxy reads its hits off the raw bands, before the smoothing.
+            if state.viz_mode() == VizMode::Galaxy {
+                let raw: [f32; SPECTRUM_BANDS] = std::array::from_fn(|i| (l_bands[i] + r_bands[i]) / 2.0);
+                self.galaxy.hop(&raw, (FFT_SIZE / 2) as f32 / self.sample_rate.max(1) as f32);
+            }
 
             // Analysis-spectrogram capture: accumulate mono magnitude = avg(|L|,|R|)
             // per bin, and push one averaged dB column every `hops_per_col` hops so
@@ -633,6 +648,27 @@ impl VizAnalyser {
             // 50% overlap
             self.ch_l.sample_buffer.drain(..FFT_SIZE / 2);
             self.ch_r.sample_buffer.drain(..FFT_SIZE / 2);
+        }
+
+        // The galaxy moves by the audio this call covered, like the meter.
+        if state.viz_mode() == VizMode::Galaxy {
+            let secs = frames as f32 / self.sample_rate.max(1) as f32;
+            let level = (self.smoothed_peak_l + self.smoothed_peak_r) / 2.0;
+            let bands: [f32; SPECTRUM_BANDS] =
+                std::array::from_fn(|i| (self.ch_l.smoothed[i] + self.ch_r.smoothed[i]) / 2.0);
+            self.galaxy.update(secs, level, &bands);
+        }
+        if state.viz_mode() == VizMode::Cymatics {
+            let secs = frames as f32 / self.sample_rate.max(1) as f32;
+            let bands: [f32; SPECTRUM_BANDS] =
+                std::array::from_fn(|i| (self.ch_l.smoothed[i] + self.ch_r.smoothed[i]) / 2.0);
+            self.cymatics.update(secs, &bands);
+        }
+        if state.viz_mode() == VizMode::Polar {
+            let secs = frames as f32 / self.sample_rate.max(1) as f32;
+            self.polar_trail.push(secs, &self.ch_l.smoothed, &self.ch_r.smoothed);
+        } else {
+            self.polar_trail.clear();
         }
     }
 
@@ -930,7 +966,7 @@ fn vu_history_lines(hist: &[(f32, f32)], w: usize, rows: usize, style: VizStyle,
 /// window edge (a 14-column VU line in a 1-column window). An over-wide line
 /// wraps into a row nobody budgeted for and drifts the frame, so a too-small
 /// window gets a clipped picture rather than a broken frame.
-fn fit_width(lines: Vec<String>, width: usize) -> Vec<String> {
+pub(crate) fn fit_width(lines: Vec<String>, width: usize) -> Vec<String> {
     lines
         .into_iter()
         .map(|l| {
@@ -1351,7 +1387,7 @@ fn spectrum_group(spec: &[f32; SPECTRUM_BANDS], group: (usize, usize)) -> (f32, 
 /// Short label for a band centre, in at most three columns and never
 /// ambiguous: `fmt_gutter_hz` rounds 1000, 1250 and 1600 all to "1k", which
 /// would print the same label over three different bins.
-fn fmt_band_hz(f: f32) -> String {
+pub(crate) fn fmt_band_hz(f: f32) -> String {
     let hz = f.round() as i64;
     if hz < 1000 {
         return format!("{hz}");
@@ -1466,6 +1502,9 @@ fn viz_max_rows(mode: VizMode, fullscreen: bool, extras: bool) -> usize {
         // Sixel to encode per hop, so its normal ceiling stays put.
         VizMode::SpectrogramAnalysis =>
             if fullscreen { SPECTRO_ANALYSIS_MAX_ROWS } else { SPECTRO_ANALYSIS_ROWS },
+        VizMode::Polar => if fullscreen { crate::viz_polar::POLAR_MAX_ROWS } else { 36 },
+        VizMode::Galaxy => if fullscreen { crate::viz_galaxy::GALAXY_MAX_ROWS } else { 16 },
+        VizMode::Cymatics => if fullscreen { crate::viz_cymatics::CYMATICS_MAX_ROWS } else { 24 },
         _ => 0,
     }
 }
@@ -1486,7 +1525,7 @@ const OSCILLOSCOPE_DUAL_ROWS: usize = 10;
 const OSCILLOSCOPE_MAX_COLS: usize = WAVEFORM_BUF_SIZE / 2;
 
 // Bit offsets within a braille cell for dot (px, py) where px∈0..2, py∈0..4.
-const BRAILLE_BITS: [[u32; 4]; 2] = [
+pub(crate) const BRAILLE_BITS: [[u32; 4]; 2] = [
     [0x01, 0x02, 0x04, 0x40],
     [0x08, 0x10, 0x20, 0x80],
 ];
@@ -2798,7 +2837,10 @@ mod analysis_tests {
             VizMode::SpectrumVertical,
             VizMode::Oscilloscope,
             VizMode::Lissajous,
+            VizMode::Polar,
             VizMode::Spectrogram,
+            VizMode::Galaxy,
+            VizMode::Cymatics,
         ];
         for mode in modes {
             for style in [VizStyle::Dots, VizStyle::Bars] {
@@ -2822,6 +2864,12 @@ mod analysis_tests {
                                 render_lissajous(&analyser, style, term_w, rows),
                             VizMode::Spectrogram =>
                                 render_spectrogram(&analyser, style, term_w, rows),
+                            VizMode::Polar =>
+                                crate::viz_polar::render_polar(&state, &analyser.polar_trail, style, term_w, rows, extras),
+                            VizMode::Galaxy => crate::viz_galaxy::render_galaxy(
+                                &analyser.galaxy, state.theme_kind(), style, term_w, rows),
+                            VizMode::Cymatics => crate::viz_cymatics::render_cymatics(
+                                &analyser.cymatics, state.theme_kind(), style, term_w, rows, extras),
                             _ => unreachable!(),
                         };
                         assert_eq!(
@@ -2855,8 +2903,8 @@ mod analysis_tests {
                 let avail = viz_rows_available(term_h, above, 3);
                 for mode in [VizMode::VuMeter, VizMode::SpectrumHorizontal,
                              VizMode::SpectrumVertical, VizMode::Oscilloscope,
-                             VizMode::Lissajous, VizMode::Spectrogram,
-                             VizMode::SpectrogramAnalysis] {
+                             VizMode::Lissajous, VizMode::Polar, VizMode::Spectrogram,
+                             VizMode::SpectrogramAnalysis, VizMode::Galaxy, VizMode::Cymatics] {
                     {
                         let body = viz_body_rows(mode, avail, true, true);
                         assert!(body <= avail, "{mode:?} claimed {body} of {avail}");

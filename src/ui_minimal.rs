@@ -417,6 +417,9 @@ pub fn print_status_minimal(
                 VizMode::Oscilloscope => render_oscilloscope(analyser, viz_style, term_w, viz_body),
                 VizMode::Lissajous => render_lissajous(analyser, viz_style, term_w, viz_body),
                 VizMode::Spectrogram => render_spectrogram(analyser, viz_style, term_w, viz_body),
+                VizMode::Polar => crate::viz_polar::render_polar(state, &analyser.polar_trail, viz_style, term_w, viz_body, extras),
+                VizMode::Galaxy => crate::viz_galaxy::render_galaxy(&analyser.galaxy, state.theme_kind(), viz_style, term_w, viz_body),
+                VizMode::Cymatics => crate::viz_cymatics::render_cymatics(&analyser.cymatics, state.theme_kind(), viz_style, term_w, viz_body, extras),
                 VizMode::SpectrogramAnalysis => unreachable!("handled above"),
             };
             for line in &viz_lines {
@@ -611,6 +614,9 @@ fn viz_section_label(mode: VizMode) -> &'static str {
         VizMode::SpectrumVertical => "SPECTRUM",
         VizMode::Oscilloscope => "OSCILLOSCOPE",
         VizMode::Lissajous => "VECTOR",
+        VizMode::Polar => "POLAR",
+        VizMode::Galaxy => "GALAXY",
+        VizMode::Cymatics => "CYMATICS",
         VizMode::Spectrogram | VizMode::SpectrogramAnalysis => "SPECTROGRAM",
     }
 }

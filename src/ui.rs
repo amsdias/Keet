@@ -8,7 +8,7 @@ use crossterm::terminal;
 
 use crate::state::{
     Pick, PlayerState, VizMode, RepeatMode,
-    C_RESET, C_BOLD, C_DIM, C_CYAN, C_RED,
+    C_RESET, C_BOLD,
     ViewMode, InputMode, UiState,
 };
 use crate::viz::{StatsMonitor, VizAnalyser};
@@ -983,7 +983,8 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
                     let on = state.toggle_viz_extras();
                     let what = match state.viz_mode() {
                         VizMode::VuMeter => "level history",
-                        VizMode::SpectrumHorizontal | VizMode::SpectrumVertical => "band legend",
+                        VizMode::SpectrumHorizontal | VizMode::SpectrumVertical | VizMode::Polar => "band legend",
+                        VizMode::Cymatics => "frequency readout",
                         _ => "detail (not used by this viz)",
                     };
                     ui.set_status(format!("{what}: {}", if on { "on" } else { "off" }));
@@ -2274,8 +2275,7 @@ fn prompt_path_line() -> Option<PathBuf> {
                 KeyCode::Esc => break None,
                 KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => break None,
                 KeyCode::Enter => {
-                    let trimmed = buf.trim().to_string();
-                    break if trimmed.is_empty() { None } else { Some(PathBuf::from(trimmed)) };
+                    break crate::welcome::parse_typed_path(&buf);
                 }
                 KeyCode::Backspace
                     if buf.pop().is_some() => {
@@ -2300,55 +2300,11 @@ fn prompt_path_line() -> Option<PathBuf> {
     result
 }
 
-/// Interactive first-launch picker shown when the user runs keet with no args
-/// and no saved session. Returns the selected path or None if the user quit.
-pub fn run_first_launch_picker() -> Option<PathBuf> {
-    let native = has_native_picker();
-    loop {
-        println!();
-        println!("  {}Keet{} — no music source given and no saved session.", C_BOLD, C_RESET);
-        println!();
-        if native {
-            println!("  {}P{}  Pick a folder", C_CYAN, C_RESET);
-        }
-        println!("  {}T{}  Type a path", C_CYAN, C_RESET);
-        println!("  {}Q{}  Quit", C_CYAN, C_RESET);
-        println!();
-        crate::term::out!("  {}Choose:{} ", C_DIM, C_RESET);
-        crate::term::flush();
-
-        if terminal::enable_raw_mode().is_err() {
-            return None;
-        }
-        let key = loop {
-            if let Ok(true) = event::poll(Duration::from_millis(500)) {
-                if let Ok(Event::Key(k)) = event::read() {
-                    if k.kind == KeyEventKind::Release { continue; }
-                    break k;
-                }
-            }
-        };
-        let _ = terminal::disable_raw_mode();
-        println!();
-
-        let chosen = match key.code {
-            KeyCode::Char('p') | KeyCode::Char('P') if native => pick_folder_native(),
-            KeyCode::Char('t') | KeyCode::Char('T') => prompt_path_line(),
-            KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => return None,
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return None,
-            _ => continue,
-        };
-
-        match chosen {
-            Some(p) if p.exists() => return Some(p),
-            Some(p) => {
-                println!("  {}Path not found:{} {}", C_RED, C_RESET, p.display());
-            }
-            None => {
-                println!("  {}Cancelled{}", C_DIM, C_RESET);
-            }
-        }
-    }
+/// The first-launch screen (`welcome.rs`), shown when keet runs with no
+/// sources and no saved session. Returns the chosen folder, or None if the
+/// user quit.
+pub fn run_first_launch_picker(kind: crate::theme::ThemeKind) -> Option<PathBuf> {
+    crate::welcome::run(kind, has_native_picker(), pick_folder_native)
 }
 
 #[cfg(test)]

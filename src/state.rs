@@ -159,6 +159,9 @@ pub enum VizMode {
     Lissajous = 5,
     Spectrogram = 6,
     SpectrogramAnalysis = 7,
+    Polar = 8,
+    Galaxy = 9,
+    Cymatics = 10,
 }
 
 impl VizMode {
@@ -169,9 +172,12 @@ impl VizMode {
             VizMode::SpectrumHorizontal => VizMode::SpectrumVertical,
             VizMode::SpectrumVertical => VizMode::Oscilloscope,
             VizMode::Oscilloscope => VizMode::Lissajous,
-            VizMode::Lissajous => VizMode::Spectrogram,
+            VizMode::Lissajous => VizMode::Polar,
+            VizMode::Polar => VizMode::Spectrogram,
             VizMode::Spectrogram => VizMode::SpectrogramAnalysis,
-            VizMode::SpectrogramAnalysis => VizMode::None,
+            VizMode::SpectrogramAnalysis => VizMode::Galaxy,
+            VizMode::Galaxy => VizMode::Cymatics,
+            VizMode::Cymatics => VizMode::None,
         }
     }
 
@@ -184,6 +190,9 @@ impl VizMode {
             5 => VizMode::Lissajous,
             6 => VizMode::Spectrogram,
             7 => VizMode::SpectrogramAnalysis,
+            8 => VizMode::Polar,
+            9 => VizMode::Galaxy,
+            10 => VizMode::Cymatics,
             _ => VizMode::None,
         }
     }
@@ -199,6 +208,9 @@ impl VizMode {
             "lissajous" | "vector" => Some(VizMode::Lissajous),
             "spectrogram" => Some(VizMode::Spectrogram),
             "analysis" | "analysis-spectrogram" => Some(VizMode::SpectrogramAnalysis),
+            "polar" | "polar-spectrum" => Some(VizMode::Polar),
+            "galaxy" => Some(VizMode::Galaxy),
+            "cymatics" | "chladni" => Some(VizMode::Cymatics),
             _ => None,
         }
     }

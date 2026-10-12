@@ -16,6 +16,9 @@ mod config;
 mod library;
 mod eq_ui;
 mod viz;
+mod viz_cymatics;
+mod viz_galaxy;
+mod viz_polar;
 mod audio;
 mod decode;
 mod playlist;
@@ -35,6 +38,7 @@ mod gapless;
 mod fade;
 mod signal;
 mod term;
+mod welcome;
 #[cfg(target_os = "windows")]
 mod wasapi_out;
 mod wasapi_logic;
@@ -1029,7 +1033,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 (paths, rs.shuffle || opts.shuffle, rm)
             }
             None => {
-                match ui::run_first_launch_picker() {
+                // The configured theme colours the screen (no session to take one from).
+                let kind = opts.theme
+                    .or_else(|| config::load().theme.as_deref().and_then(theme::ThemeKind::from_str))
+                    .unwrap_or(theme::ThemeKind::Classic);
+                match ui::run_first_launch_picker(kind) {
                     Some(p) => (vec![p], false, state::RepeatMode::Off),
                     None => {
                         eprintln!("Usage: {} <file-or-folder>... [options]  (--help for all of them)", args[0]);

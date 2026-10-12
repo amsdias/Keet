@@ -14,7 +14,8 @@ pub struct Config {
     #[serde(default)]
     pub theme: Option<String>,
     /// Default visualization: `none | vu | spectrum | spectrum-vertical |
-    /// oscilloscope | lissajous | spectrogram | analysis`.
+    /// oscilloscope | lissajous | polar | spectrogram | analysis | galaxy |
+    /// cymatics`.
     #[serde(default)]
     pub viz: Option<String>,
     /// Default ReplayGain mode: `track | album | off`.
