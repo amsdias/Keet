@@ -1,0 +1,15 @@
+{
+  "name": "Electronic",
+  "bands": [
+    { "type": "peak",       "freq": 31,    "gain": 0.0,  "q": 0.71 },
+    { "type": "low_shelf",  "freq": 60,    "gain": 4.0,  "q": 0.71 },
+    { "type": "peak",       "freq": 120,   "gain": 2.0,  "q": 0.8 },
+    { "type": "peak",       "freq": 400,   "gain": -2.0, "q": 1.0 },
+    { "type": "peak",       "freq": 800,   "gain": 0.0,  "q": 0.71 },
+    { "type": "peak",       "freq": 1500,  "gain": 0.0,  "q": 0.71 },
+    { "type": "peak",       "freq": 3000,  "gain": 1.5,  "q": 1.0 },
+    { "type": "peak",       "freq": 6000,  "gain": 0.0,  "q": 0.71 },
+    { "type": "high_shelf", "freq": 9000,  "gain": 3.5,  "q": 0.71 },
+    { "type": "peak",       "freq": 16000, "gain": 0.0,  "q": 0.71 }
+  ]
+}

@@ -82,20 +82,25 @@ pub fn parse_lyrics(raw: &str) -> Lyrics {
             // A line may carry several timestamps sharing the same text.
             // Non-timestamped lines (metadata like [ar:Artist]) yield nothing.
             for (time, text) in parse_lrc_line(line) {
-                // Lyrics are drawn straight into frame lines, and LRCLIB text
-                // is user-submitted: strip control characters (ESC, CR, ...).
                 let time = (time - offset_secs).max(0.0);
-                lines.push(LrcLine { time, text: crate::ansi::sanitize_display(&strip_word_tags(&text)) });
+                lines.push(LrcLine { time, text: clean_line(&strip_word_tags(&text)) });
             }
         }
         lines.sort_by(|a, b| a.time.partial_cmp(&b.time).unwrap_or(std::cmp::Ordering::Equal));
         Lyrics::Synced(lines)
     } else {
-        let lines: Vec<String> = raw.lines()
-            .map(crate::ansi::sanitize_display)
-            .collect();
+        let lines: Vec<String> = raw.lines().map(clean_line).collect();
         Lyrics::Plain(lines)
     }
+}
+
+/// A lyric line as it is shown. Lyrics are drawn straight into frame lines,
+/// and LRCLIB text is user-submitted: control characters (ESC, CR, ...) are
+/// stripped. Spaces at either end are dropped — most LRC files put one after
+/// the timestamp (`[00:17.12] I feel it`), which shifted those lines a
+/// column right of the rest and off Minimal's centre.
+fn clean_line(text: &str) -> String {
+    crate::ansi::sanitize_display(text).trim().to_string()
 }
 
 /// Remove enhanced-LRC word timing (`<00:12.34>` before each word): Keet
@@ -248,6 +253,8 @@ pub enum Lookup<T> {
     Found(T),
     NotFound,
     Failed,
+    /// Asked too often (HTTP 429), with the Retry-After seconds when given.
+    Busy(Option<u64>),
 }
 
 /// Session cache of network lookups, keyed by query. Shared with the worker
@@ -259,25 +266,6 @@ pub struct LookupCache<T: Clone = String> {
 }
 
 impl<T: Clone> LookupCache<T> {
-    /// The remembered answer for `key`, or `fetch` it — remembering found and
-    /// not-found answers, but not failures.
-    pub fn get_or_fetch(&self, key: String, fetch: impl FnOnce() -> Lookup<T>) -> Option<T> {
-        if let Some(hit) = self.known(&key) {
-            return hit;
-        }
-        match fetch() {
-            Lookup::Found(v) => {
-                self.remember(key, Some(v.clone()));
-                Some(v)
-            }
-            Lookup::NotFound => {
-                self.remember(key, None);
-                None
-            }
-            Lookup::Failed => None,
-        }
-    }
-
     /// The remembered answer, if there is one (`Some(None)` = known missing).
     pub fn known(&self, key: &str) -> Option<Option<T>> {
         self.map.lock().ok().and_then(|m| m.get(key).cloned())
@@ -300,12 +288,22 @@ pub fn fetch_lrclib(artist: &str, title: &str, duration_secs: Option<u32>) -> Lo
         url.push_str(&format!("&duration={}", dur));
     }
 
-    let response = match http_agent().get(&url).call() {
-        Ok(r) if r.status() == 200 => r,
-        // LRCLIB answers 404 for a track it has no lyrics for.
-        Err(ureq::Error::StatusCode(404)) => return Lookup::NotFound,
-        _ => return Lookup::Failed,
+    // Statuses read here, not as errors: a 429's Retry-After is a header.
+    let response = match http_agent().get(&url).config().http_status_as_error(false).build().call() {
+        Ok(r) => r,
+        Err(_) => return Lookup::Failed,
     };
+    match response.status().as_u16() {
+        200 => {}
+        // LRCLIB answers 404 for a track it has no lyrics for.
+        404 => return Lookup::NotFound,
+        // Asked too often: every launch asked again (see `LyricsDisk`).
+        429 => {
+            let after = response.headers().get("retry-after").and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse().ok());
+            return Lookup::Busy(after);
+        }
+        _ => return Lookup::Failed,
+    }
     let Some(body) = response
         .into_body()
         .read_to_string()
@@ -326,6 +324,151 @@ pub fn fetch_lrclib(artist: &str, title: &str, duration_secs: Option<u32>) -> Lo
     Lookup::NotFound
 }
 
+
+/// `fetch` (LRCLIB), asked once more after a wait when it was busy (429:
+/// its Retry-After, capped at 30 s) or failed (5 s). `wait` sleeps up to the
+/// given time and says whether to go on (false: the track changed). Found
+/// and not found are answers: no retry.
+pub fn fetch_with_retry(
+    mut fetch: impl FnMut() -> Lookup<String>,
+    wait: impl FnOnce(std::time::Duration) -> bool,
+) -> Lookup<String> {
+    let first = fetch();
+    let secs = match first {
+        Lookup::Busy(after) => after.unwrap_or(5).clamp(1, 30),
+        Lookup::Failed => 5,
+        answered => return answered,
+    };
+    if !wait(std::time::Duration::from_secs(secs)) {
+        return first;
+    }
+    fetch()
+}
+
+/// LRCLIB's answers kept on disk (`<config>/lyrics`), so a restart does not
+/// ask again: it rate-limits (429), and every launch asking for the same
+/// track hit it — the lyrics then failed on most runs. Found lyrics are kept
+/// for good; "LRCLIB has none" for `MISSING_KEEP` (lyrics get added there).
+/// Keyed by artist, title and duration (another duration, another version).
+pub struct LyricsDisk {
+    dir: std::path::PathBuf,
+}
+
+/// How long a "not on LRCLIB" answer is trusted.
+const MISSING_KEEP: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+
+impl LyricsDisk {
+    pub fn in_config() -> Option<Self> {
+        Some(Self::at(crate::playlist::keet_config_dir()?.join("lyrics")))
+    }
+
+    pub fn at(dir: std::path::PathBuf) -> Self {
+        Self { dir }
+    }
+
+    /// `<artist> - <title> - <duration> <hash>`: the names cut to a byte
+    /// budget (a long classical title ran past the file system's 255 bytes
+    /// and the save failed, silently, so every launch asked LRCLIB again),
+    /// and a hash of the exact artist, title and duration, so two artists
+    /// that clean up to the same text (AC/DC, AC:DC) get two files.
+    fn base(&self, artist: &str, title: &str, dur: Option<u32>) -> Option<std::path::PathBuf> {
+        let cut = |s: String, max: usize| -> String {
+            let mut end = 0;
+            for (i, c) in s.char_indices() {
+                if i + c.len_utf8() > max {
+                    break;
+                }
+                end = i + c.len_utf8();
+            }
+            s[..end].trim_end().to_string()
+        };
+        let (a, t) = (cut(crate::cover::sanitize_fs(artist), 60), cut(crate::cover::sanitize_fs(title), 100));
+        if a.is_empty() || t.is_empty() {
+            return None;
+        }
+        // FNV-1a: stable across runs and builds (std's hasher is not).
+        let key = format!("{artist}\0{title}\0{}", dur.unwrap_or(0));
+        let hash = key.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3));
+        Some(self.dir.join(format!("{a} - {t} - {} {:08x}", dur.unwrap_or(0), hash as u32)))
+    }
+
+    /// `base` with `.ext` APPENDED: `with_extension` replaces whatever
+    /// follows the last dot, and "Mr. Brightside" became "… - Mr.lrc",
+    /// one file with "Mr. Jones".
+    fn file(base: &std::path::Path, ext: &str) -> std::path::PathBuf {
+        let mut name = base.as_os_str().to_os_string();
+        name.push(".");
+        name.push(ext);
+        name.into()
+    }
+
+    /// `Some(Some(lyrics))` found, `Some(None)` known missing (this week),
+    /// `None` unknown.
+    pub fn load(&self, artist: &str, title: &str, dur: Option<u32>) -> Option<Option<String>> {
+        let base = self.base(artist, title, dur)?;
+        if let Ok(text) = std::fs::read_to_string(Self::file(&base, "lrc")) {
+            return Some(Some(text));
+        }
+        let age = std::fs::metadata(Self::file(&base, "none")).ok()?.modified().ok()?.elapsed().ok()?;
+        (age < MISSING_KEEP).then_some(None)
+    }
+
+    pub fn store(&self, artist: &str, title: &str, dur: Option<u32>, lyrics: Option<&str>) {
+        let Some(base) = self.base(artist, title, dur) else { return };
+        let _ = std::fs::create_dir_all(&self.dir);
+        match lyrics {
+            Some(text) => {
+                let _ = crate::playlist::write_atomic(&Self::file(&base, "lrc"), text.as_bytes());
+                let _ = std::fs::remove_file(Self::file(&base, "none"));
+            }
+            None => {
+                let _ = crate::playlist::write_atomic(&Self::file(&base, "none"), b"");
+            }
+        }
+    }
+}
+
+/// LRCLIB's lyrics for (artist, title, duration): what this session or an
+/// earlier run (`disk`) already knows, else `fetch` (with one retry, `wait`
+/// between). Found and not-found answers are remembered, in both; a busy or
+/// failed lookup is not (it says nothing about the track: the next play asks
+/// again).
+pub fn lookup_lrclib(
+    net: &LookupCache,
+    disk: Option<&LyricsDisk>,
+    (artist, title, dur): (&str, &str, Option<u32>),
+    fetch: impl FnMut() -> Lookup<String>,
+    wait: impl FnOnce(std::time::Duration) -> bool,
+) -> Lookup<String> {
+    let key = format!("{artist}\0{title}\0{}", dur.unwrap_or(0));
+    let known = net.known(&key).or_else(|| disk.and_then(|d| d.load(artist, title, dur)));
+    if let Some(answer) = known {
+        net.remember(key, answer.clone());
+        return answer.map_or(Lookup::NotFound, Lookup::Found);
+    }
+    let answer = fetch_with_retry(fetch, wait);
+    let keep = match &answer {
+        Lookup::Found(text) => Some(Some(text.clone())),
+        Lookup::NotFound => Some(None),
+        Lookup::Busy(_) | Lookup::Failed => None,
+    };
+    if let Some(keep) = keep {
+        if let Some(d) = disk {
+            d.store(artist, title, dur, keep.as_deref());
+        }
+        net.remember(key, keep);
+    }
+    answer
+}
+
+/// What the lyrics worker found for a track.
+pub enum LyricsAnswer {
+    Found(Lyrics, LyricsSource),
+    /// Neither the file nor LRCLIB has any.
+    Missing,
+    /// LRCLIB could not be asked (busy, unreachable): not "no lyrics".
+    Unavailable(&'static str),
+}
 
 /// Where a track's lyrics came from, shown beside them ("synced · LRCLIB"):
 /// LRCLIB is user-submitted, so its timing and text deserve less trust than
@@ -418,6 +561,89 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_busy_or_failed_lrclib_is_asked_once_more_after_a_wait() {
+        use std::cell::RefCell;
+        use std::time::Duration;
+        // 429 with Retry-After: 2 s → waits 2 s, then asks again.
+        let answers = RefCell::new(vec![Lookup::Found("[00:01.00]hi".to_string()), Lookup::Busy(Some(2))]);
+        let waited = RefCell::new(Vec::new());
+        let got = fetch_with_retry(|| answers.borrow_mut().pop().unwrap(), |d| { waited.borrow_mut().push(d); true });
+        assert!(matches!(got, Lookup::Found(_)));
+        assert_eq!(*waited.borrow(), [Duration::from_secs(2)]);
+        // A failure with no hint: a few seconds; a huge Retry-After: capped.
+        for (first, wait) in [(Lookup::Failed, 5), (Lookup::Busy(None), 5), (Lookup::Busy(Some(3600)), 30)] {
+            let answers = RefCell::new(vec![Lookup::NotFound, first]);
+            let waited = RefCell::new(Vec::new());
+            let got = fetch_with_retry(|| answers.borrow_mut().pop().unwrap(), |d| { waited.borrow_mut().push(d); true });
+            assert!(matches!(got, Lookup::NotFound));
+            assert_eq!(*waited.borrow(), [Duration::from_secs(wait)]);
+        }
+        // Once only: still failing, it says so.
+        let calls = RefCell::new(0);
+        let got = fetch_with_retry(|| { *calls.borrow_mut() += 1; Lookup::<String>::Busy(Some(1)) }, |_| true);
+        assert!(matches!(got, Lookup::Busy(_)) && *calls.borrow() == 2);
+        // The track changed during the wait: no second request.
+        let calls = RefCell::new(0);
+        fetch_with_retry(|| { *calls.borrow_mut() += 1; Lookup::<String>::Failed }, |_| false);
+        assert_eq!(*calls.borrow(), 1);
+        // Found or not found: answered, no retry.
+        let calls = RefCell::new(0);
+        fetch_with_retry(|| { *calls.borrow_mut() += 1; Lookup::<String>::NotFound }, |_| panic!("no wait"));
+        assert_eq!(*calls.borrow(), 1);
+    }
+
+    #[test]
+    fn long_or_lookalike_names_each_get_their_own_lyrics_file() {
+        let dir = std::env::temp_dir().join(format!("keet-lyrics-names-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let disk = LyricsDisk::at(dir.clone());
+        // A classical title far past a file name's 255 bytes, multi-byte too.
+        let title = "Symphonie Nr. 9 d-Moll op. 125 „Chorfantasie“ – IV. Presto – Allegro assai – ".repeat(4);
+        disk.store("Wiener Philharmoniker, Karl Böhm", &title, Some(1500), Some("words"));
+        assert_eq!(disk.load("Wiener Philharmoniker, Karl Böhm", &title, Some(1500)), Some(Some("words".into())));
+        for e in std::fs::read_dir(&dir).unwrap() {
+            assert!(e.unwrap().file_name().len() <= 200, "a file name the file system takes");
+        }
+        // Two artists that clean up to the same text: two files.
+        disk.store("AC/DC", "Song", None, Some("one"));
+        disk.store("AC:DC", "Song", None, Some("two"));
+        assert_eq!(disk.load("AC/DC", "Song", None), Some(Some("one".into())));
+        assert_eq!(disk.load("AC:DC", "Song", None), Some(Some("two".into())));
+        // A dot in a title is not an extension: "Mr. Brightside" and
+        // "Mr. Jones" are two files.
+        disk.store("X", "Mr. Brightside", None, Some("one"));
+        disk.store("X", "Mr. Jones", None, None);
+        assert_eq!(disk.load("X", "Mr. Brightside", None), Some(Some("one".into())));
+        assert_eq!(disk.load("X", "Mr. Jones", None), Some(None));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lrclib_answers_are_kept_on_disk_found_for_good_missing_for_a_week() {
+        let dir = std::env::temp_dir().join(format!("keet-lyrics-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let disk = LyricsDisk::at(dir.clone());
+        assert_eq!(disk.load("A/C", "Song?", Some(200)), None, "nothing known yet");
+        disk.store("A/C", "Song?", Some(200), Some("[00:01.00]la"));
+        assert_eq!(disk.load("A/C", "Song?", Some(200)), Some(Some("[00:01.00]la".to_string())));
+        // Another duration is another version.
+        assert_eq!(disk.load("A/C", "Song?", Some(201)), None);
+        // Not on LRCLIB: remembered, but only for a week (lyrics get added).
+        disk.store("B", "Other", None, None);
+        assert_eq!(disk.load("B", "Other", None), Some(None));
+        let marker = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|e| e == "none")).expect("the missing marker");
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(8 * 24 * 3600);
+        std::fs::File::options().write(true).open(&marker).unwrap().set_modified(old).unwrap();
+        assert_eq!(disk.load("B", "Other", None), None, "a week on, asked again");
+        // Found later: the marker goes.
+        disk.store("B", "Other", None, Some("words"));
+        assert_eq!(disk.load("B", "Other", None), Some(Some("words".to_string())));
+        assert!(!marker.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn source_line_names_kind_and_origin() {
         let synced = parse_lyrics("[00:01.00]hi");
         let plain = parse_lyrics("hi\nthere");
@@ -456,30 +682,42 @@ mod tests {
     }
 
     #[test]
-    fn network_lookups_are_cached_except_failures() {
-        // Every play of a track re-asked LRCLIB (or iTunes) — the same answer
-        // each time, up to 15 s of waiting for it. Found and definitively
-        // missing results are remembered for the session; a failure (offline,
-        // timeout) is retried next time.
+    fn network_lookups_are_kept_except_failures() {
+        // Every play of a track re-asked LRCLIB — and every launch: it
+        // rate-limited them. Found and definitively missing answers are kept
+        // for the session and on disk; a failure (offline, busy) is retried
+        // next time.
+        let dir = std::env::temp_dir().join(format!("keet-lookup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let disk = LyricsDisk::at(dir.clone());
+        let track = ("A", "B", Some(100));
+        let no_wait = |_| true;
         let cache = LookupCache::default();
         let mut calls = 0;
         for _ in 0..3 {
-            let got = cache.get_or_fetch("a\0b".into(), || { calls += 1; Lookup::Found("words".to_string()) });
-            assert_eq!(got.as_deref(), Some("words"));
+            let got = lookup_lrclib(&cache, Some(&disk), track, || { calls += 1; Lookup::Found("words".to_string()) }, no_wait);
+            assert!(matches!(got, Lookup::Found(ref w) if w == "words"));
+        }
+        assert_eq!(calls, 1, "asked once");
+        // A later run (a fresh session cache) finds it on disk.
+        let mut calls = 0;
+        let got = lookup_lrclib(&LookupCache::default(), Some(&disk), track, || { calls += 1; Lookup::Failed }, no_wait);
+        assert!(matches!(got, Lookup::Found(_)) && calls == 0, "not asked again after a restart");
+        // A definite miss is kept too.
+        let mut calls = 0;
+        for _ in 0..3 {
+            let got = lookup_lrclib(&cache, Some(&disk), ("A", "Missing", None), || { calls += 1; Lookup::NotFound }, no_wait);
+            assert!(matches!(got, Lookup::NotFound));
         }
         assert_eq!(calls, 1);
-
+        // Failures and busy answers are not: asked again (twice each: the retry).
         let mut calls = 0;
         for _ in 0..3 {
-            assert_eq!(cache.get_or_fetch("missing".into(), || { calls += 1; Lookup::NotFound }), None);
+            let got = lookup_lrclib(&cache, Some(&disk), ("A", "Offline", None), || { calls += 1; Lookup::Busy(Some(1)) }, no_wait);
+            assert!(matches!(got, Lookup::Busy(_)));
         }
-        assert_eq!(calls, 1, "a definite miss is remembered too");
-
-        let mut calls = 0;
-        for _ in 0..3 {
-            assert_eq!(cache.get_or_fetch("offline".into(), || { calls += 1; Lookup::Failed }), None);
-        }
-        assert_eq!(calls, 3, "failures are retried");
+        assert_eq!(calls, 6, "retried every time, never remembered");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -511,6 +749,19 @@ mod tests {
         let plain = parse_lyrics("verse\x1B[2J one\nverse two");
         assert!(!plain.line_text(0).contains('\x1B'));
         assert_eq!(plain.line_text(1), "verse two");
+    }
+
+    #[test]
+    fn lyric_lines_keep_no_spaces_at_their_ends() {
+        // LRCLIB's usual form: a space after the timestamp.
+        let synced = parse_lyrics("[00:17.12] I feel it 
+[00:19.00]  so   loud");
+        assert_eq!(synced.line_text(0), "I feel it");
+        assert_eq!(synced.line_text(1), "so   loud", "the spacing inside is kept");
+        let plain = parse_lyrics("  first 
+second	");
+        assert_eq!(plain.line_text(0), "first");
+        assert_eq!(plain.line_text(1), "second");
     }
 }
 

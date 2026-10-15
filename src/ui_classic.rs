@@ -7,28 +7,27 @@
 //! the playlist, the lyrics) with that section's hints, then the body, a
 //! message line and a key bar for the view.
 
+use crate::tui::Cols;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
-use crossterm::terminal;
+use ratatui::layout::Rect;
+use ratatui::text::Line;
+use ratatui::Frame;
 
-use crate::ansi::{fit_segments, truncate_plain, visible_len};
-use crate::state::{InputMode, PlayerState, RepeatMode, RgMode, UiState, ViewMode, VizMode, VizStyle};
+use crate::ansi::truncate_plain;
+use crate::state::{Hit, PlayerState, RepeatMode, RgMode, UiState, VizMode, VizStyle};
 use crate::theme::{palette, Palette, ThemeKind};
-use crate::ui::{format_time, list_scroll, render_tree_body, FrameWriter};
-use crate::viz::{
-    analysis_needs_raw_lines, render_lissajous, render_oscilloscope, render_spectrogram,
-    render_spectrogram_analysis, render_spectrum_horizontal, render_spectrum_vertical,
-    render_vu_meter, viz_body_rows, viz_rows_available, viz_top_pad, StatsMonitor, VizAnalyser,
-};
+use crate::tui::{self, fit_segments, LineBuf};
+use crate::ui::{format_time, Ctx};
+use crate::viz::{viz_body_rows, viz_rows_available, viz_top_pad, StatsMonitor};
 
 /// Columns the cover needs beside a readable info column (2 + 20 + 2 + 36).
 const COVER_MIN_W: usize = 60;
-/// Rows a view's body needs below the header before the header may grow:
-/// the player's transport + status + rule, four rows of visualisation and the
-/// footer; the playlist and lyrics also want ten rows of list.
+/// Rows the player's body needs below the header before the header may
+/// grow: transport + status + rule, four rows of visualisation and the
+/// footer.
 const PLAYER_BODY_MIN: usize = 2 + 1 + 4 + FOOTER_ROWS;
-const LIST_BODY_MIN: usize = 2 + 1 + 1 + FOOTER_ROWS + 10;
 /// Below this height the gap row under the header goes too.
 const GAP_MIN_H: usize = 16;
 
@@ -36,9 +35,9 @@ const GAP_MIN_H: usize = 16;
 /// their index in `info_lines`: the title always; then, dropped first to
 /// last, the next track, the play modes, the device, the format, the verdict
 /// and the artist. Shown in their own order.
-fn compact_info(info: Vec<String>, budget: usize) -> Vec<String> {
+fn compact_info(info: Vec<Line<'static>>, budget: usize) -> Vec<Line<'static>> {
     const DROP_ORDER: [usize; 6] = [9, 7, 6, 3, 4, 1];
-    let mut keep: Vec<bool> = info.iter().map(|l| !l.is_empty()).collect();
+    let mut keep: Vec<bool> = info.iter().map(|l| l.cols() > 0).collect();
     keep[0] = true;
     for &i in &DROP_ORDER {
         if keep.iter().filter(|&&k| k).count() <= budget.max(1) {
@@ -48,73 +47,53 @@ fn compact_info(info: Vec<String>, budget: usize) -> Vec<String> {
     }
     info.into_iter().zip(keep).filter(|(_, k)| *k).map(|(l, _)| l).collect()
 }
-/// Rows kept below a body: message line, key bar, one row of slack (a frame
-/// ending on the window's last row scrolls on the next write).
+/// Rows kept below a body: message line, key bar, one row of slack.
 const FOOTER_ROWS: usize = 3;
-
-/// One frame row and whether it carries image cells (written without the
-/// leading erase, see `FrameWriter::first_line_raw`).
-struct Row {
-    text: String,
-    raw: bool,
-}
-
-impl Row {
-    fn text(text: String) -> Self {
-        Self { text, raw: false }
-    }
-}
-
-/// Emit `rows`, the first as the frame's anchor.
-fn emit(w: &mut FrameWriter, rows: Vec<Row>) {
-    for (i, row) in rows.into_iter().enumerate() {
-        match (i, row.raw) {
-            (0, true) => w.first_line_raw(&row.text),
-            (0, false) => w.first_line(&row.text),
-            (_, true) => w.line_raw(&row.text),
-            (_, false) => w.line(&row.text),
-        }
-    }
-}
 
 fn khz(rate: u32) -> String {
     let k = rate as f32 / 1000.0;
     if k.fract() == 0.0 { format!("{k:.0} kHz") } else { format!("{k:.1} kHz") }
 }
 
+/// The ` · ` between items, dim.
+fn dot_sep(p: &Palette) -> Line<'static> {
+    tui::line(" · ", p.dim)
+}
+
 /// "label value" with the label dim; the value dim too when it reads "off".
-fn pair(p: &Palette, label: &str, value: &str) -> String {
+fn pair(p: &Palette, label: &str, value: &str) -> Line<'static> {
     let v = if value == "off" { p.dim } else { p.fg };
-    format!("{}{label}{} {v}{value}{}", p.dim, p.reset, p.reset)
+    let mut l = LineBuf::new();
+    l.styled(label, p.dim).reset().push(' ').styled(value, v);
+    l.into_line()
 }
 
 /// A key bar: as many `key label` items as fit, whole.
-fn key_bar(p: &Palette, keys: &[(&str, &str)], width: usize) -> String {
-    let items: Vec<String> = keys
-        .iter()
-        .map(|(k, l)| format!("{}{}{k}{} {}{l}{}", p.accent, p.bold, p.reset, p.dim, p.reset))
-        .collect();
-    format!("  {}", fit_segments(&items, "  ", width.saturating_sub(2)))
+/// (Each key clickable: register the bar where it is drawn.)
+fn key_bar(p: &Palette, keys: &[(&str, &str)], width: usize) -> crate::hints::Bar {
+    let look = crate::ui::key_look(crate::theme::ThemeKind::Classic, p);
+    crate::hints::indent(crate::hints::bar(keys, &look, width.saturating_sub(2)), 2)
 }
 
 /// `── Title ───────── hint ──` across the window; the hint goes first when
 /// the window is too narrow for both.
-fn titled_rule(p: &Palette, title: &str, hint: &str, width: usize) -> String {
-    let fixed = 2 + 3 + visible_len(title) + 1 + 2;
-    let with_hint = fixed + visible_len(hint) + 2;
+fn titled_rule(p: &Palette, title: &str, hint: &str, width: usize) -> Line<'static> {
+    let fixed = 2 + 3 + tui::width(title) + 1 + 2;
+    let with_hint = fixed + tui::width(hint) + 2;
     let (hint, fill) = if !hint.is_empty() && width >= with_hint + 3 {
-        (format!("{} {hint} {}", p.dim, p.reset), width - with_hint)
+        (Some(format!(" {hint} ")), width - with_hint)
     } else {
-        (String::new(), width.saturating_sub(fixed))
+        (None, width.saturating_sub(fixed))
     };
-    format!(
-        "  {r}── {rst}{b}{title}{rst}{r} {}{rst}{hint}{r}──{rst}",
-        "─".repeat(fill),
-        r = p.rule, b = p.bold, rst = p.reset,
-    )
+    let mut l = LineBuf::new();
+    l.push_str("  ").styled("── ", p.rule).styled(title, p.bold).styled(&format!(" {}", "─".repeat(fill)), p.rule);
+    if let Some(h) = hint {
+        l.styled(&h, p.dim);
+    }
+    l.styled("──", p.rule);
+    l.into_line()
 }
 
-/// The track after the current one, as the playlist loop will pick it.
 /// The track that plays next, as the producer will be told (`ui::next_pick`):
 /// files already found unplayable are passed over, so the line never names
 /// one that has been reported as skipped.
@@ -139,7 +118,7 @@ fn track_title(ui: &UiState, idx: usize, playlist: &[PathBuf], fallback: &str) -
 }
 
 /// The info column beside the cover: title, artist · album, format, the
-/// bit-perfect verdict, device, play modes, what comes next. Blank strings are
+/// bit-perfect verdict, device, play modes, what comes next. Blank lines are
 /// the spacing rows the cover's height leaves room for.
 #[allow(clippy::too_many_arguments)]
 fn info_lines(
@@ -152,21 +131,20 @@ fn info_lines(
     playlist: &[PathBuf],
     p: &Palette,
     width: usize,
-) -> Vec<String> {
-    let rst = p.reset;
+) -> Vec<Line<'static>> {
     let idx = state.current_track.load(Ordering::Relaxed);
     let title = track_title(ui, idx, playlist, name);
     let (artist, album) = ui.metadata_cache.artist_album(idx);
 
-    let title_line = format!("{}{}{rst}", p.bold, truncate_plain(&title, width));
+    let title_line = tui::line(truncate_plain(&title, width), p.bold);
     let mut who = Vec::new();
     if let Some(a) = artist {
-        who.push(format!("{}{a}{rst}", p.accent));
+        who.push(tui::line(a, p.accent));
     }
     if let Some(al) = album {
-        who.push(format!("{}{al}{rst}", p.dim));
+        who.push(tui::line(al, p.dim));
     }
-    let who_line = fit_segments(&who, &format!("{} · {rst}", p.dim), width);
+    let who_line = fit_segments(&who, &dot_sep(p), width);
 
     // FLAC 24-bit · 96 kHz → 48 kHz · stereo · 6:12
     let src_rate = state.sample_rate.load(Ordering::Relaxed) as u32;
@@ -186,17 +164,17 @@ fn info_lines(
         n => format!("{n} ch"),
     };
     let format_items = vec![
-        format!("{}{codec}{rst}", p.fg),
-        format!("{}{rate}{rst}", p.dim),
-        format!("{}{channels}{rst}", p.dim),
-        format!("{}{}{rst}", p.dim, format_time(state.total_secs())),
+        tui::line(codec, p.fg),
+        tui::line(rate, p.dim),
+        tui::line(channels, p.dim),
+        tui::line(format_time(state.total_secs()), p.dim),
     ];
-    let format_line = fit_segments(&format_items, &format!("{} · {rst}", p.dim), width);
+    let format_line = fit_segments(&format_items, &dot_sep(p), width);
 
     let verdict = crate::signal::verdict(&crate::signal::PathInputs::from_state(state, fx_name, cf_name));
     let verdict_line = match crate::signal::fitted(&verdict, " · ", width) {
-        Some((ok, text)) => format!("{}{text}{rst}", if ok { p.accent } else { p.warn }),
-        None => String::new(),
+        Some((ok, text)) => tui::line(text, if ok { p.accent } else { p.warn }),
+        None => Line::default(),
     };
 
     // ● FiiO KA17 · exclusive · 96 kHz / 24-bit
@@ -211,72 +189,86 @@ fn info_lines(
     // The mode goes whole or not at all: when it would leave the device name
     // under 8 columns, the line is the name alone (the window edge would
     // otherwise cut the mode text mid-word).
-    let name_room = width.saturating_sub(4 + visible_len(&mode) + 3);
-    let device_line = if name_room >= 8.min(visible_len(device)) && name_room > 0 {
-        format!("{}●{rst} {}{} · {mode}{rst}", p.accent, truncate_plain(device, name_room), p.dim)
+    let name_room = width.saturating_sub(4 + tui::width(&mode) + 3);
+    let mut device_line = LineBuf::new();
+    device_line.styled("●", p.accent).reset().push(' ');
+    if name_room >= 8.min(tui::width(device)) && name_room > 0 {
+        device_line.push_str(&truncate_plain(device, name_room)).styled(&format!(" · {mode}"), p.dim);
     } else {
-        format!("{}●{rst} {}", p.accent, truncate_plain(device, width.saturating_sub(4)))
-    };
+        device_line.push_str(&truncate_plain(device, width.saturating_sub(4)));
+    }
 
     // shuffle ○ off   repeat ● all   xfade 4 s   rg album   hq
-    let lamp = |on: bool| if on { format!("{}●{rst}", p.accent) } else { format!("{}○{rst}", p.dim) };
+    let lamp = |l: &mut LineBuf, on: bool| {
+        if on { l.styled("●", p.accent) } else { l.styled("○", p.dim) };
+    };
     let repeat = state.repeat_mode();
     let xfade = state.crossfade_secs.load(Ordering::Relaxed);
+    let mut shuffle = LineBuf::new();
+    shuffle.styled("shuffle", p.dim).reset().push(' ');
+    lamp(&mut shuffle, ui.shuffle);
+    shuffle.reset().push_str(if ui.shuffle { " on" } else { " off" });
+    let mut rep = LineBuf::new();
+    rep.styled("repeat", p.dim).reset().push(' ');
+    lamp(&mut rep, repeat != RepeatMode::Off);
+    rep.reset().push(' ').push_str(match repeat { RepeatMode::Off => "off", RepeatMode::All => "all", RepeatMode::One => "one" });
     let mut modes = vec![
-        format!("{}shuffle{rst} {} {}", p.dim, lamp(ui.shuffle), if ui.shuffle { "on" } else { "off" }),
-        format!(
-            "{}repeat{rst} {} {}",
-            p.dim,
-            lamp(repeat != RepeatMode::Off),
-            match repeat { RepeatMode::Off => "off", RepeatMode::All => "all", RepeatMode::One => "one" },
-        ),
+        shuffle.into_line(),
+        rep.into_line(),
         pair(p, "xfade", &if xfade == 0 { "off".to_string() } else { format!("{xfade} s") }),
         pair(p, "rg", match state.rg_mode() { RgMode::Track => "track", RgMode::Album => "album", RgMode::Off => "off" }),
     ];
     if ui.hq_resampler {
-        modes.push(format!("{}hq resampler{rst}", p.dim));
+        modes.push(tui::line("hq resampler", p.dim));
     }
-    let modes_line = fit_segments(&modes, "   ", width);
+    let modes_line = fit_segments(&modes, &Line::raw("   "), width);
 
     // track 4 of 11 · next Glasswork — Ines Varela
     let total = state.total_tracks.load(Ordering::Relaxed);
-    let mut next_items = vec![format!("{}track {} of {total}{rst}", p.dim, idx + 1)];
+    let mut next_items = vec![tui::line(format!("track {} of {total}", idx + 1), p.dim)];
     match next_index(ui, state, playlist) {
         Some(n) => {
-            let t = track_title(ui, n, playlist, "");
-            let by = ui.metadata_cache.artist_album(n).0.map(|a| format!("{} — {a}{rst}", p.dim)).unwrap_or_default();
-            let queued = if ui.enqueue_count > 0 { format!("{} (queued){rst}", p.dim) } else { String::new() };
-            next_items.push(format!("{}next{rst} {t}{by}{queued}", p.dim));
+            let mut l = LineBuf::new();
+            l.styled("next", p.dim).reset().push(' ').push_str(&track_title(ui, n, playlist, ""));
+            if let Some(a) = ui.metadata_cache.artist_album(n).0 {
+                l.styled(&format!(" — {a}"), p.dim);
+            }
+            if ui.enqueue_count > 0 {
+                l.styled(" (queued)", p.dim);
+            }
+            next_items.push(l.into_line());
         }
-        None => next_items.push(format!("{}last track{rst}", p.dim)),
+        None => next_items.push(tui::line("last track", p.dim)),
     }
-    let next_line = fit_segments(&next_items, &format!("{} · {rst}", p.dim), width);
+    let next_line = fit_segments(&next_items, &dot_sep(p), width);
 
     vec![
-        title_line, who_line, String::new(), format_line, verdict_line, String::new(),
-        device_line, modes_line, String::new(), next_line,
+        title_line, who_line, Line::default(), format_line, verdict_line, Line::default(),
+        device_line.into_line(), modes_line, Line::default(), next_line,
     ]
 }
 
 /// `▶ 02:41  ━━━━━━━━●──────────  06:12  −3:31`
-fn transport_line(state: &PlayerState, p: &Palette, width: usize) -> String {
-    let rst = p.reset;
+/// The line, and the progress bar's columns on it (`start..start + width`)
+/// when there is room for one.
+fn transport_line(state: &PlayerState, p: &Palette, width: usize) -> (Line<'static>, Option<(usize, usize)>) {
     let (t, total) = (state.time_secs(), state.total_secs());
-    let icon = if state.is_paused() { format!("{}⏸{rst}", p.fg) } else { format!("{}▶{rst}", p.accent) };
-    let left = format!("  {icon} {}{}{rst}  ", p.bold, format_time(t));
-    let right = format!("  {}  {}−{}{rst}", format_time(total), p.dim, format_time((total - t).max(0.0)));
-    let bar_w = width.saturating_sub(visible_len(&left) + visible_len(&right));
+    let (icon, icon_style) = if state.is_paused() { ("⏸", p.fg) } else { ("▶", p.accent) };
+    let mut l = LineBuf::new();
+    l.push_str("  ").styled(icon, icon_style).reset().push(' ').styled(&format_time(t), p.bold).reset();
+    let right_w = 2 + format_time(total).len() + 2 + 1 + format_time((total - t).max(0.0)).len();
+    let bar_w = width.saturating_sub(l.width() + 2 + right_w);
     if bar_w < 4 {
-        return format!("  {icon} {}{}{rst} / {}", p.bold, format_time(t), format_time(total));
+        l.push_str(&format!(" / {}", format_time(total)));
+        return (l.into_line(), None);
     }
+    l.push_str("  ");
+    let bar_x = l.width();
     let progress = if total > 0.0 { (t / total).clamp(0.0, 1.0) } else { 0.0 };
     let filled = (progress * (bar_w - 1) as f64).round() as usize;
-    format!(
-        "{left}{a}{}●{rst}{r}{}{rst}{right}",
-        "━".repeat(filled),
-        "─".repeat(bar_w - 1 - filled),
-        a = p.accent, r = p.rule,
-    )
+    l.styled(&format!("{}●", "━".repeat(filled)), p.accent).styled(&"─".repeat(bar_w - 1 - filled), p.rule);
+    l.reset().push_str(&format!("  {}  ", format_time(total))).styled(&format!("−{}", format_time((total - t).max(0.0))), p.dim);
+    (l.into_line(), Some((bar_x, bar_w)))
 }
 
 /// `vol 82%   bal C   eq Custom   fx off   …   clip ○` — the clip lamp ends
@@ -289,8 +281,7 @@ fn status_line(
     cf_name: &str,
     stats: &mut StatsMonitor,
     width: usize,
-) -> String {
-    let rst = p.reset;
+) -> Line<'static> {
     let buf = state.buffer_level.load(Ordering::Relaxed);
     let cap = state.ring_capacity.load(Ordering::Relaxed).max(1);
     stats.update_buf(buf as f32 / cap as f32 * 100.0);
@@ -324,98 +315,80 @@ fn status_line(
     }
     let xruns = state.xrun_count.load(Ordering::Relaxed);
     if xruns > 0 {
-        items.push(format!("{}{xruns} dropouts{rst}", p.warn));
+        items.push(tui::line(format!("{xruns} dropouts"), p.warn));
     }
     // Shape as well as colour: ● clipping, ○ idle.
-    let lamp = if state.is_clipping() {
-        format!("   {}clip{rst} {}●{rst}", p.dim, p.danger)
+    let mut lamp = LineBuf::new();
+    lamp.push_str("   ").styled("clip", p.dim).reset().push(' ');
+    if state.is_clipping() {
+        lamp.styled("●", p.danger);
     } else {
-        format!("   {}clip{rst} {}○{rst}", p.dim, p.good)
-    };
-    let room = width.saturating_sub(2 + visible_len(&lamp));
-    format!("  {}{lamp}", fit_segments(&items, "   ", room))
+        lamp.styled("○", p.good);
+    }
+    let lamp = lamp.into_line();
+    let room = width.saturating_sub(2 + lamp.cols());
+    let mut l = LineBuf::new();
+    l.push_str("  ").append(fit_segments(&items, &Line::raw("   "), room)).append(lamp);
+    l.into_line()
 }
 
 /// The block every Classic view starts with: header (cover + info), a gap,
-/// the transport line and the status row.
-#[allow(clippy::too_many_arguments)]
-fn top_rows(
-    state: &PlayerState,
-    ui: &mut UiState,
-    name: &str,
-    ext: &str,
-    eq_preset: &crate::eq::EqPreset,
-    fx_name: &str,
-    cf_name: &str,
-    stats: &mut StatsMonitor,
-    prev_frame_lines: usize,
-    playlist: &[PathBuf],
-    p: &Palette,
-    (term_w, term_h): (usize, usize),
-    budget: usize,
-) -> Vec<Row> {
+/// the transport line and the status row. Draws it from the top of the
+/// window and returns how many rows it took.
+fn draw_top(f: &mut Frame, cx: &mut Ctx, p: &Palette, budget: usize) -> usize {
+    let area = f.area();
+    let (term_w, term_h) = (area.width as usize, area.height as usize);
+    let state = cx.state;
     let size = crate::cover::CoverSize::CLASSIC;
     // The cover comes with its full ten rows or not at all: an image taller
-    // than the space left scrolls the screen, and in a short window it pushed
-    // the list and the key bar off the bottom.
-    let cover_on = ui.cover_enabled && term_w >= COVER_MIN_W && budget >= size.rows as usize;
-    let mut rows = Vec::with_capacity(16);
+    // than the space left would push the list and the key bar off the bottom.
+    let cover_on = cx.ui.cover_enabled && term_w >= COVER_MIN_W && budget >= size.rows as usize;
+    let mut y = 0;
 
     if cover_on {
         let info_w = term_w.saturating_sub(2 + size.cols as usize + 2 + 1);
-        let info = info_lines(state, ui, name, ext, fx_name, cf_name, playlist, p, info_w);
+        let info = info_lines(state, cx.ui, cx.name, cx.ext, cx.fx_name, cx.cf_name, cx.playlist, p, info_w);
         // Emit-on-change for images that stay put (Kitty, iTerm2, Sixel):
         // re-sending one 20×/s is the cost the spectrogram rule avoids.
-        let sticky = crate::cover::image_is_sticky();
-        let repaint = !sticky
-            || prev_frame_lines == usize::MAX
-            || !ui.cover_block_intact
-            || ui.cover_dirty_frame;
-        let cover_lines = if repaint {
-            match ui.cover.as_ref() {
-                Some(img) => crate::cover::render(img),
-                None => crate::cover::empty_slot_lines(size),
-            }
-        } else {
-            crate::cover::passive_lines(size)
-        };
+        let ui = &mut *cx.ui;
+        let repaint = cx.repaint || !ui.cover_block_intact || ui.cover_dirty_frame;
+        let slot = Rect { x: area.x + 2, y: area.y, width: size.cols as u16, height: size.rows as u16 }.intersection(area);
+        match crate::cover::draw(ui.cover.as_ref(), size, repaint) {
+            crate::cover::CoverDraw::Cells(lines) => tui::draw_lines(f.buffer_mut(), slot, &lines),
+            crate::cover::CoverDraw::Image(payload) => tui::place_image(tui::ImageSlot::Cover, slot, payload),
+        }
         ui.cover_block_intact = true;
         ui.cover_dirty_frame = false;
-        for (i, info_line) in info.into_iter().enumerate() {
-            // Cut to the column: these rows are written raw (the image), so
-            // the frame's own cut at the window edge does not reach them.
-            let info_line = crate::ansi::truncate_ansi(&info_line, info_w);
-            let cover = cover_lines.get(i).map(String::as_str).unwrap_or("");
-            if sticky {
-                // The image's cells come first: no erase before them, one
-                // after (clears only what follows the image on this row).
-                rows.push(Row { text: format!("  {cover}  {info_line}\x1B[K"), raw: true });
-            } else {
-                rows.push(Row::text(format!("  {cover}  {info_line}")));
-            }
-        }
+        let info_area = Rect { x: area.x + 2 + size.cols as u16 + 2, y: area.y, width: info_w as u16, height: size.rows as u16 }.intersection(area);
+        tui::draw_lines(f.buffer_mut(), info_area, &info);
+        y += size.rows as usize;
     } else {
-        if ui.cover_block_intact
+        if cx.ui.cover_block_intact
             && matches!(crate::cover::detect_protocol(), crate::cover::GraphicsProtocol::Kitty)
         {
             // A Kitty image is an overlay: drawing text over its cells leaves it.
             crate::term::out!("{}", crate::cover::kitty_clear_escape());
         }
-        ui.cover_block_intact = false;
+        cx.ui.cover_block_intact = false;
         let info_w = term_w.saturating_sub(3);
         // Without the cover's height to fill, the spacing rows go, and a
         // short window keeps only what fits (compact_info).
-        let info = info_lines(state, ui, name, ext, fx_name, cf_name, playlist, p, info_w);
-        for line in compact_info(info, budget) {
-            rows.push(Row::text(format!("  {line}")));
-        }
+        let info = info_lines(state, cx.ui, cx.name, cx.ext, cx.fx_name, cx.cf_name, cx.playlist, p, info_w);
+        let info = compact_info(info, budget);
+        tui::draw_lines(f.buffer_mut(), tui::indent(tui::rows(area, 0, info.len()), 2), &info);
+        y += info.len();
     }
     if term_h >= GAP_MIN_H {
-        rows.push(Row::text(String::new()));
+        y += 1;
     }
-    rows.push(Row::text(transport_line(state, p, term_w)));
-    rows.push(Row::text(status_line(state, p, eq_preset, fx_name, cf_name, stats, term_w)));
-    rows
+    let (transport, bar) = transport_line(state, p, term_w);
+    if let Some((x, w)) = bar {
+        let at = Rect { x: area.x + x as u16, y: area.y + y as u16, width: w as u16, height: 1 }.intersection(area);
+        cx.ui.hits.push((at, Hit::Seek));
+    }
+    let status = status_line(state, p, cx.eq_preset, cx.fx_name, cx.cf_name, cx.stats, term_w);
+    tui::draw_lines(f.buffer_mut(), tui::rows(area, y, 2), &[transport, status]);
+    y + 2
 }
 
 fn viz_title(mode: VizMode) -> &'static str {
@@ -457,112 +430,60 @@ const PLAYER_KEYS: &[(&str, &str)] = &[
     ("⇧R", "repeat"), ("x", "fx"), ("c", "xfeed"), ("⇧F", "full"), ("t", "theme"),
 ];
 
-/// The message line: the active status, else empty (it keeps its row, so the
-/// key bar does not jump when a message comes and goes).
-fn message_line(ui: &mut UiState, p: &Palette) -> String {
-    match ui.active_status() {
-        Some(msg) => format!("  {}{msg}{}", p.accent, p.reset),
-        None => String::new(),
-    }
-}
 
-/// Classic's renderer for the player, playlist and lyrics views. Returns the
-/// rows drawn below the anchor (FrameWriter's count).
-#[allow(clippy::too_many_arguments)] // cohesive render context, as in ui.rs
-pub fn print_status_classic(
-    state: &PlayerState,
-    ui: &mut UiState,
-    name: &str,
-    track_info: &str,
-    ext: &str,
-    eq_preset: &crate::eq::EqPreset,
-    fx_name: &str,
-    cf_name: &str,
-    stats: &mut StatsMonitor,
-    prev_frame_lines: usize,
-    playlist: &[PathBuf],
-    analyser: &VizAnalyser,
-) -> usize {
+/// Classic's renderer for the player, playlist and lyrics views.
+pub fn draw(f: &mut Frame, cx: &mut Ctx) {
     let p = palette(ThemeKind::Classic);
-    let (term_w, term_h) = terminal::size()
-        .map(|(w, h)| (w as usize, h as usize))
-        .unwrap_or((120, 40));
-    let fullscreen = state.viz_fullscreen() && ui.view_mode == ViewMode::Player;
+    let area = f.area();
+    let (term_w, term_h) = (area.width as usize, area.height as usize);
+    // (Always the player view here: `ui::draw_view` draws it as such under
+    // every panel and dialog.)
+    let fullscreen = cx.state.viz_fullscreen();
 
-    // Sixel emit-on-change bookkeeping: cleared every frame, re-asserted only
-    // by the analysis branch. Any frame that does not reach it may paint over
+    // Image emit-on-change bookkeeping: cleared every frame, re-asserted only
+    // by the analysis branch. Any frame that does not reach it may draw over
     // the block, so the next analysis render must re-emit.
-    let block_was_intact = ui.spectro_block_intact;
-    ui.spectro_block_intact = false;
+    let block_was_intact = cx.ui.spectro_block_intact;
+    cx.ui.spectro_block_intact = false;
 
-    if prev_frame_lines != usize::MAX && prev_frame_lines > 0 {
-        crate::term::out!("\x1B[{}F", prev_frame_lines); // CPL: up N lines, column 1
-    }
-    let mut w = FrameWriter::fitted();
-
-    let top = if fullscreen {
+    let top_n = if fullscreen {
         // Full window: the header and its cover go; one line carries the
         // song, the clock and the way back out.
-        if ui.cover_block_intact
+        if cx.ui.cover_block_intact
             && matches!(crate::cover::detect_protocol(), crate::cover::GraphicsProtocol::Kitty)
         {
             crate::term::out!("{}", crate::cover::kitty_clear_escape());
         }
-        ui.cover_block_intact = false;
+        cx.ui.cover_block_intact = false;
+        let state = cx.state;
         let track = state.current_track.load(Ordering::Relaxed) + 1;
         let total = state.total_tracks.load(Ordering::Relaxed);
-        let icon = if state.is_paused() { format!("{}⏸", p.fg) } else { format!("{}▶", p.accent) };
-        let head = format!(
-            "{d}[{track}/{total}]{r} {icon}{r} {b}{n}{r}  ",
-            d = p.dim, r = p.reset, b = p.bold, n = truncate_plain(name, 35),
-        );
-        let room = term_w.saturating_sub(visible_len(&head));
-        let items = fit_segments(
-            &crate::ui::fullscreen_items(track_info, state.time_secs(), state.total_secs()),
-            "  •  ",
-            room,
-        );
-        vec![Row::text(format!("{head}{}{items}{}", p.dim, p.reset))]
+        let (icon, icon_style) = if state.is_paused() { ("⏸", p.fg) } else { ("▶", p.accent) };
+        let mut head = LineBuf::new();
+        head.styled(&format!("[{track}/{total}]"), p.dim).reset().push(' ').styled(icon, icon_style).reset().push(' ');
+        head.styled(&truncate_plain(cx.name, 35), p.bold).reset().push_str("  ");
+        let room = term_w.saturating_sub(head.width());
+        let items: Vec<Line<'static>> = crate::ui::fullscreen_items(cx.track_info, state.time_secs(), state.total_secs())
+            .into_iter()
+            .map(|s| tui::line(s, p.dim))
+            .collect();
+        head.append(fit_segments(&items, &tui::line("  •  ", p.dim), room));
+        tui::draw_lines(f.buffer_mut(), area, &[head.into_line()]);
+        1
     } else {
         // The header takes what the view's body leaves (see PLAYER_BODY_MIN).
         let gap = usize::from(term_h >= GAP_MIN_H);
-        let body_min = if ui.view_mode == ViewMode::Player { PLAYER_BODY_MIN } else { LIST_BODY_MIN };
-        let budget = term_h.saturating_sub(body_min + gap);
-        top_rows(
-            state, ui, name, ext, eq_preset, fx_name, cf_name, stats, prev_frame_lines,
-            playlist, p, (term_w, term_h), budget,
-        )
+        let budget = term_h.saturating_sub(PLAYER_BODY_MIN + gap);
+        draw_top(f, cx, p, budget)
     };
-    let top_n = top.len();
-    emit(&mut w, top);
 
-    match ui.view_mode {
-        ViewMode::Playlist => playlist_body(state, ui, &mut w, p, playlist, (term_w, term_h), top_n),
-        ViewMode::Lyrics => lyrics_body(state, ui, &mut w, p, (term_w, term_h), top_n),
-        _ => player_body(
-            state, ui, &mut w, p, analyser, prev_frame_lines, block_was_intact,
-            (term_w, term_h), top_n, fullscreen,
-        ),
-    }
-
-    crate::term::out!("\x1B[J");
-    crate::term::flush();
-    w.count()
+    player_body(f, cx, p, block_was_intact, top_n, fullscreen);
 }
 
-#[allow(clippy::too_many_arguments)]
-fn player_body(
-    state: &PlayerState,
-    ui: &mut UiState,
-    w: &mut FrameWriter,
-    p: &Palette,
-    analyser: &VizAnalyser,
-    prev_frame_lines: usize,
-    block_was_intact: bool,
-    (term_w, term_h): (usize, usize),
-    top_n: usize,
-    fullscreen: bool,
-) {
+fn player_body(f: &mut Frame, cx: &mut Ctx, p: &Palette, block_was_intact: bool, top_n: usize, fullscreen: bool) {
+    let area = f.area();
+    let (term_w, term_h) = (area.width as usize, area.height as usize);
+    let state = cx.state;
     let viz_mode = state.viz_mode();
     let viz_style = state.viz_style();
     let extras = state.viz_extras();
@@ -576,273 +497,53 @@ fn player_body(
     // Outside full window the block gets every row the window has spare,
     // each mode centred in it: the message line and key bar sit at the
     // window's bottom (as in the other themes) and stay put as `v` cycles.
-    // Sized to the tallest mode instead, a tall window kept rows empty below
-    // the key bar. Full window centres in the whole space instead.
+    // Full window centres in the whole space instead.
     let slot = if fullscreen { body } else { avail };
     let pad = if fullscreen { viz_top_pad(avail, body, true) } else { slot.saturating_sub(body) / 2 };
 
-    if ruled && viz_mode == VizMode::None {
-        w.line(&titled_rule(p, "Visualization off", &format!("v {}", viz_next_name(viz_mode)), term_w));
-    } else if ruled {
-        let style = if viz_mode == VizMode::SpectrogramAnalysis {
-            if matches!(viz_style, VizStyle::Dots) { "linear" } else { "log" }
+    let mut y = top_n;
+    if ruled {
+        let rule = if viz_mode == VizMode::None {
+            titled_rule(p, "Visualization off", &format!("v {}", viz_next_name(viz_mode)), term_w)
         } else {
-            match viz_style { VizStyle::Dots => "bars", VizStyle::Bars => "dots" }
+            let style = if viz_mode == VizMode::SpectrogramAnalysis {
+                if matches!(viz_style, VizStyle::Dots) { "linear" } else { "log" }
+            } else {
+                match viz_style { VizStyle::Dots => "bars", VizStyle::Bars => "dots" }
+            };
+            let hint = format!("v {} · b {style}", viz_next_name(viz_mode));
+            titled_rule(p, viz_title(viz_mode), &hint, term_w)
         };
-        let hint = format!("v {} · b {style}", viz_next_name(viz_mode));
-        w.line(&titled_rule(p, viz_title(viz_mode), &hint, term_w));
+        tui::draw_lines(f.buffer_mut(), tui::rows(area, y, 1), &[rule]);
+        y += 1;
     }
-    for _ in 0..pad {
-        w.line("");
-    }
-
-    match viz_mode {
-        VizMode::None => {}
-        VizMode::VuMeter => render_vu_meter(state, viz_style, term_w, body, extras).iter().for_each(|l| w.line(l)),
-        VizMode::SpectrumHorizontal => {
-            render_spectrum_horizontal(state, viz_style, term_w, body, extras).iter().for_each(|l| w.line(l))
-        }
-        VizMode::SpectrumVertical => {
-            render_spectrum_vertical(state, viz_style, term_w, body, extras).iter().for_each(|l| w.line(l))
-        }
-        VizMode::Oscilloscope => render_oscilloscope(analyser, viz_style, term_w, body).iter().for_each(|l| w.line(l)),
-        VizMode::Lissajous => render_lissajous(analyser, viz_style, term_w, body).iter().for_each(|l| w.line(l)),
-        VizMode::Spectrogram => render_spectrogram(analyser, viz_style, term_w, body).iter().for_each(|l| w.line(l)),
-        VizMode::Polar => {
-            crate::viz_polar::render_polar(state, &analyser.polar_trail, viz_style, term_w, body, extras).iter().for_each(|l| w.line(l))
-        }
-        VizMode::Galaxy => crate::viz_galaxy::render_galaxy(&analyser.galaxy, state.theme_kind(), viz_style, term_w, body)
-            .iter()
-            .for_each(|l| w.line(l)),
-        VizMode::Cymatics => {
-            crate::viz_cymatics::render_cymatics(&analyser.cymatics, state.theme_kind(), viz_style, term_w, body, extras)
-                .iter()
-                .for_each(|l| w.line(l))
-        }
-        VizMode::SpectrogramAnalysis => {
-            // viz_style selects the frequency axis here: Dots = log, Bars = linear.
-            let log_axis = matches!(viz_style, VizStyle::Dots);
-            // Sixel: no erase-to-EOL, the block erases itself (viz.rs).
-            let raw = analysis_needs_raw_lines();
-            // Re-emit on a full repaint, when another view painted over the
-            // block, or when the block moved or resized (keyed on its own
-            // first row and height, not the frame's: see CLAUDE.md).
-            let block = (w.count(), body);
-            let force = prev_frame_lines == usize::MAX || !block_was_intact || block != ui.last_viz_block;
-            ui.last_viz_block = block;
-            ui.spectro_block_intact = true;
-            for line in render_spectrogram_analysis(analyser, term_w, log_axis, state.is_paused(), body, force) {
-                if raw { w.line_raw(&line); } else { w.line(&line); }
-            }
-        }
-    }
-
-    for _ in (pad + body)..slot {
-        w.line("");
-    }
-
     if fullscreen {
-        if let Some(msg) = ui.active_status() {
-            w.line(&format!("  {}{msg}{}", p.accent, p.reset));
+        let block = tui::rows(area, y + pad, body);
+        crate::ui::draw_viz(f, block, cx, block_was_intact);
+    } else {
+        // The slot is shared with the docked panels (`ui::dock`); the
+        // visualization is centred in its part of it.
+        let region = tui::indent(tui::rows(area, y, slot), 2);
+        let dock = crate::ui::dock(cx.ui, viz_mode != VizMode::None, region);
+        if let Some(r) = dock.viz {
+            let r = Rect { x: area.x, width: r.right() - area.x, ..r };
+            let body = viz_body_rows(viz_mode, r.height as usize, false, extras);
+            let block = tui::rows(r, (r.height as usize).saturating_sub(body) / 2, body);
+            crate::ui::draw_viz(f, block, cx, block_was_intact);
         }
+        crate::ui::draw_docked(f, cx, &dock.panels);
+    }
+    if fullscreen {
+        crate::ui::draw_status_line(f, cx.ui, tui::rows(area, y + pad + body, 1), p);
         return;
     }
-    w.line(&message_line(ui, p));
-    w.line(&key_bar(p, PLAYER_KEYS, term_w));
-}
-
-fn format_total(secs: f64) -> String {
-    let total = secs.max(0.0) as u64;
-    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
-    if h > 0 { format!("{h}:{m:02}:{s:02}") } else { format!("{m}:{s:02}") }
-}
-
-fn playlist_body(
-    state: &PlayerState,
-    ui: &mut UiState,
-    w: &mut FrameWriter,
-    p: &Palette,
-    playlist: &[PathBuf],
-    (term_w, term_h): (usize, usize),
-    top_n: usize,
-) {
-    let rst = p.reset;
-    let tree = ui.library_tree_mode;
-    // One pass over the durations for the total and the time column's width.
-    let (total_secs, longest) = (0..playlist.len())
-        .filter_map(|i| ui.metadata_cache.duration(i))
-        .fold((0.0f64, 0.0f64), |(sum, max), d| (sum + d, max.max(d)));
-    let hint = if tree {
-        format!("{} tracks · {} · Tab list · / filter", playlist.len(), format_total(total_secs))
-    } else {
-        format!("{} tracks · {} · Tab tree · / search", playlist.len(), format_total(total_secs))
-    };
-    w.line(&titled_rule(p, "Playlist", &hint, term_w));
-
-    let header_rows = usize::from(!tree);
-    let visible_rows = term_h.saturating_sub(top_n + 1 + header_rows + FOOTER_ROWS).max(1);
-    ui.last_visible_rows = visible_rows;
-
-    if tree {
-        let lines = render_tree_body(ui, visible_rows, term_w, p);
-        let n = lines.len();
-        lines.iter().for_each(|l| w.line(l));
-        (n..visible_rows).for_each(|_| w.line(""));
-    } else {
-        // Columns: marker · number · title · album · time.
-        let num_w = playlist.len().to_string().len().max(2);
-        // Wide enough for the longest duration listed (10 h+ is "10:00:00").
-        let time_w = 1 + format_time(longest).len().max(5);
-        let content = term_w.saturating_sub(2 + 1 + 3 + num_w + 3 + time_w + 1);
-        let album_w = if content >= 50 { (content * 30 / 100).clamp(12, 32) } else { 0 };
-        let title_w = content.saturating_sub(album_w);
-        let cell = |s: &str, width: usize| {
-            let t = truncate_plain(s, width.saturating_sub(1));
-            let pad = width.saturating_sub(visible_len(&t));
-            format!("{t}{}", " ".repeat(pad))
-        };
-        w.line(&format!(
-            "{}  {}   {:>num_w$}   {}{}{:>time_w$}{rst}",
-            p.dim, " ", "#", cell("Title", title_w), cell(if album_w > 0 { "Album" } else { "" }, album_w), "Time",
-        ));
-
-        let search_active = matches!(&ui.input_mode, InputMode::Search(q) if !q.is_empty());
-        let items_len = if search_active && ui.filtered_indices.is_empty() {
-            0
-        } else if ui.filtered_indices.is_empty() {
-            playlist.len()
-        } else {
-            ui.filtered_indices.len()
-        };
-        ui.scroll_offset = list_scroll(ui.cursor, ui.scroll_offset, items_len, visible_rows);
-        let queued = (ui.current + 1)..=(ui.current + ui.enqueue_count);
-
-        if items_len == 0 && search_active {
-            w.line(&format!("  {}(no matches){rst}", p.dim));
-            (1..visible_rows).for_each(|_| w.line(""));
-        } else {
-            let shown = visible_rows.min(items_len.saturating_sub(ui.scroll_offset));
-            for row in 0..shown {
-                let pos = ui.scroll_offset + row;
-                let idx = if ui.filtered_indices.is_empty() { pos } else { ui.filtered_indices[pos] };
-                let playing = idx == ui.current;
-                let cursor = pos == ui.cursor;
-                let is_queued = ui.enqueue_count > 0 && queued.contains(&idx);
-                let title = ui.metadata_cache.display_name(idx, &playlist[idx]);
-                let album = ui.metadata_cache.album(idx).unwrap_or_default();
-                let dur = ui.metadata_cache.duration(idx).map(format_time).unwrap_or_default();
-                let num = format!("{:0>num_w$}", idx + 1);
-                let marker = if playing { "♪" } else if cursor { "▌" } else if is_queued { "+" } else { " " };
-                let line = if cursor {
-                    let plain = format!(
-                        "  {marker}   {num}   {}{}{dur:>time_w$}",
-                        cell(&title, title_w), cell(&album, album_w),
-                    );
-                    crate::theme::cursor_row(p, &plain, term_w)
-                } else if playing {
-                    format!(
-                        "  {a}{marker}{rst}   {a}{b}{num}   {}{rst}{d}{}{rst}{dur:>time_w$}",
-                        cell(&title, title_w), cell(&album, album_w),
-                        a = p.accent, b = p.bold, d = p.dim,
-                    )
-                } else {
-                    format!(
-                        "  {a}{marker}{rst}   {d}{num}{rst}   {}{d}{}{rst}{dur:>time_w$}",
-                        cell(&title, title_w), cell(&album, album_w),
-                        a = p.accent, d = p.dim,
-                    )
-                };
-                w.line(&line);
-            }
-            (shown..visible_rows).for_each(|_| w.line(""));
-        }
-    }
-
-    // The message row doubles as the prompt while typing.
-    let message = match &ui.input_mode {
-        InputMode::Search(q) => format!("  {}/{rst} {q}{}_{rst}", p.accent, p.dim),
-        InputMode::SavePlaylist(n) => format!("  {}save as{rst} {n}{}_{rst}", p.accent, p.dim),
-        InputMode::Normal => message_line(ui, p),
-    };
-    w.line(&message);
-    let keys: &[(&str, &str)] = if tree {
-        &[("↵", "play"), ("?", "keys"), ("←→", "fold"), ("/", "filter"), ("d", "remove"), ("Tab", "list"), ("l", "close")]
-    } else {
-        &[
-            ("↵", "play"), ("?", "keys"), ("a", "queue"), ("/", "search"), ("d", "remove"), ("s", "save"),
-            ("⇧s", "sort"), ("Tab", "tree"), ("l", "close"),
-        ]
-    };
-    w.line(&key_bar(p, keys, term_w));
-    let _ = state;
-}
-
-fn lyrics_body(
-    state: &PlayerState,
-    ui: &mut UiState,
-    w: &mut FrameWriter,
-    p: &Palette,
-    (term_w, term_h): (usize, usize),
-    top_n: usize,
-) {
-    let rst = p.reset;
-    let synced = ui.lyrics.as_ref().is_some_and(|l| l.is_synced());
-    let mut hint = match &ui.lyrics {
-        Some(l) => crate::lyrics::source_line(l, ui.lyrics_source),
-        None => String::new(),
-    };
-    if synced && ui.lyrics_offset != 0.0 {
-        hint.push_str(&format!(" · offset {:+.1} s", ui.lyrics_offset));
-    }
-    w.line(&titled_rule(p, "Lyrics", &hint, term_w));
-
-    let visible_rows = term_h.saturating_sub(top_n + 1 + FOOTER_ROWS).max(1);
-    match ui.lyrics.as_ref() {
-        Some(lyrics) => {
-            let total = lyrics.line_count();
-            let current = lyrics.current_line(state.time_secs() + ui.lyrics_offset);
-            // Follow the song: keep the current line centred until the user scrolls.
-            if synced && ui.lyrics_auto_scroll {
-                if let Some(cur) = current {
-                    ui.lyrics_scroll = cur.saturating_sub(visible_rows / 2);
-                }
-            }
-            ui.lyrics_scroll = if total > visible_rows { ui.lyrics_scroll.min(total - visible_rows) } else { 0 };
-            for row in 0..visible_rows {
-                let i = ui.lyrics_scroll + row;
-                if i >= total {
-                    w.line("");
-                    continue;
-                }
-                let text = lyrics.line_text(i);
-                let line = match lyrics.line_time(i) {
-                    Some(t) => {
-                        let ts = format_time(t);
-                        match current {
-                            Some(c) if c == i => format!("    {a}{ts}{rst} {a}{b}▸ {text}{rst}", a = p.accent, b = p.bold),
-                            Some(c) if i < c => format!("    {d}{ts}   {text}{rst}", d = p.dim),
-                            _ => format!("    {d}{ts}{rst}   {text}", d = p.dim),
-                        }
-                    }
-                    None => format!("    {text}"),
-                };
-                w.line(&line);
-            }
-        }
-        None => {
-            let what = if ui.lyrics_receiver.is_some() { "looking for lyrics…" } else { "no lyrics for this track" };
-            w.line(&format!("    {}{what}{rst}", p.dim));
-            (1..visible_rows).for_each(|_| w.line(""));
-        }
-    }
-
-    w.line(&message_line(ui, p));
-    let keys: &[(&str, &str)] = if synced {
-        &[("a d", "sync ±0.5 s"), ("0", "reset"), ("w s", "scroll"), ("y", "close"), ("q", "quit")]
-    } else {
-        &[("w s", "scroll"), ("y", "close"), ("q", "quit")]
-    };
-    w.line(&key_bar(p, keys, term_w));
+    y += slot;
+    let keys = key_bar(p, PLAYER_KEYS, term_w);
+    keys.register(&mut cx.ui.hits, area.x, area.y + y as u16 + 1);
+    // The message line keeps its row when empty, so the key bar does not
+    // jump when a message comes and goes.
+    crate::ui::draw_status_line(f, cx.ui, tui::rows(area, y, 1), p);
+    tui::draw_lines(f.buffer_mut(), tui::rows(area, y + 1, 1), &[keys.line]);
 }
 
 #[cfg(test)]
@@ -853,6 +554,10 @@ mod tests {
         palette(ThemeKind::Classic)
     }
 
+    fn visible_len(l: &Line) -> usize {
+        crate::tui::Cols::cols(l)
+    }
+
     #[test]
     fn titled_rules_span_the_window_and_drop_the_hint_first() {
         for w in [40, 80, 100, 160] {
@@ -860,14 +565,14 @@ mod tests {
             assert_eq!(visible_len(&r), w, "{w}: {r:?}");
         }
         let narrow = titled_rule(pal(), "Spectrum", "a very long hint that cannot fit", 40);
-        assert!(!crate::ansi::strip_ansi(&narrow).contains("hint"), "{narrow:?}");
+        assert!(!tui::plain(&narrow).contains("hint"), "{narrow:?}");
         assert_eq!(visible_len(&narrow), 40);
     }
 
     #[test]
     fn key_bars_end_on_a_whole_key() {
-        let bar = crate::ansi::strip_ansi(&key_bar(pal(), PLAYER_KEYS, 30));
-        assert!(visible_len(&bar) <= 30, "{bar:?}");
+        let bar = tui::plain(&key_bar(pal(), PLAYER_KEYS, 30).line);
+        assert!(tui::width(&bar) <= 30, "{bar:?}");
         assert!(bar.trim_end().ends_with("seek") || bar.trim_end().ends_with("track"), "{bar:?}");
     }
 
@@ -875,10 +580,10 @@ mod tests {
     fn the_transport_line_fills_the_window() {
         let st = PlayerState::new();
         for w in [20, 60, 100, 200] {
-            let line = transport_line(&st, pal(), w);
+            let (line, _) = transport_line(&st, pal(), w);
             assert!(visible_len(&line) <= w, "{w}: {line:?}");
         }
-        assert_eq!(visible_len(&transport_line(&st, pal(), 100)), 100);
+        assert_eq!(visible_len(&transport_line(&st, pal(), 100).0), 100);
     }
 
     #[test]
@@ -888,8 +593,8 @@ mod tests {
         let mut stats = StatsMonitor::new();
         for w in [30, 60, 120] {
             let line = status_line(&st, pal(), &eq, "None", "Off", &mut stats, w);
-            let plain = crate::ansi::strip_ansi(&line);
-            assert!(visible_len(&plain) <= w, "{w}: {plain:?}");
+            let plain = tui::plain(&line);
+            assert!(tui::width(&plain) <= w, "{w}: {plain:?}");
             assert!(plain.trim_end().ends_with("clip ○"), "{w}: {plain:?}");
         }
     }
@@ -913,17 +618,18 @@ mod tests {
 
     #[test]
     fn a_short_header_keeps_the_title_and_drops_the_rest_in_order() {
-        let info: Vec<String> = ["title", "artist", "", "format", "verdict", "", "device", "modes", "", "next"]
-            .map(String::from)
+        let info: Vec<Line<'static>> = ["title", "artist", "", "format", "verdict", "", "device", "modes", "", "next"]
+            .map(Line::raw)
             .to_vec();
-        assert_eq!(compact_info(info.clone(), 10), ["title", "artist", "format", "verdict", "device", "modes", "next"]);
-        assert_eq!(compact_info(info.clone(), 5), ["title", "artist", "format", "verdict", "device"]);
-        assert_eq!(compact_info(info.clone(), 2), ["title", "artist"]);
-        assert_eq!(compact_info(info.clone(), 0), ["title"], "the title always stays");
+        let kept = |info: Vec<Line<'static>>, budget| compact_info(info, budget).iter().map(tui::plain).collect::<Vec<_>>();
+        assert_eq!(kept(info.clone(), 10), ["title", "artist", "format", "verdict", "device", "modes", "next"]);
+        assert_eq!(kept(info.clone(), 5), ["title", "artist", "format", "verdict", "device"]);
+        assert_eq!(kept(info.clone(), 2), ["title", "artist"]);
+        assert_eq!(kept(info.clone(), 0), ["title"], "the title always stays");
         // Shared mode has no verdict: one fewer line to begin with.
         let mut shared = info;
-        shared[4].clear();
-        assert_eq!(compact_info(shared, 4), ["title", "artist", "format", "device"]);
+        shared[4] = Line::default();
+        assert_eq!(kept(shared, 4), ["title", "artist", "format", "device"]);
     }
 
     #[test]
@@ -936,8 +642,8 @@ mod tests {
         let playlist = [PathBuf::from("/a.flac")];
         for w in [20, 30, 40, 45, 60, 100] {
             let lines = info_lines(&st, &ui, "a", "flac", "", "", &playlist, pal(), w);
-            let device = lines.iter().map(|l| crate::ansi::strip_ansi(l)).find(|l| l.contains("FiiO")).unwrap();
-            assert!(visible_len(&device) <= w, "{w}: {device:?}");
+            let device = lines.iter().map(tui::plain).find(|l| l.contains("FiiO")).unwrap();
+            assert!(tui::width(&device) <= w, "{w}: {device:?}");
             if device.contains("exclusive") {
                 assert!(device.ends_with("-bit"), "{w}: the mode cut short: {device:?}");
             }

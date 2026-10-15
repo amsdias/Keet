@@ -1,0 +1,15 @@
+{
+  "name": "Blues",
+  "bands": [
+    { "type": "peak",       "freq": 31,    "gain": 0.0,  "q": 0.71 },
+    { "type": "peak",       "freq": 62,    "gain": 0.0,  "q": 0.71 },
+    { "type": "low_shelf",  "freq": 100,   "gain": 2.0,  "q": 0.71 },
+    { "type": "peak",       "freq": 250,   "gain": 0.0,  "q": 0.71 },
+    { "type": "peak",       "freq": 500,   "gain": 0.0,  "q": 0.71 },
+    { "type": "peak",       "freq": 800,   "gain": 1.5,  "q": 0.8 },
+    { "type": "peak",       "freq": 1500,  "gain": 0.0,  "q": 0.71 },
+    { "type": "peak",       "freq": 3000,  "gain": 1.0,  "q": 1.0 },
+    { "type": "high_shelf", "freq": 8000,  "gain": 1.0,  "q": 0.71 },
+    { "type": "peak",       "freq": 16000, "gain": 0.0,  "q": 0.71 }
+  ]
+}

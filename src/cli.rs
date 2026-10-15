@@ -140,6 +140,10 @@ pub const KEYS: &[(&str, &[(&str, &str)])] = &[
         ("p", "Pick a source (folder dialog)"),
         ("t", "Next theme"),
         ("i", "CPU / memory stats"),
+        ("m", "Mouse on / off"),
+        ("k", "Dock / float the playlist or lyrics"),
+        ("Shift+K", "Close a docked panel"),
+        ("Shift+W", "Save these settings as defaults"),
         ("q", "Quit (or Esc twice)"),
     ]),
     ("PLAYLIST  (l)", &[
@@ -152,13 +156,14 @@ pub const KEYS: &[(&str, &[(&str, &str)])] = &[
         ("/", "Search"),
         ("Shift+S", "Sort by artist, album, track"),
         ("Tab", "Artist / album tree"),
-        ("Esc / l", "Close"),
+        ("Esc / l", "Close / unfocus"),
     ]),
     ("LYRICS  (y)", &[
         ("w / s", "Scroll (stops following the song)"),
+        ("Enter", "Follow the song again"),
         ("a / d", "Sync −/+ 0.5 s (kept per track)"),
         ("0", "Reset the sync offset"),
-        ("Esc / y", "Close"),
+        ("Esc / y", "Close / unfocus"),
     ]),
     ("EQ EDITOR  (e)", &[
         ("Left / Right", "Select a band"),

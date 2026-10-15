@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 
 use symphonia::core::formats::FormatOptions;
@@ -39,6 +39,11 @@ pub struct MetadataCache {
     // RwLock: many concurrent readers (UI playlist render) vs rare writers
     // (background scan threads). Mutex caused UI stutter on large libraries.
     entries: RwLock<Vec<Option<CachedMeta>>>,
+    /// (sum, longest) of the known durations, kept up to date by every write
+    /// (taken while the entries' write lock is held): the playlist panel shows
+    /// both every frame, and a docked one redraws at the visualization's rate
+    /// — scanning a 50k-track library twice per frame under the read lock.
+    durations: Mutex<(f64, f64)>,
     pub cancel: AtomicBool,
 }
 
@@ -47,6 +52,7 @@ impl MetadataCache {
         let entries: Vec<Option<CachedMeta>> = (0..len).map(|_| None).collect();
         Arc::new(Self {
             entries: RwLock::new(entries),
+            durations: Mutex::new((0.0, 0.0)),
             cancel: AtomicBool::new(false),
         })
     }
@@ -119,10 +125,40 @@ impl MetadataCache {
         entries.get(index).and_then(|e| e.as_ref()).and_then(|m| m.title.clone())
     }
 
+    /// Tests: a track whose tags carry these lyrics.
+    #[cfg(test)]
+    pub fn set_lyrics_for_test(&self, index: usize, lyrics: &str) {
+        self.set(index, CachedMeta {
+            display: String::new(),
+            search_text: String::new(),
+            artist: None,
+            title: None,
+            album: None,
+            rg_track_gain: None,
+            rg_track_peak: None,
+            rg_album_gain: None,
+            rg_album_peak: None,
+            lyrics: Some(lyrics.to_string()),
+            duration_secs: None,
+            track_number: None,
+            disc_number: None,
+        });
+    }
+
     fn set(&self, index: usize, meta: CachedMeta) {
         let mut entries = self.entries.write().unwrap();
         if index < entries.len() {
+            let old = entries[index].as_ref().and_then(|m| m.duration_secs);
+            let new = meta.duration_secs;
             entries[index] = Some(meta);
+            let mut d = self.durations.lock().unwrap();
+            d.0 += new.unwrap_or(0.0) - old.unwrap_or(0.0);
+            let longest_shrank = old.is_some_and(|o| o >= d.1 && new.is_none_or(|n| n < o));
+            if longest_shrank {
+                *d = Self::totals(&entries); // the longest shrank: count again
+            } else if let Some(n) = new {
+                d.1 = d.1.max(n);
+            }
         }
     }
 
@@ -139,6 +175,12 @@ impl MetadataCache {
             .map(|p| map.remove(p))
             .collect();
         *entries = new_entries;
+        *self.durations.lock().unwrap() = Self::totals(&entries);
+    }
+
+    fn totals(entries: &[Option<CachedMeta>]) -> (f64, f64) {
+        let known = || entries.iter().flatten().filter_map(|m| m.duration_secs);
+        (known().sum(), known().fold(0.0, f64::max))
     }
 
     // NOTE: there are deliberately NO positional mutators (remove_at/move_entry)
@@ -150,14 +192,12 @@ impl MetadataCache {
     /// library header totals the playlist each frame, and summing through
     /// `duration(i)` took a lock per track (10k locks a frame on a big list).
     pub fn total_duration(&self) -> f64 {
-        let entries = self.entries.read().unwrap();
-        entries.iter().flatten().filter_map(|m| m.duration_secs).sum()
+        self.durations.lock().unwrap().0
     }
 
     /// The longest known track duration (one read lock).
     pub fn max_duration(&self) -> f64 {
-        let entries = self.entries.read().unwrap();
-        entries.iter().flatten().filter_map(|m| m.duration_secs).fold(0.0, f64::max)
+        self.durations.lock().unwrap().1
     }
 
     pub fn duration(&self, index: usize) -> Option<f64> {
@@ -500,6 +540,42 @@ pub fn spawn_metadata_scan(
 #[cfg(test)]
 mod real_file_tests {
     use super::*;
+
+    fn meta(secs: Option<f64>) -> CachedMeta {
+        CachedMeta {
+            display: String::new(),
+            search_text: String::new(),
+            artist: None,
+            title: None,
+            album: None,
+            rg_track_gain: None,
+            rg_track_peak: None,
+            rg_album_gain: None,
+            rg_album_peak: None,
+            lyrics: None,
+            duration_secs: secs,
+            track_number: None,
+            disc_number: None,
+        }
+    }
+
+    #[test]
+    fn the_kept_total_and_longest_follow_every_write() {
+        let c = MetadataCache::new(3);
+        c.set(0, meta(Some(100.0)));
+        c.set(1, meta(Some(300.0)));
+        c.set(2, meta(None));
+        assert_eq!((c.total_duration(), c.max_duration()), (400.0, 300.0));
+        // The longest re-read shorter: the longest is counted again.
+        c.set(1, meta(Some(50.0)));
+        assert_eq!((c.total_duration(), c.max_duration()), (150.0, 100.0));
+        c.set(2, meta(Some(20.0)));
+        assert_eq!((c.total_duration(), c.max_duration()), (170.0, 100.0));
+        // A reindex drops the removed track's time.
+        let old: Vec<PathBuf> = ["/a", "/b", "/c"].iter().map(PathBuf::from).collect();
+        c.reindex(&old[1..], &old);
+        assert_eq!((c.total_duration(), c.max_duration()), (70.0, 50.0));
+    }
 
     #[test]
     fn id3v1_is_only_ever_the_fallback() {

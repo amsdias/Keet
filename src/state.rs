@@ -5,7 +5,16 @@ use std::time::Instant;
 use std::path::PathBuf;
 
 pub const SUPPORTED_EXTENSIONS: &[&str] = &["mp3", "flac", "wav", "ogg", "aac", "m4a", "mp4", "m4b", "aiff", "aif"];
-pub const VIZ_BUFFER_SIZE: usize = 8192; // Small buffer for viz tap from audio callback
+pub const VIZ_BUFFER_SIZE: usize = 8192; // The viz tap's smallest ring
+
+/// The viz tap's ring at an output rate: the analyser drains it once a
+/// drawn frame, so it holds a quarter-second of stereo — 2.5 frames at the
+/// slowest `viz_fps`. A fixed 8192 samples was under one frame at 10 fps
+/// (48 kHz: 9600) or a 192 kHz stream at 30 (12 800), and the tap dropped
+/// the rest every frame: everything timed by audio ran slow.
+pub fn viz_capacity_for(output_rate: u32) -> usize {
+    (output_rate as usize / 2).max(VIZ_BUFFER_SIZE)
+}
 
 /// Ring buffer capacity for a given output rate: ~4 seconds of stereo f32.
 /// Sized per-stream rather than worst-case — 48 kHz output => 1.5 MB, 192 kHz => 6 MB.
@@ -58,14 +67,11 @@ pub const ATTACK: f32 = 0.7;       // Snappiness of the rise
 pub const HOLD_TIME: u8 = 10;      // Frames for the dot to "hang"
 
 // ANSI color codes
-pub const C_RESET: &str = "\x1B[0m";
-pub const C_BOLD: &str = "\x1B[1m";
-pub const C_DIM: &str = "\x1B[2m";
-pub const C_CYAN: &str = "\x1B[36m";
-pub const C_GREEN: &str = "\x1B[32m";
-pub const C_YELLOW: &str = "\x1B[33m";
-pub const C_MAGENTA: &str = "\x1B[35m";
-pub const C_RED: &str = "\x1B[31m";
+/// Moving visualizations draw at this many frames per second unless
+/// `config.json` says otherwise, within `VIZ_FPS_RANGE`.
+pub const DEFAULT_VIZ_FPS: u32 = 30;
+pub const VIZ_FPS_RANGE: (u32, u32) = (10, 60);
+
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -103,6 +109,23 @@ pub enum VizStyle {
 }
 
 impl VizStyle {
+    /// From a `config.json` value: `dots` or `bars`.
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "dots" | "braille" => Some(VizStyle::Dots),
+            "bars" | "blocks" => Some(VizStyle::Bars),
+            _ => None,
+        }
+    }
+
+    /// Its `config.json` name.
+    pub fn name(self) -> &'static str {
+        match self {
+            VizStyle::Dots => "dots",
+            VizStyle::Bars => "bars",
+        }
+    }
+
     pub fn from_u8(value: u8) -> Self {
         match value {
             1 => VizStyle::Dots,
@@ -165,6 +188,23 @@ pub enum VizMode {
 }
 
 impl VizMode {
+    /// Its `config.json` name (what `from_str` reads back).
+    pub fn config_name(self) -> &'static str {
+        match self {
+            VizMode::None => "none",
+            VizMode::VuMeter => "vu",
+            VizMode::SpectrumHorizontal => "spectrum",
+            VizMode::SpectrumVertical => "spectrum-vertical",
+            VizMode::Oscilloscope => "oscilloscope",
+            VizMode::Lissajous => "lissajous",
+            VizMode::Spectrogram => "spectrogram",
+            VizMode::SpectrogramAnalysis => "analysis",
+            VizMode::Polar => "polar",
+            VizMode::Galaxy => "galaxy",
+            VizMode::Cymatics => "cymatics",
+        }
+    }
+
     pub fn next(self) -> Self {
         match self {
             VizMode::None => VizMode::VuMeter,
@@ -406,6 +446,9 @@ pub struct PlayerState {
 
     // Pre/post-fader metering (false = post-fader, true = pre-fader)
     pub(crate) pre_fader: AtomicBool,
+    /// A media key or the OS now-playing widget changed something (pause, a
+    /// seek, a skip): the frame loop draws at once (`take_remote_change`).
+    remote_change: AtomicBool,
 
     // Show CPU/memory stats in status line
     pub(crate) show_stats: AtomicBool,
@@ -424,6 +467,11 @@ pub struct PlayerState {
     /// it is one key — each mode decides what "more detail" means for it, and
     /// the modes with nothing useful to add ignore it.
     pub(crate) viz_extras: AtomicBool,
+    /// Frames per second while a visualization moves (`config.json`
+    /// `viz_fps`).
+    pub(crate) viz_fps: AtomicU32,
+    /// Mouse support wanted (`config.json` `mouse`, `m` toggles).
+    pub(crate) mouse: AtomicBool,
 
     // Decode error from producer thread (None = no error)
     pub(crate) decode_error: Mutex<Option<SkipError>>,
@@ -548,11 +596,14 @@ impl PlayerState {
             effects_preset_count: AtomicUsize::new(0),
             effects_changed: AtomicBool::new(false),
             pre_fader: AtomicBool::new(false),
+            remote_change: AtomicBool::new(false),
             show_stats: AtomicBool::new(false),
             crossfade_secs: AtomicU32::new(0),
             viz_style: AtomicU8::new(VizStyle::Dots as u8),
             viz_fullscreen: AtomicBool::new(false),
             viz_extras: AtomicBool::new(false),
+            viz_fps: AtomicU32::new(DEFAULT_VIZ_FPS),
+            mouse: AtomicBool::new(true),
             decode_error: Mutex::new(None),
             decode_notice: Mutex::new(None),
             track_transition_count: AtomicUsize::new(0),
@@ -588,14 +639,17 @@ impl PlayerState {
     }
 
     pub fn set_theme(&self, kind: crate::theme::ThemeKind) {
+        // HiFi's VU panel is fed whatever the mode (`shown_viz`).
         self.theme.store(kind as u8, Ordering::Relaxed);
-        // HiFi's static VU panel needs live peak data to be useful — without
-        // a viz mode driving the analyser, the bars sit flat at -∞. Default
-        // viz on when entering HiFi, but only if the user hasn't already
-        // picked a mode.
-        if kind == crate::theme::ThemeKind::HiFi && self.viz_mode() == VizMode::None {
-            self.viz_mode.store(VizMode::VuMeter as u8, Ordering::Relaxed);
-        }
+    }
+
+    /// The visualization on screen: HiFi's slot is always its VU panel,
+    /// whatever the mode (none included); the other themes show the mode.
+    /// The analyser feed and the frame rate go by this. The SETTING is left
+    /// alone — rewriting `"viz": "none"` to the VU meter for HiFi followed
+    /// the user into Classic, and Shift+W saved it.
+    pub fn shown_viz(&self) -> VizMode {
+        if self.theme_kind() == crate::theme::ThemeKind::HiFi { VizMode::VuMeter } else { self.viz_mode() }
     }
 
     pub fn cycle_theme(&self) -> crate::theme::ThemeKind {
@@ -843,6 +897,16 @@ impl PlayerState {
         self.effects_changed.swap(false, Ordering::Relaxed)
     }
 
+    /// A media key acted (see `remote_change`).
+    pub fn note_remote_change(&self) {
+        self.remote_change.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether a media key acted since the last call.
+    pub fn take_remote_change(&self) -> bool {
+        self.remote_change.swap(false, Ordering::Relaxed)
+    }
+
     pub fn toggle_pre_fader(&self) {
         self.pre_fader.fetch_xor(true, Ordering::Relaxed);
     }
@@ -861,6 +925,17 @@ impl PlayerState {
 
     pub fn viz_extras(&self) -> bool {
         self.viz_extras.load(Ordering::Relaxed)
+    }
+
+    /// Set the moving-visualization frame rate, kept within `VIZ_FPS_RANGE`.
+    pub fn set_viz_fps(&self, fps: u32) {
+        let (lo, hi) = VIZ_FPS_RANGE;
+        self.viz_fps.store(fps.clamp(lo, hi), Ordering::Relaxed);
+    }
+
+    /// Time between frames while a visualization moves.
+    pub fn viz_frame(&self) -> std::time::Duration {
+        std::time::Duration::from_micros(1_000_000 / self.viz_fps.load(Ordering::Relaxed).max(1) as u64)
     }
 
     /// Returns the new state. Like the full-window toggle, this changes the
@@ -1091,11 +1166,64 @@ pub enum ViewMode {
     Help,
 }
 
+/// Something on screen the mouse acts on (`UiState::hits`, rebuilt by every
+/// frame).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hit {
+    /// A progress bar: a click or drag seeks to that point of the track.
+    Seek,
+    /// The flat playlist's rows, the first showing list position `first`.
+    List { first: usize },
+    /// The library tree's rows, the first showing visible row `first`.
+    Tree { first: usize },
+    /// A dialog: clicks inside it do nothing, a click outside closes it.
+    Dialog,
+    /// A tab naming a view: a click opens it.
+    Tab(ViewMode),
+    /// A docked panel: a click in it gives it the keys.
+    Panel(ViewMode),
+    /// A key hint: a click presses that key.
+    Key(crossterm::event::KeyCode, crossterm::event::KeyModifiers),
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub enum InputMode {
     Normal,
-    Search(String),
-    SavePlaylist(String),
+    Search(crate::text_input::TextInput),
+    SavePlaylist(crate::text_input::TextInput),
+    /// The `o` dialog: a folder, file or playlist to open.
+    OpenPath(crate::text_input::TextInput),
+}
+
+impl InputMode {
+    /// The mode's text field, if it has one.
+    pub fn field(&self) -> Option<&crate::text_input::TextInput> {
+        match self {
+            InputMode::Search(t) | InputMode::SavePlaylist(t) | InputMode::OpenPath(t) => Some(t),
+            InputMode::Normal => None,
+        }
+    }
+
+    /// Whether this mode floats a dialog over the view.
+    pub(crate) fn is_overlay(&self) -> bool {
+        matches!(self, InputMode::OpenPath(_))
+    }
+
+    /// A search with something typed in it.
+    pub fn searching(&self) -> bool {
+        matches!(self, InputMode::Search(q) if !q.is_empty())
+    }
+}
+
+/// What a click landed on, for telling a double click: a list's or tree's
+/// ITEM (its position), else the screen row. By screen row alone, a first
+/// click that scrolled the list made the second one a double click on the
+/// track scrolled under the pointer, which played.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ClickSpot {
+    ListItem(usize),
+    TreeItem(usize),
+    Row(u16),
 }
 
 pub struct UiState {
@@ -1171,27 +1299,34 @@ pub struct UiState {
     /// the playlist length = past the end). Cleared by the next track change.
     pub removed_current_next: Option<usize>,
     pub terminal_resized: bool,
-    /// Whether the previous frame left the analysis-spectrogram sixel block on
-    /// screen untouched. Cleared at the top of every print_status frame and
-    /// re-asserted by the analysis branch — any other frame (playlist/lyrics
-    /// view, another viz mode) leaves it false, forcing a full re-emit when
-    /// the spectrogram next renders over whatever that frame painted.
+    /// Whether the previous frame left the analysis-spectrogram image on
+    /// screen untouched. Cleared at the top of every frame and re-asserted by
+    /// the analysis branch — any other frame (playlist/lyrics view, another
+    /// viz mode) leaves it false, forcing a full re-emit when the spectrogram
+    /// next renders over whatever that frame drew.
     pub spectro_block_intact: bool,
-    /// (first row, body height) of the viz block the last frame drew, the row
-    /// counted in frame lines below the anchor (so it includes the top padding
-    /// AND everything above the block). A change in EITHER means the block
-    /// moved or resized, so a Sixel image must be re-emitted. The padding
-    /// alone misses moves caused by rows above it (a status line replacing
-    /// the 4-row command tray moves the block up 2 rows, stranding the image).
-    pub last_viz_block: (usize, usize),
-    pub lyrics: Option<crate::lyrics::Lyrics>,
-    pub lyrics_receiver: Option<std::sync::mpsc::Receiver<Option<(crate::lyrics::Lyrics, crate::lyrics::LyricsSource)>>>,
+    /// Where the viz block the last frame drew sat. A block that moved or
+    /// resized must send its image again (a status line replacing Minimal's
+    /// 4-row command tray moves it up 2 rows).
+    pub last_viz_block: ratatui::layout::Rect,
+    /// The track's lyrics. Private: every change goes through `set_lyrics`,
+    /// which drops `lyrics_wrap` with them (kept, the old song's rows showed
+    /// under the new song's line numbers).
+    lyrics: Option<crate::lyrics::Lyrics>,
+    pub lyrics_receiver: Option<std::sync::mpsc::Receiver<crate::lyrics::LyricsAnswer>>,
+    /// Why the lyrics could not be looked up (LRCLIB busy or unreachable),
+    /// shown instead of "no lyrics for this track", which it is not.
+    pub lyrics_unavailable: Option<&'static str>,
+    /// The synced lyric line the last check saw (`ui::lyrics_line_moved`).
+    pub lyrics_line_seen: Option<usize>,
     /// Where `lyrics` came from (None while there are none).
     pub lyrics_source: Option<crate::lyrics::LyricsSource>,
     /// The window is below ui::MIN_WINDOW and shows the too-small screen.
     pub too_small: bool,
     /// The view the key list (`?`) was opened from, and closes back to.
     pub help_return: ViewMode,
+    /// The view the EQ editor (`e`) was opened from, and closes back to.
+    pub eq_return: ViewMode,
     /// A first Esc in the player view asked "press Esc again to quit" and
     /// waits until then for the second.
     pub esc_quit_until: Option<Instant>,
@@ -1216,7 +1351,16 @@ pub struct UiState {
     pub output_opened_at: Option<Instant>,
     /// A rescan in progress on a worker thread (see `ui::poll_rescan`).
     pub rescan_receiver: Option<std::sync::mpsc::Receiver<crate::playlist::RescanResult>>,
+    /// The lyrics panel's first screen row, as the last frame drew it.
     pub lyrics_scroll: usize,
+    /// Rows the user scrolled (w/s, the wheel) since the last frame, applied
+    /// by the draw: only it knows where following the song puts the panel
+    /// (right after `y` that is not row 0) and where its last row is. A frame
+    /// that does not draw the panel drops it (`ui::draw`).
+    pub lyrics_step: isize,
+    /// The lyrics wrapped for the panel (`lyrics_panel`), kept until the
+    /// width or theme change; `set_lyrics` drops it with the lyrics.
+    lyrics_wrap: Option<crate::lyrics_panel::Wrapped>,
     pub lyrics_auto_scroll: bool,
     pub lyrics_offset: f64, // seconds added to the playback clock: positive = lyrics EARLIER. Per track, saved in lyrics_offsets
     /// Monotonic counter incremented on each lyrics spawn. Workers capture a snapshot
@@ -1225,9 +1369,9 @@ pub struct UiState {
 
     /// Currently-resolved album cover (half-block pre-rendered lines if decoded).
     pub cover: Option<crate::cover::CoverImage>,
-    /// Emit-on-change bookkeeping for the Minimal cover slot, mirroring
-    /// `spectro_block_intact`: false means another view painted over the
-    /// block, so the image must be re-transmitted rather than stepped past.
+    /// Emit-on-change bookkeeping for the cover slot, mirroring
+    /// `spectro_block_intact`: false means another view drew over the slot,
+    /// so the image must be sent again rather than left in place.
     pub cover_block_intact: bool,
     /// Set when the cover itself changed (new track, load completed, theme
     /// switch re-decoded it at a different size) — forces one repaint.
@@ -1240,9 +1384,117 @@ pub struct UiState {
     pub cover_enabled: bool,
     /// Visible playlist rows from the last render — used by PageUp/PageDown.
     pub last_visible_rows: usize,
+    /// Something the screen shows changed (a key, a resize, a background
+    /// result): draw now rather than at the next scheduled frame.
+    pub dirty: bool,
+    /// `Shift+W` asked to write the settings as defaults (the player has the
+    /// preset names it takes).
+    pub save_defaults: bool,
+    /// Why the `o` dialog's path was not opened ("Not found: …"), shown in
+    /// the dialog until the path is edited.
+    pub open_error: Option<String>,
+    /// Where the last frame drew things a click or the wheel acts on.
+    pub hits: Vec<(ratatui::layout::Rect, Hit)>,
+    /// The last left click (when, the target it hit, row): a second on the
+    /// same row of the same target soon after is a double click.
+    pub last_click: Option<(Instant, Option<ratatui::layout::Rect>, ClickSpot)>,
+    /// An event read right behind an Esc (to tell a lone Esc from a key
+    /// sequence) that was not a key: handled next, after the Esc. Thrown
+    /// away, a click or a dropped folder within the tick was lost.
+    pub deferred_event: Option<crossterm::event::Event>,
+    /// The list's / the tree's cursor was put by a click: the next draw
+    /// keeps the scroll while the row is visible (the margin's scroll moved
+    /// it from under the pointer, and the second click of a double click
+    /// landed on another row).
+    /// (The cursor the click put: a key that moved it since scrolls as ever.)
+    pub list_clicked: Option<usize>,
+    pub tree_clicked: Option<usize>,
+    /// Keys a click pressed (a key hint), handled by the next `poll_input`
+    /// pass as if typed.
+    pub pressed: std::collections::VecDeque<crossterm::event::KeyEvent>,
+    /// The panels (`ViewMode::Playlist`, `ViewMode::Lyrics`) docked into the
+    /// player's layout rather than floating (`k`).
+    pub docked: Vec<ViewMode>,
+    /// The panels, the one used last first: the order docked panels keep
+    /// their room in when the window is short of it.
+    pub panel_recent: Vec<ViewMode>,
+    /// The docked panels the last frame found room for (the rest float when
+    /// opened).
+    pub docked_shown: Vec<ViewMode>,
+    /// The panel the last frame drew floating, if any. With `docked_shown`,
+    /// what was on screen: `ui::open_view` focuses such a panel as it was
+    /// and sets up only one that was not.
+    pub floating_shown: Option<ViewMode>,
+    /// This frame's status message, read ONCE by `ui::draw` (`active_status`
+    /// advances the notice queue: a second reader in a frame could show
+    /// another message), for the theme's status line and a panel's border.
+    pub frame_status: Option<String>,
+    /// Where the theme drew its status line this frame (`ui::note_status`):
+    /// a floating panel repeats the message in its border only when it
+    /// covers that line.
+    pub status_drawn_at: Option<ratatui::layout::Rect>,
+    /// The view with the keys while the player is being drawn (the themes
+    /// draw it with `view_mode` set to the player): a docked panel's border
+    /// is lit when it is this one.
+    pub focus: ViewMode,
+    /// Where this draw put the visualization (`ui::draw_viz`), if anywhere.
+    pub viz_drawn_at: Option<ratatui::layout::Rect>,
+    /// Whether the last draw showed the visualization, not hidden under a
+    /// dialog (`viz_on_screen`).
+    pub viz_shown: bool,
+    /// The images a dialog covered in the last frame (`ui::draw`): one
+    /// newly covered is deleted (Kitty) and marked to be sent again, once;
+    /// one no dialog covers stays on screen.
+    pub images_withheld: Vec<crate::tui::ImageSlot>,
 }
 
 impl UiState {
+    /// New lyrics (or none): they open at the top, following the song, with
+    /// the last song's wrap gone. Every change of the lyrics goes through
+    /// here.
+    pub fn set_lyrics(&mut self, lyrics: Option<crate::lyrics::Lyrics>) {
+        self.lyrics = lyrics;
+        self.lyrics_wrap = None;
+        // A failed lookup belongs to the lyrics it was for.
+        self.lyrics_unavailable = None;
+        self.reset_lyrics_view();
+    }
+
+    pub fn lyrics(&self) -> Option<&crate::lyrics::Lyrics> {
+        self.lyrics.as_ref()
+    }
+
+    /// The lyrics and their wrap, for the panel that draws them.
+    pub fn lyrics_and_wrap(&mut self) -> (Option<&crate::lyrics::Lyrics>, &mut Option<crate::lyrics_panel::Wrapped>) {
+        (self.lyrics.as_ref(), &mut self.lyrics_wrap)
+    }
+
+    /// The lyrics panel as it opens: at the top, following the song (new
+    /// lyrics, or the panel opened when it was not on screen).
+    pub fn reset_lyrics_view(&mut self) {
+        self.lyrics_scroll = 0;
+        self.lyrics_step = 0;
+        self.lyrics_auto_scroll = true;
+    }
+
+    /// Scroll the lyrics by `rows` screen rows (down when positive), from
+    /// wherever the next frame finds them; with no lyrics, nothing.
+    pub fn scroll_lyrics(&mut self, rows: isize) {
+        if self.lyrics.is_some() {
+            self.lyrics_step += rows;
+        }
+    }
+
+    /// Whether the visualization is on screen: the last draw drew it and no
+    /// dialog covers it whole. Panels and the EQ editor float over the
+    /// running player, so this is a question about the last frame, not the
+    /// view: a docked panel can take the visualization's slot, a big floating
+    /// one can hide it. While it is off screen the analyser is not fed and
+    /// frames come at the idle rate.
+    pub fn viz_on_screen(&self) -> bool {
+        self.viz_shown
+    }
+
     pub fn new(source_paths: Vec<PathBuf>, metadata_cache: std::sync::Arc<crate::metadata::MetadataCache>) -> Self {
         Self {
             view_mode: ViewMode::Player,
@@ -1281,13 +1533,16 @@ impl UiState {
             removed_current_next: None,
             terminal_resized: false,
             spectro_block_intact: false,
-            last_viz_block: (0, 0),
+            last_viz_block: ratatui::layout::Rect::ZERO,
             lyrics: None,
             lyrics_receiver: None,
+            lyrics_line_seen: None,
+            lyrics_unavailable: None,
             lyrics_source: None,
             too_small: false,
             esc_quit_until: None,
             help_return: ViewMode::Player,
+            eq_return: ViewMode::Player,
             device_name: String::new(),
             hq_resampler: false,
             lyrics_offsets: Default::default(),
@@ -1298,6 +1553,8 @@ impl UiState {
             lyrics_lookups: Default::default(),
             cover_misses: Default::default(),
             lyrics_scroll: 0,
+            lyrics_step: 0,
+            lyrics_wrap: None,
             lyrics_auto_scroll: true,
             lyrics_offset: 0.0,
             lyrics_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1309,6 +1566,25 @@ impl UiState {
             cover_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             cover_enabled: true,
             last_visible_rows: 20,
+            dirty: true,
+            save_defaults: false,
+            open_error: None,
+            hits: Vec::new(),
+            last_click: None,
+            deferred_event: None,
+            list_clicked: None,
+            tree_clicked: None,
+            pressed: std::collections::VecDeque::new(),
+            docked: Vec::new(),
+            panel_recent: vec![ViewMode::Playlist, ViewMode::Lyrics],
+            docked_shown: Vec::new(),
+            floating_shown: None,
+            frame_status: None,
+            status_drawn_at: None,
+            focus: ViewMode::Player,
+            viz_drawn_at: None,
+            viz_shown: true,
+            images_withheld: Vec::new(),
         }
     }
 
@@ -1323,6 +1599,8 @@ impl UiState {
     /// a notice meant to be read (exclusive mode falling back, a bad config
     /// colour) before the first frame is even drawn.
     pub fn set_status(&mut self, msg: String) {
+        // A message is a change on screen: a frame now, also from a worker.
+        self.dirty = true;
         if !self.notice_up() {
             self.set_status_for(msg, std::time::Duration::from_secs(2));
             self.status_routine = true;
@@ -1337,6 +1615,8 @@ impl UiState {
     /// A status message that stays up for `hold` — for notices that matter
     /// more than a key's confirmation (e.g. exclusive mode falling back).
     pub fn set_status_for(&mut self, msg: String, hold: std::time::Duration) {
+        // A message is a change on screen: a frame now, also from a worker.
+        self.dirty = true;
         self.status_message = Some((crate::ansi::sanitize_display(&msg), Instant::now()));
         self.status_hold = hold;
         self.status_routine = false;
@@ -1348,6 +1628,8 @@ impl UiState {
     /// first audio notice lands on the first frame; with one slot, each
     /// replaced the last and only the final one was ever seen.
     pub fn queue_notice(&mut self, msg: String, hold: std::time::Duration) {
+        // A message is a change on screen: a frame now, also from a worker.
+        self.dirty = true;
         // No size limit needed: repeats are dropped, and only a handful of
         // kinds exist. A queued notice can show late (behind a 10 s startup
         // one); each names what it is about (a file, the device), so it
@@ -1363,16 +1645,15 @@ impl UiState {
         }
     }
 
-    /// The status message, cut to fit the window. Every theme prints it after
-    /// a 2-column indent on a single frame line; a longer one (a device name
-    /// plus an explanation) wrapped into a row the frame never counted.
+    /// The status message up now (advancing the notice queue when it is
+    /// over: read once a frame, by `ui::draw`). Not cut here: where it is
+    /// drawn cuts it to its row (`ui::draw_status_line`, `border_status`);
+    /// cutting here too asked the terminal its size every frame, and could
+    /// cut to another width than the frame's during a resize.
     pub fn active_status(&mut self) -> Option<String> {
         if let Some((ref msg, when)) = self.status_message {
             if when.elapsed() < self.status_hold {
-                return Some(match crossterm::terminal::size() {
-                    Ok((cols, _)) => crate::ansi::truncate_plain(msg, (cols as usize).saturating_sub(3).max(1)),
-                    Err(_) => msg.clone(),
-                });
+                return Some(msg.clone());
             }
             self.status_message = None;
         }
@@ -1388,6 +1669,15 @@ impl UiState {
 #[cfg(test)]
 mod state_tests {
     use super::*;
+
+    #[test]
+    fn the_viz_ring_holds_a_frame_of_audio_at_any_rate_and_frame_rate() {
+        for rate in [44_100, 48_000, 96_000, 192_000, 384_000] {
+            let frame = rate as usize * 2 / VIZ_FPS_RANGE.0 as usize;
+            assert!(viz_capacity_for(rate) >= frame * 2, "{rate} Hz at {} fps", VIZ_FPS_RANGE.0);
+        }
+        assert!(viz_capacity_for(8_000) >= VIZ_BUFFER_SIZE);
+    }
 
     #[test]
     fn a_routine_message_does_not_wipe_a_notice_meant_to_be_read() {

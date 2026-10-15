@@ -38,6 +38,11 @@ mod gapless;
 mod fade;
 mod signal;
 mod term;
+mod tui;
+mod text_input;
+mod hints;
+mod playlist_panel;
+mod lyrics_panel;
 mod welcome;
 #[cfg(target_os = "windows")]
 mod wasapi_out;
@@ -56,7 +61,7 @@ use cpal::StreamConfig;
 use crossterm::terminal;
 use rtrb::RingBuffer;
 
-use state::{PlayerState, UiState, RgMode, ring_capacity_for, VIZ_BUFFER_SIZE};
+use state::{PlayerState, UiState, RgMode, ring_capacity_for};
 use audio::{build_stream, set_output_sample_rate, probe_sample_rate, fix_bluetooth_sample_rate};
 use playlist::{build_playlist, shuffle_list};
 use ui::arm_auto_sort;
@@ -462,6 +467,15 @@ fn apply_config(
     if let Some(v) = config.viz.as_deref().and_then(state::VizMode::from_str) {
         state.viz_mode.store(v as u8, Ordering::Relaxed);
     }
+    if let Some(fps) = config.viz_fps {
+        state.set_viz_fps(fps);
+    }
+    if let Some(on) = config.mouse {
+        state.mouse.store(on, Ordering::Relaxed);
+    }
+    if let Some(style) = config.viz_style.as_deref().and_then(state::VizStyle::from_str) {
+        state.viz_style.store(style as u8, Ordering::Relaxed);
+    }
     if !rg_mode_flag {
         if let Some(m) = config.rg_mode.as_deref().and_then(RgMode::from_str) {
             state.rg_mode.store(m as u8, Ordering::Relaxed);
@@ -560,10 +574,11 @@ fn rate_label(src_rate: u32, stream_rate: u32, state: &PlayerState) -> String {
 /// caught decoder panic apart from one that is really taking Keet down.
 const PRODUCER_THREAD: &str = "keet-producer";
 
-/// Apply a pending full-screen repaint (resize, theme or viz-layout change).
-/// Returns true when the screen was repainted from scratch, so the caller
-/// resets its frame bookkeeping (`prev_frame_lines = usize::MAX`, any Kitty
-/// image gone). Must run after the DEC 2026 sync-begin.
+/// Take a pending full-screen repaint (resize, theme or viz-layout change).
+/// Returns true when the next frame must clear the screen and draw every
+/// cell again (`Player::full_repaint`; the clear itself goes through the
+/// terminal, so ratatui forgets what it had drawn). Must run after the DEC
+/// 2026 sync-begin.
 ///
 /// Every loop that draws frames calls this — the steady-state loop, the
 /// start-of-track buffering wait and the exclusive-mode rate-change wait —
@@ -575,18 +590,26 @@ fn repaint_if_needed(ui: &mut state::UiState) -> bool {
     ui.terminal_resized = false;
     // Remove any placed Kitty graphic: the frame redraws (and re-places) it.
     // No-op on terminals that don't speak the protocol.
-    let kitty_clear = if matches!(cover::detect_protocol(), cover::GraphicsProtocol::Kitty) {
-        format!("{}{}", cover::kitty_clear_escape(), cover::viz_image_clear_escape())
-    } else {
-        String::new()
-    };
-    // Home + erase-down (NOT \x1B[2J): ConPTY implements ED2 by scrolling the
-    // viewport into scrollback, so on Windows Terminal a 2J repaint shoves the
-    // whole UI out of sight instead of refreshing in place. ED0 from home
-    // erases the same cells without the scroll.
-    crate::term::out!("{}\x1B[0m\x1B[H\x1B[J", kitty_clear);
+    if matches!(cover::detect_protocol(), cover::GraphicsProtocol::Kitty) {
+        crate::term::out!("{}{}", cover::kitty_clear_escape(), cover::viz_image_clear_escape());
+    }
     ui.cover_block_intact = false;
     true
+}
+
+/// The startup notices for config.json's unreadable values: the ignored
+/// keys, and the Classic colours that fell back to their defaults.
+fn config_notices(problems: &[String], colours: &[&str]) -> Vec<String> {
+    let mut notes = Vec::new();
+    if !problems.is_empty() {
+        notes.push(format!("config.json: ignored {}", problems.join(", ")));
+    }
+    // Both when both: `queue_notice` shows them one after another (an
+    // `else` swallowed the colours whenever another key was bad).
+    if !colours.is_empty() {
+        notes.push(format!("config.json: classic_colors.{} is not a #RRGGBB colour — using the default", colours.join(", ")));
+    }
+    notes
 }
 
 /// Kick off the lyrics loader on a background thread and install its receiver on `ui`.
@@ -595,45 +618,65 @@ fn repaint_if_needed(ui: &mut state::UiState) -> bool {
 fn spawn_lyrics_worker(ui: &mut state::UiState, path: std::path::PathBuf, dur: Option<u32>) {
     // A manual sync fix belongs to the track it was made for, and is kept.
     ui.lyrics_offset = ui.lyrics_offsets.get(&path);
+    // Bump the generation first, whatever comes next; each worker snapshots
+    // it and bails out of the slow LRCLIB fetch if the user has skipped to
+    // another track in the meantime (a backlog of blocked HTTP threads
+    // during rapid skipping). Bumped only on the way to a new worker, the
+    // last one stayed current when this track had embedded lyrics, and
+    // asked LRCLIB again after its retry wait for a track gone.
+    let gen_snap = ui.lyrics_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     if let Some(l) = ui.metadata_cache.lyrics(ui.current) {
-        ui.lyrics = Some(lyrics::parse_lyrics(&l));
+        ui.set_lyrics(Some(lyrics::parse_lyrics(&l)));
         ui.lyrics_source = Some(lyrics::LyricsSource::Embedded);
         ui.lyrics_receiver = None;
         return;
     }
     let (cached_artist, cached_title) = ui.metadata_cache.artist_title(ui.current);
-    ui.lyrics = None;
+    ui.set_lyrics(None);
     ui.lyrics_source = None;
+    ui.lyrics_unavailable = None;
     let (tx, rx) = std::sync::mpsc::channel();
     ui.lyrics_receiver = Some(rx);
-    // Bump the generation; each worker snapshots this and bails out of the slow
-    // LRCLIB fetch if the user has skipped to another track in the meantime.
-    // This prevents a backlog of blocked HTTP threads during rapid skipping.
-    let gen_snap = ui.lyrics_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     let gen_ref = std::sync::Arc::clone(&ui.lyrics_gen);
     let net_cache = ui.lyrics_lookups.clone();
     std::thread::spawn(move || {
+        use lyrics::{Lookup, LyricsAnswer, LyricsSource};
         let (artist, title, embedded) = if cached_artist.is_some() || cached_title.is_some() {
             (cached_artist, cached_title, metadata::read_lyrics(&path))
         } else {
             metadata::read_artist_title_lyrics(&path)
         };
-        let res = if let Some(l) = embedded {
-            Some((lyrics::parse_lyrics(&l), lyrics::LyricsSource::Embedded))
+        let current = || gen_ref.load(std::sync::atomic::Ordering::Relaxed) == gen_snap;
+        let found = |s: &str| LyricsAnswer::Found(lyrics::parse_lyrics(s), LyricsSource::Lrclib);
+        let answer = if let Some(l) = embedded {
+            LyricsAnswer::Found(lyrics::parse_lyrics(&l), LyricsSource::Embedded)
         } else if let (Some(a), Some(t)) = (artist, title) {
-            // Skip the network round-trip if a newer request has already been issued.
-            if gen_ref.load(std::sync::atomic::Ordering::Relaxed) != gen_snap {
-                None
-            } else {
-                let key = format!("{a}\0{t}\0{}", dur.unwrap_or(0));
-                net_cache
-                    .get_or_fetch(key, || lyrics::fetch_lrclib(&a, &t, dur))
-                    .map(|s| (lyrics::parse_lyrics(&s), lyrics::LyricsSource::Lrclib))
+            // Asked once more after a wait when busy or failed; the wait ends
+            // early if the track changes.
+            let wait = |d: std::time::Duration| {
+                let until = std::time::Instant::now() + d;
+                while std::time::Instant::now() < until {
+                    if !current() {
+                        return false;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+                current()
+            };
+            let disk = lyrics::LyricsDisk::in_config();
+            // Skip the network round-trip if a newer request has already
+            // been issued (what is already known is still read).
+            let fetch = || if current() { lyrics::fetch_lrclib(&a, &t, dur) } else { Lookup::Failed };
+            match lyrics::lookup_lrclib(&net_cache, disk.as_ref(), (&a, &t, dur), fetch, wait) {
+                Lookup::Found(text) => found(&text),
+                Lookup::NotFound => LyricsAnswer::Missing,
+                Lookup::Busy(_) => LyricsAnswer::Unavailable("LRCLIB busy, try again later"),
+                Lookup::Failed => LyricsAnswer::Unavailable("LRCLIB unreachable"),
             }
         } else {
-            None
+            LyricsAnswer::Missing
         };
-        let _ = tx.send(res);
+        let _ = tx.send(answer);
     });
 }
 
@@ -641,6 +684,8 @@ fn spawn_lyrics_worker(ui: &mut state::UiState, path: std::path::PathBuf, dur: O
 /// sidecar, on-disk cache, then iTunes Search (saving result back to cache).
 /// Exits early (before HTTP) if a newer track has been selected.
 fn spawn_cover_worker(ui: &mut state::UiState, path: std::path::PathBuf, size: cover::CoverSize) {
+    // Any older worker is out of date, whatever comes next.
+    let gen_snap = ui.cover_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     if !ui.cover_enabled {
         ui.cover = None;
         ui.cover_receiver = None;
@@ -652,7 +697,6 @@ fn spawn_cover_worker(ui: &mut state::UiState, path: std::path::PathBuf, size: c
     ui.cover_dirty_frame = true;
     let (tx, rx) = std::sync::mpsc::channel();
     ui.cover_receiver = Some(rx);
-    let gen_snap = ui.cover_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     let gen_ref = std::sync::Arc::clone(&ui.cover_gen);
     let misses = ui.cover_misses.clone();
     std::thread::spawn(move || {
@@ -692,7 +736,7 @@ fn spawn_cover_worker(ui: &mut state::UiState, path: std::path::PathBuf, size: c
                         // about the album, and remembering it would keep the
                         // cover away for the session after the network came
                         // back. The next play of the album simply asks again.
-                        lyrics::Lookup::Failed => None,
+                        lyrics::Lookup::Failed | lyrics::Lookup::Busy(_) => None,
                     }
                 }
             }
@@ -722,16 +766,34 @@ impl Drop for TerminalGuard {
 /// that wiped the user's screen.
 fn enter_alternate_screen(w: &mut impl Write) {
     crate::term::flush();
-    let _ = w.write_all(b"\x1B[?1049h\x1B[?2026l\x1B[0m\x1B[H\x1B[J");
+    let _ = w.write_all(alt_screen_enter(cfg!(windows)).as_bytes());
     let _ = w.flush();
     ON_ALTERNATE_SCREEN.store(true, Ordering::Relaxed);
+}
+
+/// The bytes that enter the alternate screen. Bracketed paste (?2004): a
+/// paste — or a folder dropped on the terminal — arrives as one Paste event
+/// instead of keystrokes, so it goes into a text field whole and can never
+/// trigger keys. NOT on Windows: crossterm reads console input records
+/// there and never makes a Paste event, so the terminal's paste markers
+/// (`ESC[200~` … `ESC[201~`) arrived as keystrokes — the Esc closed the
+/// field a dropped folder was meant for. Without them a drop types into the
+/// open field, as before bracketed paste.
+fn alt_screen_enter(windows: bool) -> &'static str {
+    if windows { "\x1B[?1049h\x1B[?2026l\x1B[0m\x1B[H\x1B[J" } else { "\x1B[?1049h\x1B[?2026l\x1B[?2004h\x1B[0m\x1B[H\x1B[J" }
+}
+
+/// The bytes that leave it (bracketed paste off where it was on).
+fn alt_screen_leave(windows: bool) -> &'static str {
+    if windows { "\x1B[0m\x1B[?1049l" } else { "\x1B[0m\x1B[?2004l\x1B[?1049l" }
 }
 
 /// Leave it only when in it: `?1049l` also restores a cursor position saved
 /// on entry, and with none saved some terminals jump to the top left.
 fn leave_alternate_screen(w: &mut impl Write) {
     if ON_ALTERNATE_SCREEN.swap(false, Ordering::Relaxed) {
-        let _ = w.write_all(b"\x1B[0m\x1B[?1049l");
+        crate::tui::release_mouse(w);
+        let _ = w.write_all(alt_screen_leave(cfg!(windows)).as_bytes());
         let _ = w.flush();
     }
 }
@@ -830,7 +892,7 @@ fn rebuild_stream(
     // to stay the old ring's. The producer reads the size from its own ring.
     let ring_cap = ring_capacity_for(stream_rate);
     let (prod, cons) = RingBuffer::<f32>::new(ring_cap);
-    let (viz_prod, viz_cons) = RingBuffer::<f32>::new(VIZ_BUFFER_SIZE);
+    let (viz_prod, viz_cons) = RingBuffer::<f32>::new(state::viz_capacity_for(stream_rate));
 
     // Windows exclusive mode: Keet's own WASAPI exclusive stream (cpal only
     // opens shared mode), in the most precise layout the device accepts at
@@ -934,7 +996,7 @@ fn rebuild_stream(
             let ring_cap = ring_capacity_for(rate);
             state.output_rate.store(rate as u64, Ordering::Relaxed);
             let (p, c) = RingBuffer::<f32>::new(ring_cap);
-            let (vp, vc) = RingBuffer::<f32>::new(VIZ_BUFFER_SIZE);
+            let (vp, vc) = RingBuffer::<f32>::new(state::viz_capacity_for(rate));
             let cfg = StreamConfig {
                 channels: fallback.channels(),
                 sample_rate: rate,
@@ -1129,6 +1191,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // yields to an explicit CLI flag for the same setting.
     let rg_flag = args.iter().any(|a| a == "--rg-mode");
     apply_config(&state, &app_config, rg_flag, eq_arg.is_some(), &eq_presets, &cf_presets);
+    // The Sixel cell size, settled before the first image is sized; a bad
+    // value is named with the other config problems.
+    let sixel_problem = match config::sixel_cell(app_config.sixel_cell.as_deref()) {
+        Ok(cell) => {
+            viz::set_sixel_cell(cell);
+            None
+        }
+        Err(e) => {
+            viz::set_sixel_cell(None);
+            Some(e)
+        }
+    };
     // An option typed with a resume (`keet --eq Rock`) wins over the saved
     // session, which apply_resume_state just restored over it.
     if resume_state_loaded.is_some() {
@@ -1187,17 +1261,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(note) = skipped_sources {
         ui.queue_notice(note, Duration::from_secs(10));
     }
+    // Panels docked at startup; a name that is not a panel is ignored and
+    // named, like any other bad value.
+    let mut problems = app_config.problems.clone();
+    problems.extend(sixel_problem);
+    let (docked, bad) = ui::docked_from_config(app_config.docked.as_deref().unwrap_or_default());
+    ui.docked = docked;
+    problems.extend(bad);
+    if let Some(style) = app_config.viz_style.as_deref() {
+        if state::VizStyle::from_str(style).is_none() {
+            problems.push(format!("viz_style ({style:?} is not dots or bars)"));
+        }
+    }
     // Unreadable config values: each was skipped on its own (config::parse).
-    if !app_config.problems.is_empty() {
-        ui.queue_notice(
-            format!("config.json: ignored {}", app_config.problems.join(", ")),
-            std::time::Duration::from_secs(8),
-        );
-    } else if !classic_colour_problems.is_empty() {
-        ui.queue_notice(
-            format!("config.json: classic_colors.{} is not a #RRGGBB colour — using the default", classic_colour_problems.join(", ")),
-            std::time::Duration::from_secs(8),
-        );
+    for adjusted in &app_config.adjusted {
+        ui.queue_notice(format!("config.json: {adjusted}"), std::time::Duration::from_secs(8));
+    }
+    for note in config_notices(&problems, &classic_colour_problems) {
+        ui.queue_notice(note, std::time::Duration::from_secs(8));
     }
     state.repeat_mode.store(repeat_mode as u8, Ordering::Relaxed);
 
@@ -1240,6 +1321,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // device or a bad option is reported on the user's own screen, which
     // nothing has touched.
     enter_alternate_screen(&mut io::stdout());
+    // Clicks and the wheel (config.json `mouse`, `m` toggles).
+    crate::tui::set_mouse(state.mouse.load(Ordering::Relaxed));
 
     // Hide cursor to prevent flickering
     crate::term::out!("\x1B[?25l");
@@ -1356,6 +1439,61 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod main_tests {
     use super::*;
+
+    #[test]
+    fn a_bad_classic_colour_is_reported_beside_other_config_problems() {
+        let notes = config_notices(&["docked (\"lyric\" is not a panel)".into()], &["highlight"]);
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(notes[1].contains("classic_colors.highlight"));
+        assert_eq!(config_notices(&[], &[]).len(), 0);
+    }
+
+    #[test]
+    fn embedded_lyrics_call_off_the_last_tracks_lookup() {
+        let mut ui = UiState::new(Vec::new(), metadata::MetadataCache::new(2));
+        ui.metadata_cache.set_lyrics_for_test(1, "[00:01.00]hello");
+        // Track 0's lookup is out (waiting out a 429, say)...
+        let before = ui.lyrics_gen.load(Ordering::Relaxed);
+        // ...and the next track has its own lyrics.
+        ui.current = 1;
+        spawn_lyrics_worker(&mut ui, std::path::PathBuf::from("/b.flac"), None);
+        assert!(ui.lyrics().is_some(), "the embedded lyrics show");
+        assert_ne!(ui.lyrics_gen.load(Ordering::Relaxed), before, "the old lookup is no longer current");
+    }
+
+    #[test]
+    fn hifi_shows_its_vu_meter_without_rewriting_the_setting() {
+        // `"viz": "none"` with HiFi: the meter shows and is fed, and the
+        // setting stays none (rewritten to the VU meter, it followed the
+        // user to Classic, and Shift+W saved it).
+        let state = PlayerState::new();
+        state.set_theme(theme::ThemeKind::HiFi);
+        let config = config::Config { viz: Some("none".into()), ..Default::default() };
+        apply_config(&state, &config, false, false, &[], &[]);
+        assert_eq!(state.viz_mode(), state::VizMode::None, "the setting as configured");
+        assert_eq!(state.shown_viz(), state::VizMode::VuMeter, "what HiFi shows");
+        state.set_theme(theme::ThemeKind::Classic);
+        assert_eq!(state.shown_viz(), state::VizMode::None, "and back in Classic, none");
+        // Entering HiFi with none set leaves it set too.
+        state.set_theme(theme::ThemeKind::HiFi);
+        assert_eq!(state.viz_mode(), state::VizMode::None);
+    }
+
+    #[test]
+    fn bracketed_paste_is_never_turned_on_for_windows() {
+        // On Windows crossterm never makes a Paste event: the markers came
+        // through as keys (an Esc first) and broke dropping a folder.
+        for w in [alt_screen_enter(true), alt_screen_leave(true)] {
+            assert!(!w.contains("2004"), "{w:?}");
+        }
+        assert!(alt_screen_enter(false).contains("\x1B[?2004h"));
+        assert!(alt_screen_leave(false).contains("\x1B[?2004l"));
+        // Both enter and leave the alternate screen.
+        for windows in [true, false] {
+            assert!(alt_screen_enter(windows).starts_with("\x1B[?1049h"));
+            assert!(alt_screen_leave(windows).ends_with("\x1B[?1049l"));
+        }
+    }
 
     #[test]
     fn output_retries_back_off_to_eight_seconds() {

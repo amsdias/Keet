@@ -1,7 +1,7 @@
-//! Shared ANSI-aware string helpers for the terminal renderers.
-//!
-//! One definition per behavior, for every renderer (`ui.rs`, `ui_minimal.rs`,
-//! `ui_hifi.rs`, `library.rs`): separate copies drift apart.
+//! Shared width and cutting helpers for plain text (the renderers' styled
+//! lines have theirs in `tui`, built on these), and `sanitize_display` for
+//! untrusted text. They skip ANSI escapes when measuring, so a string that
+//! carries one is still measured right.
 //!
 //! Terminating on "the first ASCII letter" is right for CSI, but wrong for the
 //! string-terminated families. A Kitty graphics APC — `ESC _ G a=d,… ESC \` —
@@ -10,150 +10,155 @@
 //! that carried an album cover therefore returned nonsense. These walk the
 //! sequence families properly.
 
-/// How many chars an escape sequence starting at `bytes[i]` (an `\x1B`)
-/// occupies, including the introducer.
+use ratatui::buffer::CellWidth;
+use unicode_segmentation::UnicodeSegmentation;
+
+/// How many BYTES an escape sequence starting at `s[at]` (an `\x1B`)
+/// occupies, including the introducer. Every delimiter is ASCII, and no
+/// byte of a multi-byte character is, so a walk over bytes never stops
+/// inside a character.
 ///
 /// - CSI (`ESC [`): parameters, then a final byte in `@`..`~`
 /// - OSC/APC/DCS/PM (`ESC ] _ P ^`): string-terminated, by BEL or `ESC \`
-/// - anything else: a two-character sequence
-fn escape_len(chars: &[char], i: usize) -> usize {
-    let next = match chars.get(i + 1) {
-        Some(c) => *c,
-        None => return 1,
-    };
+/// - anything else: the ESC and the character after it
+fn escape_len(s: &str, at: usize) -> usize {
+    let b = s.as_bytes();
+    let Some(&next) = b.get(at + 1) else { return 1 };
     match next {
-        '[' => {
+        b'[' => {
             // Parameter and intermediate bytes are 0x20..=0x3F; anything else
             // ends the sequence. A broken one (no final byte) then stops
             // before the next ESC or control character instead of swallowing
             // the text after it, up to whatever letter came next.
-            let mut j = i + 2;
-            while j < chars.len() && matches!(chars[j], ' '..='?') {
+            let mut j = at + 2;
+            while j < b.len() && matches!(b[j], b' '..=b'?') {
                 j += 1;
             }
-            match chars.get(j) {
-                Some('@'..='~') => j + 1 - i,
-                _ => j - i,
+            match b.get(j) {
+                Some(b'@'..=b'~') => j + 1 - at,
+                _ => j - at,
             }
         }
-        ']' | '_' | 'P' | '^' => {
-            let mut j = i + 2;
-            while j < chars.len() {
-                if chars[j] == '\u{7}' {
-                    return j + 1 - i;
+        b']' | b'_' | b'P' | b'^' => {
+            let mut j = at + 2;
+            while j < b.len() {
+                if b[j] == 0x07 {
+                    return j + 1 - at;
                 }
-                if chars[j] == '\x1B' && chars.get(j + 1) == Some(&'\\') {
-                    return j + 2 - i;
+                if b[j] == 0x1B && b.get(j + 1) == Some(&b'\\') {
+                    return j + 2 - at;
                 }
                 j += 1;
             }
-            chars.len() - i
+            b.len() - at
         }
-        _ => 2,
+        _ => 1 + s[at + 1..].chars().next().map_or(0, char::len_utf8),
     }
 }
 
-/// Terminal columns one character occupies: 2 for CJK and most emoji, 0 for
-/// combining marks and control characters, 1 otherwise.
-fn char_width(c: char) -> usize {
-    unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)
+/// Columns `text` (plain, no escapes) takes AS RATATUI DRAWS IT: grapheme
+/// by grapheme, each measured by ratatui's own `CellWidth`, a grapheme with
+/// a control character in it not drawn at all (`Buffer::set_stringn`). Hand-
+/// written rules for emoji sequences, flags, variation selectors and joiners
+/// disagreed with the drawing in a new case every time one was fixed (a
+/// joiner after CJK, between Sinhala letters, ⌚ + VS15); a measure that is
+/// not the drawing's own ends up a column off somewhere.
+pub(crate) fn plain_width(text: &str) -> usize {
+    // The visualisations' lines (braille, blocks, ASCII) are all single
+    // cells: splitting them into graphemes cost as much as drawing them.
+    if text.chars().all(single_cell) {
+        return text.chars().count();
+    }
+    text.graphemes(true).map(grapheme_width).sum()
+}
+
+/// A character that is one cell on its own and never part of a longer
+/// grapheme: ASCII, box drawing, blocks, braille — what the visualisations
+/// draw with — and accented Latin letters (Latin-1, Latin Extended-A: most
+/// European titles), precomposed, so one char each. Not the soft hyphen
+/// (U+00AD); not © ® ▪ ▫ ▶ ◀ ◻ ◼ (emoji glyphs: after a joiner they join
+/// the emoji before them); not ◽ ◾ (two cells wide). Each is checked against
+/// ratatui's drawing and the grapheme rules
+/// (`tui::tests::every_single_cell_character_is_one_cell_as_drawn`); a mark
+/// after one is not in the set, so such a string takes the full path.
+pub(crate) fn single_cell(c: char) -> bool {
+    matches!(
+        c,
+        ' '..='~'
+            | '\u{00A0}'..='\u{00A8}'
+            | '\u{00AA}'..='\u{00AC}'
+            | '\u{00AF}'..='\u{017F}'
+            | '\u{2500}'..='\u{25A9}'
+            | '\u{25AC}'..='\u{25B5}'
+            | '\u{25B7}'..='\u{25BF}'
+            | '\u{25C1}'..='\u{25FA}'
+            | '\u{25FF}'
+            | '\u{2800}'..='\u{28FF}'
+    )
+}
+
+/// Columns one grapheme takes as drawn.
+pub(crate) fn grapheme_width(g: &str) -> usize {
+    if g.contains(char::is_control) { 0 } else { usize::from(g.cell_width()) }
+}
+
+/// `s` as plain-text runs and escape sequences (true), in order, without
+/// copying or collecting it.
+fn segments(s: &str) -> impl Iterator<Item = (bool, &str)> {
+    let mut pos = 0;
+    std::iter::from_fn(move || {
+        let rest = s.get(pos..).filter(|r| !r.is_empty())?;
+        let len = if rest.starts_with('\x1B') { escape_len(s, pos) } else { rest.find('\x1B').unwrap_or(rest.len()) };
+        pos += len;
+        Some((rest.starts_with('\x1B'), &rest[..len]))
+    })
 }
 
 /// Terminal columns a string occupies, skipping ANSI escape sequences of every
 /// family (see [`escape_len`]). Counts COLUMNS, not chars: a CJK title of 35
 /// chars draws ~70 columns, and a char count let it wrap.
 pub(crate) fn visible_len(s: &str) -> usize {
-    let chars: Vec<char> = s.chars().collect();
-    let mut n = 0usize;
-    let mut prev = None;
-    let mut flag = Flags::default();
-    let mut i = 0usize;
-    while i < chars.len() {
-        if chars[i] == '\x1B' {
-            i += escape_len(&chars, i);
-        } else {
-            n += flag.width(prev, chars[i]);
-            prev = Some(chars[i]);
-            i += 1;
-        }
+    if !s.contains('\x1B') {
+        return plain_width(s);
     }
-    n
+    segments(s).filter(|(esc, _)| !esc).map(|(_, t)| plain_width(t)).sum()
 }
 
-/// Pairs regional indicators into flags: two of them (🇵 + 🇹) draw ONE
-/// 2-column glyph. The first of a pair carries both columns and the second
-/// none, so a cut keeps a flag whole or drops it — counted one column each,
-/// the widths added up but a cut could land between the halves.
-#[derive(Default)]
-struct Flags {
-    open: bool,
-}
-
-impl Flags {
-    fn width(&mut self, prev: Option<char>, c: char) -> usize {
-        if ('\u{1F1E6}'..='\u{1F1FF}').contains(&c) {
-            self.open = !self.open;
-            if self.open { 2 } else { 0 }
-        } else {
-            self.open = false;
-            cluster_width(prev, c)
-        }
-    }
-}
-
-/// Columns `c` adds after `prev`, for the emoji sequences a per-char count
-/// gets wrong: a variation selector 16 turns a 1-column symbol into a
-/// 2-column emoji (❤ + VS16 = ❤️), anything after a zero-width joiner merges
-/// into the preceding emoji (👨‍👩‍👧 is one glyph), and a skin-tone modifier
-/// colours the emoji before it rather than adding one.
-///
-/// Variation selector 15 (text presentation, ⌚ + VS15) is deliberately NOT
-/// counted as narrowing: terminals disagree (most draw the emoji 2 columns
-/// wide regardless, a few switch to a 1-column glyph), and measuring 2 where
-/// the glyph is 1 leaves a blank cell, while measuring 1 where it is 2 wraps
-/// the row and drifts the frame. The safe error is the one kept.
-fn cluster_width(prev: Option<char>, c: char) -> usize {
-    match (prev, c) {
-        (Some('\u{200D}'), _) => 0,
-        (Some(p), '\u{FE0F}') if char_width(p) == 1 => 1,
-        (Some(p), '\u{1F3FB}'..='\u{1F3FF}') if char_width(p) == 2 => 0,
-        _ => char_width(c),
-    }
-}
-
-/// Core of every truncation: keep escapes whole, keep printable characters
-/// while they fit in `max_cols`, never split a wide character across the edge
-/// (it is left out instead), and keep zero-width combining marks with their
-/// base. Returns the cut string and whether anything printable was dropped.
+/// Core of every truncation: keep escapes whole, keep whole graphemes while
+/// they fit in `max_cols` (a wide one that would straddle the edge is left
+/// out, a combining mark stays with its base). Returns the cut string and
+/// whether anything printable was dropped.
 fn cut_to_width(s: &str, max_cols: usize) -> (String, bool) {
-    let chars: Vec<char> = s.chars().collect();
+    // Plain single-cell text (most titles, every playlist row each frame):
+    // one column a char, no grapheme splitting.
+    if s.chars().all(single_cell) {
+        return match s.char_indices().nth(max_cols) {
+            Some((end, _)) => (s[..end].to_string(), true),
+            None => (s.to_string(), false),
+        };
+    }
     let mut cols = 0usize;
     let mut out = String::with_capacity(s.len());
-    let mut prev = None;
-    let mut flag = Flags::default();
     let mut styled = false;
-    let mut i = 0usize;
-    while i < chars.len() {
-        if chars[i] == '\x1B' {
-            let n = escape_len(&chars, i);
-            out.extend(&chars[i..(i + n).min(chars.len())]);
+    for (esc, text) in segments(s) {
+        if esc {
+            out.push_str(text);
             styled = true;
-            i += n;
             continue;
         }
-        let w = flag.width(prev, chars[i]);
-        if cols + w > max_cols {
-            // The cut drops the line's closing reset along with its tail; put
-            // one back, or the colour runs on into whatever is drawn next.
-            if styled {
-                out.push_str("\x1B[0m");
+        for g in text.graphemes(true) {
+            let w = grapheme_width(g);
+            if cols + w > max_cols {
+                // The cut drops the line's closing reset along with its tail; put
+                // one back, or the colour runs on into whatever is drawn next.
+                if styled {
+                    out.push_str("\x1B[0m");
+                }
+                return (out, true);
             }
-            return (out, true);
+            out.push_str(g);
+            cols += w;
         }
-        out.push(chars[i]);
-        prev = Some(chars[i]);
-        cols += w;
-        i += 1;
     }
     (out, false)
 }
@@ -163,6 +168,31 @@ fn cut_to_width(s: &str, max_cols: usize) -> (String, bool) {
 /// pads or frames the result itself.
 pub(crate) fn truncate_ansi(s: &str, max_width: usize) -> String {
     cut_to_width(s, max_width).0
+}
+
+/// Plain text cut into rows of at most `width` columns, in one pass, between
+/// graphemes (a flag, a joined emoji, an emoji and its variation selector, a
+/// letter and its marks stay whole); one wider than a row (a 2-column glyph
+/// in a 1-column row) takes a row alone. Every row is a slice of `s`, and
+/// together they are all of it. Escapes are not interpreted: give it plain
+/// text.
+pub(crate) fn split_columns(s: &str, width: usize) -> Vec<&str> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    let (mut start, mut cols) = (0, 0);
+    for (i, g) in s.grapheme_indices(true) {
+        let w = grapheme_width(g);
+        if w > 0 && cols > 0 && cols + w > width {
+            rows.push(&s[start..i]);
+            start = i;
+            cols = 0;
+        }
+        cols += w;
+    }
+    if start < s.len() || rows.is_empty() {
+        rows.push(&s[start..]);
+    }
+    rows
 }
 
 /// Plain-text truncation to `max_width` columns, with a trailing ellipsis
@@ -177,39 +207,6 @@ pub(crate) fn truncate_plain(s: &str, max_width: usize) -> String {
     } else {
         cut_to_width(s, max_width).0
     }
-}
-
-/// ANSI-aware truncation with a trailing ellipsis when it actually cuts:
-/// escapes pass through (colors survive), only printable columns count against
-/// `max`. Prevents a long name from wrapping (which would drift the caller's
-/// line count) or overflowing a bordered frame.
-pub(crate) fn truncate_visible(s: &str, max: usize) -> String {
-    if visible_len(s) <= max {
-        return s.to_string();
-    }
-    if max == 0 {
-        return String::new(); // not even the ellipsis fits
-    }
-    let mut out = cut_to_width(s, max.saturating_sub(1)).0; // room for the ellipsis
-    out.push('…');
-    out
-}
-
-/// The text with every ANSI escape sequence removed (all families, see
-/// [`escape_len`]).
-pub(crate) fn strip_ansi(s: &str) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    let mut out = String::with_capacity(s.len());
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i] == '\x1B' {
-            i += escape_len(&chars, i);
-        } else {
-            out.push(chars[i]);
-            i += 1;
-        }
-    }
-    out
 }
 
 /// Join `segments` with `sep`, keeping as many as fit in `width` columns and
@@ -260,6 +257,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn escapes_split_as_they_did_char_by_char() {
+        // What the char-by-char parser this replaced made of each (multi-byte
+        // text inside and after escapes, broken and unterminated sequences,
+        // every family).
+        let expected: &[(&str, &[(bool, &str)])] = &[
+            ("plain", &[(false, "plain")]),
+            ("\u{1b}[31mred\u{1b}[0m", &[(true, "\u{1b}[31m"), (false, "red"), (true, "\u{1b}[0m")]),
+            ("a\u{1b}[1;32mé日本\u{1b}[0m", &[(false, "a"), (true, "\u{1b}[1;32m"), (false, "é日本"), (true, "\u{1b}[0m")]),
+            ("\u{1b}]8;;http://x\u{7}link\u{1b}]8;;\u{7}", &[(true, "\u{1b}]8;;http://x\u{7}"), (false, "link"), (true, "\u{1b}]8;;\u{7}")]),
+            ("\u{1b}_Ga=d,i=1;payload\u{1b}\\after", &[(true, "\u{1b}_Ga=d,i=1;payload\u{1b}\\"), (false, "after")]),
+            ("\u{1b}P1$r\u{1b}\\", &[(true, "\u{1b}P1$r\u{1b}\\")]),
+            ("\u{1b}^privacy\u{7}x", &[(true, "\u{1b}^privacy\u{7}"), (false, "x")]),
+            ("\u{1b}[12", &[(true, "\u{1b}[12")]),
+            ("\u{1b}[12é", &[(true, "\u{1b}[12"), (false, "é")]),
+            ("\u{1b}[3\u{1b}[0mx", &[(true, "\u{1b}[3"), (true, "\u{1b}[0m"), (false, "x")]),
+            ("\u{1b}é", &[(true, "\u{1b}é")]),
+            ("\u{1b}日本", &[(true, "\u{1b}日"), (false, "本")]),
+            ("end\u{1b}", &[(false, "end"), (true, "\u{1b}")]),
+            ("\u{1b}]unterminated é", &[(true, "\u{1b}]unterminated é")]),
+            ("\u{1b}[?25lé\u{1b}[?25h", &[(true, "\u{1b}[?25l"), (false, "é"), (true, "\u{1b}[?25h")]),
+            ("\u{1b}(B", &[(true, "\u{1b}("), (false, "B")]),
+            ("\u{1b}_payload with 日本 inside\u{1b}\\ok", &[(true, "\u{1b}_payload with 日本 inside\u{1b}\\"), (false, "ok")]),
+            ("ü\u{1b}[38;2;1;2;3mü", &[(false, "ü"), (true, "\u{1b}[38;2;1;2;3m"), (false, "ü")]),
+        ];
+        for &(s, want) in expected {
+            assert_eq!(segments(s).collect::<Vec<_>>(), want, "{s:?}");
+        }
+    }
+
+    #[test]
     fn segments_drop_whole_from_the_end_never_leaving_a_separator() {
         let segs = ["track 1 of 4", "16-bit stereo", "44.1k", "eq Rock"].map(String::from);
         assert_eq!(fit_segments(&segs, "  ·  ", 100), "track 1 of 4  ·  16-bit stereo  ·  44.1k  ·  eq Rock");
@@ -272,12 +299,9 @@ mod tests {
     }
 
     #[test]
-    fn a_broken_csi_stops_at_the_next_escape_and_zero_columns_is_empty() {
+    fn a_broken_csi_stops_at_the_next_escape() {
         // "ESC [ 3" never finished: the next sequence and the text stay.
-        assert_eq!(strip_ansi("\x1B[3\x1B[1mhello"), "hello");
-        assert_eq!(strip_ansi("\x1B[31mred\x1B[0m"), "red");
-        assert_eq!(truncate_visible("hello", 0), "");
-        assert_eq!(truncate_visible("hello", 1), "…");
+        assert_eq!(visible_len("\x1B[3\x1B[1mhello"), 5);
     }
 
     #[test]
@@ -307,6 +331,47 @@ mod tests {
         assert_eq!(visible_len("a\u{2764}\u{FE0F}b"), 4);
         // Cutting never splits a sequence.
         assert_eq!(truncate_ansi("\u{1F468}\u{200D}\u{1F469}x", 2), "\u{1F468}\u{200D}\u{1F469}");
+    }
+
+    #[test]
+    fn a_joiner_between_letters_joins_nothing() {
+        // Sinhala and Malayalam write the zero-width joiner inside words
+        // (ශ්‍රී): the letter after it is a letter of its own, as wide as
+        // ratatui draws it. Only an emoji joins the one after it.
+        for text in ["\u{0DC1}\u{0DCA}\u{200D}\u{0DBB}\u{0DD3}", "a\u{200D}b", "\u{0D28}\u{0D4D}\u{200D}\u{0D31}"] {
+            let drawn = crate::tui::width(text);
+            assert_eq!(visible_len(text), drawn, "{text:?}");
+        }
+        assert_eq!(visible_len("a\u{200D}b"), 2);
+        assert_eq!(split_columns("ab\u{200D}cd", 2), ["ab\u{200D}", "cd"]);
+        // A text-style ❤ (no VS16) is no emoji to join either.
+        assert_eq!(visible_len("\u{2764}\u{200D}x"), 2);
+        // Emoji still join, as ratatui measures them: 👩‍❤️‍👨, ❤️‍🔥, 👩🏽‍💻, 👨‍👩‍👧.
+        for text in [
+            "\u{1F469}\u{200D}\u{2764}\u{FE0F}\u{200D}\u{1F468}",
+            "\u{2764}\u{FE0F}\u{200D}\u{1F525}",
+            "\u{1F469}\u{1F3FD}\u{200D}\u{1F4BB}",
+            "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}",
+        ] {
+            assert_eq!(visible_len(text), 2, "{text:?}");
+            assert_eq!(crate::tui::width(text), 2, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_joined_emoji_with_a_variation_selector_is_one_glyph() {
+        // 👩‍❤️‍👨: the ❤'s VS16 sits inside the joined sequence, which is drawn
+        // as one 2-column glyph. Counted as ❤ + VS16 it measured 3 columns,
+        // and a cut could fall between the ❤ and its selector.
+        let couple = "\u{1F469}\u{200D}\u{2764}\u{FE0F}\u{200D}\u{1F468}";
+        assert_eq!(visible_len(couple), 2);
+        assert_eq!(visible_len("\u{2764}\u{FE0F}\u{200D}\u{1F525}"), 2, "❤️‍🔥");
+        assert_eq!(visible_len(&format!("{couple}{couple}")), 4, "two of them");
+        assert_eq!(visible_len(&format!("{couple}\u{2764}\u{FE0F}")), 4, "the join ends with the glyph");
+        assert_eq!(truncate_ansi(&format!("{couple}x"), 2), couple);
+        let word = format!("aaaaaaaa{couple}");
+        assert_eq!(split_columns(&word, 10), [word.as_str()], "it fits in 10");
+        assert_eq!(split_columns(&word, 9), ["aaaaaaaa", couple]);
     }
 
     #[test]
@@ -375,16 +440,6 @@ mod tests {
     }
 
     #[test]
-    fn truncate_visible_is_ansi_aware_with_ellipsis() {
-        let s = "\x1B[2mabcdef\x1B[0m";
-        assert_eq!(truncate_visible(s, 10), s, "no cut when it fits");
-        let cut = truncate_visible(s, 4);
-        assert_eq!(visible_len(&cut), 4, "3 kept chars + ellipsis");
-        assert!(cut.ends_with('…'));
-        assert!(cut.starts_with("\x1B[2m"));
-    }
-
-    #[test]
     fn widths_are_display_columns_not_chars() {
         // CJK and most emoji take two terminal columns. Counting chars let a
         // 35-char Japanese title "fit" 35 columns while drawing ~70, wrapping
@@ -405,8 +460,6 @@ mod tests {
             assert!(visible_len(&p) <= max, "truncate_plain({max}) drew {} cols: {p}", visible_len(&p));
             let a = truncate_ansi(&format!("\x1B[1m{title}\x1B[0m"), max);
             assert!(visible_len(&a) <= max, "truncate_ansi({max}) drew {} cols", visible_len(&a));
-            let v = truncate_visible(&format!("\x1B[2m{title}"), max);
-            assert!(visible_len(&v) <= max.max(1), "truncate_visible({max}) drew {} cols", visible_len(&v));
         }
         // A wide char that would straddle the edge is left out, not split.
         assert_eq!(truncate_ansi("a日本", 2), "a");
@@ -416,20 +469,9 @@ mod tests {
     }
 
     #[test]
-    fn truncate_visible_keeps_string_terminated_escapes_whole() {
-        // It used to end an escape at the first ASCII letter — the old bug
-        // escape_len exists to fix — so an APC's payload counted as text.
-        let kitty = "\x1B_Ga=d,d=i,i=1,q=2\x1B\\";
-        let cut = truncate_visible(&format!("{kitty}abcdef"), 4);
-        assert!(cut.starts_with(kitty), "APC must survive whole: {cut:?}");
-        assert_eq!(visible_len(&cut), 4);
-    }
-
-    #[test]
     fn untrusted_text_cannot_carry_control_characters() {
         // Tags and LRCLIB lyrics (user-submitted, remote) went straight into
-        // frame lines: a `\n` added a physical row (FrameWriter drift) and an
-        // ESC was executed — including query sequences whose replies arrive on
+        // frame lines: a `\n` added a physical row and an ESC was executed — including query sequences whose replies arrive on
         // stdin as keystrokes.
         assert_eq!(sanitize_display("a\x1B[6nb"), "a [6nb");
         assert_eq!(sanitize_display("line1\nline2\r"), "line1 line2 ");

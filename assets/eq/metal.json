@@ -1,0 +1,15 @@
+{
+  "name": "Metal",
+  "bands": [
+    { "type": "low_cut",    "freq": 35,    "q": 0.71 },
+    { "type": "low_shelf",  "freq": 90,    "gain": 2.0,  "q": 0.71 },
+    { "type": "peak",       "freq": 250,   "gain": 0.0,  "q": 0.71 },
+    { "type": "peak",       "freq": 500,   "gain": -2.5, "q": 1.0 },
+    { "type": "peak",       "freq": 1000,  "gain": 0.0,  "q": 0.71 },
+    { "type": "peak",       "freq": 2000,  "gain": 1.5,  "q": 1.0 },
+    { "type": "peak",       "freq": 4000,  "gain": 3.0,  "q": 1.2 },
+    { "type": "peak",       "freq": 6000,  "gain": 0.0,  "q": 0.71 },
+    { "type": "high_shelf", "freq": 8000,  "gain": 1.5,  "q": 0.71 },
+    { "type": "peak",       "freq": 16000, "gain": 0.0,  "q": 0.71 }
+  ]
+}

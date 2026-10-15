@@ -20,10 +20,11 @@
 
 use crate::state::{PlayerState, VizStyle, SPECTRUM_BANDS};
 use std::collections::VecDeque;
-use crate::theme::{fg_rgb, ThemeKind};
-use std::borrow::Cow;
-use crate::viz::{fit_width, fmt_band_hz, viz_palette, VizPalette, BRAILLE_BITS, ISO_CENTERS};
-use crate::theme::Rgb;
+use crate::theme::{Rgb, ThemeKind};
+use crate::tui::LineBuf;
+use crate::viz::{fit_width, fmt_band_hz, viz_palette, Lines, VizPalette, BRAILLE_BITS, ISO_CENTERS};
+use ratatui::style::Style;
+use ratatui::text::Line;
 
 /// The full-window ceiling: past this the circle only gets coarser bands.
 pub const POLAR_MAX_ROWS: usize = 60;
@@ -74,7 +75,7 @@ impl PolarTrail {
 
 /// See [`polar_body`]; this enforces the width half of the renderer contract
 /// (`fit_width`).
-pub fn render_polar(state: &PlayerState, trail: &PolarTrail, style: VizStyle, width: usize, rows: usize, extras: bool) -> Vec<String> {
+pub fn render_polar(state: &PlayerState, trail: &PolarTrail, style: VizStyle, width: usize, rows: usize, extras: bool) -> Lines {
     let levels = Levels {
         left: state.get_spectrum(),
         right: state.get_spectrum_r(),
@@ -124,7 +125,7 @@ struct Cell {
     peak_share: f32,
 }
 
-fn polar_body(levels: &Levels, kind: ThemeKind, style: VizStyle, width: usize, rows: usize, extras: bool) -> Vec<String> {
+fn polar_body(levels: &Levels, kind: ThemeKind, style: VizStyle, width: usize, rows: usize, extras: bool) -> Lines {
     let vp = viz_palette(kind);
     // The circle's box is square on screen: `side` rows by twice as many
     // columns. Whichever of height or width runs out first sets it.
@@ -132,7 +133,7 @@ fn polar_body(levels: &Levels, kind: ThemeKind, style: VizStyle, width: usize, r
     let room = width.saturating_sub(if legend { 2 * LEGEND_W } else { 0 } + 2);
     let side = rows.min(room / 2);
     if side < 2 {
-        return vec![String::new(); rows];
+        return vec![Line::default(); rows];
     }
     let cols = side * 2;
     let (dots_w, dots_h) = (cols * 2, side * 4);
@@ -186,7 +187,7 @@ fn polar_body(levels: &Levels, kind: ThemeKind, style: VizStyle, width: usize, r
     // The circle centred in the window; each line built as (glyph, colour)
     // per column so the legend can go into the blank cells around it.
     let x0 = (width - cols) / 2;
-    let mut grid: Vec<Vec<(char, Cow<'static, str>)>> = vec![vec![(' ', Cow::Borrowed("")); width]; side];
+    let mut grid: Vec<Vec<(char, Style)>> = vec![vec![(' ', Style::new()); width]; side];
     for y in 0..side {
         for x in 0..cols {
             let cell = cells[y * cols + x];
@@ -194,7 +195,7 @@ fn polar_body(levels: &Levels, kind: ThemeKind, style: VizStyle, width: usize, r
                 continue;
             }
             let peak = peak_only[y * cols + x];
-            let colour = Cow::Owned(fg_rgb(cell_colour(&cell, peak)));
+            let colour = crate::tui::fg(cell_colour(&cell, peak));
             grid[y][x0 + x] = (char::from_u32(0x2800 + cell.bits).unwrap_or(' '), colour);
         }
     }
@@ -202,12 +203,12 @@ fn polar_body(levels: &Levels, kind: ThemeKind, style: VizStyle, width: usize, r
         put_legend(&mut grid, x0, cols, side, &vp);
     }
 
-    let mut lines: Vec<String> = grid.iter().map(|row| join_row(row, vp.reset)).collect();
+    let mut lines: Lines = grid.iter().map(|row| join_row(row)).collect();
     // The box is square, the budget may not be: centre it in the rows given.
     let top = (rows - side) / 2;
-    let mut out = vec![String::new(); top];
+    let mut out = vec![Line::default(); top];
     out.append(&mut lines);
-    out.resize(rows, String::new());
+    out.resize(rows, Line::default());
     out
 }
 
@@ -261,16 +262,16 @@ fn cell_colour(cell: &Cell, peak: bool) -> Rgb {
 /// The legend, in the blank cells round the circle: `L` and `R` under each
 /// half, and 100 Hz / 1 kHz / 10 kHz beside the circle at their bands' height
 /// on both sides.
-fn put_legend(grid: &mut [Vec<(char, Cow<'static, str>)>], x0: usize, cols: usize, side: usize, vp: &VizPalette) {
+fn put_legend(grid: &mut [Vec<(char, Style)>], x0: usize, cols: usize, side: usize, vp: &VizPalette) {
     let width = grid.first().map_or(0, Vec::len);
-    let write = |grid: &mut [Vec<(char, Cow<'static, str>)>], y: usize, x: usize, text: &str| {
+    let write = |grid: &mut [Vec<(char, Style)>], y: usize, x: usize, text: &str| {
         let row = &mut grid[y];
         let n = text.chars().count();
         if x + n > width || row[x..x + n].iter().any(|(c, _)| *c != ' ') {
             return;
         }
         for (i, ch) in text.chars().enumerate() {
-            row[x + i] = (ch, Cow::Borrowed(vp.dim));
+            row[x + i] = (ch, vp.dim);
         }
     };
     let bottom = side - 1;
@@ -295,30 +296,29 @@ fn put_legend(grid: &mut [Vec<(char, Cow<'static, str>)>], x0: usize, cols: usiz
     }
 }
 
-/// One row of (glyph, colour) cells as a string, trailing blanks dropped,
-/// with a colour code only where it changes.
-fn join_row(row: &[(char, Cow<'static, str>)], reset: &str) -> String {
+/// One row of (glyph, colour) cells as a line, trailing blanks dropped.
+fn join_row(row: &[(char, Style)]) -> Line<'static> {
     let end = row.iter().rposition(|(c, _)| *c != ' ').map_or(0, |i| i + 1);
-    let mut line = String::new();
-    let mut current = "";
-    for (ch, colour) in &row[..end] {
-        if *ch != ' ' && colour.as_ref() != current {
-            line.push_str(reset);
-            line.push_str(colour);
-            current = colour;
+    let mut line = LineBuf::new();
+    for &(ch, colour) in &row[..end] {
+        if ch == ' ' {
+            line.reset();
+        } else {
+            line.style(colour);
         }
-        line.push(*ch);
+        line.push(ch);
     }
-    if !current.is_empty() {
-        line.push_str(reset);
-    }
-    line
+    line.into_line()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ansi::{strip_ansi, visible_len};
+    use crate::tui::plain as strip_ansi;
+
+    fn visible_len(l: &Line) -> usize {
+        crate::tui::Cols::cols(l)
+    }
 
     fn levels(left: f32, right: f32) -> Levels {
         Levels { left: [left; SPECTRUM_BANDS], right: [right; SPECTRUM_BANDS], peaks: [0.0; SPECTRUM_BANDS], trail: Vec::new() }
@@ -326,7 +326,7 @@ mod tests {
 
     /// Lit braille dots in a rendered block, left half and right half.
     /// The circle is centred in the window, so its halves split at `width / 2`.
-    fn dots_by_half(lines: &[String], width: usize) -> (u32, u32) {
+    fn dots_by_half(lines: &[Line], width: usize) -> (u32, u32) {
         let plain: Vec<Vec<char>> = lines.iter().map(|l| strip_ansi(l).chars().collect()).collect();
         let (mut l, mut r) = (0, 0);
         for row in &plain {
@@ -386,7 +386,7 @@ mod tests {
         let lit_rows = |lv: &Levels| -> (u32, u32) {
             let lines = polar_body(lv, ThemeKind::Classic, VizStyle::Bars, 80, 20, false);
             let (top, bottom) = lines.split_at(lines.len() / 2);
-            let count = |ls: &[String]| ls.iter().map(|l| strip_ansi(l).chars().map(|c| (c as u32).wrapping_sub(0x2800).min(0x100).count_ones()).sum::<u32>()).sum::<u32>();
+            let count = |ls: &[Line]| ls.iter().map(|l| strip_ansi(l).chars().map(|c| (c as u32).wrapping_sub(0x2800).min(0x100).count_ones()).sum::<u32>()).sum::<u32>();
             (count(top), count(bottom))
         };
         let (top, bottom) = lit_rows(&bass);
@@ -467,8 +467,8 @@ mod tests {
         let mut lv = levels(0.8, 0.8);
         lv.trail = (0..TRAIL_LEN).map(|k| ([0.6 + 0.03 * k as f32; SPECTRUM_BANDS], [0.6 + 0.03 * k as f32; SPECTRUM_BANDS])).collect();
         for style in [VizStyle::Dots, VizStyle::Bars] {
-            let text = polar_body(&lv, kind, style, 100, 24, false).concat();
-            let colours: std::collections::HashSet<&str> = text.split("\x1B[38;2;").skip(1).map(|c| c.split('m').next().unwrap()).collect();
+            let lines = polar_body(&lv, kind, style, 100, 24, false);
+            let colours: std::collections::HashSet<_> = lines.iter().flat_map(|l| l.spans.iter().filter_map(|s| s.style.fg)).collect();
             assert!(colours.len() > 15, "{style:?}: {} colours", colours.len());
         }
     }

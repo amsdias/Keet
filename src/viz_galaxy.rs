@@ -19,11 +19,19 @@
 //! (<https://github.com/agentSystemLabs/nebula>).
 
 use crate::state::{VizStyle, SPECTRUM_BANDS};
-use crate::theme::{base_hue, fg_rgb, hsv, Rgb, ThemeKind};
-use crate::viz::{fit_width, BRAILLE_BITS};
+use crate::theme::{base_hue, hsv, Rgb, ThemeKind};
+use crate::tui::LineBuf;
+use crate::viz::{fit_width, Lines, BRAILLE_BITS};
+use ratatui::text::Line;
 
 /// The full-window ceiling. Past this the dust is only drawn bigger.
 pub const GALAXY_MAX_ROWS: usize = 60;
+
+/// A star at rest: centred in its cell, like the burst glyphs (`+`, `*`), so
+/// a star does not jump up and down as a treble hit bursts it and it fades
+/// (a `.` sits on the baseline). The dots style draws it as `⠆`, the two
+/// middle dots of a braille cell, for the same reason.
+const RESTING_STAR: char = '∙';
 
 /// Glyph ramp for the bars style, thin dust to bright core.
 const RAMP: [char; 8] = ['.', ':', '·', '+', '*', '*', 'o', '@'];
@@ -403,16 +411,16 @@ fn wall_time() -> f32 {
 
 /// See [`galaxy_body`]; this enforces the width half of the renderer
 /// contract (`fit_width`).
-pub fn render_galaxy(motion: &GalaxyMotion, kind: ThemeKind, style: VizStyle, width: usize, rows: usize) -> Vec<String> {
+pub fn render_galaxy(motion: &GalaxyMotion, kind: ThemeKind, style: VizStyle, width: usize, rows: usize) -> Lines {
     fit_width(galaxy_body(motion, kind, style, width, rows, wall_time()), width)
 }
 
 /// Exactly `rows` lines of the galaxy `t` seconds in, none wider than
 /// `width`. Bars draws a glyph per cell from the dust ramp; Dots draws
 /// braille, a dot per sub-cell, for finer dust.
-fn galaxy_body(motion: &GalaxyMotion, kind: ThemeKind, style: VizStyle, width: usize, rows: usize, t: f32) -> Vec<String> {
+fn galaxy_body(motion: &GalaxyMotion, kind: ThemeKind, style: VizStyle, width: usize, rows: usize, t: f32) -> Lines {
     if rows == 0 || width == 0 {
-        return vec![String::new(); rows];
+        return vec![Line::default(); rows];
     }
     let scene = Scene::new(motion, kind, t);
     // The disc fills the rows; across, it stops at MAX_STRETCH so a wide
@@ -430,10 +438,8 @@ fn galaxy_body(motion: &GalaxyMotion, kind: ThemeKind, style: VizStyle, width: u
 
 type Frame = (f32, f32, f32, f32);
 
-fn glyph_row(scene: &Scene, y: usize, width: usize, (cx, cy, sx, sy): Frame) -> String {
-    let mut line = String::new();
-    let mut current: Option<Rgb> = None;
-    let mut blanks = 0;
+fn glyph_row(scene: &Scene, y: usize, width: usize, (cx, cy, sx, sy): Frame) -> Line<'static> {
+    let mut line = LineBuf::new();
     for x in 0..width {
         let (dx, dy) = ((x as f32 + 0.5 - cx) * sx, (y as f32 + 0.5 - cy) * sy);
         let d = density(dx, dy, scene) * scene.gain;
@@ -446,27 +452,27 @@ fn glyph_row(scene: &Scene, y: usize, width: usize, (cx, cy, sx, sy): Frame) -> 
         };
         match cell {
             Some((ch, c)) => {
-                line.push_str(&" ".repeat(blanks));
-                blanks = 0;
-                if current != Some(c) {
-                    line.push_str(&fg_rgb(c));
-                    current = Some(c);
-                }
-                line.push(ch);
+                line.fg(c).push(ch);
             }
-            None => blanks += 1,
+            None => {
+                line.reset().push(' ');
+            }
         }
     }
-    if current.is_some() {
-        line.push_str("\x1B[0m");
+    trim_blanks(line)
+}
+
+/// A row with its trailing blanks dropped (they draw nothing).
+fn trim_blanks(line: LineBuf) -> Line<'static> {
+    let mut line = line.into_line();
+    while line.spans.last().is_some_and(|s| s.content.trim().is_empty()) {
+        line.spans.pop();
     }
     line
 }
 
-fn braille_row(scene: &Scene, y: usize, width: usize, (cx, cy, sx, sy): Frame) -> String {
-    let mut line = String::new();
-    let mut current: Option<Rgb> = None;
-    let mut blanks = 0;
+fn braille_row(scene: &Scene, y: usize, width: usize, (cx, cy, sx, sy): Frame) -> Line<'static> {
+    let mut line = LineBuf::new();
     for x in 0..width {
         let mut bits = 0u32;
         let mut peak = 0.0f32;
@@ -489,35 +495,18 @@ fn braille_row(scene: &Scene, y: usize, width: usize, (cx, cy, sx, sy): Frame) -
         }
         if bits == 0 {
             match star(scene, x, y) {
-                Some((ch, c)) => {
-                    line.push_str(&" ".repeat(blanks));
-                    blanks = 0;
-                    if current != Some(c) {
-                        line.push_str(&fg_rgb(c));
-                        current = Some(c);
-                    }
-                    // A resting star is one braille dot here; a burst keeps
-                    // its bright glyph.
-                    line.push(if ch == '.' { '⠂' } else { ch });
-                }
-                None => blanks += 1,
-            }
+                // A resting star is one braille dot here; a burst keeps its
+                // bright glyph.
+                Some((ch, c)) => line.fg(c).push(if ch == RESTING_STAR { '⠆' } else { ch }),
+                None => line.reset().push(' '),
+            };
             continue;
         }
         let (dx, dy) = ((x as f32 + 0.5 - cx) * sx, (y as f32 + 0.5 - cy) * sy);
         let c = scene.colour(peak, dx, dy);
-        line.push_str(&" ".repeat(blanks));
-        blanks = 0;
-        if current != Some(c) {
-            line.push_str(&fg_rgb(c));
-            current = Some(c);
-        }
-        line.push(char::from_u32(0x2800 + bits).unwrap_or(' '));
+        line.fg(c).push(char::from_u32(0x2800 + bits).unwrap_or(' '));
     }
-    if current.is_some() {
-        line.push_str("\x1B[0m");
-    }
-    line
+    trim_blanks(line)
 }
 
 /// Star colours, hottest to coolest (O, B, A, F, G, K, M), and how many
@@ -568,16 +557,20 @@ fn star(scene: &Scene, x: usize, y: usize) -> Option<(char, Rgb)> {
     if tw < 0.45 {
         return None;
     }
-    Some(('.', star_colour(h, if tw > 0.85 { 0.85 } else { 0.5 })))
+    Some((RESTING_STAR, star_colour(h, if tw > 0.85 { 0.85 } else { 0.5 })))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ansi::{strip_ansi, visible_len};
+    use crate::tui::plain as strip_ansi;
 
-    fn lit(lines: &[String]) -> usize {
-        lines.iter().map(|l| strip_ansi(l).chars().filter(|c| !matches!(c, ' ' | '.' | '⠂')).count()).sum()
+    fn visible_len(l: &Line) -> usize {
+        crate::tui::Cols::cols(l)
+    }
+
+    fn lit(lines: &[Line]) -> usize {
+        lines.iter().map(|l| strip_ansi(l).chars().filter(|&c| !matches!(c, ' ' | RESTING_STAR | '⠆')).count()).sum()
     }
 
     /// Exactly the rows given, none wider than the window, at every size.
@@ -774,7 +767,7 @@ mod tests {
     /// A treble hit bursts the stars: far more are out just after one.
     #[test]
     fn a_treble_hit_bursts_the_stars() {
-        let stars = |lines: &[String]| -> usize {
+        let stars = |lines: &[Line]| -> usize {
             lines.iter().map(|l| strip_ansi(l).chars().filter(|c| matches!(c, '*' | '+')).count()).sum()
         };
         let mut m = GalaxyMotion::default();

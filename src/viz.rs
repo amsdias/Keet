@@ -18,62 +18,44 @@ use realfft::{RealFftPlanner, RealToComplex};
 use crate::state::{
     PlayerState, VizMode, VizStyle, SPECTRUM_BANDS, FFT_SIZE, VIZ_DECAY,
     BAR_DECAY, GRAVITY, DOT_GRAVITY, ATTACK, VIZ_ATTACK, HOLD_TIME,
-    C_RESET, C_DIM, C_CYAN, C_GREEN, C_YELLOW, C_MAGENTA, C_RED,
 };
 use crate::theme::{palette as theme_palette, ThemeKind};
+use crate::tui::LineBuf;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::Line;
+
+/// A visualisation's rows, top to bottom.
+pub type Lines = Vec<Line<'static>>;
+
+// The fixed signal colours some modes use whatever the theme (the scope's
+// level bands, the vectorscope's cyan): the terminal's own ANSI colours.
+const RED: Style = Style::new().fg(Color::Red);
+const YELLOW: Style = Style::new().fg(Color::Yellow);
+const GREEN: Style = Style::new().fg(Color::Green);
+const CYAN: Style = Style::new().fg(Color::Cyan);
+const MAGENTA: Style = Style::new().fg(Color::Magenta);
+const DIM: Style = Style::new().add_modifier(Modifier::DIM);
 
 /// Per-theme color set used by the viz renderers. `low/mid/hot` map onto the
 /// classic green→yellow→red gradient; non-Classic themes collapse them onto
 /// the active palette so the spectrum/VU adopt the theme's identity.
 pub(crate) struct VizPalette {
-    pub(crate) low: &'static str,
-    pub(crate) mid: &'static str,
-    pub(crate) hot: &'static str,
-    #[allow(dead_code)]
-    accent: &'static str,
-    pub(crate) dim: &'static str,
-    pub(crate) reset: &'static str,
+    pub(crate) low: Style,
+    pub(crate) mid: Style,
+    pub(crate) hot: Style,
+    pub(crate) dim: Style,
 }
 
 pub(crate) fn viz_palette(kind: ThemeKind) -> VizPalette {
+    let p = theme_palette(kind);
     match kind {
-        ThemeKind::Classic => {
-            // The signal colour for the body, caution for the loud top rows:
-            // one meaning per colour (theme.rs).
-            let p = theme_palette(ThemeKind::Classic);
-            VizPalette {
-                low: p.accent,
-                mid: p.accent,
-                hot: p.warn,
-                accent: p.accent,
-                dim: p.dim,
-                reset: p.reset,
-            }
-        }
-        ThemeKind::Minimal => {
-            // Monochrome: the warm-cyan accent for content, danger only for clip/hot.
-            let p = theme_palette(ThemeKind::Minimal);
-            VizPalette {
-                low: p.accent,
-                mid: p.accent,
-                hot: p.danger,
-                accent: p.accent,
-                dim: p.dim,
-                reset: p.reset,
-            }
-        }
-        ThemeKind::HiFi => {
-            // Amber gradient: dim→fg→accent→danger.
-            let p = theme_palette(ThemeKind::HiFi);
-            VizPalette {
-                low: p.fg,
-                mid: p.accent,
-                hot: p.danger,
-                accent: p.accent,
-                dim: p.dim,
-                reset: p.reset,
-            }
-        }
+        // The signal colour for the body, caution for the loud top rows:
+        // one meaning per colour (theme.rs).
+        ThemeKind::Classic => VizPalette { low: p.accent, mid: p.accent, hot: p.warn, dim: p.dim },
+        // Monochrome: the warm-cyan accent for content, danger only for clip/hot.
+        ThemeKind::Minimal => VizPalette { low: p.accent, mid: p.accent, hot: p.danger, dim: p.dim },
+        // Amber gradient: dim→fg→accent→danger.
+        ThemeKind::HiFi => VizPalette { low: p.fg, mid: p.accent, hot: p.danger, dim: p.dim },
     }
 }
 
@@ -90,7 +72,7 @@ pub(crate) const ISO_CENTERS: [f32; SPECTRUM_BANDS] = [
 /// signal colour; Minimal/HiFi project onto a 3-stop ramp (low→mid→hot) sized
 /// to the band index so the visual identity stays consistent with the rest of
 /// the theme.
-fn band_color(idx: usize, vp: &VizPalette, kind: ThemeKind) -> &'static str {
+fn band_color(idx: usize, vp: &VizPalette, kind: ThemeKind) -> Style {
     if matches!(kind, ThemeKind::Classic) {
         // One signal colour across the bands: the old colour per frequency
         // range meant nothing (theme.rs, one meaning per colour).
@@ -242,6 +224,8 @@ pub struct StatsMonitor {
     pub(crate) cpu_usage: f32,
     pub(crate) memory_mb: f64,
     pub(crate) smoothed_buf_pct: f32,
+    /// When the gauge last eased (`update_buf_at`).
+    buf_eased_at: Option<Instant>,
 }
 
 impl StatsMonitor {
@@ -258,6 +242,7 @@ impl StatsMonitor {
             cpu_usage: 0.0,
             memory_mb: 0.0,
             smoothed_buf_pct: 0.0,
+            buf_eased_at: None,
         }
     }
 
@@ -278,7 +263,22 @@ impl StatsMonitor {
     }
 
     pub fn update_buf(&mut self, raw_pct: f32) {
-        self.smoothed_buf_pct = self.smoothed_buf_pct * 0.85 + raw_pct * 0.15;
+        self.update_buf_at(raw_pct, Instant::now());
+    }
+
+    /// The buffer gauge eases toward `raw_pct` by the time since it last did:
+    /// 15% of the way per 50 ms (the tick it was tuned at). Per call, it
+    /// moved ~7× slower at the idle frame rate than at 30 fps, followed
+    /// `viz_fps`, and a frame drawn twice (the stale-image retry) stepped twice.
+    fn update_buf_at(&mut self, raw_pct: f32, now: Instant) {
+        const STEP_SECS: f32 = 0.05;
+        let steps = match self.buf_eased_at {
+            Some(t) => (now.saturating_duration_since(t).as_secs_f32() / STEP_SECS).min(40.0),
+            None => 1.0,
+        };
+        self.buf_eased_at = Some(now);
+        let keep = 0.85_f32.powf(steps);
+        self.smoothed_buf_pct = self.smoothed_buf_pct * keep + raw_pct * (1.0 - keep);
     }
 }
 
@@ -349,6 +349,8 @@ pub struct VizAnalyser {
     ballistics: Ballistics,
     // Recent raw (L, R) samples, newest at back. Used by oscilloscope and lissajous.
     pub(crate) waveform_buf: VecDeque<(f32, f32)>,
+    /// The vectorscope's correlation and balance, averaged over audio time.
+    pub(crate) correlation: Correlation,
     /// What the music has done to the galaxy (`viz_galaxy`).
     pub(crate) galaxy: crate::viz_galaxy::GalaxyMotion,
     /// The polar spectrum's trails (`viz_polar`).
@@ -474,6 +476,7 @@ impl VizAnalyser {
             sample_rate,
             ballistics: Ballistics::for_rate(sample_rate),
             waveform_buf: VecDeque::with_capacity(WAVEFORM_BUF_SIZE),
+            correlation: Correlation::default(),
             galaxy: Default::default(),
             polar_trail: Default::default(),
             cymatics: Default::default(),
@@ -498,6 +501,7 @@ impl VizAnalyser {
         let mut peak_r: f32 = 0.0;
 
         let frames = samples.len() / channels;
+        let alpha = Correlation::alpha(self.sample_rate);
         for f in 0..frames {
             let l_raw = samples[f * channels];
             let l = l_raw.abs();
@@ -518,7 +522,9 @@ impl VizAnalyser {
                 self.waveform_buf.pop_front();
             }
             self.waveform_buf.push_back((l_raw, r_raw));
+            self.correlation.push(l_raw, r_raw, alpha);
         }
+        self.correlation.advance(frames as f32 / self.sample_rate.max(1) as f32);
 
         // The meter's motion follows the AUDIO's time, not the UI's frame
         // count: these constants are tuned per 50 ms frame, and stepping them
@@ -542,7 +548,7 @@ impl VizAnalyser {
             let l_bands = Self::run_fft_and_compute(&*self.fft, &mut self.fft_input, &mut self.fft_output, &mut self.fft_scratch, self.sample_rate);
 
             // Analysis-spectrogram capture: stash L magnitudes (fft_output now holds L's spectrum).
-            let capture = state.viz_mode() == VizMode::SpectrogramAnalysis;
+            let capture = state.shown_viz() == VizMode::SpectrogramAnalysis;
             if capture {
                 let nbins = self.fft_output.len();
                 self.spectro_mag_l.resize(nbins, 0.0);
@@ -556,7 +562,7 @@ impl VizAnalyser {
             let r_bands = Self::run_fft_and_compute(&*self.fft, &mut self.fft_input, &mut self.fft_output, &mut self.fft_scratch, self.sample_rate);
 
             // The galaxy reads its hits off the raw bands, before the smoothing.
-            if state.viz_mode() == VizMode::Galaxy {
+            if state.shown_viz() == VizMode::Galaxy {
                 let raw: [f32; SPECTRUM_BANDS] = std::array::from_fn(|i| (l_bands[i] + r_bands[i]) / 2.0);
                 self.galaxy.hop(&raw, (FFT_SIZE / 2) as f32 / self.sample_rate.max(1) as f32);
             }
@@ -651,20 +657,20 @@ impl VizAnalyser {
         }
 
         // The galaxy moves by the audio this call covered, like the meter.
-        if state.viz_mode() == VizMode::Galaxy {
+        if state.shown_viz() == VizMode::Galaxy {
             let secs = frames as f32 / self.sample_rate.max(1) as f32;
             let level = (self.smoothed_peak_l + self.smoothed_peak_r) / 2.0;
             let bands: [f32; SPECTRUM_BANDS] =
                 std::array::from_fn(|i| (self.ch_l.smoothed[i] + self.ch_r.smoothed[i]) / 2.0);
             self.galaxy.update(secs, level, &bands);
         }
-        if state.viz_mode() == VizMode::Cymatics {
+        if state.shown_viz() == VizMode::Cymatics {
             let secs = frames as f32 / self.sample_rate.max(1) as f32;
             let bands: [f32; SPECTRUM_BANDS] =
                 std::array::from_fn(|i| (self.ch_l.smoothed[i] + self.ch_r.smoothed[i]) / 2.0);
             self.cymatics.update(secs, &bands);
         }
-        if state.viz_mode() == VizMode::Polar {
+        if state.shown_viz() == VizMode::Polar {
             let secs = frames as f32 / self.sample_rate.max(1) as f32;
             self.polar_trail.push(secs, &self.ch_l.smoothed, &self.ch_r.smoothed);
         } else {
@@ -895,7 +901,7 @@ fn vu_scale_marks(bar_width: usize) -> Vec<(usize, &'static str)> {
 }
 
 /// The permanent dB scale under the bars.
-fn vu_scale_row(bar_width: usize, label_w: usize, vp: &VizPalette) -> String {
+fn vu_scale_row(bar_width: usize, label_w: usize, vp: &VizPalette) -> Line<'static> {
     let mut cells = vec![' '; bar_width];
     for (col, text) in vu_scale_marks(bar_width) {
         for (i, ch) in text.chars().enumerate() {
@@ -904,19 +910,16 @@ fn vu_scale_row(bar_width: usize, label_w: usize, vp: &VizPalette) -> String {
             }
         }
     }
-    let mut line = String::from("  ");
-    for _ in 0..label_w {
-        line.push(' ');
-    }
-    line.push_str(vp.dim);
-    line.extend(cells);
-    line.push_str(vp.reset);
-    line
+    let mut line = LineBuf::new();
+    line.spaces(2 + label_w);
+    line.style(vp.dim);
+    line.push_str(&cells.into_iter().collect::<String>());
+    line.into_line()
 }
 
 /// The level-over-time strip: newest at the right, filled from the bottom.
 fn vu_history_lines(hist: &[(f32, f32)], w: usize, rows: usize, style: VizStyle,
-                    vp: &VizPalette) -> Vec<String> {
+                    vp: &VizPalette) -> Lines {
     // The strip is drawn in the same alphabet as the bars above it — braille in
     // Dots, blocks in Bars — or the two halves of the meter read as different
     // visualizations stacked on top of each other.
@@ -931,19 +934,11 @@ fn vu_history_lines(hist: &[(f32, f32)], w: usize, rows: usize, style: VizStyle,
         // Row 0 is the top of the strip, so it covers the highest level slice.
         let row_bottom = (rows - 1 - row) as f32 / rows as f32;
         let row_top = (rows - row) as f32 / rows as f32;
-        let mut line = String::from("  ");
-        let pad = w.saturating_sub(shown.len());
-        for _ in 0..pad {
-            line.push(' ');
-        }
-        let mut last = "";
+        let mut line = LineBuf::new();
+        line.spaces(2 + w.saturating_sub(shown.len()));
         for &(l, r) in shown {
             let level = l.max(r).clamp(0.0, 1.0);
-            let color = if level >= 0.8 { vp.hot } else if level >= 0.6 { vp.mid } else { vp.low };
-            if color != last {
-                line.push_str(color);
-                last = color;
-            }
+            line.style(if level >= 0.8 { vp.hot } else if level >= 0.6 { vp.mid } else { vp.low });
             if level >= row_top {
                 line.push(full);
             } else if level > row_bottom {
@@ -953,8 +948,7 @@ fn vu_history_lines(hist: &[(f32, f32)], w: usize, rows: usize, style: VizStyle,
                 line.push(' ');
             }
         }
-        line.push_str(vp.reset);
-        lines.push(line);
+        lines.push(line.into_line());
     }
     lines
 }
@@ -963,22 +957,11 @@ fn vu_history_lines(hist: &[(f32, f32)], w: usize, rows: usize, style: VizStyle,
 /// than the window"), enforced in one place per renderer instead of inside
 /// each layout. Several layouts have a floor — the VU label column plus a
 /// 10-cell bar, an 8-column scope grid — and below it they drew past the
-/// window edge (a 14-column VU line in a 1-column window). An over-wide line
-/// wraps into a row nobody budgeted for and drifts the frame, so a too-small
-/// window gets a clipped picture rather than a broken frame.
-pub(crate) fn fit_width(lines: Vec<String>, width: usize) -> Vec<String> {
-    lines
-        .into_iter()
-        .map(|l| {
-            if crate::ansi::visible_len(&l) <= width {
-                l
-            } else {
-                // The cut drops the line's trailing SGR reset with the text
-                // after it; restore one so the colour can't bleed on.
-                format!("{}\x1B[0m", crate::ansi::truncate_ansi(&l, width))
-            }
-        })
-        .collect()
+/// window edge (a 14-column VU line in a 1-column window). The frame cuts
+/// what it draws at the block's edge anyway; cutting here keeps the lines a
+/// renderer returns honest about their width (the size sweeps check it).
+pub(crate) fn fit_width(lines: Lines, width: usize) -> Lines {
+    lines.into_iter().map(|l| crate::tui::truncate(l, width)).collect()
 }
 
 /// Columns of history `elapsed` seconds add, carrying the fraction: one per
@@ -1034,73 +1017,48 @@ fn vu_dot(level: f32, hold: &mut f32, timer: &mut f32, steps: f32) {
 
 /// See `render_vu_meter_body`; this enforces the width half of the renderer contract
 /// (`fit_width`).
-pub fn render_vu_meter(state: &PlayerState, style: VizStyle, width: usize, rows: usize, extras: bool) -> Vec<String> {
+pub fn render_vu_meter(state: &PlayerState, style: VizStyle, width: usize, rows: usize, extras: bool) -> Lines {
     fit_width(render_vu_meter_body(state, style, width, rows, extras), width)
 }
 
 fn render_vu_meter_body(state: &PlayerState, style: VizStyle, width: usize, rows: usize,
-                       extras: bool) -> Vec<String> {
+                       extras: bool) -> Lines {
     let (left, right) = state.get_peaks();
     let (dot_l, dot_r) = state.get_vu_dots();
     // Fill the width: 2-space pad + "L " label (2) + 2-col safety margin = 6 overhead.
     let bar_width = width.saturating_sub(6).max(10);
     let vp = viz_palette(state.theme_kind());
 
-    fn make_bar(level: f32, dot_val: f32, label: &str, width: usize, style: VizStyle, vp: &VizPalette) -> String {
+    fn make_bar(level: f32, dot_val: f32, label: &str, width: usize, style: VizStyle, vp: &VizPalette) -> Line<'static> {
         let full = (level.clamp(0.0, 1.0) * width as f32) as usize;
         let dot_idx = (dot_val.clamp(0.0, 1.0) * width as f32) as usize;
 
         let yellow_start = width * 6 / 10 + 1;
         let red_start = width * 8 / 10 + 1;
 
-        let mut bar = format!("  {dim}{label}{rst} ", dim = vp.dim, rst = vp.reset, label = label);
-        let mut last_color = "";
+        let mut bar = LineBuf::new();
+        bar.push_str("  ").styled(label, vp.dim).reset().push(' ');
+        let (fill, rest) = match style { VizStyle::Dots => ('⣿', '⣀'), VizStyle::Bars => ('█', '▏') };
+        let dot = match style { VizStyle::Dots => '⠅', VizStyle::Bars => '▏' };
         for i in 0..width {
             let color = if i >= red_start { vp.hot }
                         else if i >= yellow_start { vp.mid }
                         else { vp.low };
-            if color != last_color {
-                bar.push_str(color);
-                last_color = color;
-            }
-
-            match style {
-                VizStyle::Dots => {
-                    if i < full {
-                        bar.push('⣿');
-                    } else if i == dot_idx && dot_idx > 0 {
-                        bar.push_str(vp.reset);
-                        bar.push_str(color);
-                        last_color = color;
-                        bar.push('⠅');
-                    } else {
-                        if last_color != vp.dim { bar.push_str(vp.dim); last_color = vp.dim; }
-                        bar.push('⣀');
-                    }
-                }
-                VizStyle::Bars => {
-                    if i < full {
-                        bar.push('█');
-                    } else if i == dot_idx && dot_idx > 0 {
-                        // Bright thin bar as peak dot
-                        bar.push_str(vp.reset);
-                        bar.push_str(color);
-                        last_color = color;
-                        bar.push('▏');
-                    } else {
-                        if last_color != vp.dim { bar.push_str(vp.dim); last_color = vp.dim; }
-                        bar.push('▏');
-                    }
-                }
+            if i < full {
+                bar.style(color).push(fill);
+            } else if i == dot_idx && dot_idx > 0 {
+                // The peak hold: a bright mark in the zone's colour.
+                bar.style(color).push(dot);
+            } else {
+                bar.style(vp.dim).push(rest);
             }
         }
-        bar.push_str(vp.reset);
-        bar
+        bar.into_line()
     }
 
     let lay = vu_layout(rows, extras);
     let hist = vu_push_history(left, right, lay.history > 0);
-    let mut lines: Vec<String> = Vec::with_capacity(rows);
+    let mut lines: Lines = Vec::with_capacity(rows);
     if lay.thickness > 0 {
         // One label per channel, on the block's middle row. Repeating it on
         // every row of a thick bar reads as three separate meters.
@@ -1110,7 +1068,7 @@ fn render_vu_meter_body(state: &PlayerState, style: VizStyle, width: usize, rows
             lines.push(make_bar(left, dot_l, label, bar_width, style, &vp));
         }
         for _ in 0..lay.gap {
-            lines.push(String::new());
+            lines.push(Line::default());
         }
         for i in 0..lay.thickness {
             let label = if i == mid { "R" } else { " " };
@@ -1125,9 +1083,7 @@ fn render_vu_meter_body(state: &PlayerState, style: VizStyle, width: usize, rows
     }
     // The layout is the contract: return exactly the rows we were given.
     lines.truncate(rows);
-    while lines.len() < rows {
-        lines.push(String::new());
-    }
+    lines.resize(rows, Line::default());
     lines
 }
 
@@ -1145,12 +1101,12 @@ const SPECTRUM_H_BLOCKS_DN: &[char] = &[' ', '▇', '▆', '▅', '▄', '▃', 
 
 /// See `render_spectrum_horizontal_body`; this enforces the width half of the renderer contract
 /// (`fit_width`).
-pub fn render_spectrum_horizontal(state: &PlayerState, style: VizStyle, width: usize, rows: usize, extras: bool) -> Vec<String> {
+pub fn render_spectrum_horizontal(state: &PlayerState, style: VizStyle, width: usize, rows: usize, extras: bool) -> Lines {
     fit_width(render_spectrum_horizontal_body(state, style, width, rows, extras), width)
 }
 
 fn render_spectrum_horizontal_body(state: &PlayerState, style: VizStyle, width: usize,
-                                  rows: usize, extras: bool) -> Vec<String> {
+                                  rows: usize, extras: bool) -> Lines {
     let spec_l = state.get_spectrum();
     let spec_r = state.get_spectrum_r();
     let kind = state.theme_kind();
@@ -1158,7 +1114,7 @@ fn render_spectrum_horizontal_body(state: &PlayerState, style: VizStyle, width: 
     let cw = spectrum_cell_w(width);
     let cols = spectrum_col_count(width, cw);
     let groups = spectrum_columns(cols);
-    let indent = " ".repeat(spectrum_indent(width, groups.len(), cw));
+    let indent = spectrum_indent(width, groups.len(), cw);
     // Rows split evenly between the two channels; an odd budget leaves one
     // blank row on the centre line rather than making the channels unequal.
     // With the legend on, the centre line between the up-growing L bars and the
@@ -1166,28 +1122,27 @@ fn render_spectrum_horizontal_body(state: &PlayerState, style: VizStyle, width: 
     let legend = extras && rows >= 3;
     let n = ((rows.saturating_sub(usize::from(legend))) / 2).max(1);
     let centre = rows.saturating_sub(n * 2);
-    let mut lines: Vec<String> = Vec::with_capacity(rows);
+    let mut lines: Lines = Vec::with_capacity(rows);
 
     // L channel: bars grow upward. Rows print top→bottom, so row 0 covers the
     // highest magnitude slice [(n-1)/n, 1.0] and the last row the base [0, 1/n].
     for r in 0..n {
         let lo = (n - 1 - r) as f32 / n as f32;
         let hi = (n - r) as f32 / n as f32;
-        let mut line = indent.clone();
+        let mut line = LineBuf::new();
+        line.spaces(indent);
         for &g in &groups {
             let (level, src) = spectrum_group(&spec_l, g);
-            let color = band_color(src, &vp, kind);
-            line.push_str(&h_cell(level, lo, hi, style, color, true, cw));
+            h_cell(&mut line, level, lo, hi, style, band_color(src, &vp, kind), true, cw);
         }
-        line.push_str(vp.reset);
-        lines.push(line);
+        lines.push(line.into_line());
     }
 
     for i in 0..centre {
         if legend && i == 0 {
-            lines.push(spectrum_legend_row(&groups, cw, indent.len(), &vp));
+            lines.push(spectrum_legend_row(&groups, cw, indent, &vp));
         } else {
-            lines.push(String::new());
+            lines.push(Line::default());
         }
     }
 
@@ -1196,52 +1151,55 @@ fn render_spectrum_horizontal_body(state: &PlayerState, style: VizStyle, width: 
     for r in 0..n {
         let lo = r as f32 / n as f32;
         let hi = (r + 1) as f32 / n as f32;
-        let mut line = indent.clone();
+        let mut line = LineBuf::new();
+        line.spaces(indent);
         for &g in &groups {
             let (level, src) = spectrum_group(&spec_r, g);
-            let color = band_color(src, &vp, kind);
-            line.push_str(&h_cell(level, lo, hi, style, color, false, cw));
+            h_cell(&mut line, level, lo, hi, style, band_color(src, &vp, kind), false, cw);
         }
-        line.push_str(vp.reset);
-        lines.push(line);
+        lines.push(line.into_line());
     }
 
     lines.truncate(rows);
     lines
 }
 
-/// Render one 2-char-wide spectrum cell for a horizontal-spectrum row spanning the
-/// magnitude range `[lo, hi)`. `up` selects bottom-up fill (L channel) vs top-down
-/// fill (R channel).
-fn h_cell(level: f32, lo: f32, hi: f32, style: VizStyle, color: &str, up: bool, cw: usize) -> String {
+/// Append one `cw`-wide spectrum cell for a horizontal-spectrum row spanning
+/// the magnitude range `[lo, hi)`. `up` selects bottom-up fill (L channel) vs
+/// top-down fill (R channel).
+#[allow(clippy::too_many_arguments)]
+fn h_cell(line: &mut LineBuf, level: f32, lo: f32, hi: f32, style: VizStyle, color: Style, up: bool, cw: usize) {
     if level >= hi {
         let full = match style { VizStyle::Bars => '█', VizStyle::Dots => '⣿' };
-        return spectrum_cell(color, full, cw);
+        return spectrum_cell(line, color, full, cw);
     }
     if level <= lo {
-        return " ".repeat(cw);
+        line.spaces(cw);
+        return;
     }
     let frac = (level - lo) / (hi - lo); // fraction of this row that's filled
     match style {
         VizStyle::Dots => {
             let idx = ((frac * 4.0).ceil() as usize).clamp(1, 4);
             let ch = if up { H_UP_BRAILLE[idx] } else { H_DN_BRAILLE[idx] };
-            spectrum_cell(color, ch, cw)
+            spectrum_cell(line, color, ch, cw)
         }
         VizStyle::Bars => {
             let idx = ((frac * 8.0).ceil() as usize).clamp(1, 8);
             if up {
-                spectrum_cell(color, SPECTRUM_H_CHARS[idx], cw)
+                spectrum_cell(line, color, SPECTRUM_H_CHARS[idx], cw)
             } else if idx >= 8 {
-                spectrum_cell(color, '█', cw)
+                spectrum_cell(line, color, '█', cw)
             } else {
                 // Reverse video: FG becomes BG and vice versa, so the block's
                 // "empty" part uses the terminal's real background (invisible),
-                // making the block fill from the top of the cell.
-                // Reverse video fills from the top of the cell; the glyph is
+                // making the block fill from the top of the cell. The glyph is
                 // repeated across the bar's width like every other cell.
-                format!("{}\x1B[7m{}\x1B[27m{C_RESET} ", color,
-                        SPECTRUM_H_BLOCKS_DN[idx].to_string().repeat(cw - 1))
+                line.style(color.add_modifier(Modifier::REVERSED));
+                for _ in 1..cw {
+                    line.push(SPECTRUM_H_BLOCKS_DN[idx]);
+                }
+                line.reset().push(' ');
             }
         }
     }
@@ -1249,12 +1207,12 @@ fn h_cell(level: f32, lo: f32, hi: f32, style: VizStyle, color: &str, up: bool, 
 
 /// See `render_spectrum_vertical_body`; this enforces the width half of the renderer contract
 /// (`fit_width`).
-pub fn render_spectrum_vertical(state: &PlayerState, style: VizStyle, width: usize, rows: usize, extras: bool) -> Vec<String> {
+pub fn render_spectrum_vertical(state: &PlayerState, style: VizStyle, width: usize, rows: usize, extras: bool) -> Lines {
     fit_width(render_spectrum_vertical_body(state, style, width, rows, extras), width)
 }
 
 fn render_spectrum_vertical_body(state: &PlayerState, style: VizStyle, width: usize,
-                                rows: usize, extras: bool) -> Vec<String> {
+                                rows: usize, extras: bool) -> Lines {
     const LOWER_BLOCKS: &[char] = &[' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇'];
     const BRAILLE_V: &[char] = &[' ', '⣀', '⣀', '⣤', '⣤', '⣶', '⣶', '⣿'];
     let spec_l = state.get_spectrum();
@@ -1270,14 +1228,14 @@ fn render_spectrum_vertical_body(state: &PlayerState, style: VizStyle, width: us
     let height = rows - usize::from(legend);
     let cw = spectrum_cell_w(width);
     let groups = spectrum_columns(spectrum_col_count(width, cw));
-    let indent = " ".repeat(spectrum_indent(width, groups.len(), cw));
-    let mut lines = vec![String::new(); height];
+    let indent = spectrum_indent(width, groups.len(), cw);
+    let mut lines: Lines = Vec::with_capacity(rows);
 
     let vp = viz_palette(state.theme_kind());
     // Top rows are "hot" (loud), bottom rows are quiet. Keyed off the row's
     // position in the range rather than a fixed 8-entry table, so the ramp
     // holds at any height: the top quarter is hot, the next quarter mid.
-    let row_color = |row: usize| -> &str {
+    let row_color = |row: usize| -> Style {
         let frac = row as f32 / height as f32;
         if frac < 0.25 { vp.hot } else if frac < 0.5 { vp.mid } else { vp.low }
     };
@@ -1288,7 +1246,8 @@ fn render_spectrum_vertical_body(state: &PlayerState, style: VizStyle, width: us
     };
 
     for row in 0..height {
-        lines[row].push_str(&indent);
+        let mut line = LineBuf::new();
+        line.spaces(indent);
         let row_bottom = (height - 1 - row) as f32 / height as f32;
         let row_top = (height - row) as f32 / height as f32;
         let color = row_color(row);
@@ -1302,13 +1261,11 @@ fn render_spectrum_vertical_body(state: &PlayerState, style: VizStyle, width: us
 
             if bar_full {
                 let ch = match style { VizStyle::Bars => '█', VizStyle::Dots => '⣿' };
-                lines[row].push_str(C_RESET);
-                lines[row].push_str(&spectrum_cell(color, ch, cw));
+                spectrum_cell(&mut line, color, ch, cw);
             } else if bar_partial && dot_in_row {
                 let frac = (dot - row_bottom) / (row_top - row_bottom);
                 let idx = (frac * 7.0).clamp(1.0, 7.0) as usize;
-                lines[row].push_str(C_RESET);
-                lines[row].push_str(&spectrum_cell(color, partials[idx], cw));
+                spectrum_cell(&mut line, color, partials[idx], cw);
             } else if dot_in_row {
                 let dot_ch = match style {
                     VizStyle::Dots => '⣀',
@@ -1318,22 +1275,19 @@ fn render_spectrum_vertical_body(state: &PlayerState, style: VizStyle, width: us
                         LOWER_BLOCKS[idx.min(2)]
                     }
                 };
-                lines[row].push_str(C_RESET);
-                lines[row].push_str(&spectrum_cell(color, dot_ch, cw));
+                spectrum_cell(&mut line, color, dot_ch, cw);
             } else if bar_partial {
                 let frac = (level - row_bottom) / (row_top - row_bottom);
                 let idx = (frac * 7.0).max(1.0) as usize;
-                lines[row].push_str(C_RESET);
-                lines[row].push_str(&spectrum_cell(color, partials[idx], cw));
+                spectrum_cell(&mut line, color, partials[idx], cw);
             } else {
-                lines[row].push_str(vp.reset);
-                for _ in 0..cw { lines[row].push(' '); }
+                line.reset().spaces(cw);
             }
         }
-        lines[row].push_str(vp.reset);
+        lines.push(line.into_line());
     }
     if legend {
-        lines.push(spectrum_legend_row(&groups, cw, indent.len(), &vp));
+        lines.push(spectrum_legend_row(&groups, cw, indent, &vp));
     }
     lines
 }
@@ -1422,7 +1376,7 @@ fn spectrum_indent(width: usize, cols: usize, cw: usize) -> usize {
 /// octave ladder uses. Labels name the band actually under them, taken from the
 /// same `ISO_CENTERS` table that defines the bins, so they cannot drift.
 fn spectrum_legend_row(groups: &[(usize, usize)], cw: usize, indent: usize,
-                       vp: &VizPalette) -> String {
+                       vp: &VizPalette) -> Line<'static> {
     let width = groups.len() * cw;
     let mut cells = vec![' '; width];
     let mut next_free = 0usize;
@@ -1438,20 +1392,18 @@ fn spectrum_legend_row(groups: &[(usize, usize)], cw: usize, indent: usize,
         // One clear column between labels, or they read as one number.
         next_free = col + text.len() + 1;
     }
-    let mut line = " ".repeat(indent);
-    line.push_str(vp.dim);
-    line.extend(cells);
-    line.push_str(vp.reset);
-    line
+    let mut line = LineBuf::new();
+    line.spaces(indent).style(vp.dim).push_str(&cells.into_iter().collect::<String>());
+    line.into_line()
 }
 
 /// One spectrum cell: `cw - 1` glyphs, then the gap column.
-fn spectrum_cell(color: &str, ch: char, cw: usize) -> String {
-    let mut s = String::with_capacity(color.len() + cw);
-    s.push_str(color);
-    for _ in 1..cw { s.push(ch); }
-    s.push(' ');
-    s
+fn spectrum_cell(line: &mut LineBuf, color: Style, ch: char, cw: usize) {
+    line.style(color);
+    for _ in 1..cw {
+        line.push(ch);
+    }
+    line.push(' ');
 }
 
 /// Rows the viz body occupies given the rows the frame can spare. Modes that
@@ -1532,11 +1484,11 @@ pub(crate) const BRAILLE_BITS: [[u32; 4]; 2] = [
 
 /// See `render_oscilloscope_body`; this enforces the width half of the renderer contract
 /// (`fit_width`).
-pub fn render_oscilloscope(analyser: &VizAnalyser, style: VizStyle, width: usize, rows: usize) -> Vec<String> {
+pub fn render_oscilloscope(analyser: &VizAnalyser, style: VizStyle, width: usize, rows: usize) -> Lines {
     fit_width(render_oscilloscope_body(analyser, style, width, rows), width)
 }
 
-fn render_oscilloscope_body(analyser: &VizAnalyser, style: VizStyle, width: usize, rows: usize) -> Vec<String> {
+fn render_oscilloscope_body(analyser: &VizAnalyser, style: VizStyle, width: usize, rows: usize) -> Lines {
     // Fill the terminal width (2-space pad + 2-col safety margin), with a sane cap.
     let cols = width.saturating_sub(4).clamp(8, OSCILLOSCOPE_MAX_COLS);
     if rows == 0 {
@@ -1551,7 +1503,7 @@ fn render_oscilloscope_body(analyser: &VizAnalyser, style: VizStyle, width: usiz
     }
 }
 
-fn render_oscilloscope_bars(analyser: &VizAnalyser, cols: usize, rows: usize) -> Vec<String> {
+fn render_oscilloscope_bars(analyser: &VizAnalyser, cols: usize, rows: usize) -> Lines {
     let buf = &analyser.waveform_buf;
     // 2× horizontal resolution via quadrant blocks: sample at 2× cell width.
     let sub_cols = cols * 2;
@@ -1588,12 +1540,12 @@ fn render_oscilloscope_bars(analyser: &VizAnalyser, cols: usize, rows: usize) ->
     for cy in 0..rows {
         let from_edge = cy.min(rows - 1 - cy);
         let color = match from_edge {
-            0 => C_RED,
-            1 => C_YELLOW,
-            _ => C_GREEN,
+            0 => RED,
+            1 => YELLOW,
+            _ => GREEN,
         };
-        let mut line = String::from("  ");
-        line.push_str(color);
+        let mut line = LineBuf::new();
+        line.push_str("  ").style(color);
         let top_row = cy * 2;
         let bot_row = cy * 2 + 1;
         for cx in 0..cols {
@@ -1606,13 +1558,12 @@ fn render_oscilloscope_bars(analyser: &VizAnalyser, cols: usize, rows: usize) ->
             let idx = (tl) | (tr << 1) | (bl << 2) | (br << 3);
             line.push(QUAD[idx as usize]);
         }
-        line.push_str(C_RESET);
-        lines.push(line);
+        lines.push(line.into_line());
     }
     lines
 }
 
-fn render_oscilloscope_dots(analyser: &VizAnalyser, cols: usize, rows: usize) -> Vec<String> {
+fn render_oscilloscope_dots(analyser: &VizAnalyser, cols: usize, rows: usize) -> Lines {
     let buf = &analyser.waveform_buf;
     let dots_w = cols * 2; // braille 2 dots/cell
     let dots_h = rows * 4; // braille 4 dots/cell
@@ -1658,8 +1609,8 @@ fn render_oscilloscope_dots(analyser: &VizAnalyser, cols: usize, rows: usize) ->
     // Render grid row-by-row. Color by distance from center (green → yellow → red).
     let mut lines = Vec::with_capacity(rows);
     for cy in 0..rows {
-        let mut line = String::from("  ");
-        let mut last_color = "";
+        let mut line = LineBuf::new();
+        line.push_str("  ");
         for cx in 0..cols {
             let (mut bits, mut bits_l, mut bits_r) = (0u32, 0u32, 0u32);
             for py in 0..4 {
@@ -1682,28 +1633,23 @@ fn render_oscilloscope_dots(analyser: &VizAnalyser, cols: usize, rows: usize) ->
                 // traces pass are mono content, one-sided cells are the
                 // difference between the channels.
                 match (bits_l != 0, bits_r != 0) {
-                    (true, true) => C_GREEN,
-                    (true, false) => C_CYAN,
-                    (false, true) => C_MAGENTA,
-                    (false, false) => C_GREEN,
+                    (true, true) => GREEN,
+                    (true, false) => CYAN,
+                    (false, true) => MAGENTA,
+                    (false, false) => GREEN,
                 }
             } else {
                 // Colour by row — rows near the edges are louder, so redder.
                 match cy.min(rows - 1 - cy) {
-                    0 => C_RED,
-                    1 => C_YELLOW,
-                    _ => C_GREEN,
+                    0 => RED,
+                    1 => YELLOW,
+                    _ => GREEN,
                 }
             };
-            if color != last_color {
-                line.push_str(color);
-                last_color = color;
-            }
             let ch = char::from_u32(0x2800 + bits).unwrap_or(' ');
-            line.push(ch);
+            line.style(color).push(ch);
         }
-        line.push_str(C_RESET);
-        lines.push(line);
+        lines.push(line.into_line());
     }
     lines
 }
@@ -1714,24 +1660,72 @@ const LISSAJOUS_MAX_ROWS: usize = 40;
 /// Columns the side panel needs before it is worth drawing.
 const LISSAJOUS_PANEL_W: usize = 12;
 
-/// Inter-channel correlation and balance over the waveform buffer.
-///
-/// Correlation is the normalised dot product: +1 mono, 0 uncorrelated, -1 the
-/// channels cancelling — the number a vectorscope exists to show, and the one
-/// thing its picture makes you estimate by eye. Balance is the signed share of
-/// energy, negative to the left.
-fn lissajous_stats(buf: &std::collections::VecDeque<(f32, f32)>) -> (f32, f32) {
-    let (mut lr, mut ll, mut rr) = (0.0f64, 0.0f64, 0.0f64);
-    for &(l, r) in buf.iter() {
-        lr += (l * r) as f64;
-        ll += (l * l) as f64;
-        rr += (r * r) as f64;
+/// Stereo correlation (+1 identical channels, 0 unrelated, −1 opposite) and
+/// balance as a meter reads them: from products averaged over `CORR_SECS` of
+/// AUDIO (an exponential average, three multiplies a sample), not one 21 ms
+/// buffer — over 21 ms ordinary stereo (wide reverb, stereo synths, little
+/// bass) swings negative all the time, and "MONO RISK" flashed through
+/// healthy music. The warning wants the average below `MONO_RISK_BELOW` for
+/// `MONO_RISK_AFTER`, and stays `MONO_RISK_HOLD` after it recovers.
+#[derive(Default)]
+pub(crate) struct Correlation {
+    lr: f64,
+    ll: f64,
+    rr: f64,
+    /// Audio seconds the average has been below the threshold.
+    below: f32,
+    /// Audio seconds the warning has left to show.
+    hold: f32,
+}
+
+const CORR_SECS: f64 = 0.3;
+const MONO_RISK_BELOW: f32 = -0.2;
+const MONO_RISK_AFTER: f32 = 1.0;
+const MONO_RISK_HOLD: f32 = 1.0;
+
+impl Correlation {
+    /// The per-sample weight of a new sample at `rate`.
+    pub(crate) fn alpha(rate: u32) -> f64 {
+        1.0 - (-1.0 / (CORR_SECS * rate.max(1) as f64)).exp()
     }
-    let denom = (ll * rr).sqrt();
-    let corr = if denom > 1e-12 { (lr / denom) as f32 } else { 0.0 };
-    let total = ll + rr;
-    let bal = if total > 1e-12 { ((rr - ll) / total) as f32 } else { 0.0 };
-    (corr.clamp(-1.0, 1.0), bal.clamp(-1.0, 1.0))
+
+    pub(crate) fn push(&mut self, l: f32, r: f32, alpha: f64) {
+        let (l, r) = (l as f64, r as f64);
+        // Feedback state: flushed, as every IIR's is (in silence it decays
+        // into the subnormal range, 10-100x slower on x86).
+        let f = crate::eq::flush_denormal_f64;
+        self.lr = f(self.lr + alpha * (l * r - self.lr));
+        self.ll = f(self.ll + alpha * (l * l - self.ll));
+        self.rr = f(self.rr + alpha * (r * r - self.rr));
+    }
+
+    /// `secs` of audio went by: the warning's clocks.
+    pub(crate) fn advance(&mut self, secs: f32) {
+        if self.value() < MONO_RISK_BELOW {
+            self.below += secs;
+            if self.below >= MONO_RISK_AFTER {
+                self.hold = MONO_RISK_HOLD;
+            }
+        } else {
+            self.below = 0.0;
+            self.hold = (self.hold - secs).max(0.0);
+        }
+    }
+
+    pub(crate) fn value(&self) -> f32 {
+        let denom = (self.ll * self.rr).sqrt();
+        if denom > 1e-12 { ((self.lr / denom) as f32).clamp(-1.0, 1.0) } else { 0.0 }
+    }
+
+    /// −1 all left, +1 all right.
+    pub(crate) fn balance(&self) -> f32 {
+        let total = self.ll + self.rr;
+        if total > 1e-12 { (((self.rr - self.ll) / total) as f32).clamp(-1.0, 1.0) } else { 0.0 }
+    }
+
+    pub(crate) fn mono_risk(&self) -> bool {
+        self.hold > 0.0
+    }
 }
 /// Terminal cells are roughly 1:2, so a square box needs twice as many columns
 /// as rows. A vectorscope that is not square lies about phase.
@@ -1739,18 +1733,18 @@ const LISSAJOUS_ASPECT: usize = 2;
 
 /// See `render_lissajous_body`; this enforces the width half of the renderer contract
 /// (`fit_width`).
-pub fn render_lissajous(analyser: &VizAnalyser, style: VizStyle, width: usize, rows: usize) -> Vec<String> {
+pub fn render_lissajous(analyser: &VizAnalyser, style: VizStyle, width: usize, rows: usize) -> Lines {
     fit_width(render_lissajous_body(analyser, style, width, rows), width)
 }
 
-fn render_lissajous_body(analyser: &VizAnalyser, style: VizStyle, width: usize, rows: usize) -> Vec<String> {
+fn render_lissajous_body(analyser: &VizAnalyser, style: VizStyle, width: usize, rows: usize) -> Lines {
     // Unlike every other mode the two axes are ONE knob: whichever of height or
     // width runs out first sets the box, and the leftover width stays margin
     // rather than being stretched into.
     let avail_cols = width.saturating_sub(4);
     let side = rows.min(avail_cols / LISSAJOUS_ASPECT);
     if side == 0 {
-        return vec![String::new(); rows];
+        return vec![Line::default(); rows];
     }
     let cols = side * LISSAJOUS_ASPECT;
     let pad = (width.saturating_sub(cols) / 2).max(2);
@@ -1764,7 +1758,8 @@ fn render_lissajous_body(analyser: &VizAnalyser, style: VizStyle, width: usize, 
     // space that cannot hold more scatter.
     let right = width.saturating_sub(pad + cols);
     if right >= LISSAJOUS_PANEL_W && lines.len() >= 3 {
-        let (corr, bal) = lissajous_stats(&analyser.waveform_buf);
+        let c = &analyser.correlation;
+        let (corr, bal) = (c.value(), c.balance());
         let panel = [
             format!("corr {corr:+.2}"),
             match bal {
@@ -1772,8 +1767,9 @@ fn render_lissajous_body(analyser: &VizAnalyser, style: VizStyle, width: usize, 
                 b if b < 0.0 => format!("bal  L{:.0}%", -b * 100.0),
                 b => format!("bal  R{:.0}%", b * 100.0),
             },
-            // Correlation near -1 means the channels cancel in mono.
-            if corr < -0.2 { "MONO RISK".to_string() } else { String::new() },
+            // The channels cancel in mono, and have for a while (a
+            // momentary dip is ordinary stereo).
+            if c.mono_risk() { "MONO RISK".to_string() } else { String::new() },
         ];
         let top = lines.len().saturating_sub(panel.len()) / 2;
         for (i, text) in panel.iter().enumerate() {
@@ -1781,20 +1777,17 @@ fn render_lissajous_body(analyser: &VizAnalyser, style: VizStyle, width: usize, 
                 continue;
             }
             if let Some(line) = lines.get_mut(top + i) {
-                line.push_str(&format!("  {C_DIM}{text}{C_RESET}"));
+                line.push_span(ratatui::text::Span::styled(format!("  {text}"), DIM));
             }
         }
     }
     // The box is square, the budget may not be: pad the remainder so the frame
     // still gets exactly the rows it accounted for.
-    while lines.len() < rows {
-        lines.push(String::new());
-    }
-    lines.truncate(rows);
+    lines.resize(rows, Line::default());
     lines
 }
 
-fn render_lissajous_bars(analyser: &VizAnalyser, pad: usize, rows: usize, cols: usize) -> Vec<String> {
+fn render_lissajous_bars(analyser: &VizAnalyser, pad: usize, rows: usize, cols: usize) -> Lines {
     let buf = &analyser.waveform_buf;
     let mut counts = vec![0u32; cols * rows];
     let inv_sqrt2 = std::f32::consts::FRAC_1_SQRT_2;
@@ -1813,8 +1806,8 @@ fn render_lissajous_bars(analyser: &VizAnalyser, pad: usize, rows: usize, cols: 
 
     let mut lines = Vec::with_capacity(rows);
     for cy in 0..rows {
-        let mut line = " ".repeat(pad);
-        line.push_str(C_CYAN);
+        let mut line = LineBuf::new();
+        line.spaces(pad).style(CYAN);
         for cx in 0..cols {
             let f = counts[cy * cols + cx] as f32 / max;
             let ch = if f == 0.0 { ' ' }
@@ -1824,13 +1817,12 @@ fn render_lissajous_bars(analyser: &VizAnalyser, pad: usize, rows: usize, cols: 
                 else { '█' };
             line.push(ch);
         }
-        line.push_str(C_RESET);
-        lines.push(line);
+        lines.push(line.into_line());
     }
     lines
 }
 
-fn render_lissajous_dots(analyser: &VizAnalyser, pad: usize, rows: usize, cols: usize) -> Vec<String> {
+fn render_lissajous_dots(analyser: &VizAnalyser, pad: usize, rows: usize, cols: usize) -> Lines {
     let (dots_w, dots_h) = (cols * 2, rows * 4);
     let buf = &analyser.waveform_buf;
     let mut grid = vec![0u32; dots_w * dots_h];
@@ -1852,8 +1844,8 @@ fn render_lissajous_dots(analyser: &VizAnalyser, pad: usize, rows: usize, cols: 
 
     let mut lines = Vec::with_capacity(rows);
     for cy in 0..rows {
-        let mut line = " ".repeat(pad);
-        line.push_str(C_CYAN);
+        let mut line = LineBuf::new();
+        line.spaces(pad).style(CYAN);
         for cx in 0..cols {
             let mut bits: u32 = 0;
             for py in 0..4 {
@@ -1868,8 +1860,7 @@ fn render_lissajous_dots(analyser: &VizAnalyser, pad: usize, rows: usize, cols: 
             let ch = char::from_u32(0x2800 + bits).unwrap_or(' ');
             line.push(ch);
         }
-        line.push_str(C_RESET);
-        lines.push(line);
+        lines.push(line.into_line());
     }
     lines
 }
@@ -1880,9 +1871,9 @@ fn render_lissajous_dots(analyser: &VizAnalyser, pad: usize, rows: usize, cols: 
 const SPECTROGRAM_ROWS: usize = 10;
 
 // 31 bands → 10 octave rows (top = highest freq). Colors mirror BAND_COLORS by region.
-const SPECTROGRAM_ROW_COLORS: [&str; SPECTROGRAM_ROWS] = [
-    C_MAGENTA, C_RED, C_RED, C_YELLOW, C_YELLOW,
-    C_YELLOW, C_GREEN, C_GREEN, C_GREEN, C_CYAN,
+const SPECTROGRAM_ROW_COLORS: [Style; SPECTROGRAM_ROWS] = [
+    MAGENTA, RED, RED, YELLOW, YELLOW,
+    YELLOW, GREEN, GREEN, GREEN, CYAN,
 ];
 
 // 9-level braille fill, one extra dot per step so each magnitude maps to a
@@ -1899,11 +1890,11 @@ const SPECTROGRAM_CEIL: f32 = 0.62;  // lower to make peaks reach full height so
 
 /// See `render_spectrogram_body`; this enforces the width half of the renderer contract
 /// (`fit_width`).
-pub fn render_spectrogram(analyser: &VizAnalyser, style: VizStyle, width: usize, rows: usize) -> Vec<String> {
+pub fn render_spectrogram(analyser: &VizAnalyser, style: VizStyle, width: usize, rows: usize) -> Lines {
     fit_width(render_spectrogram_body(analyser, style, width, rows), width)
 }
 
-fn render_spectrogram_body(analyser: &VizAnalyser, style: VizStyle, width: usize, rows: usize) -> Vec<String> {
+fn render_spectrogram_body(analyser: &VizAnalyser, style: VizStyle, width: usize, rows: usize) -> Lines {
     if rows == 0 {
         return Vec::new();
     }
@@ -1935,11 +1926,11 @@ fn render_spectrogram_body(analyser: &VizAnalyser, style: VizStyle, width: usize
 
     let mut lines = Vec::with_capacity(rows);
     for (row, &(lo, hi)) in band_groups.iter().enumerate() {
-        let mut line = String::from("  ");
+        let mut line = LineBuf::new();
         // The colour ramp is a fixed table read by position, not by index, so
         // it stretches over any number of rows instead of running off its end.
         let color = SPECTROGRAM_ROW_COLORS[row * SPECTROGRAM_ROW_COLORS.len() / rows];
-        line.push_str(color);
+        line.push_str("  ").style(color);
         // Show the newest `cols` columns: oldest on the left, newest on the right.
         // Pad with spaces when history hasn't filled the visible width yet.
         let n = hist.len().min(cols);
@@ -1960,8 +1951,7 @@ fn render_spectrogram_body(analyser: &VizAnalyser, style: VizStyle, width: usize
             let idx = ((v_norm * 8.0) as usize).min(8);
             line.push(chars[idx]);
         }
-        line.push_str(C_RESET);
-        lines.push(line);
+        lines.push(line.into_line());
     }
     lines
 }
@@ -2048,31 +2038,56 @@ fn analysis_sixel_palette() -> &'static [(u8, u8, u8)] {
 /// image (or the half-block grid) gets blank rows: a picture cannot be cut to
 /// width the way text can — a Kitty/Sixel image placed wider than the window
 /// overflows it whatever the text around it says.
-pub fn render_spectrogram_analysis(analyser: &VizAnalyser, width: usize, log_axis: bool, paused: bool, rows: usize, force: bool) -> Vec<String> {
-    let lines = render_spectrogram_analysis_body(analyser, width, log_axis, paused, rows, force);
-    if lines.iter().any(|l| crate::ansi::visible_len(l) > width) {
-        return vec![String::new(); rows];
-    }
-    lines
+/// What the analysis spectrogram draws this frame.
+#[derive(Clone)]
+pub enum AnalysisOut {
+    /// Cells: the half-block picture with its legend down the left.
+    Lines(Lines),
+    /// A pixel image (Kitty, Sixel) over `cols`×`rows` blank cells starting
+    /// `x` cells into the block: its escape sequence, or None when the one
+    /// on screen is unchanged (Sixel's emit-on-change).
+    Image { x: usize, cols: usize, rows: usize, payload: Option<String> },
 }
 
-fn render_spectrogram_analysis_body(analyser: &VizAnalyser, width: usize, log_axis: bool, paused: bool, rows: usize, force: bool) -> Vec<String> {
+impl AnalysisOut {
+    /// Nothing to draw in `rows` rows.
+    fn blank(rows: usize) -> Self {
+        AnalysisOut::Lines(vec![Line::default(); rows])
+    }
+}
+
+/// What an analysis frame was drawn from: the newest column's generation,
+/// the width, the axis and the rows.
+type AnalysisKey = (u64, usize, bool, usize);
+
+pub fn render_spectrogram_analysis(analyser: &VizAnalyser, width: usize, log_axis: bool, paused: bool, rows: usize, force: bool) -> AnalysisOut {
+    let out = render_spectrogram_analysis_body(analyser, width, log_axis, paused, rows, force);
+    let fits = match &out {
+        AnalysisOut::Lines(lines) => lines.iter().all(|l| crate::tui::Cols::cols(l) <= width),
+        AnalysisOut::Image { x, cols, .. } => x + cols <= width,
+    };
+    if fits { out } else { AnalysisOut::blank(rows) }
+}
+
+fn render_spectrogram_analysis_body(analyser: &VizAnalyser, width: usize, log_axis: bool, paused: bool, rows: usize, force: bool) -> AnalysisOut {
     use std::cell::RefCell;
     thread_local! {
         // Reused across frames so the per-frame image buffers aren't reallocated each tick.
         static RGB_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
         static LEVELS_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
         // Paused-frame cache: while paused the image is frozen, so reuse the last
-        // rendered lines (keyed by column generation + geometry) to skip the encode.
-        static CACHE: RefCell<(u64, usize, bool, usize, Vec<String>)> =
-            const { RefCell::new((u64::MAX, 0, false, 0, Vec::new())) };
+        // render (keyed by column generation + geometry) to skip the encode.
+        static CACHE: RefCell<Option<(AnalysisKey, AnalysisOut)>> = const { RefCell::new(None) };
         // Key of the sixel block last emitted to the terminal. Sixel pixels
         // persist as cell content, so an unchanged frame can be skipped
         // entirely — no re-encode, no re-transmission through ConPTY.
         static LAST_EMIT: RefCell<(u64, usize, bool, usize)> =
             const { RefCell::new((u64::MAX, 0, false, 0)) };
     }
-    let sixel = analysis_needs_raw_lines();
+    if rows == 0 {
+        return AnalysisOut::Lines(Vec::new());
+    }
+    let sixel = analysis_is_sixel();
     let protocol = crate::cover::detect_protocol();
     // Frequency legend. Both image protocols draw it INTO the image: cells and
     // pixels are different coordinate systems, and a legend snapped to cell
@@ -2089,41 +2104,35 @@ fn render_spectrogram_analysis_body(analyser: &VizAnalyser, width: usize, log_ax
     let gen = analyser.spectro_last_gen;
     let key = (gen, width, log_axis, rows);
 
+    // Protocol-dependent geometry: Some((w, h)) renders a pixel image that big,
+    // None falls back to half-block truecolor (text, so it redraws cleanly and
+    // fills the width). Per-protocol rationale lives in analysis_image_geometry.
+    let image_geom = analysis_image_geometry(protocol, cols, rows);
+
     // Sixel emit-on-change: the image only changes when a new hop lands
     // (gen bump) or the geometry/axis changes. Re-encoding + re-sending the
     // blob 20×/s through ConPTY saturates Windows Terminal's CPU-side sixel
-    // pipeline and makes the scroll cadence jerky. Passive empty lines move
-    // the cursor over the block without touching its cells.
-    if analysis_can_skip_emit(sixel, force, key, LAST_EMIT.with(|c| *c.borrow())) {
-        return vec![String::new(); rows];
+    // pipeline and makes the scroll cadence jerky. The cells stay blank and
+    // the image on screen stays.
+    if image_geom.is_some() && analysis_can_skip_emit(sixel, force, key, LAST_EMIT.with(|c| *c.borrow())) {
+        return AnalysisOut::Image { x: 2, cols, rows, payload: None };
     }
 
     // When paused the content can't change, so reuse the cached render and skip the
     // per-frame image build + PNG re-encode entirely.
     if paused {
-        let hit = CACHE.with(|c| {
-            let c = c.borrow();
-            if c.0 == gen && c.1 == width && c.2 == log_axis && c.3 == rows && !c.4.is_empty() {
-                Some(c.4.clone())
-            } else {
-                None
-            }
-        });
-        if let Some(lines) = hit {
+        let hit = CACHE.with(|c| c.borrow().as_ref().filter(|(k, _)| *k == key).map(|(_, out)| out.clone()));
+        if let Some(out) = hit {
             if sixel {
                 LAST_EMIT.with(|c| *c.borrow_mut() = key);
             }
-            return lines;
+            return out;
         }
     }
 
-    // Protocol-dependent geometry: Some((w, h)) renders a pixel image that big,
-    // None falls back to half-block truecolor (text, so it redraws cleanly and
-    // fills the width). Per-protocol rationale lives in analysis_image_geometry.
-    let image_geom = analysis_image_geometry(protocol, cols, rows);
     // Half-block: 1 px/col, 2 px-rows/char row, sized directly to the cell area.
     let (w, h) = image_geom.unwrap_or((cols, rows * 2));
-    let lines = LEVELS_BUF.with(|lcell| {
+    let out = LEVELS_BUF.with(|lcell| {
         let mut lguard = lcell.borrow_mut();
         let levels: &mut Vec<u8> = &mut lguard;
         // Image paths map pixels through a logical timeline of history slots;
@@ -2131,10 +2140,6 @@ fn render_spectrogram_analysis_body(analyser: &VizAnalyser, width: usize, log_ax
         // the full 512-hop history (terminal scales smoothly). Sixel shows
         // the most recent w/k hops at exactly k px each (w is a multiple of
         // k, see analysis_image_geometry) — uniform hop widths, no shimmer.
-        // Sixel reserves a pixel strip on the left for the legend, then trims
-        // what remains to a whole number of px-per-hop so scrolling features
-        // keep a uniform width (see analysis_image_geometry). The trim's
-        // remainder is absorbed into the strip, which is only background.
         let scale = legend_scale(h, rows);
         let strip = if image_geom.is_some() {
             legend_strip_w(h, log_axis, analyser.sample_rate as f32, scale)
@@ -2156,7 +2161,7 @@ fn render_spectrogram_analysis_body(analyser: &VizAnalyser, width: usize, log_ax
             (0, w)
         };
         analysis_levels_into(levels, analyser, w, h, log_axis, logical_cols, left_px);
-        let mut lines = if image_geom.is_some() && sixel {
+        if image_geom.is_some() && sixel {
             // Fixed-palette indexed sixel — no quantizer, no shimmer.
             for lv in levels.iter_mut() { *lv >>= 1; }
             // Painted into the same pixels as the spectrogram, so the two share
@@ -2169,55 +2174,54 @@ fn render_spectrogram_analysis_body(analyser: &VizAnalyser, width: usize, log_ax
             draw_pixel_legend(
                 &mut plot, h, left_px, log_axis, analyser.sample_rate as f32, scale,
             );
-            crate::cover::render_viz_sixel_indexed(
-                levels, analysis_sixel_palette(), w, h, cols as u32, rows as u32,
-                crate::cover::Gutter::NONE,
-            )
-        } else {
-            RGB_BUF.with(|cell| {
-                let mut guard = cell.borrow_mut();
-                let rgb: &mut Vec<u8> = &mut guard;
-                colorize_levels(levels, rgb);
-                if image_geom.is_some() {
-                    // Drawn after colorising: the legend is a flat colour, not
-                    // a colormap entry, so it must not go through the ramp.
-                    let mut plot = |x: usize, y: usize| {
-                        if x < w && y < h {
-                            let i = (y * w + x) * 3;
-                            rgb[i] = LEGEND_RGB.0;
-                            rgb[i + 1] = LEGEND_RGB.1;
-                            rgb[i + 2] = LEGEND_RGB.2;
-                        }
-                    };
-                    draw_pixel_legend(
-                        &mut plot, h, left_px, log_axis, analyser.sample_rate as f32, scale,
-                    );
-                    crate::cover::render_image_block(rgb.as_slice(), w as u32, h as u32, cols as u32, rows as u32)
-                } else {
-                    crate::cover::render_half_block_public(w as u32, h as u32, rgb.as_slice())
-                }
-            })
-        };
-        // Sixel weaves the gutter in itself — its self-erase pass would wipe a
-        // plain prefix off row 0 (see cover::viz_sixel_lines). Kitty places the
-        // image at the cursor and half-block is ordinary text, so both just
-        // take the legend as a prefix.
-        if gutter_w > 0 && !(image_geom.is_some() && sixel) {
-            for (line, g) in lines.iter_mut().zip(gutter.iter()) {
-                line.insert_str(0, g);
-            }
+            let payload = crate::cover::sixel_encode_indexed(levels, analysis_sixel_palette(), w, h);
+            return AnalysisOut::Image { x: 2, cols, rows, payload: Some(payload) };
         }
-        for line in lines.iter_mut() { line.insert_str(0, "  "); }
-        lines
+        RGB_BUF.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            let rgb: &mut Vec<u8> = &mut guard;
+            colorize_levels(levels, rgb);
+            if image_geom.is_some() {
+                // Drawn after colorising: the legend is a flat colour, not
+                // a colormap entry, so it must not go through the ramp.
+                let mut plot = |x: usize, y: usize| {
+                    if x < w && y < h {
+                        let i = (y * w + x) * 3;
+                        rgb[i] = LEGEND_RGB.0;
+                        rgb[i + 1] = LEGEND_RGB.1;
+                        rgb[i + 2] = LEGEND_RGB.2;
+                    }
+                };
+                draw_pixel_legend(
+                    &mut plot, h, left_px, log_axis, analyser.sample_rate as f32, scale,
+                );
+                let payload = crate::cover::viz_image_payload(rgb.as_slice(), w as u32, h as u32, cols as u32, rows as u32);
+                AnalysisOut::Image { x: 2, cols, rows, payload }
+            } else {
+                // Half-block is cells: the legend goes down its left.
+                let picture = crate::cover::half_block_lines(w as u32, h as u32, rgb.as_slice());
+                let mut lines = Vec::with_capacity(rows);
+                for (i, row) in picture.into_iter().enumerate() {
+                    let mut line = LineBuf::new();
+                    line.push_str("  ");
+                    if let Some(g) = gutter.get(i) {
+                        line.append(g.clone());
+                    }
+                    line.append(row);
+                    lines.push(line.into_line());
+                }
+                AnalysisOut::Lines(lines)
+            }
+        })
     });
 
     if paused {
-        CACHE.with(|c| *c.borrow_mut() = (gen, width, log_axis, rows, lines.clone()));
+        CACHE.with(|c| *c.borrow_mut() = Some((key, out.clone())));
     }
     if sixel {
         LAST_EMIT.with(|c| *c.borrow_mut() = key);
     }
-    lines
+    out
 }
 
 /// Whether this frame's sixel analysis block can be left untouched on screen
@@ -2257,12 +2261,10 @@ pub fn viz_rows_available(term_h: usize, rows_above: usize, below: usize) -> usi
     term_h.saturating_sub(rows_above + below)
 }
 
-/// Whether the analysis-spectrogram lines must be printed WITHOUT the usual
-/// per-line erase-to-EOL. Sixel pixels are ordinary cell content: the row-1
-/// transmit paints the whole block downward, so erasing rows 2..N afterwards
-/// wipes the image to a 1-row strip. The sixel first line erases the block
-/// itself before painting (see cover::viz_sixel_lines).
-pub fn analysis_needs_raw_lines() -> bool {
+/// Whether the analysis spectrogram is drawn in Sixel: its pixels are cell
+/// content that persists until written over, so an unchanged frame can skip
+/// the image entirely (`analysis_can_skip_emit`).
+fn analysis_is_sixel() -> bool {
     matches!(
         crate::cover::detect_protocol(),
         crate::cover::GraphicsProtocol::Sixel
@@ -2286,6 +2288,32 @@ fn protocol_draws_image_legend(protocol: crate::cover::GraphicsProtocol) -> bool
 /// image cannot spill past its reserved rows on any real terminal.
 pub(crate) const SIXEL_CELL_FLOOR: (usize, usize) = (8, 16);
 
+/// Windows Terminal's Sixel cell: it maps Sixel pixels onto a VIRTUAL
+/// 10×20 cell (the VT340's) and scales the image to the real font, so this
+/// holds at any font, display scaling or zoom. Sized for 8×16, images filled
+/// 80% of their block there.
+const WINDOWS_TERMINAL_SIXEL_CELL: (usize, usize) = (10, 20);
+
+static SIXEL_CELL: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+
+/// The cell size Sixel images are sized for: `config.json`'s `sixel_cell`,
+/// else Windows Terminal's virtual cell, else the floor. Never queried from
+/// the terminal (its reply would arrive as keystrokes).
+pub(crate) fn sixel_cell() -> (usize, usize) {
+    *SIXEL_CELL.get_or_init(|| sixel_cell_for(None, std::env::var_os("WT_SESSION").is_some()))
+}
+
+/// Settle `sixel_cell` at startup with the configured size, if any. Call
+/// before the first image is sized.
+pub(crate) fn set_sixel_cell(configured: Option<(usize, usize)>) {
+    let _ = SIXEL_CELL.set(sixel_cell_for(configured, std::env::var_os("WT_SESSION").is_some()));
+}
+
+/// Pure core of `sixel_cell`.
+fn sixel_cell_for(configured: Option<(usize, usize)>, windows_terminal: bool) -> (usize, usize) {
+    configured.unwrap_or(if windows_terminal { WINDOWS_TERMINAL_SIXEL_CELL } else { SIXEL_CELL_FLOOR })
+}
+
 fn analysis_image_geometry(
     protocol: crate::cover::GraphicsProtocol,
     cols: usize,
@@ -2295,7 +2323,9 @@ fn analysis_image_geometry(
     // (auto-scroll storm), and underfilling is only cosmetic now that the
     // frequency legend is drawn inside the image rather than in cells beside
     // it — nothing depends on knowing the terminal's real cell size.
-    analysis_image_geometry_with(protocol, cols, rows, SIXEL_CELL_FLOOR)
+    // Kitty scales its images itself; only the aspect of the box matters.
+    let cell = if protocol == crate::cover::GraphicsProtocol::Sixel { sixel_cell() } else { SIXEL_CELL_FLOOR };
+    analysis_image_geometry_with(protocol, cols, rows, cell)
 }
 
 /// Pure core of `analysis_image_geometry`, parameterized on the cell size.
@@ -2308,8 +2338,8 @@ fn analysis_image_geometry_with(
     use crate::cover::GraphicsProtocol as GP;
     match protocol {
         // Kitty scales the image to the cell box and its id-addressed images
-        // survive the per-frame cursor-up redraw as a separate layer: render
-        // one pixel column per stored hop (history depth) + oversampled height.
+        // are a layer of their own over the cells: render one pixel column
+        // per stored hop (history depth) + oversampled height.
         // Kitty scales the image into its cell box, so the image is sized to
         // that box using the SAME assumed cell as Sixel. Rendering a fixed 512
         // px width instead made the terminal stretch it much further
@@ -2653,7 +2683,7 @@ fn analysis_gutter(
     rows: usize,
     log_axis: bool,
     sample_rate: f32,
-) -> (Vec<String>, usize) {
+) -> (Lines, usize) {
     if term_w < GUTTER_MIN_TERM_W {
         return (Vec::new(), 0);
     }
@@ -2668,8 +2698,8 @@ fn analysis_gutter(
     let lines = labels
         .into_iter()
         .map(|label| match label {
-            Some(text) => format!("{C_DIM}{text:>label_w$}\u{2524}{C_RESET}"),
-            None => format!("{C_DIM}{:label_w$}\u{2502}{C_RESET}", ""),
+            Some(text) => crate::tui::line(format!("{text:>label_w$}\u{2524}"), DIM),
+            None => crate::tui::line(format!("{:label_w$}\u{2502}", ""), DIM),
         })
         .collect();
     (lines, label_w + 1)
@@ -2700,6 +2730,28 @@ fn analysis_colormap(t: f32) -> (u8, u8, u8) {
 #[cfg(test)]
 mod analysis_tests {
     use super::*;
+
+    #[test]
+    fn the_buffer_gauge_eases_by_time_not_by_frames() {
+        let t0 = Instant::now();
+        let ease = |step_ms: u64, steps: u64| {
+            let mut m = StatsMonitor::new();
+            for k in 0..=steps {
+                m.update_buf_at(80.0, t0 + Duration::from_millis(step_ms * k));
+            }
+            m.smoothed_buf_pct
+        };
+        // One second at 20 fps (the 50 ms tick it was tuned at) and at the
+        // idle rate (4 fps): the same place.
+        let (fast, idle) = (ease(50, 20), ease(250, 4));
+        assert!((fast - idle).abs() < 1.0, "{fast} at 20 fps vs {idle} at 4 fps");
+        // A frame drawn twice at one instant (the stale-image retry) moves nothing.
+        let mut m = StatsMonitor::new();
+        m.update_buf_at(80.0, t0);
+        let once = m.smoothed_buf_pct;
+        m.update_buf_at(80.0, t0);
+        assert_eq!(m.smoothed_buf_pct, once);
+    }
 
     /// One analysis hop's band values for a windowed signal.
     fn bands_for(signal: impl Fn(f32) -> f32, rate: u32) -> [f32; SPECTRUM_BANDS] {
@@ -2828,7 +2880,7 @@ mod analysis_tests {
     /// never budgeted for, which is what scrolls the frame).
     #[test]
     fn scaled_viz_fill_their_row_budget_at_every_window_size() {
-        use crate::ansi::visible_len;
+        let visible_len = |l: &Line| crate::tui::Cols::cols(l);
         let state = PlayerState::new();
         let analyser = VizAnalyser::new(48000);
         let modes = [
@@ -2922,24 +2974,29 @@ mod analysis_tests {
     fn analysis_block_fills_its_row_budget_across_window_sizes() {
         // Same contract as the cell-based modes, on a coarser grid: this one
         // encodes an image per call, so sweeping every size costs half a minute.
-        use crate::ansi::visible_len;
+        let visible_len = |l: &Line| crate::tui::Cols::cols(l);
         let analyser = VizAnalyser::new(48000);
         for term_w in [1usize, 4, 8, 11, 24, 60, 120, 240] {
             for rows in [0usize, 1, 2, 5, 9, 16, 24, 32] {
                 let budget = viz_body_rows(VizMode::SpectrogramAnalysis, rows, true, false);
                 for log in [true, false] {
-                    let lines = render_spectrogram_analysis(
-                        &analyser, term_w, log, false, budget, true,
-                    );
-                    assert_eq!(
-                        lines.len(), budget,
-                        "w={term_w} budget={budget}: got {} lines", lines.len()
-                    );
-                    for (i, l) in lines.iter().enumerate() {
-                        assert!(
-                            visible_len(l) <= term_w,
-                            "w={term_w} budget={budget} line {i} is {} wide", visible_len(l)
-                        );
+                    match render_spectrogram_analysis(&analyser, term_w, log, false, budget, true) {
+                        AnalysisOut::Lines(lines) => {
+                            assert_eq!(
+                                lines.len(), budget,
+                                "w={term_w} budget={budget}: got {} lines", lines.len()
+                            );
+                            for (i, l) in lines.iter().enumerate() {
+                                assert!(
+                                    visible_len(l) <= term_w,
+                                    "w={term_w} budget={budget} line {i} is {} wide", visible_len(l)
+                                );
+                            }
+                        }
+                        AnalysisOut::Image { x, cols, rows, .. } => {
+                            assert_eq!(rows, budget, "w={term_w}");
+                            assert!(x + cols <= term_w, "w={term_w}: image {x}+{cols}");
+                        }
                     }
                 }
             }
@@ -2984,28 +3041,127 @@ mod analysis_tests {
         }
     }
 
+    /// `secs` of `f(sample index) -> (l, r)` at 48 kHz, fed as the analyser
+    /// feeds it: 1024-sample calls.
+    fn feed(c: &mut Correlation, secs: f32, from: usize, f: &dyn Fn(usize) -> (f32, f32)) -> usize {
+        let rate = 48_000u32;
+        let n = (secs * rate as f32) as usize;
+        for chunk in (from..from + n).collect::<Vec<_>>().chunks(1024) {
+            let a = Correlation::alpha(rate);
+            for &i in chunk {
+                let (l, r) = f(i);
+                c.push(l, r, a);
+            }
+            c.advance(chunk.len() as f32 / rate as f32);
+        }
+        from + n
+    }
+
     #[test]
     fn vectorscope_stats_name_what_the_picture_only_implies() {
-        use std::collections::VecDeque;
-        let mk = |f: &dyn Fn(usize) -> (f32, f32)| -> VecDeque<(f32, f32)> {
-            (0..512).map(f).collect()
+        let sine = |i: usize| (i as f32 * 0.05).sin();
+        let read = |f: &dyn Fn(usize) -> (f32, f32)| {
+            let mut c = Correlation::default();
+            feed(&mut c, 1.0, 0, f);
+            (c.value(), c.balance())
         };
-        let sine = |i: usize| (i as f32 * 0.1).sin();
         // Identical channels: perfectly correlated, dead centre.
-        let (c, b) = lissajous_stats(&mk(&|i| (sine(i), sine(i))));
-        assert!((c - 1.0).abs() < 1e-3, "mono corr {c}");
-        assert!(b.abs() < 1e-3, "mono bal {b}");
+        let (c, b) = read(&|i| (sine(i), sine(i)));
+        assert!((c - 1.0).abs() < 1e-3 && b.abs() < 1e-3, "mono {c} {b}");
         // Inverted: cancels in mono, which is the thing worth warning about.
-        let (c, _) = lissajous_stats(&mk(&|i| (sine(i), -sine(i))));
+        let (c, _) = read(&|i| (sine(i), -sine(i)));
         assert!((c + 1.0).abs() < 1e-3, "out-of-phase corr {c}");
         // One channel only: hard to that side.
-        let (_, b) = lissajous_stats(&mk(&|i| (sine(i), 0.0)));
-        assert!((b + 1.0).abs() < 1e-3, "left-only bal {b}");
-        let (_, b) = lissajous_stats(&mk(&|i| (0.0, sine(i))));
-        assert!((b - 1.0).abs() < 1e-3, "right-only bal {b}");
+        assert!((read(&|i| (sine(i), 0.0)).1 + 1.0).abs() < 1e-3);
+        assert!((read(&|i| (0.0, sine(i))).1 - 1.0).abs() < 1e-3);
         // Silence must not divide by zero.
-        assert_eq!(lissajous_stats(&mk(&|_| (0.0, 0.0))), (0.0, 0.0));
-        assert_eq!(lissajous_stats(&VecDeque::new()), (0.0, 0.0));
+        assert_eq!(read(&|_| (0.0, 0.0)), (0.0, 0.0));
+        assert_eq!(Correlation::default().value(), 0.0);
+    }
+
+    /// How often a real track shows "MONO RISK", by the old rule (a 21 ms
+    /// window below −0.2) and the meter's: `ffmpeg -i track.flac -f f32le
+    /// -ac 2 -ar 48000 /tmp/t.raw`, then `KEET_CORR_RAW=/tmp/t.raw cargo test
+    /// --release mono_risk_on_a_real_track -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn mono_risk_on_a_real_track() {
+        let Ok(path) = std::env::var("KEET_CORR_RAW") else { return };
+        let bytes = std::fs::read(path).expect("raw f32le stereo");
+        let samples: Vec<f32> = bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
+        let frames: Vec<(f32, f32)> = samples.as_chunks::<2>().0.iter().map(|&[l, r]| (l, r)).collect();
+        let (rate, per_frame) = (48_000usize, 1600); // 30 frames a second
+        let mut c = Correlation::default();
+        let a = Correlation::alpha(rate as u32);
+        let (mut old, mut new, mut n) = (0, 0, 0);
+        // Separate warnings (off → on), each rule's.
+        let (mut old_on, mut new_on, mut was_old, mut was_new) = (0, 0, false, false);
+        for (k, chunk) in frames.chunks(per_frame).enumerate() {
+            for &(l, r) in chunk {
+                c.push(l, r, a);
+            }
+            c.advance(chunk.len() as f32 / rate as f32);
+            let end = (k * per_frame + chunk.len()).min(frames.len());
+            let window = &frames[end.saturating_sub(WAVEFORM_BUF_SIZE)..end];
+            let (lr, ll, rr) = window.iter().fold((0.0f64, 0.0f64, 0.0f64), |(a, b, c), &(l, r)| {
+                (a + (l * r) as f64, b + (l * l) as f64, c + (r * r) as f64)
+            });
+            let corr21 = if ll * rr > 1e-24 { lr / (ll * rr).sqrt() } else { 0.0 };
+            let (o, m) = (corr21 < -0.2, c.mono_risk());
+            old_on += usize::from(o && !was_old);
+            new_on += usize::from(m && !was_new);
+            (was_old, was_new) = (o, m);
+            old += usize::from(o);
+            new += usize::from(m);
+            n += 1;
+        }
+        println!(
+            "{n} frames: old rule {old} ({:.1}%) in {old_on} flashes, the meter {new} ({:.1}%) in {new_on} warnings (avg {:.1} s each)",
+            old as f64 * 100.0 / n as f64,
+            new as f64 * 100.0 / n as f64,
+            if new_on > 0 { new as f64 / new_on as f64 / 30.0 } else { 0.0 }
+        );
+    }
+
+    #[test]
+    fn the_correlation_state_never_goes_subnormal_in_silence() {
+        // Long silence decays the averages geometrically, into the subnormal
+        // range where x86 math is 10-100x slower: they are flushed instead.
+        let mut c = Correlation { lr: 1e-309, ll: 1e-309, rr: -1e-309, ..Default::default() };
+        c.push(0.0, 0.0, Correlation::alpha(48_000));
+        for v in [c.lr, c.ll, c.rr] {
+            assert!(v == 0.0 || v.is_normal(), "{v:e} is subnormal");
+        }
+    }
+
+    #[test]
+    fn mono_risk_means_a_sustained_cancellation_not_a_flicker() {
+        let sine = |i: usize| (i as f32 * 0.05).sin();
+        let other = |i: usize| (i as f32 * 0.071).sin();
+        // Wide stereo whose 21 ms windows dip negative now and then (a burst
+        // of inverted audio every 300 ms, 30 ms long): no warning.
+        let mut c = Correlation::default();
+        let wide = |i: usize| {
+            let inverted = (i / 1440) % 10 < 1; // 30 ms slots at 48 kHz: one in ten inverted
+            if inverted { (sine(i), -sine(i)) } else { (sine(i), 0.6 * sine(i) + 0.4 * other(i)) }
+        };
+        let mut at = 0;
+        for _ in 0..50 {
+            at = feed(&mut c, 0.1, at, &wide);
+            assert!(!c.mono_risk(), "a flicker flagged at {at}: corr {}", c.value());
+        }
+        // Inverted for real: flagged only after a second of it.
+        let inverted = |i: usize| (sine(i), -sine(i));
+        at = feed(&mut c, 0.8, at, &inverted);
+        assert!(!c.mono_risk(), "flagged before a second of it");
+        at = feed(&mut c, 0.7, at, &inverted);
+        assert!(c.mono_risk(), "a second and more of cancellation: corr {}", c.value());
+        // Back to normal: the warning holds a moment, then goes.
+        let normal = |i: usize| (sine(i), sine(i));
+        at = feed(&mut c, 0.5, at, &normal);
+        assert!(c.mono_risk(), "held, not blinking off at once");
+        feed(&mut c, 1.5, at, &normal);
+        assert!(!c.mono_risk(), "gone once it has recovered");
     }
 
     #[test]
@@ -3355,6 +3511,13 @@ mod analysis_tests {
     }
 
     #[test]
+    fn sixel_images_are_sized_for_the_configured_cell_then_windows_terminal_then_the_floor() {
+        assert_eq!(sixel_cell_for(Some((12, 24)), true), (12, 24), "the setting wins");
+        assert_eq!(sixel_cell_for(None, true), (10, 20), "Windows Terminal's virtual cell");
+        assert_eq!(sixel_cell_for(None, false), SIXEL_CELL_FLOOR);
+    }
+
+    #[test]
     fn analysis_geometry_kitty_matches_the_cell_box_aspect() {
         use crate::cover::GraphicsProtocol as GP;
         // Sized to the assumed cell box, so the terminal's upscale is the same
@@ -3544,7 +3707,7 @@ mod analysis_tests {
                     assert!(w >= GUTTER_W, "gutter narrower than the floor at sr {sr}");
                     for line in &lines {
                         assert_eq!(
-                            crate::ansi::visible_len(line),
+                            crate::tui::Cols::cols(line),
                             w,
                             "row width != reported (sr {sr}, log {log_axis}): {line:?}"
                         );
@@ -3629,7 +3792,7 @@ mod analysis_tests {
         assert_eq!(lines.len(), 16);
         assert_eq!(w, GUTTER_W);
         for line in &lines {
-            assert_eq!(crate::ansi::visible_len(line), GUTTER_W);
+            assert_eq!(crate::tui::Cols::cols(line), GUTTER_W);
         }
         assert!(gutter_labels(16, true, 0.0).iter().all(|l| l.is_none()));
         assert!(gutter_labels(16, false, 0.0).iter().all(|l| l.is_none()));

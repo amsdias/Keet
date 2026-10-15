@@ -6,13 +6,16 @@
 //! buffer instead, and [`flush`] hands the whole frame to the terminal in a
 //! single write — which also keeps a frame from ever reaching the screen
 //! half-drawn. All main-thread terminal output must use it: a direct `print!`
-//! would land before the buffered text queued ahead of it.
+//! would land before the buffered text queued ahead of it. ratatui writes
+//! here too ([`Writer`] is its backend's output): the cells it changed, the
+//! image payloads placed after them and the synchronized-update markers round
+//! them all leave in that one write.
 
 use std::cell::RefCell;
 use std::io::Write as _;
 
 thread_local! {
-    static BUF: RefCell<String> = RefCell::new(String::with_capacity(64 * 1024));
+    static BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(64 * 1024));
 }
 
 /// Queue text for the terminal (see [`out!`]).
@@ -23,8 +26,27 @@ pub fn push(args: std::fmt::Arguments) {
         return;
     }
     BUF.with(|b| {
-        let _ = std::fmt::Write::write_fmt(&mut *b.borrow_mut(), args);
+        let _ = std::io::Write::write_fmt(&mut *b.borrow_mut(), args);
     });
+}
+
+/// The frame buffer as an `io::Write`: what ratatui's backend writes into.
+/// Its `flush` does nothing — the frame goes out once, in [`flush`], after
+/// the images placed over it and the end of the synchronized update.
+pub struct Writer;
+
+impl std::io::Write for Writer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        // As `push`: tests draw thousands of frames and never flush.
+        if !cfg!(test) {
+            BUF.with(|b| b.borrow_mut().extend_from_slice(bytes));
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Throw away everything queued (a frame a panic interrupted half-built:
@@ -41,6 +63,16 @@ pub fn discard() {
     });
 }
 
+/// How much is queued now: `rewind` drops what comes after.
+pub fn mark() -> usize {
+    BUF.with(|b| b.borrow().len())
+}
+
+/// Drop what was queued after `mark` (a draw pass thrown away for another).
+pub fn rewind(to: usize) {
+    BUF.with(|b| b.borrow_mut().truncate(to));
+}
+
 /// Write everything queued in one go, then flush the terminal.
 pub fn flush() {
     BUF.with(|b| {
@@ -48,9 +80,9 @@ pub fn flush() {
         let mut stdout = std::io::stdout().lock();
         if !b.is_empty() {
             if no_color() {
-                let _ = stdout.write_all(strip_colour(&b).as_bytes());
+                let _ = stdout.write_all(strip_colour(&String::from_utf8_lossy(&b)).as_bytes());
             } else {
-                let _ = stdout.write_all(b.as_bytes());
+                let _ = stdout.write_all(&b);
             }
             b.clear();
         }
@@ -139,6 +171,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_frame_can_be_rewound_to_what_was_queued_before_it() {
+        discard();
+        BUF.with(|b| b.borrow_mut().extend_from_slice(b"\x1B[?1049l\x1B[?1049h"));
+        let start = mark();
+        BUF.with(|b| b.borrow_mut().extend_from_slice(b"a whole cell diff"));
+        rewind(start);
+        BUF.with(|b| assert_eq!(&b.borrow()[..], b"\x1B[?1049l\x1B[?1049h", "only the pass is dropped"));
+        discard();
+    }
+
+    #[test]
     fn colour_goes_and_attributes_stay() {
         assert_eq!(strip_colour("\x1B[1;38;2;255;179;71mKEET\x1B[0m"), "\x1B[1mKEET\x1B[0m");
         assert_eq!(strip_colour("\x1B[32m▶\x1B[0m \x1B[2mdim\x1B[m"), "▶\x1B[0m \x1B[2mdim\x1B[m");
@@ -148,7 +191,7 @@ mod tests {
 
     #[test]
     fn discard_drops_a_half_built_frame() {
-        BUF.with(|b| b.borrow_mut().push_str("half a frame"));
+        BUF.with(|b| b.borrow_mut().extend_from_slice(b"half a frame"));
         discard();
         assert!(BUF.with(|b| b.borrow().is_empty()));
         // With the buffer borrowed (a panic inside `push`), it returns quietly.

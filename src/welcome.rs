@@ -13,8 +13,13 @@
 //! of time, a block wordmark the art never paints over) is inspired by the
 //! splash screen of nebula (<https://github.com/agentSystemLabs/nebula>).
 
-use crate::ansi::{truncate_plain, visible_len};
+use crate::text_input::Edit;
+use crate::tui::Cols;
+use crate::ansi::truncate_plain;
 use crate::theme::{Palette, ThemeKind};
+use crate::tui::{self, LineBuf};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::Line;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -65,7 +70,6 @@ const GLINT: Rgb = (255, 255, 255);
 const STAR_DIM: Rgb = (78, 78, 78);
 const STAR_LIT: Rgb = (188, 188, 188);
 
-use crate::theme::fg_rgb as fg;
 
 /// KEET in 5-row block letters; each `#` is drawn two cells wide so the
 /// letters keep their shape in tall terminal cells.
@@ -92,7 +96,7 @@ pub enum Mode {
     /// The keys: pick, type, quit.
     Keys,
     /// A path being typed (or pasted, or dropped).
-    Typing(String),
+    Typing(crate::text_input::TextInput),
 }
 
 /// A line under the keys: a problem, or a plain word.
@@ -160,41 +164,50 @@ fn mark_colour(x: f32, t: f32, fade: f32, kind: ThemeKind) -> Rgb {
 
 /// One row of the wordmark, coloured, `wordmark_width()` columns wide. The
 /// blocks build up `░ → ▒ → █` while the scene fades in.
-fn wordmark_row(row: usize, t: f32, fade: f32, kind: ThemeKind) -> String {
+fn wordmark_row(row: usize, t: f32, fade: f32, kind: ThemeKind) -> Line<'static> {
     let block = if fade < 0.45 { "░░" } else if fade < 0.8 { "▒▒" } else { "██" };
     let width = wordmark_width() as f32;
-    let mut out = String::from("\x1B[1m");
+    let bold = Style::new().add_modifier(Modifier::BOLD);
+    let mut out = LineBuf::new();
     let mut col = 0;
     for (i, letter) in LETTERS.iter().enumerate() {
         if i > 0 {
-            out.push_str(&" ".repeat(LETTER_GAP));
+            out.style(bold).spaces(LETTER_GAP);
             col += LETTER_GAP;
         }
         for ch in letter[row].chars() {
             if ch == '#' {
                 let c = mark_colour(col as f32 / width, t, fade, kind);
-                out.push_str(&fg(c));
-                out.push_str(block);
+                out.style(bold.patch(tui::fg(c))).push_str(block);
             } else {
-                out.push_str("  ");
+                out.style(bold).push_str("  ");
             }
             col += 2;
         }
     }
-    out.push_str("\x1B[0m");
-    out
+    out.into_line()
 }
 
 /// `key label` pairs joined with a dim dot, as long as they fit `width`;
 /// otherwise one pair per line.
-fn key_lines(keys: &[(&str, &str)], width: usize, p: &Palette) -> Vec<String> {
+fn key_lines(keys: &[(&str, &str)], width: usize, p: &Palette) -> Vec<Line<'static>> {
     let sep = "   ·   ";
-    let plain: Vec<String> = keys.iter().map(|(k, l)| format!("{k} {l}")).collect();
-    let one_line = plain.iter().map(|s| visible_len(s)).sum::<usize>() + visible_len(sep) * keys.len().saturating_sub(1);
-    let styled = |(k, l): &(&str, &str)| format!("{}{}{k}{} {}{l}{}", p.bold, p.accent, p.reset, p.dim, p.reset);
+    let one_line = keys.iter().map(|(k, l)| tui::width(k) + 1 + tui::width(l)).sum::<usize>()
+        + tui::width(sep) * keys.len().saturating_sub(1);
+    let styled = |(k, l): &(&str, &str)| {
+        let mut b = LineBuf::new();
+        b.styled(k, p.bold.patch(p.accent)).reset().push(' ').styled(l, p.dim);
+        b.into_line()
+    };
     if one_line <= width {
-        let dot = format!("{}{sep}{}", p.dim, p.reset);
-        vec![keys.iter().map(styled).collect::<Vec<_>>().join(&dot)]
+        let mut line = LineBuf::new();
+        for (i, k) in keys.iter().enumerate() {
+            if i > 0 {
+                line.styled(sep, p.dim);
+            }
+            line.append(styled(k));
+        }
+        vec![line.into_line()]
     } else {
         keys.iter().map(styled).collect()
     }
@@ -202,7 +215,7 @@ fn key_lines(keys: &[(&str, &str)], width: usize, p: &Palette) -> Vec<String> {
 
 /// The text block: wordmark (or name), the situation, then the keys or the
 /// path being typed, and the note. Each line is at most `width` columns.
-fn text_lines(view: &View, width: usize, big: bool, t: f32, fade: f32) -> Vec<String> {
+fn text_lines(view: &View, width: usize, big: bool, t: f32, fade: f32) -> Vec<Line<'static>> {
     let p = view.palette;
     let mut lines = Vec::new();
     if big {
@@ -210,12 +223,14 @@ fn text_lines(view: &View, width: usize, big: bool, t: f32, fade: f32) -> Vec<St
             lines.push(wordmark_row(row, t, fade, view.kind));
         }
     } else {
-        lines.push(format!("{}{}◆ {}Keet{}", p.accent, p.bold, p.fg, p.reset));
+        let mut l = LineBuf::new();
+        l.styled("◆ ", p.accent.patch(p.bold)).styled("Keet", p.bold.patch(p.fg));
+        lines.push(l.into_line());
     }
-    lines.push(String::new());
+    lines.push(Line::default());
     let situation = "No music given, and no session to resume.";
-    lines.push(format!("{}{}{}", p.dim, truncate_plain(situation, width), p.reset));
-    lines.push(String::new());
+    lines.push(tui::line(truncate_plain(situation, width), p.dim));
+    lines.push(Line::default());
     match view.mode {
         Mode::Keys => {
             let mut keys = Vec::new();
@@ -226,51 +241,59 @@ fn text_lines(view: &View, width: usize, big: bool, t: f32, fade: f32) -> Vec<St
             keys.push(("q", "quit"));
             lines.extend(key_lines(&keys, width, p));
         }
-        Mode::Typing(buf) => {
-            // The end of a long path is the part being typed: keep it.
+        Mode::Typing(field) => {
+            // The field scrolled to keep the cursor in view, the cell under
+            // the cursor reversed (it was always the end: the arrow keys
+            // moved nothing).
             let prompt = "path › ";
-            let room = width.saturating_sub(prompt.len() + 1);
-            let shown = tail_fitting(buf, room);
-            lines.push(format!(
-                "{}{prompt}{}{shown}\x1B[7m \x1B[27m{}",
-                p.accent, p.fg, p.reset
-            ));
+            let room = width.saturating_sub(tui::width(prompt)); // columns, not bytes: › is 3
+            let (before, at, after) = shown_path(field, room);
+            let mut l = LineBuf::new();
+            l.styled(prompt, p.accent).styled(&before, p.fg);
+            l.style(p.fg.add_modifier(Modifier::REVERSED)).push_str(&at);
+            l.styled(&after, p.fg);
+            lines.push(l.into_line());
             let hint = "Enter open · Esc back · drop a folder here";
-            lines.push(format!("{}{}{}", p.dim, truncate_plain(hint, width), p.reset));
+            lines.push(tui::line(truncate_plain(hint, width), p.dim));
         }
     }
     if let Some(note) = view.note {
-        lines.push(String::new());
+        lines.push(Line::default());
         let colour = if note.error { p.danger } else { p.dim };
-        lines.push(format!("{colour}{}{}", truncate_plain(&note.text, width), p.reset));
+        lines.push(tui::line(truncate_plain(&note.text, width), colour));
     }
     lines
 }
 
-/// The end of `s` that fits in `cols` columns, with `…` in front when cut.
-fn tail_fitting(s: &str, cols: usize) -> String {
-    if visible_len(s) <= cols {
-        return s.to_string();
-    }
-    let mut kept: Vec<char> = Vec::new();
-    let mut used = 1; // the ellipsis
-    for c in s.chars().rev() {
-        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-        if used + w > cols {
+/// The typed path as drawn in `cols` columns: what comes before the cursor,
+/// the cell under it (a space at the end), and the rest — scrolled to keep
+/// the cursor in view (`TextInput::view`), never a bidi mark (the path keeps
+/// them, a real name may have them; drawn, a right-to-left override
+/// reversed the row in a bidi-aware terminal).
+pub(crate) fn shown_path(field: &crate::text_input::TextInput, cols: usize) -> (String, String, String) {
+    use unicode_segmentation::UnicodeSegmentation;
+    let (shown, col) = field.view(cols);
+    let shown = crate::ansi::sanitize_display(&shown);
+    let mut used = 0;
+    let mut split = shown.len();
+    for (i, g) in shown.grapheme_indices(true) {
+        if used >= col {
+            split = i;
             break;
         }
-        used += w;
-        kept.push(c);
+        used += crate::ansi::grapheme_width(g);
     }
-    kept.reverse();
-    format!("…{}", kept.into_iter().collect::<String>())
+    let (before, rest) = shown.split_at(split);
+    let mut gs = rest.graphemes(true);
+    let at = gs.next().unwrap_or(" ").to_string();
+    (before.to_string(), at, gs.collect())
 }
 
 /// Where a frame puts its text: the lines (each cut to the window and
 /// centred in the block), the block's first row and columns, and the carve
 /// — the block plus a margin round it, which the sky never paints.
 struct Layout {
-    text: Vec<String>,
+    text: Vec<Line<'static>>,
     top: usize,
     left: usize,
     width: usize,
@@ -285,15 +308,17 @@ fn layout(t: f32, width: usize, rows: usize, view: &View) -> Layout {
     let fade = fade_at(t);
     let big = width >= BIG_MIN.0 && rows + 1 >= BIG_MIN.1;
     let lines = text_lines(view, width, big, t, fade);
-    let lines: Vec<String> = lines.iter().take(rows).map(|l| crate::ansi::truncate_visible(l, width)).collect();
-    let block_w = lines.iter().map(|l| visible_len(l)).max().unwrap_or(0);
+    let lines: Vec<Line<'static>> = lines.into_iter().take(rows).map(|l| tui::truncate_ellipsis(l, width)).collect();
+    let block_w = lines.iter().map(Cols::cols).max().unwrap_or(0);
     // Each line centred in the block, padded to its width.
     let text = lines
-        .iter()
+        .into_iter()
         .map(|l| {
-            let w = visible_len(l);
+            let w = l.cols();
             let left = (block_w - w) / 2;
-            format!("{}{l}\x1B[0m{}", " ".repeat(left), " ".repeat(block_w - w - left))
+            let mut row = LineBuf::new();
+            row.spaces(left).append(l).reset().spaces(block_w - w - left);
+            row.into_line()
         })
         .collect::<Vec<_>>();
     // The text sits low; the ripples spread in the sky above it.
@@ -309,10 +334,9 @@ fn layout(t: f32, width: usize, rows: usize, view: &View) -> Layout {
 }
 
 /// One frame, `t` seconds after the screen opened, for a `width`×`height`
-/// window: exactly `height - 1` lines (the bottom row stays empty, so
-/// nothing ever scrolls), none wider than `width`. Colours are full SGR
-/// sequences; `term::flush` strips them under NO_COLOR.
-pub fn frame(t: f32, width: usize, height: usize, view: &View) -> Vec<String> {
+/// window: exactly `height - 1` lines (the bottom row stays empty), none
+/// wider than `width`.
+pub fn frame(t: f32, width: usize, height: usize, view: &View) -> Vec<Line<'static>> {
     let rows = height.saturating_sub(1).max(1);
     let width = width.max(1);
     let fade = fade_at(t);
@@ -325,36 +349,23 @@ pub fn frame(t: f32, width: usize, height: usize, view: &View) -> Vec<String> {
 
     let mut out = Vec::with_capacity(rows);
     for y in 0..rows {
-        let mut line = String::new();
-        let mut colour: Option<Rgb> = None;
+        let mut line = LineBuf::new();
         let text_row = y.checked_sub(lay.top).and_then(|i| lay.text.get(i));
         let mut x = 0;
         while x < width {
             if let Some(row) = text_row.filter(|_| x == lay.left) {
-                if colour.take().is_some() {
-                    line.push_str("\x1B[0m");
-                }
-                line.push_str(row);
+                line.append(row.clone());
                 x += lay.width.max(1);
                 continue;
             }
             let carved = (x0..x1).contains(&x) && (y0..y1).contains(&y);
             match (!carved).then(|| sky_cell(x, y, t, fade, geometry, kind)).flatten() {
-                Some((ch, c)) => {
-                    if colour != Some(c) {
-                        line.push_str(&fg(c));
-                        colour = Some(c);
-                    }
-                    line.push(ch);
-                }
-                None => line.push(' '),
-            }
+                Some((ch, c)) => line.fg(c).push(ch),
+                None => line.reset().push(' '),
+            };
             x += 1;
         }
-        if colour.is_some() {
-            line.push_str("\x1B[0m");
-        }
-        out.push(line);
+        out.push(line.into_line());
     }
     out
 }
@@ -443,21 +454,29 @@ pub fn run(kind: ThemeKind, native: bool, pick_folder: impl Fn() -> Option<PathB
     }
     let mut stdout = std::io::stdout();
     crate::enter_alternate_screen(&mut stdout);
-    crate::term::out!("\x1B[?25l");
+    let mut term = match crate::tui::terminal() {
+        Ok(t) => t,
+        Err(_) => {
+            crate::leave_alternate_screen(&mut stdout);
+            let _ = terminal::disable_raw_mode();
+            return None;
+        }
+    };
     let palette = crate::theme::palette(kind);
     let opened = Instant::now();
     let mut mode = Mode::Keys;
     let mut note: Option<Note> = None;
 
     let chosen = 'screen: loop {
-        let (w, h) = terminal::size().map(|(w, h)| (w as usize, h as usize)).unwrap_or((80, 24));
         let view = View { kind, palette, native, mode: &mode, note: note.as_ref() };
-        let lines = frame(opened.elapsed().as_secs_f32(), w, h, &view);
-        crate::term::out!("\x1B[?2026h\x1B[H");
-        for (i, line) in lines.iter().enumerate() {
-            crate::term::out!("{}\r{line}\x1B[K", if i == 0 { "" } else { "\n" });
-        }
-        crate::term::out!("\x1B[J\x1B[?2026l");
+        let t = opened.elapsed().as_secs_f32();
+        crate::term::out!("\x1B[?2026h");
+        let _ = term.draw(|f| {
+            let area = f.area();
+            let lines = frame(t, area.width as usize, area.height as usize, &view);
+            tui::draw_lines(f.buffer_mut(), area, &lines);
+        });
+        crate::term::out!("\x1B[?2026l");
         crate::term::flush();
 
         // Wait out the rest of the frame, handling every key that arrives.
@@ -468,6 +487,16 @@ pub fn run(kind: ThemeKind, native: bool, pick_folder: impl Fn() -> Option<PathB
                 break;
             }
             let Ok(ev) = event::read() else { break 'screen None };
+            // A pasted or dropped path goes into the typed one.
+            if let Event::Paste(text) = &ev {
+                match &mut mode {
+                    Mode::Typing(field) => field.insert(&crate::text_input::clean(text)),
+                    // A fresh path: the spaces round it mean nothing either.
+                    Mode::Keys => mode = Mode::Typing(crate::text_input::TextInput::with(crate::text_input::clean(text).trim())),
+                }
+                note = None;
+                continue;
+            }
             let Event::Key(k) = ev else { continue };
             if k.kind == KeyEventKind::Release {
                 continue;
@@ -479,7 +508,7 @@ pub fn run(kind: ThemeKind, native: bool, pick_folder: impl Fn() -> Option<PathB
                 Mode::Keys => match k.code {
                     KeyCode::Char('q' | 'Q') | KeyCode::Esc => break 'screen None,
                     KeyCode::Char('t' | 'T') => {
-                        mode = Mode::Typing(String::new());
+                        mode = Mode::Typing(Default::default());
                         note = None;
                     }
                     KeyCode::Char('p' | 'P') if native => {
@@ -489,21 +518,16 @@ pub fn run(kind: ThemeKind, native: bool, pick_folder: impl Fn() -> Option<PathB
                     }
                     _ => {}
                 },
-                Mode::Typing(buf) => match k.code {
-                    KeyCode::Esc => {
+                Mode::Typing(field) => match field.handle(k) {
+                    Edit::Cancel => {
                         mode = Mode::Keys;
                         note = None;
                     }
-                    KeyCode::Enter => match parse_typed_path(buf) {
+                    Edit::Submit => match parse_typed_path(field.text()) {
                         Some(p) if p.exists() => break 'screen Some(p),
                         Some(p) => note = Some(Note { text: format!("Not found: {}", p.display()), error: true }),
                         None => {}
                     },
-                    KeyCode::Backspace => {
-                        buf.pop();
-                    }
-                    KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => buf.clear(),
-                    KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => buf.push(c),
                     _ => {}
                 },
             }
@@ -528,19 +552,86 @@ pub fn run(kind: ThemeKind, native: bool, pick_folder: impl Fn() -> Option<PathB
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_typed_path_can_be_edited_where_the_cursor_is() {
+        use crate::text_input::TextInput;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let key = |c| KeyEvent::new(c, KeyModifiers::NONE);
+        let mut field = TextInput::new();
+        for c in "/Users/me/Musc".chars() {
+            field.handle(key(KeyCode::Char(c)));
+        }
+        field.handle(key(KeyCode::Left));
+        field.handle(key(KeyCode::Char('i')));
+        assert_eq!(field.text(), "/Users/me/Music", "Left moved the cursor, and `i` went there");
+        // Drawn with the cursor where it is: on the `c`.
+        field.handle(key(KeyCode::Left));
+        let typing = Mode::Typing(field);
+        let lines = text_lines(&view(&typing, None, ThemeKind::Classic), 40, false, 1.0, 1.0);
+        let row = lines.iter().find(|l| tui::plain(l).starts_with("path ›")).expect("the prompt");
+        let reversed: Vec<&str> = row.spans.iter().filter(|s| s.style.add_modifier.contains(Modifier::REVERSED)).map(|s| s.content.as_ref()).collect();
+        assert_eq!(reversed, ["i"], "{row:?}");
+    }
+
+    #[test]
+    fn the_typed_path_takes_altgr_and_backspace_takes_a_whole_character() {
+        use crate::text_input::TextInput;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let key = |c, m| KeyEvent::new(c, m);
+        let mut f = TextInput::with("C:");
+        // Windows reports AltGr as Ctrl+Alt: `\` on a German layout.
+        f.handle(key(KeyCode::Char('\\'), KeyModifiers::CONTROL | KeyModifiers::ALT));
+        assert_eq!(f.text(), "C:\\", "AltGr types");
+        // Backspace takes what shows as one character.
+        let mut f = TextInput::with("/Mu\u{301}");
+        f.handle(key(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(f.text(), "/M", "the accented u whole");
+        let mut f = TextInput::with("/a\u{2764}\u{FE0F}");
+        f.handle(key(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(f.text(), "/a", "the emoji with its selector");
+    }
+
     fn view<'a>(mode: &'a Mode, note: Option<&'a Note>, kind: ThemeKind) -> View<'a> {
         View { kind, palette: crate::theme::palette(kind), native: true, mode, note }
     }
 
-    fn plain(lines: &[String]) -> Vec<String> {
-        lines.iter().map(|l| crate::ansi::strip_ansi(l)).collect()
+    fn plain(lines: &[Line]) -> Vec<String> {
+        lines.iter().map(tui::plain).collect()
+    }
+
+    /// The typed path gets every column the prompt leaves (it was measured
+    /// in bytes: `›` is 3 bytes in 1 column, and the path was cut 2 early).
+    #[test]
+    fn a_typed_path_that_fits_is_shown_whole() {
+        let path = "/Music/Kind of Blue/12"; // 22 columns: "path › " + it + the cursor = 30
+        let typing = Mode::Typing(crate::text_input::TextInput::with(path));
+        let lines = plain(&text_lines(&view(&typing, None, ThemeKind::Classic), 30, false, 1.0, 1.0));
+        let row = lines.iter().find(|l| l.starts_with("path ›")).expect("the prompt");
+        assert!(row.contains(path), "cut though it fits: {row:?}");
+    }
+
+    /// A typed path that ratatui's `Line::width` measures narrower than it
+    /// is drawn (halfwidth kana with sound marks) is laid out by the drawn
+    /// width: mixing the two underflowed the centring and crashed the screen.
+    #[test]
+    fn a_path_of_halfwidth_kana_lays_out_without_overflow() {
+        let typing = Mode::Typing(crate::text_input::TextInput::with(&format!("/{}", "\u{FF76}\u{FF9E}".repeat(60))));
+        for kind in [ThemeKind::Classic, ThemeKind::Minimal, ThemeKind::HiFi] {
+            for w in [20, 40, 60, 80, 120] {
+                for h in [12, 24, 40] {
+                    for l in frame(3.7, w, h, &view(&typing, None, kind)) {
+                        assert!(crate::tui::Cols::cols(&l) <= w, "{kind:?} {w}x{h}: {l:?}");
+                    }
+                }
+            }
+        }
     }
 
     /// Every size a drag passes through: exactly height - 1 lines, none
     /// wider than the window, in every theme and both modes.
     #[test]
     fn every_size_fills_the_window_and_never_overflows() {
-        let typing = Mode::Typing("/Users/someone/Music/a very long folder name/ünïcödé/日本語".into());
+        let typing = Mode::Typing(crate::text_input::TextInput::with("/Users/someone/Music/a very long folder name/ünïcödé/日本語"));
         let note = Note { text: "Not found: /nowhere/at/all/with/a/long/path".into(), error: true };
         for kind in [ThemeKind::Classic, ThemeKind::Minimal, ThemeKind::HiFi] {
             for (mode, note) in [(&Mode::Keys, None), (&typing, Some(&note))] {
@@ -549,7 +640,7 @@ mod tests {
                         let lines = frame(3.7, w, h, &view(mode, note, kind));
                         assert_eq!(lines.len(), h.saturating_sub(1).max(1), "{w}x{h}");
                         for l in &lines {
-                            assert!(visible_len(l) <= w, "{w}x{h}: {} > {w}: {l:?}", visible_len(l));
+                            assert!(crate::tui::Cols::cols(l) <= w, "{w}x{h}: {} > {w}: {l:?}", crate::tui::Cols::cols(l));
                         }
                     }
                 }
@@ -571,7 +662,7 @@ mod tests {
     /// either text or a space.
     #[test]
     fn nothing_is_drawn_round_the_text() {
-        let typing = Mode::Typing("/Music/Kind of Blue".into());
+        let typing = Mode::Typing(crate::text_input::TextInput::with("/Music/Kind of Blue"));
         let note = Note { text: "Not found: /Music/Kind of Blue".into(), error: true };
         for (mode, note) in [(&Mode::Keys, None), (&typing, Some(&note))] {
             let v = view(mode, note, ThemeKind::HiFi);
@@ -583,7 +674,7 @@ mod tests {
                     for (y, line) in lines.iter().enumerate().take(y1).skip(y0) {
                         let chars: Vec<char> = line.chars().collect();
                         let text: Vec<char> = match y.checked_sub(lay.top).and_then(|i| lay.text.get(i)) {
-                            Some(row) => crate::ansi::strip_ansi(row).chars().collect(),
+                            Some(row) => tui::plain(row).chars().collect(),
                             None => Vec::new(),
                         };
                         for x in x0..x1 {
@@ -645,12 +736,25 @@ mod tests {
         assert_eq!(hsv(360.0, 1.0, 1.0), (255, 0, 0));
     }
 
-    /// A long typed path keeps its END on screen (the part being typed).
+    /// A long typed path keeps the cursor's end on screen, cut between
+    /// whole characters as drawn, never wider than its room.
     #[test]
     fn a_long_path_shows_its_end() {
-        assert_eq!(tail_fitting("/a/b/c", 10), "/a/b/c");
-        assert_eq!(tail_fitting("/music/albums/kind of blue", 10), "…d of blue");
-        assert_eq!(visible_len(&tail_fitting("/x/日本語の歌", 6)), 5);
+        use crate::text_input::TextInput;
+        let (b, a, rest) = shown_path(&TextInput::with("/music/albums/kind of blue"), 10);
+        assert_eq!((b.as_str(), a.as_str(), rest.as_str()), ("… of blue", " ", ""));
+        let couple = "\u{1F469}\u{200D}\u{2764}\u{FE0F}\u{200D}\u{1F468}";
+        for path in [format!("/a/{couple}{couple}b"), "/ｶﾞｶﾞｶﾞｶﾞ".to_string(), "/x\u{2764}\u{FE0F}y".to_string(), "/x/日本語の歌".to_string()] {
+            for cols in 3..12 {
+                let (b, a, rest) = shown_path(&TextInput::with(&path), cols);
+                let w = crate::tui::width(&b) + crate::tui::width(&a) + crate::tui::width(&rest);
+                assert!(w <= cols, "{b:?}{a:?}{rest:?} in {cols}");
+                let kept = b.trim_start_matches('…');
+                assert!(path.ends_with(kept), "{kept:?} is not a tail of {path:?}");
+                assert!(!kept.starts_with('\u{FE0F}') && !kept.starts_with('\u{200D}') && !kept.starts_with('\u{FF9E}'), "{b:?} starts mid-character");
+            }
+        }
+        assert!(!shown_path(&TextInput::with("~/\u{202E}x"), 40).0.contains('\u{202E}'), "no bidi mark drawn");
     }
 
     #[test]

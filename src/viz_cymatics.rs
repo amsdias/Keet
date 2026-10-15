@@ -30,8 +30,10 @@
 //! a pure function of it and the wall-clock time (for the shimmer).
 
 use crate::state::{VizStyle, SPECTRUM_BANDS};
-use crate::theme::{base_hue, fg_rgb, hsv, Rgb, ThemeKind};
-use crate::viz::{fit_width, BRAILLE_BITS, ISO_CENTERS};
+use crate::theme::{base_hue, hsv, Rgb, ThemeKind};
+use crate::tui::LineBuf;
+use crate::viz::{fit_width, Lines, BRAILLE_BITS, ISO_CENTERS};
+use ratatui::text::Line;
 use std::f32::consts::PI;
 
 /// The full-window ceiling: past this the plate is only drawn bigger.
@@ -240,7 +242,7 @@ fn wall_time() -> f32 {
 
 /// See [`cymatics_body`]; this enforces the width half of the renderer
 /// contract (`fit_width`).
-pub fn render_cymatics(motion: &CymaticsMotion, kind: ThemeKind, style: VizStyle, width: usize, rows: usize, extras: bool) -> Vec<String> {
+pub fn render_cymatics(motion: &CymaticsMotion, kind: ThemeKind, style: VizStyle, width: usize, rows: usize, extras: bool) -> Lines {
     fit_width(cymatics_body(motion, kind, style, width, rows, extras, wall_time()), width)
 }
 
@@ -258,14 +260,14 @@ fn readout(motion: &CymaticsMotion, aspect: usize) -> String {
 }
 
 /// Exactly `rows` lines of the plate `t` seconds in, none wider than `width`.
-fn cymatics_body(motion: &CymaticsMotion, kind: ThemeKind, style: VizStyle, width: usize, rows: usize, extras: bool, t: f32) -> Vec<String> {
+fn cymatics_body(motion: &CymaticsMotion, kind: ThemeKind, style: VizStyle, width: usize, rows: usize, extras: bool, t: f32) -> Lines {
     let legend = extras && rows >= 4;
     let plate_rows = rows - usize::from(legend);
     // `side` rows by 2·aspect times as many columns: a square cell pair is
     // one square on screen.
     let (side, aspect) = plate_shape(width, plate_rows);
     if side < 2 {
-        return vec![String::new(); rows];
+        return vec![Line::default(); rows];
     }
     let cols = side * 2 * aspect;
     let (dw, dh) = (cols * 2, side * 4);
@@ -314,12 +316,11 @@ fn cymatics_body(motion: &CymaticsMotion, kind: ThemeKind, style: VizStyle, widt
     let x0 = (width - cols) / 2;
     let mut lines = Vec::with_capacity(rows);
     for _ in 0..(plate_rows - side) / 2 {
-        lines.push(String::new());
+        lines.push(Line::default());
     }
     for cy in 0..side {
-        let mut line = " ".repeat(x0);
-        let mut current: Option<Rgb> = None;
-        let mut blanks = 0;
+        let mut line = LineBuf::new();
+        line.spaces(x0);
         for cx in 0..cols {
             let mut bits = 0u32;
             let mut nearest = f32::MAX;
@@ -350,29 +351,23 @@ fn cymatics_body(motion: &CymaticsMotion, kind: ThemeKind, style: VizStyle, widt
                 },
             };
             match glyph {
-                Some(ch) => {
-                    line.push_str(&" ".repeat(blanks));
-                    blanks = 0;
-                    let c = colour(closeness, cx, cy);
-                    if current != Some(c) {
-                        line.push_str(&fg_rgb(c));
-                        current = Some(c);
-                    }
-                    line.push(ch);
-                }
-                None => blanks += 1,
-            }
+                Some(ch) => line.fg(colour(closeness, cx, cy)).push(ch),
+                None => line.reset().push(' '),
+            };
         }
-        if current.is_some() {
-            line.push_str("\x1B[0m");
+        let mut line = line.into_line();
+        while line.spans.last().is_some_and(|s| s.content.trim().is_empty()) {
+            line.spans.pop();
         }
         lines.push(line);
     }
-    lines.resize(plate_rows, String::new());
+    lines.resize(plate_rows, Line::default());
     if legend {
         let text = crate::ansi::truncate_plain(&readout(motion, aspect), width);
-        let pad = width.saturating_sub(crate::ansi::visible_len(&text)) / 2;
-        lines.push(format!("{}\x1B[2m{text}\x1B[0m", " ".repeat(pad)));
+        let pad = width.saturating_sub(crate::tui::width(&text)) / 2;
+        let mut line = LineBuf::new();
+        line.spaces(pad).styled(&text, ratatui::style::Style::new().add_modifier(ratatui::style::Modifier::DIM));
+        lines.push(line.into_line());
     }
     lines
 }
@@ -380,9 +375,13 @@ fn cymatics_body(motion: &CymaticsMotion, kind: ThemeKind, style: VizStyle, widt
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ansi::{strip_ansi, visible_len};
+    use crate::tui::plain as strip_ansi;
 
-    fn lit(lines: &[String]) -> u32 {
+    fn visible_len(l: &Line) -> usize {
+        crate::tui::Cols::cols(l)
+    }
+
+    fn lit(lines: &[Line]) -> u32 {
         lines
             .iter()
             .map(|l| strip_ansi(l).chars().map(|c| match c {
@@ -533,8 +532,8 @@ mod tests {
         assert_ne!(plate_hue(k, 0.1, 0.5, 0.0), plate_hue(k, 0.9, 0.5, 0.0), "with the frequency");
         assert_ne!(plate_hue(k, 0.3, 0.1, 0.0), plate_hue(k, 0.3, 0.9, 0.0), "with the loudness");
         let m = CymaticsMotion { parts: vec![(14, 1.0)], target: 14, candidate: None, level: 0.8 };
-        let text = cymatics_body(&m, k, VizStyle::Dots, 120, 30, false, 3.0).concat();
-        let colours: std::collections::HashSet<&str> = text.split("\x1B[38;2;").skip(1).map(|c| c.split('m').next().unwrap()).collect();
+        let lines = cymatics_body(&m, k, VizStyle::Dots, 120, 30, false, 3.0);
+        let colours: std::collections::HashSet<_> = lines.iter().flat_map(|l| l.spans.iter().filter_map(|s| s.style.fg)).collect();
         assert!(colours.len() > 30, "{} colours", colours.len());
     }
 

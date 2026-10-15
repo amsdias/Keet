@@ -228,9 +228,16 @@ For a *persistent* default that applies on every launch (including with explicit
 |-----|--------|
 | `theme` | `classic` \| `minimal` \| `hifi` |
 | `viz` | `none` \| `vu` \| `spectrum` \| `spectrum-vertical` \| `oscilloscope` \| `lissajous` \| `polar` \| `spectrogram` \| `analysis` \| `galaxy` \| `cymatics` |
+| `viz_fps` | frames per second while a visualization moves, `10`–`60` (default `30`); still screens redraw only when something changes |
+| `mouse` | `true` (default: click or drag the progress bar to seek, click a list row to select it and double-click to play it, the wheel scrolls lists and lyrics, a click outside a dialog closes it; Shift+drag still selects text in most terminals) \| `false`; `m` toggles it |
+| `viz_style` | `bars` \| `dots` (braille) |
+| `sixel_cell` | your terminal's cell size in pixels, `[width, height]`, for Sixel images (the analysis spectrogram, the cover). Keet never asks the terminal, so it assumes `[10, 20]` in Windows Terminal (which scales Sixel to its font) and `[8, 16]` elsewhere; set this when an image fills only part of its space. Never set it larger than the real cell: an image taller than its space makes the screen scroll on every frame |
+| `docked` | the panels docked into the player at startup: a list of `playlist` and/or `lyrics` (each shows only where the window has room for it) |
 | `rg_mode` | `track` \| `album` \| `off` |
 | `eq` | any preset name (built-in or custom) |
 | `crossfeed` | `off` \| `light` \| `medium` \| `strong` \| any custom preset name |
+
+`Shift+W` writes the current theme, visualization and style, docked panels, EQ preset, crossfeed and ReplayGain mode into `config.json` as the defaults, keeping every other key (a Custom EQ is not a preset and is left out). A file that is not valid JSON is never overwritten: fix or remove it first.
 | `classic_use_truecolor` | `false` (default: Classic uses the terminal's ANSI green / yellow / red, which follow its colour scheme) \| `true` (use `classic_colors`) |
 | `classic_colors` | `{"highlight": "#7DD3B8", "warning": "#E9B65C", "error": "#F07A78"}` — any left out keep these defaults |
 
@@ -483,7 +490,7 @@ src/
 ├── main.rs         Entry point, startup (device, first stream), shared output helpers
 ├── player.rs       The playback loop (track starts, transitions, recovery, frames)
 ├── cli.rs          Command-line parsing, --help, the key list (also the ? screen)
-├── state.rs        PlayerState, UiState, ViewMode, constants, ANSI colors
+├── state.rs        PlayerState, UiState, ViewMode, constants
 ├── theme.rs        Theme palettes (Classic/Minimal/Hi-Fi), theme resolution
 ├── config.rs       User preferences from config.json, read key by key
 ├── audio.rs        Audio stream, sample rate switching, CoreAudio FFI
@@ -498,9 +505,11 @@ src/
 ├── crossfeed.rs    Meier-style headphone crossfeed (level/cutoff/ITD, JSON presets)
 ├── fade.rs         Click-free preset changes for the DSP stages
 ├── playlist.rs     Playlist builder, M3U reader/writer, rescan, shuffle
+├── playlist_panel.rs  The playlist panel: list + library tree, floating or docked
 ├── library.rs      Artist→album→track tree (build/filter/navigation) + shared renderer
 ├── metadata.rs     Tag reading (artist, title, album, track #, lyrics, ReplayGain), background scan
 ├── lyrics.rs       LRC parser, LRCLIB API client, per-track sync offsets
+├── lyrics_panel.rs  The lyrics panel, floating or docked
 ├── cover.rs        Album cover decoding, Kitty/iTerm2/Sixel/half-block rendering
 ├── resume.rs       Resume state persistence (save/restore sessions)
 ├── welcome.rs      First-launch screen (animated ripples, folder prompt)
@@ -510,11 +519,14 @@ src/
 ├── viz_cymatics.rs Cymatics visualization (Chladni plate patterns of the dominant frequency)
 ├── media_keys.rs   OS media transport controls (souvlaki)
 ├── term.rs         Batched terminal output (one write per frame), NO_COLOR
+├── tui.rs          ratatui plumbing: backend, styled-line building, image placement
+├── hints.rs        Key bars whose keys the mouse can press
+├── text_input.rs   The one-line text field (search, save as, open path)
 ├── ansi.rs         Display width, cutting and fitting lines, sanitising text
-├── ui.rs           Render dispatch, FrameWriter, keyboard input, playlist editing, help screen
-├── ui_classic.rs   Classic theme renderers (Player/Playlist/Lyrics)
-├── ui_minimal.rs   Minimal theme renderers (Player/Library/Lyrics)
-└── ui_hifi.rs      Hi-Fi theme renderers (Player/Library/Lyrics)
+├── ui.rs           Render dispatch, dialogs, docking, keyboard and mouse input, playlist editing
+├── ui_classic.rs   Classic theme: the player view
+├── ui_minimal.rs   Minimal theme: the player view
+└── ui_hifi.rs      Hi-Fi theme: the player view
 ```
 
 ### Resampler Modes
@@ -553,7 +565,8 @@ Multiple files, folders, and M3U playlists can be passed as arguments. Duplicate
 | cpal 0.18 | Cross-platform audio I/O (native PipeWire + PulseAudio hosts on Linux) |
 | symphonia 0.6 | Audio decoding (MP3, FLAC, WAV, OGG, AAC, ALAC, AIFF, isomp4), SIMD by default |
 | rubato 4.0 | Sample rate conversion |
-| crossterm 0.29 | Terminal UI |
+| crossterm 0.29 | Terminal input and control |
+| ratatui 0.30 | Terminal UI: cell buffer (only changed cells are sent), layout, blocks |
 | rtrb 0.3 | Lock-free ring buffer |
 | realfft 3.4 | FFT for spectrum analysis |
 | serde 1.0 | JSON deserialization for EQ/effects/crossfeed presets |

@@ -1,0 +1,15 @@
+{
+  "name": "Small Speakers",
+  "bands": [
+    { "type": "peak",       "freq": 31,    "gain": 0.0,  "q": 0.71 },
+    { "type": "peak",       "freq": 62,    "gain": 0.0,  "q": 0.71 },
+    { "type": "peak",       "freq": 150,   "gain": 3.0,  "q": 0.8 },
+    { "type": "peak",       "freq": 400,   "gain": 1.0,  "q": 1.0 },
+    { "type": "peak",       "freq": 800,   "gain": 0.0,  "q": 0.71 },
+    { "type": "peak",       "freq": 1500,  "gain": 0.0,  "q": 0.71 },
+    { "type": "peak",       "freq": 2500,  "gain": 0.0,  "q": 0.71 },
+    { "type": "peak",       "freq": 3500,  "gain": -2.0, "q": 1.5 },
+    { "type": "peak",       "freq": 6000,  "gain": 0.0,  "q": 0.71 },
+    { "type": "high_shelf", "freq": 10000, "gain": 1.0,  "q": 0.71 }
+  ]
+}

@@ -22,9 +22,9 @@ use crate::eq::{self, EqPreset};
 use crate::media_keys;
 use crate::playlist::{next_cycle, shuffle_list};
 use crate::resume::ResumeState;
-use crate::state::{self, PlayerState, UiState, VizMode, VIZ_BUFFER_SIZE};
+use crate::state::{self, PlayerState, UiState, ViewMode, VizMode, VIZ_BUFFER_SIZE};
 use crate::theme;
-use crate::ui::{self, arm_auto_sort, format_time, poll_auto_sort, poll_input, poll_library_tree, print_status};
+use crate::ui::{self, arm_auto_sort, format_time, poll_auto_sort, poll_input, poll_library_tree};
 use crate::viz::{StatsMonitor, VizAnalyser};
 use crate::{
     build_resume_state, locked_rate_note, open_output, output_failed, rate_label, schedule_retry,
@@ -86,7 +86,17 @@ pub struct Player {
     skipped: Vec<String>,
 
     // --- frame state ---
-    pub prev_frame_lines: usize,
+    /// The terminal the frames are drawn on.
+    pub term: crate::tui::Term,
+    /// Clear the screen before the next draw (a resize, a theme or layout
+    /// change): ratatui then redraws every cell and every image is sent again.
+    pub full_repaint: bool,
+    /// The window size the last frame was drawn for. ratatui clears the
+    /// screen itself when it changes, which takes the images with it, so a
+    /// change is a full repaint even before the resize event arrives.
+    pub drawn_size: (u16, u16),
+    /// A dialog was open over the last frame (see `ui::overlay_open`).
+    pub overlay_shown: bool,
     /// The Kitty analysis-spectrogram image was placed last frame (so it can
     /// be deleted, by id, when the user switches away from that mode).
     pub prev_viz_image_shown: bool,
@@ -107,6 +117,8 @@ pub struct Player {
     viz_analyser: VizAnalyser,
     viz_scratch: Vec<f32>,
     last_ui: Instant,
+    /// When playback was last seen running (see `VIZ_SETTLE`).
+    last_playing: Instant,
 }
 
 /// What `main` hands over to start playback.
@@ -163,7 +175,10 @@ impl Player {
             resume_position: s.resume_position,
             heard_any: false,
             skipped: Vec::new(),
-            prev_frame_lines: usize::MAX,
+            term: crate::tui::terminal().expect("the backend's size never fails"),
+            full_repaint: true,
+            drawn_size: (0, 0),
+            overlay_shown: false,
             prev_viz_image_shown: false,
             last_transition_count: 0,
             shown_device_name: s.shown_device_name,
@@ -177,6 +192,7 @@ impl Player {
             viz_analyser: VizAnalyser::new(stream_rate),
             viz_scratch: Vec::with_capacity(VIZ_BUFFER_SIZE),
             last_ui: Instant::now(),
+            last_playing: Instant::now(),
         }
     }
 
@@ -258,7 +274,20 @@ impl Player {
     /// Repaint the whole screen when the layout changed (resize, theme, full
     /// window), or show the too-small screen.
     fn repaint_screen(&mut self) {
-        let (w, h) = crossterm::terminal::size().map(|(w, h)| (w as usize, h as usize)).unwrap_or((0, 0));
+        // A dialog opening or closing repaints when an image is involved: no
+        // image goes under one, so they go and come back (see
+        // `tui::withhold_images_under`).
+        let overlay = ui::overlay_open(&self.ui);
+        if overlay != self.overlay_shown {
+            self.overlay_shown = overlay;
+            if ui::overlay_change_repaints(&self.ui) {
+                self.ui.terminal_resized = true;
+            }
+        }
+        // The size the frame is drawn at (`tui::window`: a 0×0 pty reads as
+        // 80×24). The raw size made such a pty the too-small screen for good.
+        let (w, h) = crate::tui::window();
+        let (w, h) = (w as usize, h as usize);
         if crate::ui::window_too_small(w, h) {
             if !self.ui.too_small {
                 // Entering: wipe the frame and every image, and forget that
@@ -267,7 +296,7 @@ impl Player {
                 if matches!(cover::detect_protocol(), cover::GraphicsProtocol::Kitty) {
                     crate::term::out!("{}{}", cover::kitty_clear_escape(), cover::viz_image_clear_escape());
                 }
-                crate::term::out!("\x1B[0m\x1B[H\x1B[J");
+                self.full_repaint = true;
                 self.ui.cover_block_intact = false;
                 self.ui.cover_dirty_frame = true;
                 self.ui.spectro_block_intact = false;
@@ -281,25 +310,81 @@ impl Player {
             self.ui.terminal_resized = true;
         }
         if repaint_if_needed(&mut self.ui) {
-            self.prev_frame_lines = usize::MAX;
+            self.full_repaint = true;
             self.prev_viz_image_shown = false; // the repaint cleared any viz image
         }
     }
 
-    /// The status block, drawn as one frame.
+    /// The status block, drawn as one frame: ratatui writes the cells that
+    /// changed, then the images placed over blank cells go out after them.
+    /// A Sixel or iTerm2 image that moved or went away may still show where
+    /// ratatui thinks the cells are blank; then the screen is cleared and the
+    /// frame drawn again (see `tui::stale_image_cells`).
     fn draw_status(&mut self) {
-        if self.ui.too_small {
-            crate::ui::print_too_small(&self.state, &self.ui, &self.filename);
-            return;
+        let mut repaint = std::mem::take(&mut self.full_repaint);
+        let size = crate::tui::window();
+        if size != self.drawn_size {
+            self.drawn_size = size;
+            repaint = true;
+            // Windows Terminal keeps Sixel pixels in cells a clear does not
+            // reach (they passed the console layer as an image, so to it the
+            // cells were blank all along): after a zoom the old spectrogram
+            // stuck out past the new one until the window was resized. A
+            // fresh alternate screen holds no images. Inside the frame's
+            // synchronized update, so the switch does not show.
+            if crate::tui::sixel_survives_clear() {
+                crate::term::out!("\x1B[?1049l\x1B[?1049h");
+            }
         }
-        let current_eq = &self.eq_presets[self.state.eq_index()];
-        let current_fx = &self.fx_presets[self.state.effects_index()].name;
-        let current_cf = &self.cf_presets[self.state.crossfeed_index()].name;
-        self.prev_frame_lines = print_status(
-            &self.state, &mut self.ui, &self.filename, &self.track_info, &self.track_ext,
-            current_eq, current_fx, current_cf, &mut self.stats, self.prev_frame_lines,
-            &self.playlist, &self.viz_analyser,
-        );
+        // Where this frame's draw begins: a pass thrown away for a repaint is
+        // dropped from the output (sent, it doubled the frame's bytes through
+        // ConPTY each time a Sixel image moved).
+        let start = crate::term::mark();
+        let once = ui::DrawOnce::of(&self.ui);
+        loop {
+            if repaint {
+                let _ = self.term.clear();
+                crate::tui::forget_images();
+            }
+            let current_eq = &self.eq_presets[self.state.eq_index()];
+            let current_fx = &self.fx_presets[self.state.effects_index()].name;
+            let current_cf = &self.cf_presets[self.state.crossfeed_index()].name;
+            let mut cx = ui::Ctx {
+                state: &self.state,
+                ui: &mut self.ui,
+                name: &self.filename,
+                track_info: &self.track_info,
+                ext: &self.track_ext,
+                eq_preset: current_eq,
+                fx_name: current_fx,
+                cf_name: current_cf,
+                stats: &mut self.stats,
+                playlist: &self.playlist,
+                analyser: &self.viz_analyser,
+                repaint,
+            };
+            let _ = self.term.draw(|f| ui::draw(f, &mut cx));
+            if !repaint && crate::tui::stale_image_cells() {
+                crate::tui::discard_images();
+                crate::term::rewind(start);
+                once.restore(&mut self.ui);
+                repaint = true;
+                continue;
+            }
+            // Delete the Kitty analysis-spectrogram image (by id) when this
+            // frame no longer draws it — leaving the mode, a panel docked
+            // into its slot, a dialog over it. The image is a graphics
+            // overlay, so unlike the text viz it isn't painted over. Judged
+            // by what THIS draw placed: judged before it, by the last frame,
+            // a docked panel's first frame (then the idle rate's 250 ms)
+            // stayed under the old image.
+            let kitty = matches!(cover::detect_protocol(), cover::GraphicsProtocol::Kitty);
+            if kitty_viz_gone(&mut self.prev_viz_image_shown, kitty) {
+                crate::term::out!("{}", cover::viz_image_clear_escape());
+            }
+            crate::tui::emit_images();
+            break;
+        }
     }
 
     /// One frame for the wait loops (startup buffering, rate change): a full
@@ -310,7 +395,7 @@ impl Player {
         // Media keys are pumped here too, so a pause pressed during a wait
         // (start-of-track buffering, a rate change, the repeat-all rebuild)
         // takes effect then, not after it.
-        media_keys::poll();
+        pump_media_keys(&self.state, &mut self.ui);
         crate::term::out!("\x1B[?2026h");
         self.repaint_screen();
         self.draw_status();
@@ -410,7 +495,7 @@ impl Player {
               && !state.should_quit()
         {
             poll_input(&state, &mut self.ui, &mut self.playlist);
-            media_keys::poll(); // every wait pumps them (see paint_wait_frame)
+            pump_media_keys(&state, &mut self.ui); // every wait pumps them (see paint_wait_frame)
             thread::sleep(Duration::from_millis(10));
         }
 
@@ -436,7 +521,6 @@ impl Player {
             // Force a full redraw so the next track's status line starts clean
             // instead of leaving orphan lines from the previous render.
             self.ui.terminal_resized = true;
-            self.prev_frame_lines = usize::MAX;
             return Flow::NextTrack;
         }
 
@@ -450,13 +534,11 @@ impl Player {
 
         // Load lyrics off the main thread so skip stays responsive.
         let dur = { let t = state.total_secs(); if t > 0.0 { Some(t as u32) } else { None } };
-        self.ui.lyrics_scroll = 0;
-        self.ui.lyrics_auto_scroll = true;
         let lyrics_path = self.playlist[self.ui.current].clone();
         spawn_lyrics_worker(&mut self.ui, lyrics_path.clone(), dur);
         spawn_cover_worker(&mut self.ui, lyrics_path, cover::CoverSize::for_theme(state.theme_kind()));
 
-        // Visualization analyzer (created before the startup wait so print_status
+        // Visualization analyzer (created before the startup wait so the frame
         // can draw the waveform/lissajous/spectrogram viz modes during buffering).
         self.viz_analyser = VizAnalyser::new(self.stream_rate);
         self.viz_scratch.clear();
@@ -567,11 +649,15 @@ impl Player {
         if self.ui.shuffle && !user_acted {
             shuffle_list(&mut next);
         }
+        let keep = ui::cursor_track(&self.ui, &self.playlist);
         let old_playlist = std::mem::replace(&mut self.playlist, next);
         self.state.total_tracks.store(self.playlist.len(), Ordering::Relaxed);
 
         // Reindex metadata cache
         ui::reindex_and_restart_scan(&mut self.ui, &self.playlist, &old_playlist);
+        // A live search's hits pointed into the old list (they showed, and
+        // played, other tracks, or ran past the end): re-run, cursor kept.
+        ui::refilter_to(&mut self.ui, &self.playlist, keep);
         // Re-arm the artist→album auto-sort: the rebuild above is
         // path-ordered, so without this a folder played on repeat-all
         // reverts to filename order instead of staying tag-sorted. Not for
@@ -707,6 +793,19 @@ impl Player {
     // Steady state
     // ------------------------------------------------------------------------
 
+    /// `Shift+W`: write the current settings to `config.json` as defaults.
+    fn save_defaults(&mut self) {
+        let eq = (!self.state.is_eq_custom()).then(|| self.eq_presets[self.state.eq_index()].name.as_str());
+        let cf = self.cf_presets[self.state.crossfeed_index()].name.as_str();
+        let values = default_values(&self.state, &self.ui, eq, cf);
+        let msg = match crate::config::save_defaults(values) {
+            Ok(_) if eq.is_none() => "Saved as defaults to config.json (a Custom EQ is not a preset: EQ not saved)".to_string(),
+            Ok(_) => "Saved as defaults to config.json".to_string(),
+            Err(e) => format!("Not saved: {e}"),
+        };
+        self.ui.set_status(msg);
+    }
+
     /// One pass of the playback loop: input, background results, then the
     /// events that end or restart the track, then a frame.
     fn tick(&mut self) -> Flow {
@@ -738,37 +837,63 @@ impl Player {
             }
         }
 
-        // UI update. The analysis spectrogram is the one continuously-scrolling
-        // mode; match the render cadence to its (sample-rate-adaptive) column
-        // rate so it advances one column per frame, evenly. Other modes stay at
-        // 20fps. The loop sleep below uses the SAME value, which keeps the cadence
-        // even (an unequal sleep and interval make it judder).
-        let analysis_viz = self.state.viz_mode() == VizMode::SpectrogramAnalysis;
-        let frame_ms: u64 = if analysis_viz {
-            state::spectro_frame_ms(self.state.output_rate.load(Ordering::Relaxed))
-        } else {
-            50
-        };
-        if self.last_ui.elapsed() >= Duration::from_millis(frame_ms) {
+        self.collect_background();
+        if std::mem::take(&mut self.ui.save_defaults) {
+            self.save_defaults();
+        }
+
+        // UI update: right away when something changed, at the visualization
+        // frame rate while one moves, and slowly otherwise (the clock, status
+        // messages) — a still screen is not redrawn 20 times a second.
+        let now = Instant::now();
+        // "Quit?" ran out: its box goes now (and its images come back), not
+        // up to 250 ms later on a still screen.
+        if self.ui.esc_quit_until.is_some_and(|t| t <= now) {
+            self.ui.esc_quit_until = None;
+            self.ui.dirty = true;
+        }
+        if !self.state.is_paused() {
+            self.last_playing = now;
+        }
+        let interval = frame_interval(
+            &self.state,
+            self.ui.viz_on_screen(),
+            now.duration_since(self.last_playing) < VIZ_SETTLE,
+        );
+        if self.ui.dirty || self.ui.terminal_resized || self.full_repaint || self.last_ui.elapsed() >= interval {
+            self.ui.dirty = false;
             self.render_frame();
             self.last_ui = Instant::now();
         }
 
-        media_keys::poll();
-        thread::sleep(Duration::from_millis(frame_ms));
+        pump_media_keys(&self.state, &mut self.ui);
+        // A new synced lyric line is drawn at once (see `lyrics_line_moved`).
+        if ui::lyrics_line_moved(&mut self.ui, &self.state) {
+            self.ui.dirty = true;
+        }
+        // Wait for the next frame — or input, which is handled at once. The
+        // loop's own work (the producer's questions, track changes, media
+        // keys) still runs at least every TICK.
+        // Not while Keet holds input of its own (a clicked hint's key, the
+        // event kept after an Esc): the terminal's poll does not see it, and
+        // it sat out the wait.
+        // Nor when something already asks for a frame (a media key just
+        // pumped above).
+        let wait = if ui::input_waiting(&self.ui) || self.ui.dirty {
+            Duration::ZERO
+        } else {
+            loop_wait(interval.saturating_sub(self.last_ui.elapsed()), self.ui.esc_quit_until, Instant::now())
+        };
+        let _ = crossterm::event::poll(wait);
         Flow::Continue
     }
 
     /// The quit key: clear the frame, save the session, and — in exclusive
     /// mode — give the DAC back as it was found.
     fn quit(&mut self) {
+        // Wipe the frame (the alternate screen is left on the way out).
+        let _ = self.term.clear();
         crate::term::out!("\x1B[?25h");
-        if self.prev_frame_lines != usize::MAX && self.prev_frame_lines > 0 {
-            // Back to the frame's anchor line, then erase down to wipe the
-            // whole frame.
-            crate::term::out!("\x1B[{}F", self.prev_frame_lines);
-        }
-        crate::term::out!("\x1B[J");
         crate::term::flush();
         self.save();
         // Stop the stream BEFORE giving the device back. Releasing hog mode
@@ -824,9 +949,7 @@ impl Player {
         ui::advance_to(&mut self.ui, &state, new_index);
         let ui = &mut self.ui;
 
-        if ui.view_mode == state::ViewMode::Playlist && ui.filtered_indices.is_empty() {
-            ui.cursor = ui.current;
-        }
+        ui::follow_playing(ui);
 
         // Update display info for new track
         let new_path = self.playlist[ui.current].clone();
@@ -835,8 +958,6 @@ impl Player {
             .map(|e| e.to_string_lossy().to_lowercase())
             .unwrap_or_default();
 
-        ui.lyrics_scroll = 0;
-        ui.lyrics_auto_scroll = true;
         let dur = { let t = state.total_secs(); if t > 0.0 { Some(t as u32) } else { None } };
         spawn_lyrics_worker(ui, new_path.clone(), dur);
         spawn_cover_worker(ui, new_path, cover::CoverSize::for_theme(state.theme_kind()));
@@ -1099,10 +1220,73 @@ impl Player {
         Flow::NextTrack
     }
 
-    /// One UI frame: feed the analyser, collect background results, draw.
+    /// Results from the background and notes from other threads, every
+    /// pass of the loop; whatever changes what the screen shows asks for a
+    /// frame.
+    fn collect_background(&mut self) {
+        self.follow_default_device();
+
+        // A damaged stretch the producer skipped, or a device note.
+        // Queued: on the first frame these meet the startup notices.
+        if let Some(msg) = self.state.decode_notice.lock().ok().and_then(|mut n| n.take()) {
+            self.ui.queue_notice(msg, Duration::from_secs(4));
+            self.ui.dirty = true;
+        }
+        if let Some(msg) = audio::take_notice() {
+            self.ui.queue_notice(msg, Duration::from_secs(5));
+            self.ui.dirty = true;
+        }
+
+        // Check if background lyrics fetch has completed
+        if let Some(ref rx) = self.ui.lyrics_receiver {
+            if let Ok(answer) = rx.try_recv() {
+                match answer {
+                    crate::lyrics::LyricsAnswer::Found(parsed, source) => {
+                        self.ui.set_lyrics(Some(parsed));
+                        self.ui.lyrics_source = Some(source);
+                    }
+                    crate::lyrics::LyricsAnswer::Missing => {}
+                    crate::lyrics::LyricsAnswer::Unavailable(why) => self.ui.lyrics_unavailable = Some(why),
+                }
+                self.ui.lyrics_receiver = None;
+                self.ui.dirty = true;
+            }
+        }
+
+        // Check if background cover fetch has completed
+        if let Some(ref rx) = self.ui.cover_receiver {
+            if let Ok(cover) = rx.try_recv() {
+                self.ui.cover = cover;
+                self.ui.cover_receiver = None;
+                // The renderers draw the cover per frame, emit-on-change:
+                // a newly arrived image needs exactly one repaint.
+                self.ui.cover_dirty_frame = true;
+                self.ui.dirty = true;
+            }
+        }
+
+        // OS now-playing refresh: pushing one every UI frame (~20 Hz) is
+        // needless objc/D-Bus traffic. Pause-state changes go out immediately;
+        // the position otherwise syncs at ~1 Hz.
+        if let Some(ref mut mc) = self.media_controls {
+            let paused_now = self.state.is_paused();
+            if paused_now != self.last_mk_paused
+                || self.last_mk_push.elapsed() >= Duration::from_secs(1)
+            {
+                media_keys::update_playback(mc, paused_now, self.state.time_secs());
+                self.last_mk_paused = paused_now;
+                self.last_mk_push = Instant::now();
+            }
+        }
+    }
+
+    /// One UI frame: feed the analyser, draw.
     fn render_frame(&mut self) {
         let state = Arc::clone(&self.state);
-        if state.viz_mode() != VizMode::None {
+        // The analyser only matters to a frame that shows a visualization:
+        // elsewhere its samples are dropped (the FFT is most of a frame's
+        // cost). HiFi's VU panel is its player view's visualization.
+        if state.shown_viz() != VizMode::None && self.ui.viz_on_screen() {
             let viz_available = self.viz_cons.slots();
             if viz_available > 0 {
                 if let Ok(chunk) = self.viz_cons.read_chunk(viz_available) {
@@ -1129,41 +1313,6 @@ impl Player {
             self.stats.update();
         }
 
-        self.follow_default_device();
-
-        // A damaged stretch the producer skipped, or a device note.
-        // Queued: on the first frame these meet the startup notices.
-        if let Some(msg) = self.state.decode_notice.lock().ok().and_then(|mut n| n.take()) {
-            self.ui.queue_notice(msg, Duration::from_secs(4));
-        }
-        if let Some(msg) = audio::take_notice() {
-            self.ui.queue_notice(msg, Duration::from_secs(5));
-        }
-
-        // Check if background lyrics fetch has completed
-        if let Some(ref rx) = self.ui.lyrics_receiver {
-            if let Ok(lyrics) = rx.try_recv() {
-                if let Some((parsed, source)) = lyrics {
-                    self.ui.lyrics = Some(parsed);
-                    self.ui.lyrics_source = Some(source);
-                }
-                self.ui.lyrics_receiver = None;
-            }
-        }
-
-        // Check if background cover fetch has completed
-        if let Some(ref rx) = self.ui.cover_receiver {
-            if let Ok(cover) = rx.try_recv() {
-                self.ui.cover = cover;
-                self.ui.cover_receiver = None;
-                // Minimal draws the cover per-frame with emit-on-change,
-                // so a newly arrived image needs exactly one repaint.
-                // The renderers draw the cover per frame, emit-on-change:
-                // a newly arrived image needs exactly one repaint.
-                self.ui.cover_dirty_frame = true;
-            }
-        }
-
         // Begin synchronized update (DEC mode 2026) before any frame output —
         // including the full repaint below, which also runs on every viz
         // mode/style key — so the erase-then-repaint is presented atomically.
@@ -1182,35 +1331,9 @@ impl Player {
             }
         }
 
-        // Delete the Kitty analysis-spectrogram image (by id) when it's no
-        // longer being drawn — leaving the mode OR switching away from the
-        // Player view (playlist/lyrics). The image is a graphics overlay, so
-        // unlike the text viz it isn't painted over by the new view.
-        let viz_image_shown = self.ui.view_mode == state::ViewMode::Player
-            && state.viz_mode() == VizMode::SpectrogramAnalysis
-            && matches!(cover::detect_protocol(), cover::GraphicsProtocol::Kitty);
-        if self.prev_viz_image_shown && !viz_image_shown {
-            crate::term::out!("{}", cover::viz_image_clear_escape());
-        }
-        self.prev_viz_image_shown = viz_image_shown;
-
         self.draw_status();
         crate::term::out!("\x1B[?2026l");
         crate::term::flush();
-
-        // OS now-playing refresh: pushing one every UI frame (~20 Hz) is
-        // needless objc/D-Bus traffic. Pause-state changes go out immediately;
-        // the position otherwise syncs at ~1 Hz.
-        if let Some(ref mut mc) = self.media_controls {
-            let paused_now = state.is_paused();
-            if paused_now != self.last_mk_paused
-                || self.last_mk_push.elapsed() >= Duration::from_secs(1)
-            {
-                media_keys::update_playback(mc, paused_now, state.time_secs());
-                self.last_mk_paused = paused_now;
-                self.last_mk_push = Instant::now();
-            }
-        }
     }
 
     /// Detect an endpoint change the stream never reported.
@@ -1256,5 +1379,213 @@ impl Player {
                 }
             }
         }
+    }
+}
+
+/// The loop's longest wait: the producer's questions, track changes and
+/// media keys are answered at least this often.
+const TICK: Duration = Duration::from_millis(50);
+
+/// A still screen (no visualization moving) is redrawn this often: enough
+/// for the clock and for status messages to come and go on time.
+const IDLE_FRAME: Duration = Duration::from_millis(250);
+
+/// After a pause the visualization keeps its frame rate this long, so bars
+/// and peaks fall smoothly to rest.
+const VIZ_SETTLE: Duration = Duration::from_secs(2);
+
+/// Pump the media keys and, when one changed something (play/pause, a
+/// skip, a seek), ask for a frame at once. Every loop pumps through here:
+/// the main loop used to pump without taking the change, so a media key
+/// showed up to `IDLE_FRAME` late.
+fn pump_media_keys(state: &PlayerState, ui: &mut UiState) {
+    media_keys::poll();
+    if state.take_remote_change() {
+        ui.dirty = true;
+    }
+}
+
+/// Whether the Kitty spectrogram image went away in this draw (`shown`:
+/// whether the last one placed it, updated to this one).
+fn kitty_viz_gone(shown: &mut bool, kitty: bool) -> bool {
+    let now = kitty && crate::tui::placed(crate::tui::ImageSlot::Viz);
+    let gone = *shown && !now;
+    *shown = now;
+    gone
+}
+
+/// How long the loop waits for input: until the next frame is due, never
+/// past a TICK, and never past "Quit?" running out (`quit_until`): its box
+/// must go when it does.
+fn loop_wait(frame_left: Duration, quit_until: Option<Instant>, now: Instant) -> Duration {
+    let wait = frame_left.min(TICK);
+    match quit_until {
+        Some(t) => wait.min(t.saturating_duration_since(now)),
+        None => wait,
+    }
+}
+
+/// Time between frames when nothing asked for one: the visualization's frame
+/// rate while one moves on screen — playing, settling after a pause, or a
+/// mode that moves on its own (the galaxy turns, the plate shimmers) —
+/// otherwise `IDLE_FRAME`. The analysis spectrogram keeps its own cadence,
+/// one column per frame, which keeps its scrolling even.
+fn frame_interval(state: &PlayerState, viz_on_screen: bool, playing_recently: bool) -> Duration {
+    // What is on screen, not the setting: HiFi's slot is always the VU panel
+    // (a galaxy chosen in another theme kept a paused HiFi at full rate).
+    let mode = state.shown_viz();
+    let moving = viz_on_screen
+        && mode != VizMode::None
+        && (playing_recently || matches!(mode, VizMode::Galaxy | VizMode::Cymatics));
+    if !moving {
+        IDLE_FRAME
+    } else if mode == VizMode::SpectrogramAnalysis {
+        Duration::from_millis(state::spectro_frame_ms(state.output_rate.load(Ordering::Relaxed)))
+    } else {
+        state.viz_frame()
+    }
+}
+
+/// The settings `Shift+W` saves, as `config.json` keys: the docked panels,
+/// the look and the sound. `eq` is None for a Custom EQ (not a preset; the
+/// saved EQ is left as it was).
+fn default_values(
+    state: &PlayerState,
+    ui: &UiState,
+    eq: Option<&str>,
+    crossfeed: &str,
+) -> Vec<(&'static str, serde_json::Value)> {
+    use serde_json::json;
+    let docked: Vec<&str> = ui
+        .docked
+        .iter()
+        .filter_map(|v| match v {
+            ViewMode::Playlist => Some("playlist"),
+            ViewMode::Lyrics => Some("lyrics"),
+            _ => None,
+        })
+        .collect();
+    let mut out = vec![
+        ("docked", json!(docked)),
+        ("theme", json!(state.theme_kind().name())),
+        ("viz", json!(state.viz_mode().config_name())),
+        ("viz_style", json!(state.viz_style().name())),
+        ("crossfeed", json!(crossfeed)),
+        ("rg_mode", json!(state.rg_mode().name().to_ascii_lowercase())),
+        ("mouse", json!(state.mouse.load(Ordering::Relaxed))),
+    ];
+    if let Some(eq) = eq {
+        out.push(("eq", json!(eq)));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_kitty_spectrogram_goes_in_the_frame_that_stops_drawing_it() {
+        let mut shown = false;
+        crate::tui::place_image(crate::tui::ImageSlot::Viz, ratatui::layout::Rect::new(0, 0, 10, 5), None);
+        assert!(!kitty_viz_gone(&mut shown, true));
+        crate::tui::emit_images();
+        // This frame drew a docked panel in its slot: it goes now.
+        assert!(kitty_viz_gone(&mut shown, true), "deleted in the frame that dropped it");
+        assert!(!kitty_viz_gone(&mut shown, true), "once");
+        // Not Kitty: nothing to delete by id.
+        crate::tui::place_image(crate::tui::ImageSlot::Viz, ratatui::layout::Rect::new(0, 0, 10, 5), None);
+        let mut shown = false;
+        assert!(!kitty_viz_gone(&mut shown, false));
+        crate::tui::emit_images();
+        assert!(!kitty_viz_gone(&mut shown, false));
+    }
+
+    #[test]
+    fn a_media_key_pumped_by_any_loop_asks_for_a_frame() {
+        let st = PlayerState::new();
+        let mut ui = UiState::new(Vec::new(), crate::metadata::MetadataCache::new(0));
+        ui.dirty = false;
+        pump_media_keys(&st, &mut ui);
+        assert!(!ui.dirty, "nothing changed");
+        st.note_remote_change();
+        pump_media_keys(&st, &mut ui);
+        assert!(ui.dirty, "a media key's change is drawn at once");
+    }
+
+    #[test]
+    fn the_saved_defaults_read_back_as_the_same_settings() {
+        let st = PlayerState::new();
+        st.viz_mode.store(VizMode::Galaxy as u8, Ordering::Relaxed);
+        st.toggle_viz_style();
+        let mut ui = UiState::new(Vec::new(), crate::metadata::MetadataCache::new(0));
+        ui.docked = vec![ViewMode::Lyrics, ViewMode::Playlist];
+        let values = default_values(&st, &ui, None, "Medium");
+        let text = serde_json::Value::Object(values.into_iter().map(|(k, v)| (k.to_string(), v)).collect());
+        let c = crate::config::parse_for_tests(&text.to_string());
+        assert!(c.problems.is_empty(), "{:?}", c.problems);
+        assert_eq!(c.viz.as_deref().and_then(VizMode::from_str), Some(VizMode::Galaxy));
+        assert_eq!(c.viz_style.as_deref().and_then(state::VizStyle::from_str), Some(st.viz_style()));
+        assert_eq!(c.theme.as_deref().and_then(theme::ThemeKind::from_str), Some(st.theme_kind()));
+        assert_eq!(c.rg_mode.as_deref().and_then(state::RgMode::from_str), Some(st.rg_mode()));
+        assert_eq!(c.docked, Some(vec!["lyrics".to_string(), "playlist".to_string()]));
+        assert_eq!(c.crossfeed.as_deref(), Some("Medium"));
+        assert_eq!(c.eq, None, "a Custom EQ is not saved");
+        // Mouse reporting, which `m` turns off (to select text): saved too,
+        // or the next launch turned it back on.
+        st.mouse.store(false, Ordering::Relaxed);
+        let values = default_values(&st, &ui, None, "Medium");
+        let text = serde_json::Value::Object(values.into_iter().map(|(k, v)| (k.to_string(), v)).collect());
+        assert_eq!(crate::config::parse_for_tests(&text.to_string()).mouse, Some(false));
+    }
+
+    #[test]
+    fn the_loop_wakes_when_quit_runs_out() {
+        // "Quit?" stayed up to 250 ms past its 2 s on a still screen: the
+        // loop now wakes when it runs out.
+        let now = Instant::now();
+        let soon = now + Duration::from_millis(30);
+        assert_eq!(loop_wait(Duration::from_millis(250), Some(soon), now), Duration::from_millis(30));
+        assert_eq!(loop_wait(Duration::from_millis(20), Some(soon), now), Duration::from_millis(20), "the frame comes first");
+        assert_eq!(loop_wait(Duration::from_millis(250), None, now), TICK, "never past a tick");
+        assert_eq!(loop_wait(Duration::from_millis(250), Some(now - Duration::from_millis(5)), now), Duration::ZERO, "already out");
+    }
+
+    #[test]
+    fn a_still_screen_draws_slowly_and_a_moving_one_at_the_viz_rate() {
+        let st = PlayerState::new();
+        st.viz_mode.store(VizMode::SpectrumVertical as u8, Ordering::Relaxed);
+        assert_eq!(frame_interval(&st, true, true), st.viz_frame());
+        // Paused long enough to have settled, or another view: still.
+        assert_eq!(frame_interval(&st, true, false), IDLE_FRAME);
+        assert_eq!(frame_interval(&st, false, true), IDLE_FRAME);
+        assert_eq!(frame_interval(&st, false, true), IDLE_FRAME);
+        // No visualization: still.
+        st.viz_mode.store(VizMode::None as u8, Ordering::Relaxed);
+        assert_eq!(frame_interval(&st, true, true), IDLE_FRAME);
+        // The galaxy turns and the plate shimmers even when paused.
+        for mode in [VizMode::Galaxy, VizMode::Cymatics] {
+            st.viz_mode.store(mode as u8, Ordering::Relaxed);
+            assert_eq!(frame_interval(&st, true, false), st.viz_frame(), "{mode:?}");
+        }
+        // HiFi never draws them (its slot is the VU panel): paused, still.
+        st.set_theme(crate::theme::ThemeKind::HiFi);
+        for mode in [VizMode::Galaxy, VizMode::Cymatics] {
+            st.viz_mode.store(mode as u8, Ordering::Relaxed);
+            assert_eq!(frame_interval(&st, true, false), IDLE_FRAME, "HiFi, {mode:?}");
+            assert_eq!(frame_interval(&st, true, true), st.viz_frame(), "HiFi playing, {mode:?}: the VU moves");
+        }
+    }
+
+    #[test]
+    fn the_viz_frame_rate_follows_the_setting_within_its_range() {
+        let st = PlayerState::new();
+        assert_eq!(st.viz_frame(), Duration::from_micros(1_000_000 / state::DEFAULT_VIZ_FPS as u64));
+        st.set_viz_fps(60);
+        assert_eq!(st.viz_frame(), Duration::from_micros(16_666));
+        st.set_viz_fps(500);
+        assert_eq!(st.viz_frame(), Duration::from_micros(16_666), "capped at 60");
+        st.set_viz_fps(0);
+        assert_eq!(st.viz_frame(), Duration::from_millis(100), "at least 10");
     }
 }

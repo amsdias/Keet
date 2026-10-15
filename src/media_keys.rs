@@ -51,8 +51,11 @@ fn handle_event(state: &PlayerState, event: MediaControlEvent) {
         MediaControlEvent::SetPosition(pos) => {
             state.seek_to_offset(pos.0.as_secs_f64() - state.time_secs());
         }
-        _ => {}
+        _ => return,
     }
+    // The screen changes (▶/⏸, the clock): a frame at once, not at the idle
+    // rate. (This runs inside the OS event pump, or on D-Bus's thread.)
+    state.note_remote_change();
 }
 
 pub fn update_metadata(
@@ -231,6 +234,19 @@ fn platform_hwnd() -> Option<*mut std::ffi::c_void> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_media_key_asks_for_a_frame() {
+        // Its change (▶/⏸, the clock after a seek) showed up to 250 ms late
+        // on a still screen.
+        let state = PlayerState::new();
+        assert!(!state.take_remote_change());
+        handle_event(&state, MediaControlEvent::Toggle);
+        assert!(state.take_remote_change(), "noted");
+        assert!(!state.take_remote_change(), "taken once");
+        handle_event(&state, MediaControlEvent::SetPosition(souvlaki::MediaPosition(std::time::Duration::from_secs(5))));
+        assert!(state.take_remote_change());
+    }
 
     #[test]
     fn play_and_pause_set_a_state_toggle_flips_it() {

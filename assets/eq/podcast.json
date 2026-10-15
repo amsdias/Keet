@@ -1,0 +1,15 @@
+{
+  "name": "Podcast / Speech",
+  "bands": [
+    { "type": "low_cut",    "freq": 100,   "q": 0.71 },
+    { "type": "peak",       "freq": 300,   "gain": -2.0, "q": 1.2 },
+    { "type": "peak",       "freq": 600,   "gain": 0.0,  "q": 0.71 },
+    { "type": "peak",       "freq": 1000,  "gain": 0.0,  "q": 0.71 },
+    { "type": "peak",       "freq": 1800,  "gain": 0.0,  "q": 0.71 },
+    { "type": "peak",       "freq": 2500,  "gain": 3.0,  "q": 1.2 },
+    { "type": "peak",       "freq": 5000,  "gain": 2.0,  "q": 2.0 },
+    { "type": "peak",       "freq": 8000,  "gain": 0.0,  "q": 0.71 },
+    { "type": "high_shelf", "freq": 12000, "gain": -2.0, "q": 0.71 },
+    { "type": "peak",       "freq": 16000, "gain": 0.0,  "q": 0.71 }
+  ]
+}

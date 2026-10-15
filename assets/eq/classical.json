@@ -1,0 +1,15 @@
+{
+  "name": "Classical",
+  "bands": [
+    { "type": "peak",       "freq": 31,    "gain": 0.0,  "q": 0.71 },
+    { "type": "peak",       "freq": 62,    "gain": 0.0,  "q": 0.71 },
+    { "type": "low_shelf",  "freq": 80,    "gain": 1.5,  "q": 0.71 },
+    { "type": "peak",       "freq": 250,   "gain": 0.0,  "q": 0.71 },
+    { "type": "peak",       "freq": 500,   "gain": 0.0,  "q": 0.71 },
+    { "type": "peak",       "freq": 1000,  "gain": 0.0,  "q": 0.71 },
+    { "type": "peak",       "freq": 2000,  "gain": 0.0,  "q": 0.71 },
+    { "type": "peak",       "freq": 4000,  "gain": -1.0, "q": 1.5 },
+    { "type": "peak",       "freq": 8000,  "gain": 0.0,  "q": 0.71 },
+    { "type": "high_shelf", "freq": 12000, "gain": 2.0,  "q": 0.71 }
+  ]
+}

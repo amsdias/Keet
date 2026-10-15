@@ -15,6 +15,8 @@ use std::fmt::Write as _;
 use std::io::Cursor;
 use std::sync::OnceLock;
 
+use ratatui::text::Line;
+
 use image::ImageEncoder;
 
 use symphonia::core::formats::FormatOptions;
@@ -178,8 +180,9 @@ impl CoverSize {
     }
 
     /// Sixel is pixel-exact, so its target is derived from the cell box at
-    /// the SMALLEST plausible cell (`viz::SIXEL_CELL_FLOOR`, 8×16 px) — the
-    /// same floor the analysis spectrogram uses. Sizing for 10×20 cells (the
+    /// `viz::sixel_cell()` — the configured size, Windows Terminal's virtual
+    /// 10×20, else the SMALLEST plausible cell (8×16 px) — the same cell the
+    /// analysis spectrogram uses. Sizing for 10×20 cells (the
     /// old choice) is the opposite of conservative: on any terminal with
     /// smaller cells (foot, a smaller Windows Terminal font) the cover spilled
     /// out of its slot, got overwritten by the text beside it, and could scroll
@@ -187,7 +190,7 @@ impl CoverSize {
     /// cosmetic. Height is trimmed to whole 6-px sixel bands: a partial band
     /// still advances a full six pixels.
     fn sixel_px(&self) -> (u32, u32) {
-        let (cw, ch) = crate::viz::SIXEL_CELL_FLOOR;
+        let (cw, ch) = crate::viz::sixel_cell();
         let h = (self.rows * ch as u32) / 6 * 6;
         (self.cols * cw as u32, h.max(6))
     }
@@ -217,41 +220,39 @@ impl CoverImage {
     }
 }
 
-/// Whether the detected protocol places an image that PERSISTS in its cells.
-///
-/// Kitty, iTerm2 and Sixel all do: once transmitted, the image stays until
-/// something overwrites those cells, so an unchanged frame can skip the
-/// transmit entirely (and must skip erase-to-EOL over them). Half-block *is*
-/// ordinary text, so it has to be repainted like any other content.
-pub fn image_is_sticky() -> bool {
-    !matches!(detect_protocol(), GraphicsProtocol::HalfBlock)
+/// What a cover slot draws this frame.
+pub enum CoverDraw {
+    /// Cells: the half-block picture, or blanks when there is no artwork.
+    Cells(Vec<Line<'static>>),
+    /// An image placed over the slot's blank cells: its escape sequence, or
+    /// None when the one already on screen is unchanged.
+    Image(Option<String>),
 }
 
-/// Rows that step past an already-placed image without drawing over it.
-/// Used on frames where the cover hasn't changed — re-transmitting a PNG or
-/// Sixel blob 20x/s through the terminal is exactly the cost the analysis
-/// spectrogram's emit-on-change rule exists to avoid.
-pub fn passive_lines(size: CoverSize) -> Vec<String> {
-    (0..size.rows).map(|_| format!("\x1B[{}C", size.cols)).collect()
-}
-
-/// Rows for an EMPTY cover slot: blank cells, preceded by whatever it takes to
-/// remove an image already sitting there.
+/// The slot's content: `img` drawn at `size`, re-sent only when `repaint`
+/// (an image that stays put is not sent again: re-transmitting a PNG or
+/// Sixel blob 20×/s is the cost the analysis spectrogram's emit-on-change
+/// rule exists to avoid).
 ///
-/// A Kitty placement is an overlay bound to an image id — painting the cells
-/// underneath does not remove it. Without the explicit delete, moving from a
-/// track with artwork to one without left the previous cover on screen.
-/// Sixel, iTerm2 and half-block are ordinary cell content, so blanking the
-/// cells is enough for them.
-pub fn empty_slot_lines(size: CoverSize) -> Vec<String> {
-    let blank = " ".repeat(size.cols as usize);
-    let mut lines: Vec<String> = (0..size.rows).map(|_| blank.clone()).collect();
-    if matches!(detect_protocol(), GraphicsProtocol::Kitty) {
-        if let Some(first) = lines.first_mut() {
-            first.insert_str(0, &kitty_clear_escape());
+/// No artwork draws blank cells and places no image. A Kitty image is an
+/// overlay bound to an image id — painting the cells under it does not
+/// remove it — so it is deleted here; a Sixel or iTerm2 image is cell
+/// content, and the frame clears the screen when one goes away
+/// (`tui::stale_image_cells`).
+pub fn draw(img: Option<&CoverImage>, size: CoverSize, repaint: bool) -> CoverDraw {
+    match img {
+        Some(CoverImage::HalfBlock { width, height, pixels, .. }) => {
+            CoverDraw::Cells(half_block_lines(*width, *height, pixels))
+        }
+        Some(_) if !repaint => CoverDraw::Image(None),
+        Some(img) => CoverDraw::Image(Some(image_payload(img))),
+        None => {
+            if repaint && matches!(detect_protocol(), GraphicsProtocol::Kitty) {
+                crate::term::out!("{}", kitty_clear_escape());
+            }
+            CoverDraw::Cells(vec![Line::default(); size.rows as usize])
         }
     }
-    lines
 }
 
 /// Escape sequence that removes any placement of our reserved image ID.
@@ -322,7 +323,7 @@ pub fn resolve_remote(artist: &str, album: &str, size: CoverSize) -> crate::lyri
     let bytes = match fetch_itunes(artist, album) {
         Lookup::Found(b) => b,
         Lookup::NotFound => return Lookup::NotFound,
-        Lookup::Failed => return Lookup::Failed,
+        Lookup::Failed | Lookup::Busy(_) => return Lookup::Failed,
     };
     if let Some(p) = cache_path_for(Some(artist), Some(album)) {
         if let Some(dir) = p.parent() {
@@ -394,7 +395,7 @@ fn legacy_cache_path_for(track_path: &Path, artist: Option<&str>, album: Option<
     Some(parent.join(format!("{} - {}.cover.jpg", a, al)))
 }
 
-fn sanitize_fs(s: &str) -> String {
+pub(crate) fn sanitize_fs(s: &str) -> String {
     let mut out: String = s.chars()
         .map(|c| match c {
             '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\0' => '_',
@@ -526,80 +527,52 @@ fn decode_and_resize(bytes: &[u8], size: CoverSize) -> Option<CoverImage> {
     }
 }
 
-/// Render as half-block truecolor ANSI. Returns one String per terminal row,
-/// each spanning `COVER_COLS` cells. Caller is responsible for horizontal
-/// placement (prefix/suffix).
-fn render_half_block(width: u32, height: u32, pixels: &[u8]) -> Vec<String> {
+/// An RGB image as half-block cells: each cell's upper half the foreground
+/// of `▀`, its lower half the background, two pixel rows per cell row. One
+/// line per cell row, `width` cells wide.
+pub fn half_block_lines(width: u32, height: u32, pixels: &[u8]) -> Vec<Line<'static>> {
+    use ratatui::style::{Color, Style};
     let w = width as usize;
     let h = height as usize;
-    let n_rows = h.div_ceil(2);
-    let mut lines = Vec::with_capacity(n_rows);
-
+    let px = |x: usize, y: usize| {
+        let i = (y * w + x) * 3;
+        Color::Rgb(pixels[i], pixels[i + 1], pixels[i + 2])
+    };
+    let mut lines = Vec::with_capacity(h.div_ceil(2));
     let mut y = 0;
     while y < h {
-        let mut line = String::with_capacity(w * 32);
-        let mut last_top: Option<(u8, u8, u8)> = None;
-        let mut last_bot: Option<(u8, u8, u8)> = None;
+        let mut line = crate::tui::LineBuf::new();
         for x in 0..w {
-            let top_idx = (y * w + x) * 3;
-            let top = (pixels[top_idx], pixels[top_idx + 1], pixels[top_idx + 2]);
-            let bot = if y + 1 < h {
-                let bi = ((y + 1) * w + x) * 3;
-                Some((pixels[bi], pixels[bi + 1], pixels[bi + 2]))
-            } else {
-                None
-            };
-
-            if last_top != Some(top) {
-                let _ = write!(line, "\x1B[38;2;{};{};{}m", top.0, top.1, top.2);
-                last_top = Some(top);
+            let mut style = Style::new().fg(px(x, y));
+            // An odd last row has no lower half: the terminal's background.
+            if y + 1 < h {
+                style = style.bg(px(x, y + 1));
             }
-            match bot {
-                Some(b) if last_bot != Some(b) => {
-                    let _ = write!(line, "\x1B[48;2;{};{};{}m", b.0, b.1, b.2);
-                    last_bot = Some(b);
-                }
-                None
-                    // Clear any background from previous cell on an odd last row.
-                    if last_bot.is_some() => {
-                        line.push_str("\x1B[49m");
-                        last_bot = None;
-                    }
-                _ => {}
-            }
-            line.push('▀');
+            line.style(style).push('▀');
         }
-        line.push_str("\x1B[0m");
-        lines.push(line);
+        lines.push(line.into_line());
         y += 2;
     }
     lines
 }
 
-/// Public wrapper so other modules (viz) can render an arbitrary RGB buffer
-/// as half-block truecolor rows.
-pub fn render_half_block_public(width: u32, height: u32, pixels: &[u8]) -> Vec<String> {
-    render_half_block(width, height, pixels)
-}
-
-/// Render a raw RGB image (`w`×`h` px) into a block occupying `cols`×`rows`
-/// terminal cells, using the detected graphics protocol. Returns one String per
-/// row (caller adds horizontal padding). For HalfBlock, the caller should use
-/// `render_half_block_public` instead — this fn covers the pixel-image protocols.
-pub fn render_image_block(rgb: &[u8], w: u32, h: u32, cols: u32, rows: u32) -> Vec<String> {
-    let blank = || vec![String::new(); rows as usize];
+/// A raw RGB image (`w`×`h` px) as an image over `cols`×`rows` cells in the
+/// detected graphics protocol: the escape sequence to write with the cursor
+/// at the block's top left, or None when the protocol draws no images
+/// (half-block takes `half_block_lines` instead) or encoding failed.
+pub fn viz_image_payload(rgb: &[u8], w: u32, h: u32, cols: u32, rows: u32) -> Option<String> {
     match detect_protocol() {
-        GraphicsProtocol::Kitty => match encode_png_rgb(rgb, w, h) {
-            Some(png) => viz_kitty_lines(&png, cols, rows),
-            None => blank(),
-        },
-        GraphicsProtocol::Iterm2 => match encode_png_rgb(rgb, w, h) {
-            Some(png) => viz_iterm2_lines(&png, cols, rows),
-            None => blank(),
-        },
+        // p=1 pins a single placement: re-transmitting each frame with the
+        // same image id + placement id REPLACES it in place rather than
+        // spawning a new placement every frame (which otherwise piles up and
+        // slows the terminal).
+        GraphicsProtocol::Kitty => {
+            encode_png_rgb(rgb, w, h).map(|png| kitty_transmit_with(&png, VIZ_IMAGE_ID, Some(1), cols, rows))
+        }
+        GraphicsProtocol::Iterm2 => encode_png_rgb(rgb, w, h).map(|png| iterm2_payload(&png, cols, rows)),
         GraphicsProtocol::Sixel => {
             // NOTE: the analysis spectrogram does NOT come through here — it
-            // uses render_viz_sixel_indexed (fixed palette, no quantizer; a
+            // uses sixel_encode_indexed (fixed palette, no quantizer; a
             // per-frame quantizer shimmers on animated content). This arm only
             // serves hypothetical future RGB viz images on sixel terminals.
             // icy_sixel wants RGBA; expand the borrowed RGB without an RgbImage copy.
@@ -612,12 +585,9 @@ pub fn render_image_block(rgb: &[u8], w: u32, h: u32, cols: u32, rows: u32) -> V
                 diffusion: 0.0,
                 ..icy_sixel::EncodeOptions::default()
             };
-            match icy_sixel::sixel_encode(&rgba, w as usize, h as usize, &opts) {
-                Ok(data) => viz_sixel_lines(&data, cols, rows, Gutter::NONE),
-                Err(_) => blank(),
-            }
+            icy_sixel::sixel_encode(&rgba, w as usize, h as usize, &opts).ok()
         }
-        GraphicsProtocol::HalfBlock => blank(),
+        GraphicsProtocol::HalfBlock => None,
     }
 }
 
@@ -629,17 +599,6 @@ fn encode_png_rgb(rgb: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
         .write_image(rgb, w, h, image::ExtendedColorType::Rgb8)
         .ok()?;
     Some(png)
-}
-
-fn viz_kitty_lines(png: &[u8], cols: u32, rows: u32) -> Vec<String> {
-    // p=1 pins a single placement: re-transmitting each frame with the same
-    // image id + placement id REPLACES it in place rather than spawning a new
-    // placement every frame (which otherwise piles up and slows the terminal).
-    kitty_lines(&kitty_transmit_with(png, VIZ_IMAGE_ID, Some(1), cols, rows), cols, rows)
-}
-
-fn viz_iterm2_lines(png: &[u8], cols: u32, rows: u32) -> Vec<String> {
-    iterm2_lines(png, cols, rows)
 }
 
 /// Encode an indexed-color image as a sixel blob with a caller-supplied FIXED
@@ -702,168 +661,30 @@ pub(crate) fn sixel_encode_indexed(indices: &[u8], palette: &[(u8, u8, u8)], w: 
     out
 }
 
-/// Sixel viz block from pre-indexed pixels and a fixed palette — the
-/// shimmer-free path for the analysis spectrogram (see sixel_encode_indexed).
-/// A per-row text column drawn to the LEFT of a viz image — the analysis
-/// spectrogram's frequency legend. Every entry must occupy exactly `width`
-/// cells: the renderer advances the cursor by that count rather than measuring,
-/// so a row that disagrees shifts the image on that row alone.
-pub(crate) struct Gutter<'a> {
-    pub(crate) lines: &'a [String],
-    pub(crate) width: u32,
-}
-
-impl Gutter<'_> {
-    /// No legend — the image starts at the left edge of the block.
-    pub(crate) const NONE: Gutter<'static> = Gutter { lines: &[], width: 0 };
-}
-
-pub(crate) fn render_viz_sixel_indexed(
-    indices: &[u8],
-    palette: &[(u8, u8, u8)],
-    w: usize,
-    h: usize,
-    cols: u32,
-    rows: u32,
-    gutter: Gutter<'_>,
-) -> Vec<String> {
-    let data = sixel_encode_indexed(indices, palette, w, h);
-    viz_sixel_lines(&data, cols, rows, gutter)
-}
-
-fn viz_sixel_lines(data: &str, cols: u32, rows: u32, gutter: Gutter<'_>) -> Vec<String> {
-    // Every renderer returns EXACTLY `rows` lines, a zero-row budget (a window
-    // too short for any viz) included: one line there would make the block
-    // alternate between 0 lines (skip-emit frames) and 1 (emit frames).
-    if rows == 0 {
-        return Vec::new();
-    }
-    // Sixel pixels are ordinary cell content — no Kitty-style image layer or
-    // id-replacement. Two consequences: (1) the block must clear ITSELF (one
-    // erase pass over all rows here, before painting) because stale cells are
-    // never cleared elsewhere; (2) the caller must print the remaining rows
-    // without erase-to-EOL — an EL after this line has painted them wipes that
-    // row's slice of the image (seen on Windows Terminal: 16-row image reduced
-    // to a 1-row strip). See viz::analysis_needs_raw_lines.
-    // SCORC (ESC[u) restores without consuming the save, so it's used twice.
-    //
-    // That self-erase is also why the gutter can't simply be prefixed to these
-    // lines the way every other protocol takes it: ESC[2K wipes the WHOLE row,
-    // so text printed before the pass is gone by the time the image lands. Row
-    // 0's gutter is therefore emitted after the paint (cursor rewound with
-    // ESC[u), and the image is pushed right by a cursor-forward instead.
-    // Rows 1..N are separate lines printed later, so they just carry their own.
-    let skip_gutter = |s: &mut String| {
-        // CSI 0 C still moves one column, so an absent gutter must emit nothing.
-        if gutter.width > 0 {
-            let _ = write!(s, "\x1B[{}C", gutter.width);
-        }
-    };
-    let mut first = String::with_capacity(data.len() + 8 * rows as usize + 16);
-    first.push_str("\x1B[s");
-    for _ in 0..rows {
-        first.push_str("\x1B[2K\x1B[B");
-    }
-    first.push_str("\x1B[u");
-    skip_gutter(&mut first);
-    first.push_str(data);
-    first.push_str("\x1B[u");
-    match gutter.lines.first() {
-        Some(g) => first.push_str(g),
-        None => skip_gutter(&mut first),
-    }
-    let _ = write!(first, "\x1B[{}C", cols);
-    let skip = format!("\x1B[{}C", cols);
-    let mut lines = Vec::with_capacity(rows as usize);
-    lines.push(first);
-    for row in 1..rows as usize {
-        let mut line = String::with_capacity(skip.len() + gutter.width as usize + 16);
-        match gutter.lines.get(row) {
-            Some(g) => line.push_str(g),
-            None => skip_gutter(&mut line),
-        }
-        line.push_str(&skip);
-        lines.push(line);
-    }
-    lines
-}
-
-/// Render the cover to a Vec of COVER_ROWS lines, each COVER_COLS wide.
-/// For Kitty, line 0 carries the image-transmit escape plus blank spaces;
-/// subsequent lines are blank spaces that the image overlays.
-pub fn render(img: &CoverImage) -> Vec<String> {
+/// A cover's escape sequence, written with the cursor at the slot's top
+/// left (half-block is cells: see `draw`).
+fn image_payload(img: &CoverImage) -> String {
     let size = img.size();
     match img {
-        CoverImage::HalfBlock { width, height, pixels, .. } => {
-            render_half_block(*width, *height, pixels)
-        }
-        CoverImage::Kitty { png, .. } => render_kitty(png, size),
-        CoverImage::Iterm2 { png, .. } => render_iterm2(png, size),
-        CoverImage::Sixel { data, .. } => render_sixel(data, size),
+        CoverImage::HalfBlock { .. } => String::new(),
+        CoverImage::Kitty { png, .. } => kitty_transmit(png, size),
+        CoverImage::Iterm2 { png, .. } => iterm2_payload(png, size.cols, size.rows),
+        // Sixel draws from the cursor down and right.
+        CoverImage::Sixel { data, .. } => data.clone(),
     }
 }
 
-fn render_kitty(png: &[u8], size: CoverSize) -> Vec<String> {
-    kitty_lines(&kitty_transmit(png, size), size.cols, size.rows)
-}
-
-/// An image's cell block: the transmit escape on the first row followed by
-/// blanks, blank rows below — the cells the image is placed over.
-fn kitty_lines(transmit: &str, cols: u32, rows: u32) -> Vec<String> {
-    let blank = " ".repeat(cols as usize);
-    let mut lines = Vec::with_capacity(rows as usize);
-    lines.push(format!("{transmit}{blank}"));
-    for _ in 1..rows {
-        lines.push(blank.clone());
-    }
-    lines
-}
-
-fn render_sixel(data: &str, size: CoverSize) -> Vec<String> {
-    // Same trick as iTerm2: save cursor, blast the sixel data (which leaves
-    // the cursor in implementation-defined positions), restore, then advance
-    // by size.cols via cursor-right so we don't paint over the image cells.
-    let mut lines = Vec::with_capacity(size.rows as usize);
-    let mut first = String::with_capacity(data.len() + 16);
-    first.push_str("\x1B[s");
-    first.push_str(data);
-    first.push_str("\x1B[u");
-    let _ = write!(first, "\x1B[{}C", size.cols);
-    lines.push(first);
-    let skip = format!("\x1B[{}C", size.cols);
-    for _ in 1..size.rows {
-        lines.push(skip.clone());
-    }
-    lines
-}
-
-fn render_iterm2(png: &[u8], size: CoverSize) -> Vec<String> {
-    iterm2_lines(png, size.cols, size.rows)
-}
-
-/// An iTerm2 inline image (OSC 1337) over a cols x rows cell block. Save
-/// cursor, emit the image (which would otherwise leave the cursor in an
-/// implementation-defined position), restore cursor, then advance exactly
-/// `cols` cells. The image is "attached" to the cells it occupies; using
-/// `CSI n C` instead of literal spaces avoids overwriting those image cells on
-/// the rows below. One encoder for the cover and the analysis spectrogram.
-fn iterm2_lines(png: &[u8], cols: u32, rows: u32) -> Vec<String> {
+/// An iTerm2 inline image (OSC 1337) fitted to a cols x rows cell block.
+/// One encoder for the cover and the analysis spectrogram.
+fn iterm2_payload(png: &[u8], cols: u32, rows: u32) -> String {
     let b64 = base64_encode(png);
-    let mut first = String::with_capacity(b64.len() + 128);
-    first.push_str("\x1B[s\x1B]1337;File=size=");
-    let _ = write!(first, "{}", png.len());
-    let _ = write!(first, ";width={};height={};inline=1;preserveAspectRatio=1:", cols, rows);
-    first.push_str(&b64);
-    first.push('\x07');
-    first.push_str("\x1B[u");
-    let _ = write!(first, "\x1B[{}C", cols);
-    let skip = format!("\x1B[{}C", cols);
-    let mut lines = Vec::with_capacity(rows as usize);
-    lines.push(first);
-    for _ in 1..rows {
-        lines.push(skip.clone());
-    }
-    lines
+    let mut out = String::with_capacity(b64.len() + 128);
+    out.push_str("\x1B]1337;File=size=");
+    let _ = write!(out, "{}", png.len());
+    let _ = write!(out, ";width={};height={};inline=1;preserveAspectRatio=1:", cols, rows);
+    out.push_str(&b64);
+    out.push('\x07');
+    out
 }
 
 fn kitty_transmit(png: &[u8], size: CoverSize) -> String {
@@ -943,30 +764,33 @@ mod slot_tests {
     use super::*;
 
     #[test]
-    fn empty_slot_is_blank_and_matches_the_reserved_box() {
-        // The slot must occupy exactly its reserved cells whether or not there
-        // is artwork — a short row would let the │ separator beside it jump.
+    fn an_empty_slot_is_blank_and_exactly_the_reserved_height() {
         for size in [CoverSize::MINIMAL, CoverSize::CLASSIC] {
-            let lines = empty_slot_lines(size);
-            assert_eq!(lines.len(), size.rows as usize, "row count");
-            for l in &lines {
-                // Escapes (the Kitty delete) carry no width, so measure visibly.
-                assert_eq!(crate::ansi::visible_len(l), size.cols as usize);
-                assert!(
-                    l.chars().all(|c| c == ' ' || c == '\x1B' || c.is_ascii_graphic()),
-                    "empty slot should paint nothing but blanks: {l:?}"
-                );
+            for repaint in [false, true] {
+                match draw(None, size, repaint) {
+                    CoverDraw::Cells(lines) => {
+                        assert_eq!(lines.len(), size.rows as usize);
+                        assert!(lines.iter().all(|l| crate::tui::plain(l).trim().is_empty()));
+                    }
+                    CoverDraw::Image(_) => panic!("no artwork places no image"),
+                }
             }
         }
     }
 
     #[test]
-    fn passive_and_empty_slots_agree_on_width() {
-        // Unchanged frames step past the slot; empty frames blank it. Both must
-        // land the cursor in the same column or the row's tail shifts.
-        let size = CoverSize::MINIMAL;
-        assert_eq!(passive_lines(size).len(), size.rows as usize);
-        assert_eq!(empty_slot_lines(size).len(), size.rows as usize);
+    fn half_block_covers_are_cells_two_pixel_rows_each() {
+        let (w, h) = (3, 5);
+        let pixels: Vec<u8> = (0..w * h * 3).map(|i| i as u8).collect();
+        let lines = half_block_lines(w as u32, h as u32, &pixels);
+        assert_eq!(lines.len(), 3, "an odd last row still takes a cell row");
+        for l in &lines {
+            assert_eq!(crate::tui::Cols::cols(l), w);
+            assert!(crate::tui::plain(l).chars().all(|c| c == '▀'));
+        }
+        // The last row has no lower half: no background.
+        assert!(lines[2].spans.iter().all(|s| s.style.bg.is_none()));
+        assert!(lines[0].spans.iter().all(|s| s.style.bg.is_some()));
     }
 }
 
@@ -1064,29 +888,6 @@ mod viz_sixel_tests {
     }
 
     #[test]
-    fn viz_sixel_first_line_erases_whole_block_before_painting() {
-        // Sixel pixels are ordinary cell content. The block must erase all of
-        // its rows up front, inside the same line as the transmit — if the
-        // caller erased rows 2..N after this line painted them, the image
-        // would be wiped down to a 1-row strip (observed on Windows Terminal).
-        let lines = viz_sixel_lines("SIXELDATA", 120, 16, Gutter::NONE);
-        assert_eq!(lines.len(), 16);
-        let erase_pass = "\x1B[2K\x1B[B".repeat(16);
-        let want_prefix = format!("\x1B[s{}\x1B[u", erase_pass);
-        assert!(
-            lines[0].starts_with(&want_prefix),
-            "first line must erase all rows before painting, got start: {:?}",
-            &lines[0][..lines[0].len().min(40)]
-        );
-        assert!(lines[0].contains("SIXELDATA"));
-        assert!(lines[0].ends_with("\x1B[u\x1B[120C"));
-    }
-
-    
-    
-    
-    
-    #[test]
     fn sixel_indexed_emits_fixed_palette_and_rle() {
         // 8×6 image, all palette index 0 → one band, every column has all six
         // bits set (char 63+63='~'), run of 8 (>3) uses RLE: "!8~".
@@ -1112,60 +913,10 @@ mod viz_sixel_tests {
     }
 
     #[test]
-    fn viz_sixel_gutter_is_drawn_after_the_erase_pass() {
-        // The block erases all its rows before painting, so a legend prefixed
-        // to row 0 the ordinary way would be wiped by that pass. Row 0's
-        // gutter has to come after the paint, with the image pushed right by a
-        // cursor-forward instead.
-        let gutter: Vec<String> = (0..4).map(|i| format!("{i:>3}|")).collect();
-        let lines = viz_sixel_lines("SIXELDATA", 80, 4, Gutter { lines: &gutter, width: 4 });
-        assert_eq!(lines.len(), 4);
-        let erase_pass = "\x1B[2K\x1B[B".repeat(4);
-        assert_eq!(
-            lines[0],
-            format!("\x1B[s{erase_pass}\x1B[u\x1B[4CSIXELDATA\x1B[u  0|\x1B[80C")
-        );
-        // No gutter text may appear before the erase pass finishes.
-        let paint_start = lines[0].find("SIXELDATA").unwrap();
-        assert!(!lines[0][..paint_start].contains("0|"));
-    }
-
-    #[test]
-    fn viz_sixel_gutter_rows_advance_past_gutter_and_image() {
-        // Each row must leave the cursor at the same column, or the next
-        // frame's lines start at staggered offsets.
-        let gutter: Vec<String> = (0..4).map(|i| format!("{i:>3}|")).collect();
-        let lines = viz_sixel_lines("SIXELDATA", 80, 4, Gutter { lines: &gutter, width: 4 });
-        for (row, line) in lines.iter().enumerate().skip(1) {
-            assert_eq!(*line, format!("{:>3}|\x1B[80C", row));
-        }
-    }
-
-    #[test]
-    fn viz_sixel_without_gutter_emits_no_zero_width_cursor_move() {
-        // CSI 0 C moves one column on most terminals — a stray one would shear
-        // the image one cell right of the legend-free block.
-        let lines = viz_sixel_lines("SIXELDATA", 80, 4, Gutter::NONE);
-        for line in &lines {
-            assert!(!line.contains("\x1B[0C"), "zero-width cursor move in {line:?}");
-        }
-    }
-
-    #[test]
-    fn viz_sixel_skip_lines_write_nothing_destructive() {
-        // Rows 2..N must be pure cursor-right skips: no erase, no spaces —
-        // anything that touches the cells wipes that row's slice of the image.
-        let lines = viz_sixel_lines("SIXELDATA", 80, 4, Gutter::NONE);
-        for line in &lines[1..] {
-            assert_eq!(line, "\x1B[80C");
-        }
-    }
-
-    #[test]
     fn sixel_cover_never_outgrows_its_slot() {
-        // The cover must fit the slot even on the smallest plausible cell, and
-        // end on a whole sixel band so the cursor lands inside the slot.
-        let (cw, ch) = crate::viz::SIXEL_CELL_FLOOR;
+        // The cover must fit the slot at the cell it is sized for, and end on
+        // a whole sixel band so the cursor lands inside the slot.
+        let (cw, ch) = crate::viz::sixel_cell();
         for size in [CoverSize::CLASSIC, CoverSize::MINIMAL] {
             let (w, h) = size.sixel_px();
             assert!(w as usize <= size.cols as usize * cw, "width {w} overflows {} cols", size.cols);
@@ -1234,12 +985,4 @@ mod viz_sixel_tests {
         assert_eq!(protocol_from_env(None, Some("xterm-kitty"), false, None, false, false), GraphicsProtocol::Kitty);
     }
 
-    #[test]
-    fn a_zero_row_sixel_block_emits_nothing() {
-        let palette = [(0u8, 0u8, 0u8)];
-        let lines = render_viz_sixel_indexed(&[0; 36], &palette, 6, 6, 4, 0, Gutter::NONE);
-        assert!(lines.is_empty(), "0-row budget produced {} lines", lines.len());
-        let one = render_viz_sixel_indexed(&[0; 36], &palette, 6, 6, 4, 1, Gutter::NONE);
-        assert_eq!(one.len(), 1);
-    }
 }

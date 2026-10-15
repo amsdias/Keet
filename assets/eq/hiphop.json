@@ -1,0 +1,15 @@
+{
+  "name": "Hip-Hop",
+  "bands": [
+    { "type": "peak",       "freq": 31,    "gain": 0.0,  "q": 0.71 },
+    { "type": "low_shelf",  "freq": 70,    "gain": 4.0,  "q": 0.71 },
+    { "type": "peak",       "freq": 100,   "gain": 2.0,  "q": 0.9 },
+    { "type": "peak",       "freq": 300,   "gain": -1.5, "q": 1.0 },
+    { "type": "peak",       "freq": 600,   "gain": 0.0,  "q": 0.71 },
+    { "type": "peak",       "freq": 1000,  "gain": 0.0,  "q": 0.71 },
+    { "type": "peak",       "freq": 2500,  "gain": 2.0,  "q": 1.0 },
+    { "type": "peak",       "freq": 5000,  "gain": 0.0,  "q": 0.71 },
+    { "type": "high_shelf", "freq": 9000,  "gain": 2.0,  "q": 0.71 },
+    { "type": "peak",       "freq": 16000, "gain": 0.0,  "q": 0.71 }
+  ]
+}

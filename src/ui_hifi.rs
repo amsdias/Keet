@@ -3,121 +3,100 @@
 //! Amber-CRT studio-monitor aesthetic. Matches `variant-c-screens.jsx`:
 //! double-line header strip + transport row with segmented time box +
 //! single-bordered VU panel with dB scale + knob rack + dot-marquee key bar.
-//!
-//! Same line-count contract as Classic and Minimal: returns lines drawn
-//! *below* the anchor (line 1). The anchor is the header strip's top edge.
+//! The boxes are ratatui blocks; the widest a screen grows is
+//! `HIFI_MAX_INNER` columns inside its borders, so it stays poster-like.
 
 
-use std::path::PathBuf;
+use crate::tui::Cols;
 use std::sync::atomic::Ordering;
 
-use crossterm::terminal;
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Style};
+use ratatui::text::Line;
+use ratatui::widgets::{Block, BorderType, Padding, Paragraph};
+use ratatui::Frame;
 
-use crate::ansi::{truncate_ansi, visible_len};
-use crate::state::{InputMode, PlayerState, UiState};
-use crate::theme::{palette, ThemeKind};
-use crate::viz::StatsMonitor;
+use crate::state::Hit;
+use crate::theme::{palette, Palette, ThemeKind};
+use crate::tui::{self, LineBuf};
+use crate::ui::Ctx;
 
-#[allow(clippy::too_many_arguments)] // cohesive render context; bundling into a struct adds no clarity
-pub fn print_status_hifi(
-    state: &PlayerState,
-    ui: &mut UiState,
-    name: &str,
-    eq_preset: &crate::eq::EqPreset,
-    fx_name: &str,
-    cf_name: &str,
-    stats: &mut StatsMonitor,
-    prev_viz_lines: usize,
-) -> usize {
+/// HiFi's renderer for the player, library and lyrics views.
+/// HiFi's player view (the playlist and the lyrics are panels over it).
+pub fn draw(f: &mut Frame, cx: &mut Ctx) {
+    draw_player(f, cx)
+}
+
+/// Narrowest box interior HiFi lays out for (a 34-column window). Below that
+/// the window edge cuts it.
+const HIFI_MIN_INNER: usize = 30;
+/// Widest box interior: the design stays poster-like on very wide windows.
+const HIFI_MAX_INNER: usize = 110;
+
+/// Columns inside the boxes for a window `term_w` wide.
+fn inner_width(term_w: usize) -> usize {
+    term_w.saturating_sub(4).clamp(HIFI_MIN_INNER, HIFI_MAX_INNER)
+}
+
+/// A box `inner_w` columns wide inside its borders, `inner_h` rows tall,
+/// two columns in from the left and `y` rows down; cut to the window.
+fn box_area(area: Rect, y: usize, inner_w: usize, inner_h: usize) -> Rect {
+    Rect { x: area.x + 2, y: area.y + y as u16, width: inner_w as u16 + 2, height: inner_h as u16 + 2 }.intersection(area)
+}
+
+/// The double-line header strip: `left` at its start, `right` at its end.
+fn header_strip(f: &mut Frame, area: Rect, inner_w: usize, p: &Palette, left: Line<'static>, right: Line<'static>) {
+    let row_inner_w = inner_w.saturating_sub(2);
+    let pad = row_inner_w.saturating_sub(left.cols() + right.cols());
+    let mut row = LineBuf::new();
+    row.append(left).reset().spaces(pad).append(right);
+    let block = Block::bordered().border_type(BorderType::Double).border_style(p.fg).padding(Padding::horizontal(1));
+    f.render_widget(Paragraph::new(row.into_line()).block(block), box_area(area, 0, inner_w, 1));
+}
+
+fn draw_player(f: &mut Frame, cx: &mut Ctx) {
     let p = palette(ThemeKind::HiFi);
-    let term_w = terminal::size().map(|(w, _)| w as usize).unwrap_or(120);
-
-    if prev_viz_lines != usize::MAX && prev_viz_lines > 0 {
-        crate::term::out!("\x1B[{}F", prev_viz_lines);
-    }
+    let area = f.area();
+    let term_w = area.width as usize;
+    let state = cx.state;
 
     // Pull metadata
     let idx = state.current_track.load(Ordering::Relaxed);
-    let title = ui
-        .metadata_cache
-        .title(idx)
-        .unwrap_or_else(|| name.to_string());
-    let (artist, album) = ui.metadata_cache.artist_album(idx);
+    let title = cx.ui.metadata_cache.title(idx).unwrap_or_else(|| cx.name.to_string());
+    let (artist, album) = cx.ui.metadata_cache.artist_album(idx);
 
     // Buffer pct (smoothed)
     let buf = state.buffer_level.load(Ordering::Relaxed);
     let ring_cap = state.ring_capacity.load(Ordering::Relaxed).max(1);
-    stats.update_buf(buf as f32 / ring_cap as f32 * 100.0);
-    let buf_pct = stats.smoothed_buf_pct as u32;
+    cx.stats.update_buf(buf as f32 / ring_cap as f32 * 100.0);
+    let buf_pct = cx.stats.smoothed_buf_pct as u32;
 
     // Width budget. Keep the cap modest so the design stays poster-like
     // even on very wide terminals; below it the layout follows the window down
-    // to HIFI_MIN_INNER (it had a 60-column floor, and a narrower window cut
-    // off every right border and the last knob).
-    let inner_w = term_w.saturating_sub(4).clamp(HIFI_MIN_INNER, 110);
+    // to HIFI_MIN_INNER.
+    let inner_w = inner_width(term_w);
 
-    // === Anchor (line 1): top edge of header strip (double border) ===
-    let mut w = crate::ui::FrameWriter::fitted();
-    let top = format!("╔{}╗", "═".repeat(inner_w));
-    w.first_line(&format!("  {fg}{bar}{rst}", fg = p.fg, rst = p.reset, bar = top));
-
-    // === Header strip content row: K E E T │ ▶ PLAY · SHUF-ON · RPT-ALL  ...  TRACK 05 / 34 ===
+    // === Header strip: K E E T │ ▶ PLAY · SHUF-ON · RPT-ALL  ...  TRACK 05 / 34 ===
     let track_n = state.current_track.load(Ordering::Relaxed) + 1;
     let track_total = state.total_tracks.load(Ordering::Relaxed);
-    let shuffle_on = ui.shuffle;
+    let shuffle_on = cx.ui.shuffle;
     let repeat_label = repeat_short(state.repeat_mode());
     let play_label = if state.is_paused() { "⏸ PAUSE" } else { "▶ PLAY" };
-
-    let mut header_left = String::new();
-    header_left.push_str(&format!(
-        "{accent}{bold}K E E T{rst}",
-        accent = p.accent, bold = p.bold, rst = p.reset,
-    ));
-    header_left.push_str(&format!("  {dim}│{rst}  ", dim = p.dim, rst = p.reset));
-    header_left.push_str(&format!(
-        "{accent}{play}{rst}",
-        accent = p.accent, rst = p.reset, play = play_label,
-    ));
-    header_left.push_str(&format!("  {dim}·{rst}  ", dim = p.dim, rst = p.reset));
+    let mut left = LineBuf::new();
+    left.styled("K E E T", p.accent.patch(p.bold)).reset().push_str("  ").styled("│", p.dim).reset().push_str("  ");
+    left.styled(play_label, p.accent).reset().push_str("  ").styled("·", p.dim).reset().push_str("  ");
     // Spelled out, like RPT-OFF/ALL/ONE: brightness alone is colour alone.
-    header_left.push_str(&format!(
-        "{c}{label}{rst}",
-        c = if shuffle_on { p.fg } else { p.dim }, rst = p.reset,
-        label = if shuffle_on { "SHUF-ON" } else { "SHUF-OFF" },
-    ));
-    header_left.push_str(&format!("  {dim}·{rst}  ", dim = p.dim, rst = p.reset));
-    header_left.push_str(&format!(
-        "{c}{rep}{rst}",
-        c = if repeat_label != "RPT-OFF" { p.fg } else { p.dim }, rst = p.reset, rep = repeat_label,
-    ));
-    let header_right = format!(
-        "{dim}TRACK{rst} {fg}{n:02}{rst} {dim}/ {tot}{rst}",
-        dim = p.dim, fg = p.fg, rst = p.reset, n = track_n, tot = track_total,
-    );
-
+    left.styled(if shuffle_on { "SHUF-ON" } else { "SHUF-OFF" }, if shuffle_on { p.fg } else { p.dim });
+    left.reset().push_str("  ").styled("·", p.dim).reset().push_str("  ");
+    left.styled(repeat_label, if repeat_label != "RPT-OFF" { p.fg } else { p.dim });
+    let mut right = LineBuf::new();
+    right.styled("TRACK", p.dim).reset().push(' ').styled(&format!("{track_n:02}"), p.fg).reset().push(' ').styled(&format!("/ {track_total}"), p.dim);
     // Narrow window: the track counter goes first, then the left side is
-    // cut, so the row still ends on its border.
+    // cut (by the box), so the row still ends on its border.
+    let (left, right) = (left.into_line(), right.into_line());
     let row_inner_w = inner_w.saturating_sub(2);
-    let (header_left, header_right) = if visible_len(&header_left) + 2 + visible_len(&header_right) > row_inner_w {
-        (crate::ansi::truncate_ansi(&header_left, row_inner_w), String::new())
-    } else {
-        (header_left, header_right)
-    };
-    let lvis = visible_len(&header_left);
-    let rvis = visible_len(&header_right);
-    let hpad = row_inner_w.saturating_sub(lvis + rvis);
-    w.line(&format!(
-        "  {fg}║{rst} {left}{rst}{gap}{right} {fg}║{rst}",
-        fg = p.fg, rst = p.reset,
-        left = header_left, gap = " ".repeat(hpad), right = header_right,
-    ));
-
-    // === Bottom edge of header strip ===
-    let header_bot = format!("╚{}╝", "═".repeat(inner_w));
-    w.line(&format!("  {fg}{bar}{rst}", fg = p.fg, rst = p.reset, bar = header_bot));
-
-    // Spacer
-    w.line("");
+    let right = if left.cols() + 2 + right.cols() > row_inner_w { Line::default() } else { right };
+    header_strip(f, area, inner_w, p, left, right);
 
     // === Transport row: segmented time box (3 lines) + title/meta/progress on right ===
     let progress = if state.total_secs() > 0.0 {
@@ -126,14 +105,14 @@ pub fn print_status_hifi(
     let cur = format_time(state.time_secs());
     let tot = format_time(state.total_secs());
 
-    // Segmented time box (single border, per CSS in mock):
-    //   ┌─────────┐
-    //   │  02:28  │
-    //   └─────────┘
-    let seg_w = 9; // inner width including spaces around time
-    let seg_top = format!("┌{}┐", "─".repeat(seg_w));
-    let seg_mid_inner = pad_or_truncate(&format!(" {} ", cur), seg_w);
-    let seg_bot = format!("└{}┘", "─".repeat(seg_w));
+    // Segmented time box (single border, per CSS in mock).
+    const SEG_W: usize = 9; // inner width including spaces around time
+    let seg = Rect { x: area.x + 2, y: area.y + 4, width: SEG_W as u16 + 2, height: 3 }.intersection(area);
+    let seg_text = pad_or_truncate(&format!(" {cur} "), SEG_W);
+    f.render_widget(
+        Paragraph::new(tui::line(seg_text, p.accent.patch(p.bold))).block(Block::bordered().border_style(p.fg)),
+        seg,
+    );
 
     // Right column: title (UPPERCASE bold accent), meta, then progress + " / 04:32"
     let title_up = title.to_uppercase();
@@ -157,107 +136,55 @@ pub fn print_status_hifi(
     meta.push_str(&rate_part);
 
     // Right column width = inner_w - seg_box_total_w - gap
-    let seg_total_w = seg_w + 2; // borders included
+    let seg_total_w = SEG_W + 2; // borders included
     let gap_left = 4; // spacing between seg box and right column
     let right_w = inner_w.saturating_sub(seg_total_w + gap_left).max(8);
-
-    // Row 1: seg_top  +  title (right column)
-    let title_truncated = pad_or_truncate(&title_up, right_w);
-    w.line(&format!(
-        "  {fg}{seg}{rst}{gap}{accent}{bold}{title}{rst}",
-        fg = p.fg, accent = p.accent, bold = p.bold, rst = p.reset,
-        seg = seg_top,
-        gap = " ".repeat(gap_left),
-        title = title_truncated,
-    ));
-
-    // Row 2: seg_mid  +  meta
-    let meta_truncated = pad_or_truncate(&meta, right_w);
-    w.line(&format!(
-        "  {fg}│{rst}{accent}{bold}{val}{rst}{fg}│{rst}{gap}{dim}{meta}{rst}",
-        fg = p.fg, accent = p.accent, bold = p.bold, dim = p.dim, rst = p.reset,
-        val = seg_mid_inner,
-        gap = " ".repeat(gap_left),
-        meta = meta_truncated,
-    ));
-
-    // Row 3: seg_bot  +  progress + " / TOTAL"
-    let bar_w = right_w.saturating_sub(visible_len(&tot) + 4).max(2);
-    let bar = render_solid_bar(progress, bar_w);
-    w.line(&format!(
-        "  {fg}{seg}{rst}{gap}{accent}{bar}{rst}  {dim}/ {tot}{rst}",
-        fg = p.fg, accent = p.accent, dim = p.dim, rst = p.reset,
-        seg = seg_bot,
-        gap = " ".repeat(gap_left),
-        bar = bar, tot = tot,
-    ));
-
+    let bar_w = right_w.saturating_sub(tui::width(&tot) + 4).max(2);
+    let mut bar_row = LineBuf::new();
+    bar_row.append(render_solid_bar(progress, bar_w, p)).reset().push_str("  ").styled(&format!("/ {tot}"), p.dim);
+    let mut right_col = vec![
+        tui::line(pad_or_truncate(&title_up, right_w), p.accent.patch(p.bold)),
+        tui::line(pad_or_truncate(&meta, right_w), p.dim),
+        bar_row.into_line(),
+    ];
     // Exclusive mode: the signal path verdict under the progress bar, in the
     // spacer row (an empty row otherwise).
-    let verdict = crate::signal::verdict(&crate::signal::PathInputs::from_state(state, fx_name, cf_name));
-    match crate::signal::fitted(&verdict, "  ·  ", right_w) {
-        Some((ok, text)) => w.line(&format!(
-            "  {pad}{c}{text}{rst}",
-            pad = " ".repeat(seg_total_w + gap_left),
-            c = if ok { p.good } else { p.warn },
-            rst = p.reset,
-            text = text.to_uppercase(),
-        )),
-        None => w.line(""),
+    let verdict = crate::signal::verdict(&crate::signal::PathInputs::from_state(state, cx.fx_name, cx.cf_name));
+    if let Some((ok, text)) = crate::signal::fitted(&verdict, "  ·  ", right_w) {
+        right_col.push(tui::line(text.to_uppercase(), if ok { p.good } else { p.warn }));
     }
+    let right_x = 2 + seg_total_w + gap_left;
+    let bar = Rect { x: area.x + right_x as u16, y: area.y + 6, width: bar_w as u16, height: 1 };
+    cx.ui.hits.push((bar.intersection(area), Hit::Seek));
+    let right_area = Rect { x: area.x + right_x as u16, y: area.y + 4, width: term_w.saturating_sub(right_x) as u16, height: 4 }.intersection(area);
+    tui::draw_lines(f.buffer_mut(), right_area, &right_col);
 
     // === VU panel (single border) ===
     let (lp, rp) = state.get_peaks();
     let (lp_dot, rp_dot) = state.get_vu_dots();
-    w.line(&format!(
-        "  {fg}┌{bar}┐{rst}",
-        fg = p.fg, rst = p.reset, bar = "─".repeat(inner_w),
-    ));
-
-    // Label row inside box. Inner content between the two `│` chars must span
-    // `inner_w` columns to match the box top `┌─*inner_w┐`. The format adds a
-    // leading and trailing space inside, so the label itself is `inner_w - 2`.
-    w.line(&format!(
-        "  {fg}│{rst}{row}{fg}│{rst}",
-        fg = p.fg, rst = p.reset,
-        row = vu_label_row(inner_w, state.is_clipping(), p),
-    ));
-
-    // L/R bars: row inner content (between │ │) is " L {bar}{tail} " — that's
-    // 4 fixed chars (lead space, L, space, trailing space) + meter_w + l_pad.
-    // Solve for l_pad so that 4 + meter_w + l_pad == inner_w.
     let meter_w = inner_w.saturating_sub(8).max(8);
-    let l_bar = vu_bar(lp, lp_dot, meter_w, p);
-    let r_bar = vu_bar(rp, rp_dot, meter_w, p);
     let l_pad = inner_w.saturating_sub(meter_w + 4);
-    w.line(&format!(
-        "  {fg}│{rst} {dim}L{rst} {bar}{tail} {fg}│{rst}",
-        fg = p.fg, dim = p.dim, rst = p.reset, bar = l_bar, tail = " ".repeat(l_pad),
-    ));
-    w.line(&format!(
-        "  {fg}│{rst} {dim}R{rst} {bar}{tail} {fg}│{rst}",
-        fg = p.fg, dim = p.dim, rst = p.reset, bar = r_bar, tail = " ".repeat(l_pad),
-    ));
+    let channel = |label: &str, bar: Line<'static>| {
+        let mut l = LineBuf::new();
+        l.push(' ').styled(label, p.dim).reset().push(' ').append(bar).reset().spaces(l_pad + 1);
+        l.into_line()
+    };
+    let mut scale = LineBuf::new();
+    scale.push_str("   ").append(render_db_scale(meter_w, p));
+    let vu = [
+        vu_label_row(inner_w, state.is_clipping(), p),
+        channel("L", vu_bar(lp, lp_dot, meter_w, p)),
+        channel("R", vu_bar(rp, rp_dot, meter_w, p)),
+        scale.into_line(),
+    ];
+    let vu_area = box_area(area, 8, inner_w, 4);
+    // HiFi's visualization is this panel (`viz_on_screen` asks where it was).
+    if !vu_area.is_empty() {
+        cx.ui.viz_drawn_at = Some(vu_area);
+    }
+    f.render_widget(Paragraph::new(vu.to_vec()).block(Block::bordered().border_style(p.fg)), vu_area);
 
-    // dB scale row: `   {scale}{tail} ` must total `inner_w`.
-    let scale = render_db_scale(meter_w, p);
-    let scale_visible = visible_len(&scale);
-    let scale_pad = inner_w.saturating_sub(scale_visible + 4);
-    w.line(&format!(
-        "  {fg}│{rst}   {scale}{tail} {fg}│{rst}",
-        fg = p.fg, rst = p.reset, scale = scale, tail = " ".repeat(scale_pad),
-    ));
-
-    // Bottom
-    w.line(&format!(
-        "  {fg}└{bar}┘{rst}",
-        fg = p.fg, rst = p.reset, bar = "─".repeat(inner_w),
-    ));
-
-    // Spacer
-    w.line("");
-
-    // === Knob rack: 6 cells, single border each ===
+    // === Knob rack: a bordered cell per setting ===
     let vol = state.volume.load(Ordering::Relaxed);
     let bal_val = state.balance_value();
     let bal_str = if bal_val == 0 {
@@ -267,108 +194,70 @@ pub fn print_status_hifi(
     } else {
         format!("R{}", bal_val)
     };
-    let knobs: Vec<(&str, String, bool)> = vec![
-        ("VOL",   format!("{}", vol),                   false),
-        ("EQ",    eq_preset.name.to_uppercase(),        false),
-        ("FX",    fx_name.to_uppercase(),               false),
-        ("XFEED", cf_name.to_uppercase(),               false),
-        ("BAL",   bal_str,                              false),
-        ("BUF",   format!("{}", buf_pct),               buf_pct >= 60),
+    let knobs: Vec<(&str, String, &str, bool)> = vec![
+        ("VOL",   format!("{}", vol),                   "%", false),
+        ("EQ",    cx.eq_preset.name.to_uppercase(),     "",  false),
+        ("FX",    cx.fx_name.to_uppercase(),            "",  false),
+        ("XFEED", cx.cf_name.to_uppercase(),            "",  false),
+        ("BAL",   bal_str,                              "",  false),
+        ("BUF",   format!("{}", buf_pct),               "%", buf_pct >= 60),
     ];
-    let knob_unit: Vec<&str> = vec!["%", "", "", "", "", "%"];
     // As many knobs as the width holds (minimum cell 8 + 1 gap), in this
     // order, rather than one cut at the window edge.
     let fit = ((inner_w + 1) / 9).clamp(1, knobs.len());
     let knobs = &knobs[..fit];
-
-    // Knob cell width: total inner / 6 minus gap
     let gap_w = 1usize;
-    let cell_w = (inner_w.saturating_sub(gap_w * (knobs.len() - 1))) / knobs.len();
-    let cell_w = cell_w.clamp(8, 14);
+    let cell_w = (inner_w.saturating_sub(gap_w * (knobs.len() - 1)) / knobs.len()).clamp(8, 14);
     let total_used = cell_w * knobs.len() + gap_w * (knobs.len() - 1);
     let lead = 2 + (inner_w.saturating_sub(total_used) / 2);
-
-    let mut top_row = String::new();
-    let mut label_row = String::new();
-    let mut value_row = String::new();
-    let mut bot_row = String::new();
-    top_row.push_str(&" ".repeat(lead));
-    label_row.push_str(&" ".repeat(lead));
-    value_row.push_str(&" ".repeat(lead));
-    bot_row.push_str(&" ".repeat(lead));
-    for (i, (label, value, good)) in knobs.iter().enumerate() {
-        if i > 0 {
-            top_row.push(' ');
-            label_row.push(' ');
-            value_row.push(' ');
-            bot_row.push(' ');
+    let cell_inner = cell_w.saturating_sub(2);
+    for (i, (label, value, unit, good)) in knobs.iter().enumerate() {
+        let x = lead + i * (cell_w + gap_w);
+        let knob = Rect { x: area.x + x as u16, y: area.y + 15, width: cell_w as u16, height: 4 }.intersection(area);
+        // Label: dim, centred.
+        let lw = tui::width(label);
+        let mut label_row = LineBuf::new();
+        label_row.spaces(cell_inner.saturating_sub(lw) / 2).styled(label, p.dim);
+        // Value: bold, accent (or good), with an optional dim unit. A long
+        // (custom) preset name is cut to the cell.
+        let unit_w = if unit.is_empty() { 0 } else { 1 + tui::width(unit) };
+        let value = crate::ansi::truncate_plain(value, cell_inner.saturating_sub(unit_w));
+        let val_w = tui::width(&value) + unit_w;
+        let mut value_row = LineBuf::new();
+        value_row.spaces(cell_inner.saturating_sub(val_w) / 2).styled(&value, p.bold.patch(if *good { p.good } else { p.accent }));
+        if !unit.is_empty() {
+            value_row.reset().push(' ').styled(unit, p.dim);
         }
-        top_row.push_str(&format!(
-            "{fg}┌{bar}┐{rst}",
-            fg = p.fg, rst = p.reset, bar = "─".repeat(cell_w.saturating_sub(2)),
-        ));
-        let cell_inner = cell_w.saturating_sub(2);
-        // Label row: dim, centered.
-        let pl = visible_len(label);
-        let lpad = (cell_inner.saturating_sub(pl)) / 2;
-        let rpad = cell_inner.saturating_sub(pl + lpad);
-        label_row.push_str(&format!(
-            "{fg}│{rst}{lp}{dim}{label}{rst}{rp}{fg}│{rst}",
-            fg = p.fg, dim = p.dim, rst = p.reset,
-            lp = " ".repeat(lpad), rp = " ".repeat(rpad), label = label,
-        ));
-        // Value row: bold accent, with optional dim unit suffix.
-        let unit = knob_unit[i];
-        let val_color = if *good { p.good } else { p.accent };
-        // A long (custom) preset name pushed the cell — and every cell after
-        // it — past the box: cut it to the cell.
-        let unit_w = if unit.is_empty() { 0 } else { 1 + visible_len(unit) };
-        let value = &crate::ansi::truncate_plain(value, cell_inner.saturating_sub(unit_w));
-        let val_visible = visible_len(value) + unit_w;
-        let v_lpad = (cell_inner.saturating_sub(val_visible)) / 2;
-        let v_rpad = cell_inner.saturating_sub(val_visible + v_lpad);
-        let val_styled = if unit.is_empty() {
-            format!(
-                "{bold}{vc}{val}{rst}",
-                bold = p.bold, vc = val_color, rst = p.reset, val = value,
-            )
-        } else {
-            format!(
-                "{bold}{vc}{val}{rst} {dim}{unit}{rst}",
-                bold = p.bold, vc = val_color, rst = p.reset,
-                dim = p.dim, val = value, unit = unit,
-            )
-        };
-        value_row.push_str(&format!(
-            "{fg}│{rst}{lp}{val}{rp}{fg}│{rst}",
-            fg = p.fg, rst = p.reset,
-            lp = " ".repeat(v_lpad), val = val_styled, rp = " ".repeat(v_rpad),
-        ));
-        bot_row.push_str(&format!(
-            "{fg}└{bar}┘{rst}",
-            fg = p.fg, rst = p.reset, bar = "─".repeat(cell_w.saturating_sub(2)),
-        ));
+        let rows = vec![label_row.into_line(), value_row.into_line()];
+        f.render_widget(Paragraph::new(rows).block(Block::bordered().border_style(p.fg)), knob);
     }
-    w.line(&top_row);
-    w.line(&label_row);
-    w.line(&value_row);
-    w.line(&bot_row);
-
-    // Spacer
-    w.line("");
 
     // === Marquee key bar ===
-    let footer = if let Some(msg) = ui.active_status() {
-        format!("  {accent}{msg}{rst}", accent = p.accent, rst = p.reset, msg = msg)
-    } else {
-        hifi_marquee_keys(p, term_w)
-    };
-    w.line(&truncate_ansi(&footer, term_w));
+    if !crate::ui::draw_status_line(f, cx.ui, tui::rows(area, 20, 1), p) {
+        let keys = hifi_marquee_keys(p, term_w);
+        keys.register(&mut cx.ui.hits, area.x, area.y + 20);
+        tui::draw_lines(f.buffer_mut(), tui::rows(area, 20, 1), &[keys.line]);
+    }
 
-    crate::term::out!("\x1B[J");
-    crate::term::flush();
+    // Docked panels go below the key bar, when the window has the rows.
+    if let Some(region) = dock_region(area) {
+        let dock = crate::ui::dock(cx.ui, false, region);
+        crate::ui::draw_docked(f, cx, &dock.panels);
+    }
+}
 
-    w.count()
+/// Rows below the key bar a panel needs before it can dock there.
+pub const DOCK_ROWS: u16 = 10;
+
+/// Where docked panels go in a window `area`: the rows below the key bar,
+/// as wide as the boxes above; None when there are fewer than `DOCK_ROWS`.
+pub fn dock_region(area: Rect) -> Option<Rect> {
+    const TOP: u16 = 21;
+    let rows = area.height.checked_sub(TOP)?;
+    (rows >= DOCK_ROWS).then(|| {
+        let w = inner_width(area.width as usize) as u16 + 2;
+        Rect { x: area.x + 2, y: area.y + TOP, width: w.min(area.width.saturating_sub(2)), height: rows }
+    })
 }
 
 fn repeat_short(mode: crate::state::RepeatMode) -> &'static str {
@@ -380,7 +269,7 @@ fn repeat_short(mode: crate::state::RepeatMode) -> &'static str {
     }
 }
 
-fn render_db_scale(meter_w: usize, p: &crate::theme::Palette) -> String {
+fn render_db_scale(meter_w: usize, p: &Palette) -> Line<'static> {
     let labels: &[(&str, f32, bool /*red*/)] = &[
         ("-∞", 0.00, false),
         ("-30", 0.20, false),
@@ -390,43 +279,37 @@ fn render_db_scale(meter_w: usize, p: &crate::theme::Palette) -> String {
         ("-3",  0.85, false),
         ("0dB", 1.00, true),
     ];
-    let mut out = String::new();
+    let mut out = LineBuf::new();
     let mut placed: usize = 0;
     for (i, (label, frac, red)) in labels.iter().enumerate() {
         let target = (frac * meter_w as f32) as usize;
+        let lw = tui::width(label);
         // For first label, place at column 0; for last, anchor flush to meter_w end.
-        let col = if i == labels.len() - 1 {
-            meter_w.saturating_sub(visible_len(label))
-        } else {
-            target
-        };
+        let last = i == labels.len() - 1;
+        let col = if last { meter_w.saturating_sub(lw) } else { target };
         // A label that would run into the next one, or past the meter (a
         // narrow window), is left out; the end labels always stay.
-        let last = i == labels.len() - 1;
-        let room_after = if last { 0 } else { visible_len(labels[labels.len() - 1].0) + 1 };
+        let room_after = if last { 0 } else { tui::width(labels[labels.len() - 1].0) + 1 };
         let gap = usize::from(placed > 0);
-        if !last && (col < placed + gap || col + visible_len(label) + room_after > meter_w) {
+        if !last && (col < placed + gap || col + lw + room_after > meter_w) {
             continue;
         }
         if col > placed {
-            out.push_str(&" ".repeat(col - placed));
+            out.reset().spaces(col - placed);
             placed = col;
         }
-        let color = if *red { p.danger } else { p.dim };
-        out.push_str(color);
-        out.push_str(label);
-        out.push_str(p.reset);
-        placed += visible_len(label);
+        out.styled(label, if *red { p.danger } else { p.dim });
+        placed += lw;
     }
-    out
+    out.into_line()
 }
 
-fn hifi_marquee_keys(p: &crate::theme::Palette, term_w: usize) -> String {
+fn hifi_marquee_keys(p: &Palette, term_w: usize) -> crate::hints::Bar {
     // Variant-c key bar. Deliberately NO "V VIZ": this theme's visualisation is
-    // the fixed VU panel above, so V changed nothing visible — and cycling to
-    // VizMode::None stopped the analyser that drives those meters, leaving them
-    // dead. `V` is a no-op while Hi-Fi is active (see the key handler in ui.rs).
-    let pairs: &[(&str, &str)] = &[
+    // the fixed VU panel above, so V changed nothing visible. `V` is a no-op
+    // while Hi-Fi is active (see the key handler in ui.rs); the panel is fed
+    // whatever the setting (`state.shown_viz`).
+    const KEYS: &[(&str, &str)] = &[
         ("␣",   "PLAY"),
         ("←→",  "SEEK"),
         ("↑↓",  "TRACK"),
@@ -439,122 +322,73 @@ fn hifi_marquee_keys(p: &crate::theme::Palette, term_w: usize) -> String {
         ("t",   "THEME"),
     ];
     // As many keys as the window holds: a key cut in half reads as noise.
-    let mut s = String::with_capacity(200);
-    s.push_str("  ");
-    for (i, (k, label)) in pairs.iter().enumerate() {
-        let sep = if i > 0 { 3 } else { 0 };
-        if visible_len(&s) + sep + visible_len(k) + 1 + visible_len(label) > term_w {
-            break;
-        }
-        if i > 0 {
-            s.push_str(&format!(" {dim}·{rst} ", dim = p.dim, rst = p.reset));
-        }
-        s.push_str(p.accent);
-        s.push_str(k);
-        s.push_str(p.reset);
-        s.push(' ');
-        s.push_str(p.dim);
-        s.push_str(label);
-        s.push_str(p.reset);
-    }
-    s
+    crate::hints::indent(crate::hints::bar(KEYS, &crate::ui::key_look(crate::theme::ThemeKind::HiFi, p), term_w.saturating_sub(2)), 2)
 }
-
-/// Narrowest box interior HiFi lays out for (a 34-column window). Below that
-/// FrameWriter cuts lines at the window edge.
-const HIFI_MIN_INNER: usize = 30;
 
 /// Inner content of the VU panel label row: "VU METER" on the left, a
 /// hardware-style CLIP lamp right-aligned (good-colored idle, danger on clip).
-/// Spans exactly `inner_w` visible columns so the box borders line up.
-fn vu_label_row(inner_w: usize, clipping: bool, p: &crate::theme::Palette) -> String {
+/// Spans exactly `inner_w` columns, the box's interior.
+fn vu_label_row(inner_w: usize, clipping: bool, p: &Palette) -> Line<'static> {
     let label = "VU METER";
     // Shape as well as colour: ● clipping, ○ idle (NO_COLOR, colour blindness).
-    let (lamp, glyph) = if clipping { (p.danger, '●') } else { (p.good, '○') };
+    let (lamp, glyph) = if clipping { (p.danger, "●") } else { (p.good, "○") };
     // 1 lead space + label + pad + "CLIP" + space + dot + 1 trail space.
     let pad = inner_w.saturating_sub(label.len() + 8);
-    format!(
-        " {dim}{label}{rst}{pad}{dim}CLIP{rst} {lamp}{glyph}{rst} ",
-        dim = p.dim, rst = p.reset, lamp = lamp,
-        label = label, pad = " ".repeat(pad),
-    )
+    let mut l = LineBuf::new();
+    l.push(' ').styled(label, p.dim).reset().spaces(pad).styled("CLIP", p.dim).reset().push(' ').styled(glyph, lamp).reset().push(' ');
+    l.into_line()
 }
 
 /// VU bar without channel label (label is rendered outside the bar by the
 /// caller). 0.85+ region renders in danger color, peak-hold dot in fg/danger.
-fn vu_bar(
-    peak: f32,
-    peak_dot: f32,
-    width: usize,
-    p: &crate::theme::Palette,
-) -> String {
+fn vu_bar(peak: f32, peak_dot: f32, width: usize, p: &Palette) -> Line<'static> {
     let bar_w = width.max(8);
     let seg = (peak.clamp(0.0, 1.0) * bar_w as f32) as usize;
     let dot = (peak_dot.clamp(0.0, 1.0) * bar_w as f32) as usize;
     let hot_threshold = (bar_w as f32 * 0.85) as usize;
 
-    let mut bar = String::with_capacity(bar_w * 4);
+    let mut bar = LineBuf::new();
     for i in 0..bar_w {
         let in_hot = i >= hot_threshold;
         if i < seg {
-            if in_hot { bar.push_str(p.danger); } else { bar.push_str(p.accent); }
-            bar.push('█');
+            bar.style(if in_hot { p.danger } else { p.accent }).push('█');
         } else if i == dot && dot >= seg {
-            if in_hot { bar.push_str(p.danger); } else { bar.push_str(p.fg); }
-            bar.push('█');
+            bar.style(if in_hot { p.danger } else { p.fg }).push('█');
         } else {
-            bar.push_str(p.rule);
-            bar.push('·');
+            bar.style(p.rule).push('·');
         }
     }
-    bar.push_str(p.reset);
-    bar
+    bar.into_line()
 }
 
+/// The dim amber of the progress rail.
+const RAIL: Color = Color::Rgb(122, 94, 58);
 
-fn render_solid_bar(progress: f64, width: usize) -> String {
+/// Two-tone bar: bright accent fill meeting a solid dim-amber rail. The
+/// rail's colour is used both as its own foreground AND as the boundary cell's
+/// background, so the bright fill and dim rail always meet seamlessly — a
+/// left-partial block only inks its left `frac/8`, so its empty right must be
+/// painted the rail colour or the terminal background (black) shows through
+/// as a notch that oscillates as the cell fills.
+fn render_solid_bar(progress: f64, width: usize, p: &Palette) -> Line<'static> {
     const PARTIALS: &[char] = &['▏', '▎', '▍', '▌', '▋', '▊', '▉', '█'];
-    // Two-tone bar: bright accent fill (the caller has already selected the
-    // accent foreground) meeting a solid dim-amber rail. The rail's colour is
-    // used both as its own foreground AND as the boundary cell's background, so
-    // the bright fill and dim rail always meet seamlessly — a left-partial block
-    // only inks its left `frac/8`, so its empty right must be painted the rail
-    // colour or the terminal background (black) shows through as a notch that
-    // oscillates as the cell fills. A solid rail (not the old ░ stipple) lets
-    // the boundary background match it exactly.
-    const RAIL_FG: &str = "\x1B[38;2;122;94;58m"; // dim amber, foreground
-    const RAIL_BG: &str = "\x1B[48;2;122;94;58m"; // same colour, as background
     let sub = (progress * width as f64).max(0.0);
     let full = sub as usize;
     let frac = ((sub - full as f64) * 8.0) as usize;
     let has_partial = full < width && frac > 0;
-    let mut s = String::with_capacity(width * 8);
-
+    let mut s = LineBuf::new();
     // Bright fill.
-    for _ in 0..full.min(width) {
-        s.push('█');
-    }
-
-    // Boundary cell: bright fill on the left, rail colour on the right (its
-    // background), so the fill grows into the rail with no gap. Reset only the
-    // background afterwards — the accent foreground still applies to the fill.
+    s.styled(&"█".repeat(full.min(width)), p.accent);
+    // Boundary cell: bright fill on the left, the rail on its right.
     if has_partial {
-        s.push_str(RAIL_BG);
-        s.push(PARTIALS[(frac - 1).min(PARTIALS.len() - 1)]);
-        s.push_str("\x1B[49m");
+        s.style(p.accent.bg(RAIL)).push(PARTIALS[(frac - 1).min(PARTIALS.len() - 1)]);
     }
-
     // Dim rail: solid blocks in the rail colour (shrinks as the fill grows).
     // Without colour a solid rail is indistinguishable from the fill: a line.
     let tail = width.saturating_sub(full + if has_partial { 1 } else { 0 });
-    if tail > 0 {
-        s.push_str(RAIL_FG);
-        let rail = if crate::term::no_color() { '─' } else { '█' };
-        for _ in 0..tail {
-            s.push(rail);
-        }
-    }
-    s
+    let rail = if crate::term::no_color() { '─' } else { '█' };
+    s.style(Style::new().fg(RAIL)).push_str(&rail.to_string().repeat(tail));
+    s.into_line()
 }
 
 // The one clock format (h:mm:ss past an hour), shared by every theme.
@@ -562,465 +396,11 @@ use crate::ui::format_time;
 
 /// Pad with spaces to `width` columns (or truncate with ellipsis if too long).
 /// Measured in display columns: a wide (CJK) title padded by char count
-/// overflowed its column and wrapped the row.
+/// overflowed its column.
 fn pad_or_truncate(s: &str, width: usize) -> String {
     let cut = crate::ansi::truncate_plain(s, width);
-    let visible = visible_len(&cut);
+    let visible = tui::width(&cut);
     format!("{cut}{}", " ".repeat(width.saturating_sub(visible)))
-}
-
-
-/// HiFi Library: double-bordered header strip + single-bordered list area
-/// + dot-marquee key bar. Matches `variant-c-screens.jsx::CLibrary`.
-pub fn print_status_hifi_library(
-    _state: &PlayerState,
-    ui: &mut UiState,
-    _name: &str,
-    prev_viz_lines: usize,
-    playlist: &[PathBuf],
-) -> usize {
-    let p = palette(ThemeKind::HiFi);
-    let term_w = terminal::size().map(|(w, _)| w as usize).unwrap_or(120);
-    let term_h = terminal::size().map(|(_, h)| h as usize).unwrap_or(24);
-
-    if prev_viz_lines != usize::MAX && prev_viz_lines > 0 {
-        crate::term::out!("\x1B[{}F", prev_viz_lines);
-    }
-
-    let inner_w = term_w.saturating_sub(4).clamp(HIFI_MIN_INNER, 110);
-    let row_inner_w = inner_w.saturating_sub(2);
-
-    // === Anchor (line 1): top edge of header strip (double border) ===
-    let mut w = crate::ui::FrameWriter::fitted();
-    let top = format!("╔{}╗", "═".repeat(inner_w));
-    w.first_line(&format!("  {fg}{bar}{rst}", fg = p.fg, rst = p.reset, bar = top));
-
-    // === Header content row: "L I B R A R Y" + right "N TRK · Hh Mm" ===
-    let total_secs = ui.metadata_cache.total_duration();
-    let dur_summary = format_dur_short(total_secs);
-    let header_left = format!(
-        "{accent}{bold}L I B R A R Y{rst}",
-        accent = p.accent, bold = p.bold, rst = p.reset,
-    );
-    let header_right = format!(
-        "{dim}{n} TRK · {dur}{rst}",
-        dim = p.dim, rst = p.reset, n = playlist.len(), dur = dur_summary,
-    );
-    let lvis = visible_len(&header_left);
-    let rvis = visible_len(&header_right);
-    let hpad = row_inner_w.saturating_sub(lvis + rvis).max(2);
-    w.line(&format!(
-        "  {fg}║{rst} {left}{gap}{right} {fg}║{rst}",
-        fg = p.fg, rst = p.reset,
-        left = header_left, gap = " ".repeat(hpad), right = header_right,
-    ));
-
-    // Bottom edge of header strip
-    let header_bot = format!("╚{}╝", "═".repeat(inner_w));
-    w.line(&format!("  {fg}{bar}{rst}", fg = p.fg, rst = p.reset, bar = header_bot));
-
-    // === List area: single border ===
-    let list_top = format!("┌{}┐", "─".repeat(inner_w));
-    w.line(&format!("  {fg}{bar}{rst}", fg = p.fg, rst = p.reset, bar = list_top));
-
-    // Compute visible rows. Above: anchor + header_bot + list_top = 2 below the anchor.
-    // Below: list_bot + spacer + key bar = 3.
-    // Cap the list area itself to 20 rows so the screen stays poster-like
-    // on tall terminals; on shorter ones it shrinks to fit.
-    let header_consumed = 2;
-    let footer_consumed = 3;
-    const HIFI_BODY_CAP: usize = 20;
-    let visible_rows = term_h
-        .saturating_sub(header_consumed + footer_consumed + 1)
-        .clamp(1, HIFI_BODY_CAP);
-    ui.last_visible_rows = visible_rows;
-
-    if ui.library_tree_mode {
-        // Tree body wrapped in the HiFi list frame (each row is `│ … │`).
-        let lines = crate::ui::render_tree_body(ui, visible_rows, inner_w, p);
-        for i in 0..visible_rows {
-            match lines.get(i) {
-                Some(line) => {
-                    let pad = inner_w.saturating_sub(visible_len(line));
-                    w.line(&format!(
-                        "  {fg}│{rst}{line}{sp}{fg}│{rst}",
-                        fg = p.fg, rst = p.reset, line = line, sp = " ".repeat(pad),
-                    ));
-                }
-                None => {
-                    w.line(&format!(
-                        "  {fg}│{rst}{blank}{fg}│{rst}",
-                        fg = p.fg, rst = p.reset, blank = " ".repeat(inner_w),
-                    ));
-                }
-            }
-        }
-    } else {
-    let search_active = matches!(&ui.input_mode, InputMode::Search(q) if !q.is_empty());
-    let items_len = if search_active && ui.filtered_indices.is_empty() {
-        0
-    } else if ui.filtered_indices.is_empty() {
-        playlist.len()
-    } else {
-        ui.filtered_indices.len()
-    };
-
-    ui.scroll_offset = crate::ui::list_scroll(ui.cursor, ui.scroll_offset, items_len, visible_rows);
-
-    // Row layout (inside the box, padded "  " on each side). Total body
-    // visible chars (between the two `│`) must equal `inner_w` to match the
-    // box top `┌─*inner_w┐`.
-    //   pad_l | marker | sp | num | sp | name | sp | dur | pad_r
-    let pad_l = 2usize;
-    let pad_r = 2usize;
-    let marker_w = 1usize;
-    // As many digits as the longest number: a fixed 2 pushed every row of a
-    // 100+ track list one column past the box border.
-    let num_w = playlist.len().to_string().len().max(2);
-    // Wide enough for the longest track's time (h:mm:ss past an hour).
-    let dur_w = format_time(ui.metadata_cache.max_duration()).len().max(5);
-    let inter = 1usize;
-    let name_w = inner_w
-        .saturating_sub(pad_l + marker_w + inter + num_w + inter + inter + dur_w + pad_r)
-        .max(10);
-
-    if items_len == 0 && search_active {
-        let inner_text = pad_or_truncate("  (no matches)", inner_w);
-        w.line(&format!(
-            "  {fg}│{rst}{dim}{txt}{rst}{fg}│{rst}",
-            fg = p.fg, rst = p.reset, dim = p.dim, txt = inner_text,
-        ));
-        for _ in 1..visible_rows {
-            let blank = " ".repeat(inner_w);
-            w.line(&format!(
-                "  {fg}│{rst}{txt}{fg}│{rst}",
-                fg = p.fg, rst = p.reset, txt = blank,
-            ));
-        }
-    } else {
-        let visible_count = visible_rows.min(items_len.saturating_sub(ui.scroll_offset));
-        for row in 0..visible_count {
-            let list_pos = ui.scroll_offset + row;
-            let track_idx = if ui.filtered_indices.is_empty() {
-                list_pos
-            } else {
-                ui.filtered_indices[list_pos]
-            };
-            let is_playing = track_idx == ui.current;
-            let is_cursor = list_pos == ui.cursor;
-            let row_title = ui
-                .metadata_cache
-                .title(track_idx)
-                .unwrap_or_else(|| ui.metadata_cache.display_name(track_idx, &playlist[track_idx]))
-                .to_uppercase();
-            let dur_str = match ui.metadata_cache.duration(track_idx) {
-                Some(d) => format_time(d),
-                None => "  :  ".to_string(),
-            };
-
-            let marker = if is_playing { "▶" } else { " " };
-            let num = format!("{:0>num_w$}", track_idx + 1);
-
-            let row_color = if is_playing { p.accent } else { p.fg };
-            let mark_color = if is_playing { p.accent } else { p.dim };
-
-            let title_truncated = pad_or_truncate(&row_title, name_w);
-            let dur_padded = format!("{:>w$}", dur_str, w = dur_w);
-
-            let body = format!(
-                "{lp}{mc}{marker}{rst} {dim}{num}{rst} {rc}{name}{rst} {dim}{dur}{rst}{rp}",
-                lp = " ".repeat(pad_l), rp = " ".repeat(pad_r),
-                mc = mark_color, marker = marker, rst = p.reset,
-                dim = p.dim,
-                num = num,
-                rc = row_color, name = title_truncated,
-                dur = dur_padded,
-            );
-
-            let line = if is_cursor {
-                format!(
-                    "  {fg}│{rst}{hl}{fg}│{rst}",
-                    fg = p.fg, rst = p.reset, hl = crate::theme::cursor_row(p, &body, inner_w),
-                )
-            } else {
-                format!(
-                    "  {fg}│{rst}{body}{fg}│{rst}",
-                    fg = p.fg, rst = p.reset, body = body,
-                )
-            };
-            w.line(&line);
-        }
-        for _ in visible_count..visible_rows {
-            let blank = " ".repeat(inner_w);
-            w.line(&format!(
-                "  {fg}│{rst}{txt}{fg}│{rst}",
-                fg = p.fg, rst = p.reset, txt = blank,
-            ));
-        }
-    }
-    }
-
-    // List bottom border
-    let list_bot = format!("└{}┘", "─".repeat(inner_w));
-    w.line(&format!("  {fg}{bar}{rst}", fg = p.fg, rst = p.reset, bar = list_bot));
-
-    // Spacer
-    w.line("");
-
-    // === Marquee key bar / search prompt / status ===
-    let footer = match &ui.input_mode {
-        InputMode::Search(query) => format!(
-            "  {accent}/{rst} {q}{dim}_{rst}",
-            accent = p.accent, rst = p.reset, dim = p.dim, q = query,
-        ),
-        InputMode::SavePlaylist(saved) => format!(
-            "  {dim}SAVE AS:{rst} {n}{dim}_{rst}",
-            dim = p.dim, rst = p.reset, n = saved,
-        ),
-        InputMode::Normal => {
-            if let Some(msg) = ui.active_status() {
-                format!("  {accent}{msg}{rst}", accent = p.accent, rst = p.reset, msg = msg)
-            } else if ui.library_tree_mode {
-                format!(
-                    "  {dim}[TAB] LIST · [←→] FOLD · [↵] PLAY · [/] FILTER · [D] REMOVE · [L] CLOSE{rst}",
-                    dim = p.dim, rst = p.reset,
-                )
-            } else {
-                hifi_library_marquee(p)
-            }
-        }
-    };
-    w.line(&truncate_ansi(&footer, term_w));
-
-    crate::term::out!("\x1B[J");
-    crate::term::flush();
-    w.count()
-}
-
-fn format_dur_short(secs: f64) -> String {
-    let total = secs.max(0.0) as u64;
-    let h = total / 3600;
-    let m = (total % 3600) / 60;
-    if h > 0 { format!("{h}H {m:02}M") } else { format!("{m}M") }
-}
-
-fn hifi_library_marquee(p: &crate::theme::Palette) -> String {
-    let pairs: &[(&str, &str)] = &[
-        ("↵", "PLAY"),
-        ("↑↓", "NAV"),
-        ("/", "SEARCH"),
-        ("a", "QUEUE"),
-        ("d", "REMOVE"),
-        ("s", "SAVE"),
-        ("l", "CLOSE"),
-    ];
-    let mut s = String::with_capacity(160);
-    s.push_str("  ");
-    for (i, (k, label)) in pairs.iter().enumerate() {
-        if i > 0 {
-            s.push_str(&format!(" {dim}·{rst} ", dim = p.dim, rst = p.reset));
-        }
-        s.push_str(p.accent);
-        s.push_str(k);
-        s.push_str(p.reset);
-        s.push(' ');
-        s.push_str(p.dim);
-        s.push_str(label);
-        s.push_str(p.reset);
-    }
-    s
-}
-
-/// HiFi Lyrics: double-bordered header strip + single-bordered body box +
-/// dot-marquee key bar. Matches `variant-c-screens.jsx::CLyrics`.
-pub fn print_status_hifi_lyrics(
-    state: &PlayerState,
-    ui: &mut UiState,
-    name: &str,
-    prev_viz_lines: usize,
-) -> usize {
-    let p = palette(ThemeKind::HiFi);
-    let term_w = terminal::size().map(|(w, _)| w as usize).unwrap_or(120);
-    let term_h = terminal::size().map(|(_, h)| h as usize).unwrap_or(24);
-
-    if prev_viz_lines != usize::MAX && prev_viz_lines > 0 {
-        crate::term::out!("\x1B[{}F", prev_viz_lines);
-    }
-
-    let inner_w = term_w.saturating_sub(4).clamp(HIFI_MIN_INNER, 110);
-    let row_inner_w = inner_w.saturating_sub(2);
-
-    // === Anchor (line 1): top edge of header strip (double border) ===
-    let mut w = crate::ui::FrameWriter::fitted();
-    let top = format!("╔{}╗", "═".repeat(inner_w));
-    w.first_line(&format!("  {fg}{bar}{rst}", fg = p.fg, rst = p.reset, bar = top));
-
-    // === Header content row: TITLE accent bold + right "SYNC · {SOURCE} · 02:28 / 04:32" ===
-    let idx = state.current_track.load(Ordering::Relaxed);
-    let title = ui.metadata_cache.title(idx).unwrap_or_else(|| name.to_string());
-    let title_up = title.to_uppercase();
-    let is_synced = ui.lyrics.as_ref().map(|l| l.is_synced()).unwrap_or(false);
-    let cur_t = format_time(state.time_secs());
-    let tot_t = format_time(state.total_secs());
-
-    let mut right_meta = String::new();
-    if let Some(l) = &ui.lyrics {
-        right_meta.push_str(&crate::lyrics::source_line(l, ui.lyrics_source).to_uppercase());
-        right_meta.push_str("  ·  ");
-    }
-    right_meta.push_str(&format!("{}  /  {}", cur_t, tot_t));
-
-    let header_left = format!(
-        "{accent}{bold}{title}{rst}",
-        accent = p.accent, bold = p.bold, rst = p.reset, title = title_up,
-    );
-    let header_right = format!(
-        "{dim}{m}{rst}",
-        dim = p.dim, rst = p.reset, m = right_meta,
-    );
-    let lvis = visible_len(&header_left);
-    let rvis = visible_len(&header_right);
-    let allowed_left = row_inner_w.saturating_sub(rvis + 4);
-    let header_left = if lvis > allowed_left {
-        format!(
-            "{accent}{bold}{title}{rst}",
-            accent = p.accent, bold = p.bold, rst = p.reset,
-            title = pad_or_truncate(&title_up, allowed_left),
-        )
-    } else { header_left };
-    let lvis = visible_len(&header_left);
-    let hpad = row_inner_w.saturating_sub(lvis + rvis).max(2);
-    w.line(&format!(
-        "  {fg}║{rst} {left}{gap}{right} {fg}║{rst}",
-        fg = p.fg, rst = p.reset,
-        left = header_left, gap = " ".repeat(hpad), right = header_right,
-    ));
-
-    let header_bot = format!("╚{}╝", "═".repeat(inner_w));
-    w.line(&format!("  {fg}{bar}{rst}", fg = p.fg, rst = p.reset, bar = header_bot));
-
-    // === Body box: single border, generous padding ===
-    let body_top = format!("┌{}┐", "─".repeat(inner_w));
-    w.line(&format!("  {fg}{bar}{rst}", fg = p.fg, rst = p.reset, bar = body_top));
-
-    // Reserved: header_strip 1 + header_bot 1 + body_top 1 = 3 below anchor
-    // Footer: body_bot 1 + spacer 1 + key bar 1 = 3
-    // Cap the lyrics body itself to 20 rows (matches the library cap) so the
-    // screen stays poster-like on tall terminals.
-    let header_consumed = 3;
-    let footer_consumed = 3;
-    const HIFI_BODY_CAP: usize = 20;
-    let body_rows = term_h
-        .saturating_sub(header_consumed + footer_consumed + 1)
-        .clamp(1, HIFI_BODY_CAP);
-
-    if let Some(ref lyrics) = ui.lyrics {
-        let total = lyrics.line_count();
-        let adj = state.time_secs() + ui.lyrics_offset;
-        let current_line = lyrics.current_line(adj);
-
-        if lyrics.is_synced() && ui.lyrics_auto_scroll {
-            if let Some(cur) = current_line {
-                let half = body_rows / 2;
-                ui.lyrics_scroll = cur.saturating_sub(half);
-            }
-        }
-        if total > body_rows {
-            ui.lyrics_scroll = ui.lyrics_scroll.min(total - body_rows);
-        } else {
-            ui.lyrics_scroll = 0;
-        }
-
-        let lyric_pad_l = 4usize;
-        let lyric_pad_r = 4usize;
-        // Inner content between `│ │` must equal `inner_w` to match the body
-        // top edge. Reserve 2 cols for the ▸ marker / leading "  " gutter.
-        let text_w = inner_w.saturating_sub(lyric_pad_l + lyric_pad_r + 2);
-
-        for row in 0..body_rows {
-            let line_idx = ui.lyrics_scroll + row;
-            if line_idx < total {
-                let text = lyrics.line_text(line_idx).to_uppercase();
-                let is_current = current_line == Some(line_idx);
-                let line_truncated = pad_or_truncate(&text, text_w);
-                let inner_str = if is_current {
-                    format!(
-                        "{lp}{accent}{bold}▸ {txt}{rst}{rp}",
-                        lp = " ".repeat(lyric_pad_l), rp = " ".repeat(lyric_pad_r),
-                        accent = p.accent, bold = p.bold, rst = p.reset, txt = line_truncated,
-                    )
-                } else {
-                    format!(
-                        "{lp}{dim}  {txt}{rst}{rp}",
-                        lp = " ".repeat(lyric_pad_l), rp = " ".repeat(lyric_pad_r),
-                        dim = p.dim, rst = p.reset, txt = line_truncated,
-                    )
-                };
-                w.line(&format!(
-                    "  {fg}│{rst}{inner}{fg}│{rst}",
-                    fg = p.fg, rst = p.reset, inner = inner_str,
-                ));
-            } else {
-                let blank = " ".repeat(inner_w);
-                w.line(&format!(
-                    "  {fg}│{rst}{txt}{fg}│{rst}",
-                    fg = p.fg, rst = p.reset, txt = blank,
-                ));
-            }
-        }
-    } else {
-        let msg = "  (NO LYRICS AVAILABLE)";
-        let inner_text = pad_or_truncate(msg, inner_w);
-        w.line(&format!(
-            "  {fg}│{rst}{dim}{txt}{rst}{fg}│{rst}",
-            fg = p.fg, dim = p.dim, rst = p.reset, txt = inner_text,
-        ));
-        for _ in 1..body_rows {
-            let blank = " ".repeat(inner_w);
-            w.line(&format!(
-                "  {fg}│{rst}{txt}{fg}│{rst}",
-                fg = p.fg, rst = p.reset, txt = blank,
-            ));
-        }
-    }
-
-    // Body bottom border
-    let body_bot = format!("└{}┘", "─".repeat(inner_w));
-    w.line(&format!("  {fg}{bar}{rst}", fg = p.fg, rst = p.reset, bar = body_bot));
-
-    // Spacer
-    w.line("");
-
-    // === Marquee key bar ===
-    let mut bar = String::new();
-    bar.push_str("  ");
-    bar.push_str(&format!(
-        "{accent}W/S{rst} {dim}SCROLL{rst}",
-        accent = p.accent, rst = p.reset, dim = p.dim,
-    ));
-    if is_synced {
-        bar.push_str(&format!(" {dim}·{rst} ", dim = p.dim, rst = p.reset));
-        bar.push_str(&format!(
-            "{accent}A/D{rst} {dim}SYNC ±0.5s{rst}",
-            accent = p.accent, rst = p.reset, dim = p.dim,
-        ));
-    }
-    bar.push_str(&format!(" {dim}·{rst} ", dim = p.dim, rst = p.reset));
-    bar.push_str(&format!(
-        "{accent}Y{rst} {dim}BACK{rst}",
-        accent = p.accent, rst = p.reset, dim = p.dim,
-    ));
-    if is_synced && ui.lyrics_offset != 0.0 {
-        bar.push_str(&format!(
-            " {dim}·{rst} {dim}OFFSET {ofs:+.1}s{rst}",
-            dim = p.dim, rst = p.reset, ofs = ui.lyrics_offset,
-        ));
-    }
-    w.line(&truncate_ansi(&bar, term_w));
-
-    crate::term::out!("\x1B[J");
-    crate::term::flush();
-    w.count()
 }
 
 
@@ -1034,35 +414,29 @@ mod hifi_tests {
         // (right) portion must be painted the EXACT rail colour so the bright
         // fill grows into the dim rail with no black gap between them.
         // width=20, progress=0.51 → full=10, frac=1 → one partial cell.
-        let bar = render_solid_bar(0.51, 20);
-        let has_partial = "▏▎▍▌▋▊▉".chars().any(|c| bar.contains(c));
-        assert!(has_partial, "expected a partial block char, got: {bar:?}");
-
-        // The rail is drawn solid in a dim truecolor foreground (\x1B[38;2;R;G;Bm).
-        let rail_rgb = bar
-            .split("\x1B[38;2;")
-            .nth(1)
-            .and_then(|s| s.split('m').next())
-            .expect("rail must be drawn in a truecolor foreground");
-
-        // The boundary cell's background must be that SAME colour — otherwise a
-        // gap (black, or a mismatched shade) shows where fill meets rail.
-        assert!(
-            bar.contains(&format!("\x1B[48;2;{rail_rgb}m")),
-            "boundary background must equal the rail colour {rail_rgb:?} (seamless), got: {bar:?}"
-        );
-        // Background reset after the partial so the rail cells aren't tinted.
-        assert!(bar.contains("\x1B[49m"), "background not reset after partial: {bar:?}");
+        let p = palette(ThemeKind::HiFi);
+        let bar = render_solid_bar(0.51, 20, p);
+        assert_eq!(crate::tui::Cols::cols(&bar), 20);
+        let partial = bar
+            .spans
+            .iter()
+            .find(|s| s.content.chars().any(|c| "▏▎▍▌▋▊▉".contains(c)))
+            .expect("a partial block");
+        // The rail is drawn solid in the rail colour…
+        let rail = bar.spans.last().expect("a rail");
+        assert_eq!(rail.style.fg, Some(RAIL));
+        // …and the boundary cell's background is that SAME colour.
+        assert_eq!(partial.style.bg, Some(RAIL), "the boundary must sit on the rail colour");
+        // The rail's own cells carry no background.
+        assert_eq!(rail.style.bg, None);
     }
 
     #[test]
     fn key_bar_does_not_advertise_a_viz_control() {
         // Hi-Fi draws a fixed VU panel and renders no switchable visualisation,
-        // so a VIZ hint pointed at a key that changes nothing on screen — and
-        // cycling round to VizMode::None starved the analyser that feeds these
-        // very meters, killing them.
-        let p = crate::theme::palette(crate::theme::ThemeKind::HiFi);
-        let bar = hifi_marquee_keys(p, 200);
+        // so a VIZ hint pointed at a key that changes nothing on screen.
+        let p = palette(ThemeKind::HiFi);
+        let bar = tui::plain(&hifi_marquee_keys(p, 200).line);
         assert!(!bar.contains("VIZ"), "Hi-Fi key bar still offers VIZ: {bar:?}");
         // The controls it does have must survive.
         for expected in ["PLAY", "SEEK", "TRACK", "VOL", "EQ", "FX", "LIB", "LYRICS", "THEME"] {
@@ -1072,17 +446,17 @@ mod hifi_tests {
 
     #[test]
     fn vu_label_row_spans_inner_width_with_clip_lamp() {
-        // The row sits between the box borders, so its visible width must be
-        // exactly inner_w — one column off and the right `│` breaks the frame.
-        let p = crate::theme::palette(crate::theme::ThemeKind::HiFi);
+        // The row sits between the box borders, so it must be exactly inner_w.
+        let p = palette(ThemeKind::HiFi);
         let idle = vu_label_row(60, false, p);
         let hot = vu_label_row(60, true, p);
-        assert_eq!(crate::ansi::visible_len(&idle), 60, "idle row: {idle:?}");
-        assert_eq!(crate::ansi::visible_len(&hot), 60, "hot row: {hot:?}");
+        assert_eq!(crate::tui::Cols::cols(&idle), 60);
+        assert_eq!(crate::tui::Cols::cols(&hot), 60);
         // Lamp is always present: a good-coloured ring idle, a danger dot on
         // clip — shape as well as colour, so it still reads without colour.
-        assert!(idle.contains("CLIP"));
-        assert!(idle.contains(&format!("{}○", p.good)), "idle lamp not a green ring: {idle:?}");
-        assert!(hot.contains(&format!("{}●", p.danger)), "hot lamp not red: {hot:?}");
+        let lamp = |l: &Line<'static>| l.spans.iter().find(|s| s.content == "○" || s.content == "●").cloned().unwrap();
+        assert!(tui::plain(&idle).contains("CLIP"));
+        assert_eq!((lamp(&idle).content.as_ref(), lamp(&idle).style), ("○", p.good));
+        assert_eq!((lamp(&hot).content.as_ref(), lamp(&hot).style), ("●", p.danger));
     }
 }

@@ -245,8 +245,6 @@ pub fn visible_rows_filtered(tree: &LibraryTree, query: &str) -> Vec<VisibleRow>
     rows
 }
 
-use crate::ansi::truncate_visible;
-
 /// Render the tree body as indented lines using the active theme palette. Shared
 /// across all themes — a tree is structurally identical everywhere; only colors
 /// and the cursor tint differ. Renders the window `[scroll, scroll+height)` of
@@ -263,22 +261,19 @@ pub fn render_library_tree(
     width: usize,
     p: &crate::theme::Palette,
     now_playing: Option<usize>,
-) -> Vec<String> {
+) -> Vec<ratatui::text::Line<'static>> {
+    use crate::tui::{cursor_row, truncate_ellipsis, LineBuf};
     // Saturating: a scroll past the end (the list shrank under it) draws
     // nothing instead of underflowing.
     let end = (scroll + height).min(visible.len());
     let mut out = Vec::with_capacity(end.saturating_sub(scroll));
     for (vi, &vrow) in visible.iter().enumerate().skip(scroll).take(end.saturating_sub(scroll)) {
-        // Two forms per row: `plain` (no color, for the highlighted cursor row —
-        // inner color/reset codes would cancel the highlight) and `colored`.
-        let (plain, colored) = match vrow {
+        let mut line = LineBuf::new();
+        match vrow {
             VisibleRow::Artist { artist } => {
                 let a = &tree.artists[artist];
                 let g = if fold.expanded_artists.contains(&a.name) { '▾' } else { '▸' };
-                (
-                    format!("  {} {}", g, a.name),
-                    format!("  {}{} {}{}", p.fg, g, a.name, p.reset),
-                )
+                line.push_str("  ").styled(&format!("{g} {}", a.name), p.fg);
             }
             VisibleRow::Album { artist, album } => {
                 let al = &tree.artists[artist].albums[album];
@@ -287,10 +282,7 @@ pub fn render_library_tree(
                 } else {
                     '▸'
                 };
-                (
-                    format!("    {} {}", g, al.name),
-                    format!("    {}{} {}{}", p.dim, g, al.name, p.reset),
-                )
+                line.push_str("    ").styled(&format!("{g} {}", al.name), p.dim);
             }
             VisibleRow::Track { artist, album, track } => {
                 let t = &tree.artists[artist].albums[album].tracks[track];
@@ -298,20 +290,17 @@ pub fn render_library_tree(
                 let num = t.track.map(|n| format!("{n:02}")).unwrap_or_else(|| "··".into());
                 let marker = if now { '▶' } else { ' ' };
                 let col = if now { p.accent } else { p.fg };
-                (
-                    format!("      {} {} {}", num, marker, t.title),
-                    format!("      {}{} {}{} {}{}", p.dim, num, col, marker, t.title, p.reset),
-                )
+                line.push_str("      ").styled(&num, p.dim).reset().push(' ').styled(&format!("{marker} {}", t.title), col);
             }
-        };
-        let line = if vi == cursor {
-            // Highlight the whole row (the theme's accent, or reverse video on
-            // Classic), matching the flat list.
-            crate::theme::cursor_row(p, &plain, width)
+        }
+        let line = line.into_line();
+        out.push(if vi == cursor {
+            // Highlight the whole row (the theme's accent, or reverse video
+            // without colour), matching the flat list.
+            cursor_row(p, &line, width)
         } else {
-            truncate_visible(&colored, width)
-        };
-        out.push(line);
+            truncate_ellipsis(line, width)
+        });
     }
     out
 }
@@ -470,13 +459,11 @@ mod tests {
 
         assert_eq!(lines.len(), vis.len()); // one line per visible row within the window
         // Expanded artist shows ▾, collapsed shows ▸; names present.
+        let lines: Vec<String> = lines.iter().map(crate::tui::plain).collect();
         assert!(lines[0].contains('▾') && lines[0].contains("Arctic Monkeys"));
         assert!(lines[2].contains('▸') && lines[2].contains("Radiohead"));
-        // Album row indented deeper than the artist row: compare where the
-        // names start in the VISIBLE text (the cursor row's colour escapes
-        // differ in length per theme, so raw byte positions mean nothing).
-        let plain = |s: &str| crate::ansi::strip_ansi(s);
-        assert!(plain(&lines[1]).find("AM").unwrap() > plain(&lines[0]).find("Arctic Monkeys").unwrap());
+        // Album row indented deeper than the artist row.
+        assert!(lines[1].find("AM").unwrap() > lines[0].find("Arctic Monkeys").unwrap());
 
         // A scroll past the end draws nothing (it used to underflow).
         assert!(render_library_tree(&tree, &fold, &vis, 0, 99, 10, 40, p, None).is_empty());
@@ -484,7 +471,7 @@ mod tests {
         // Windowing: height 1 from scroll 1 yields just the album row.
         let one = render_library_tree(&tree, &fold, &vis, 1, 1, 1, 40, p, None);
         assert_eq!(one.len(), 1);
-        assert!(one[0].contains("AM"));
+        assert!(crate::tui::plain(&one[0]).contains("AM"));
     }
 
     #[test]
@@ -566,13 +553,11 @@ mod tests {
         for kind in [ThemeKind::Classic, ThemeKind::Minimal, ThemeKind::HiFi] {
             let p = crate::theme::palette(kind);
             let lines = render_library_tree(&tree, &fold, &vis, 0, 0, 5, 40, p, None);
-            // Row 0 is the cursor: it must carry a highlight — reverse-video when
-            // the theme has no cursor tint (Classic), or the tint otherwise.
-            let highlighted = lines[0].contains("\x1B[7m")
-                || (!p.cursor_hl.is_empty() && lines[0].contains(p.cursor_hl));
-            assert!(highlighted, "{kind:?}: cursor row not highlighted: {:?}", lines[0]);
-            // A non-cursor row must not be reverse-video highlighted.
-            assert!(!lines[1].contains("\x1B[7m"), "{kind:?}: non-cursor row highlighted");
+            // Row 0 is the cursor: the whole row in the theme's highlight.
+            assert!(lines[0].spans.iter().all(|s| s.style == p.cursor_hl), "{kind:?}: {:?}", lines[0]);
+            assert_eq!(crate::tui::Cols::cols(&lines[0]), 40, "{kind:?}: the highlight spans the row");
+            // A non-cursor row carries no highlight.
+            assert!(lines[1].spans.iter().all(|s| s.style.bg.is_none()), "{kind:?}: non-cursor row highlighted");
         }
     }
 }

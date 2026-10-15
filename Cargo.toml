@@ -18,6 +18,11 @@ audioadapter-buffers = "5.1"
 # crossterm - Cross-platform terminal input/output
 crossterm = "0.29"
 
+# ratatui - the UI's cell buffer, layout and widgets. Default features off:
+# no calendar widget, no macros, no underline colours (one SGR less per
+# frame). Pinned to the crossterm Keet already uses, so there is one copy.
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29", "layout-cache"] }
+
 # rtrb - Lock-free ring buffer for audio
 rtrb = "0.4"
 
@@ -26,7 +31,7 @@ realfft = "3.4"
 
 # JSON parsing for EQ presets
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["preserve_order"] }
 
 # OS media transport controls (media keys, AirPods, Bluetooth headphones)
 souvlaki = "0.8"
@@ -37,10 +42,11 @@ ureq = { version = "3", default-features = false, features = ["native-tls", "gzi
 # Album cover decoding + resizing. Default-features off to skip formats we don't need.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 
-# Terminal display width of text (CJK and most emoji take two columns). Layout
-# math must count COLUMNS: counting chars wrapped wide titles/lyrics and drifted
-# the frame's line count.
-unicode-width = "0.2"
+# Graphemes, to measure and cut text exactly as ratatui draws it
+# (`ansi::plain_width`, each grapheme measured by ratatui's `CellWidth`). Layout
+# math must count COLUMNS as drawn: counting chars wrapped wide titles/lyrics
+# and drifted the frame. Already built as a ratatui dependency.
+unicode-segmentation = "1.13"
 
 # Pure-Rust Sixel encoder for terminals that don't speak Kitty/iTerm2 (Windows Terminal, foot, mlterm).
 icy_sixel = "0.7"

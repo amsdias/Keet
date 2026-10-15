@@ -3,9 +3,10 @@
 //! Three themes ship today: Classic (current green-on-default), Minimal
 //! (warm-cyan editorial), HiFi (amber CRT studio-monitor). Themes are stored
 //! on PlayerState as an AtomicU8 so the UI thread can cycle them without
-//! locks. Renderers in `ui.rs` (and the upcoming `ui_minimal.rs` /
-//! `ui_hifi.rs`) read the active theme once per frame and consult these
-//! palettes/glyphs/casing rules.
+//! locks. Renderers read the active theme once per frame and draw in these
+//! palettes' ratatui styles.
+
+use ratatui::style::{Color, Modifier, Style};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -61,43 +62,29 @@ pub fn resolve_theme(
     flag.or(config).or(resume).unwrap_or(ThemeKind::Classic)
 }
 
-/// ANSI color escapes for one theme. All strings include their full SGR
-/// prefix and can be concatenated directly into output. Reset to clear.
-#[allow(dead_code)]
+/// One theme's styles. Each is complete on its own (a span takes exactly
+/// one); combine them with `Style::patch` where a piece of text is, say, both
+/// bold and the accent.
 pub struct Palette {
-    pub fg: &'static str,
-    pub dim: &'static str,
-    pub rule: &'static str,    // very dim separator color
-    pub accent: &'static str,
-    pub good: &'static str,
-    pub warn: &'static str,
-    pub danger: &'static str,
-    pub bold: &'static str,
-    pub reset: &'static str,
+    pub fg: Style,
+    pub dim: Style,
+    pub rule: Style, // very dim separator color
+    pub accent: Style,
+    pub good: Style,
+    pub warn: Style,
+    pub danger: Style,
+    pub bold: Style,
     /// Highlight for the cursor row in lists: the accent as a background with
-    /// dark text over it. Empty = reverse video. Apply it through
-    /// [`cursor_row`], never by prefixing a coloured row.
-    pub cursor_hl: &'static str,
+    /// dark text over it (Classic: dark text on its green). Apply it through
+    /// [`crate::tui::cursor_row`], never by restyling a coloured row.
+    pub cursor_hl: Style,
 }
 
-/// Box-drawing glyph set. Currently unused — both renderers emit literal
-/// `╔╗║═` glyphs inline; the constants are kept in case a future refactor
-/// wants to drive the borders from a single table.
-#[allow(dead_code)]
-#[derive(Clone, Copy)]
-pub struct Borders {
-    pub h: char,
-    pub v: char,
-    pub tl: char,
-    pub tr: char,
-    pub bl: char,
-    pub br: char,
-}
+const DIM: Style = Style::new().add_modifier(Modifier::DIM);
+const BOLD: Style = Style::new().add_modifier(Modifier::BOLD);
 
-#[allow(dead_code)]
-impl Borders {
-    pub const SINGLE: Self = Self { h: '─', v: '│', tl: '┌', tr: '┐', bl: '└', br: '┘' };
-    pub const DOUBLE: Self = Self { h: '═', v: '║', tl: '╔', tr: '╗', bl: '╚', br: '╝' };
+const fn rgb(r: u8, g: u8, b: u8) -> Style {
+    Style::new().fg(Color::Rgb(r, g, b))
 }
 
 // Classic: the terminal's own ground and text, and three ANSI colours that
@@ -107,16 +94,15 @@ impl Borders {
 // follow the user's terminal palette, so Classic reads on a light background
 // too, and stays distinct from Minimal's cyan and HiFi's amber.
 const CLASSIC_PAL: Palette = Palette {
-    fg: "\x1B[0m",
-    dim: "\x1B[2m",
-    rule: "\x1B[2;90m",
-    accent: "\x1B[32m",
-    good: "\x1B[32m",
-    warn: "\x1B[33m",
-    danger: "\x1B[31m",
-    bold: "\x1B[1m",
-    reset: "\x1B[0m",
-    cursor_hl: "\x1B[42m\x1B[30m",
+    fg: Style::new(),
+    dim: DIM,
+    rule: DIM.fg(Color::DarkGray),
+    accent: Style::new().fg(Color::Green),
+    good: Style::new().fg(Color::Green),
+    warn: Style::new().fg(Color::Yellow),
+    danger: Style::new().fg(Color::Red),
+    bold: BOLD,
+    cursor_hl: Style::new().bg(Color::Green).fg(Color::Black),
 };
 
 /// An RGB colour from `#RRGGBB` (or `RRGGBB`). None for anything else.
@@ -133,24 +119,20 @@ pub fn parse_hex(s: &str) -> Option<(u8, u8, u8)> {
 /// once at startup; unset = the ANSI palette.
 static CLASSIC_TRUECOLOR: std::sync::OnceLock<Palette> = std::sync::OnceLock::new();
 
-fn leak(s: String) -> &'static str {
-    Box::leak(s.into_boxed_str())
-}
-
 /// Classic in the user's own truecolor highlight, warning and error colours.
 /// The cursor bar is the highlight as a background, its text dark or light
 /// by the highlight's brightness so it reads on any choice.
 fn classic_truecolor_palette(hl: (u8, u8, u8), warn: (u8, u8, u8), err: (u8, u8, u8)) -> Palette {
-    let fg = |(r, g, b): (u8, u8, u8)| leak(format!("\x1B[38;2;{r};{g};{b}m"));
+    let fg = |(r, g, b): (u8, u8, u8)| rgb(r, g, b);
     let (r, g, b) = hl;
     let luma = 0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32;
-    let text = if luma > 140.0 { "\x1B[38;2;14;16;20m" } else { "\x1B[38;2;245;245;245m" };
+    let text = if luma > 140.0 { Color::Rgb(14, 16, 20) } else { Color::Rgb(245, 245, 245) };
     Palette {
         accent: fg(hl),
         good: fg(hl),
         warn: fg(warn),
         danger: fg(err),
-        cursor_hl: leak(format!("\x1B[48;2;{r};{g};{b}m{text}")),
+        cursor_hl: Style::new().bg(Color::Rgb(r, g, b)).fg(text),
         ..CLASSIC_PAL
     }
 }
@@ -164,63 +146,37 @@ pub fn use_classic_truecolor(hl: (u8, u8, u8), warn: (u8, u8, u8), err: (u8, u8,
 // the accent so it lands on #9adcd0 regardless of palette mapping; fg/dim use
 // terminal defaults so the theme inherits the user's chosen background.
 const MINIMAL_PAL: Palette = Palette {
-    fg: "\x1B[0m",
-    dim: "\x1B[2m",
-    rule: "\x1B[38;2;35;38;42m",
-    accent: "\x1B[38;2;154;220;208m",
-    good: "\x1B[38;2;154;220;208m",
-    warn: "\x1B[38;2;233;196;106m",
-    danger: "\x1B[38;2;224;122;122m",
-    bold: "\x1B[1m",
-    reset: "\x1B[0m",
-    cursor_hl: "\x1B[48;2;154;220;208m\x1B[38;2;16;20;22m",
+    fg: Style::new(),
+    dim: DIM,
+    rule: rgb(35, 38, 42),
+    accent: rgb(154, 220, 208),
+    good: rgb(154, 220, 208),
+    warn: rgb(233, 196, 106),
+    danger: rgb(224, 122, 122),
+    bold: BOLD,
+    cursor_hl: Style::new().bg(Color::Rgb(154, 220, 208)).fg(Color::Rgb(16, 20, 22)),
 };
 
 // HiFi: amber palette per the design handoff. Truecolor throughout because
 // the studio-monitor look depends on the specific oranges; 256-color falls
 // back gracefully (most modern terminals support truecolor).
 const HIFI_PAL: Palette = Palette {
-    fg: "\x1B[38;2;240;200;120m",
-    dim: "\x1B[38;2;122;94;58m",
-    rule: "\x1B[38;2;58;42;20m",
-    accent: "\x1B[1;38;2;255;179;71m",
-    good: "\x1B[38;2;168;200;122m",
-    warn: "\x1B[38;2;224;122;74m",
-    danger: "\x1B[1;38;2;224;122;74m",
-    bold: "\x1B[1m",
-    reset: "\x1B[0m",
-    cursor_hl: "\x1B[48;2;255;179;71m\x1B[38;2;31;20;8m",
+    fg: rgb(240, 200, 120),
+    dim: rgb(122, 94, 58),
+    rule: rgb(58, 42, 20),
+    accent: rgb(255, 179, 71).add_modifier(Modifier::BOLD),
+    good: rgb(168, 200, 122),
+    warn: rgb(224, 122, 74),
+    danger: rgb(224, 122, 74).add_modifier(Modifier::BOLD),
+    bold: BOLD,
+    cursor_hl: Style::new().bg(Color::Rgb(255, 179, 71)).fg(Color::Rgb(31, 20, 8)),
 };
-
-/// A list's cursor row: `row` as plain text on the theme's highlight, cut or
-/// padded to exactly `width` columns. The colours inside `row` are dropped on
-/// purpose — every cell of a coloured row ends in a reset, and a reset also
-/// clears the background, so prefixing one tinted only the first cell (the
-/// track number) and left the rest of the row looking unselected.
-pub fn cursor_row(p: &Palette, row: &str, width: usize) -> String {
-    let plain = crate::ansi::truncate_plain(&crate::ansi::strip_ansi(row), width);
-    let pad = " ".repeat(width.saturating_sub(crate::ansi::visible_len(&plain)));
-    // NO_COLOR removes the accent background, so the cursor is reverse video.
-    if p.cursor_hl.is_empty() || crate::term::no_color() {
-        format!("\x1B[7m{plain}{pad}\x1B[27m")
-    } else {
-        format!("{}{plain}{pad}{}", p.cursor_hl, p.reset)
-    }
-}
 
 pub fn palette(kind: ThemeKind) -> &'static Palette {
     match kind {
         ThemeKind::Classic => CLASSIC_TRUECOLOR.get().unwrap_or(&CLASSIC_PAL),
         ThemeKind::Minimal => &MINIMAL_PAL,
         ThemeKind::HiFi => &HIFI_PAL,
-    }
-}
-
-#[allow(dead_code)]
-pub fn borders(kind: ThemeKind) -> Borders {
-    match kind {
-        ThemeKind::HiFi => Borders::DOUBLE,
-        _ => Borders::SINGLE,
     }
 }
 
@@ -256,10 +212,6 @@ pub fn hsv(h: f32, s: f32, v: f32) -> Rgb {
     (byte(r), byte(g), byte(b))
 }
 
-/// The SGR sequence for a truecolor foreground.
-pub fn fg_rgb(c: Rgb) -> String {
-    format!("\x1B[38;2;{};{};{}m", c.0, c.1, c.2)
-}
 
 #[cfg(test)]
 mod theme_tests {
@@ -278,14 +230,14 @@ mod theme_tests {
     #[test]
     fn a_truecolor_classic_uses_the_three_colours_and_keeps_the_rest() {
         let p = classic_truecolor_palette((125, 211, 184), (233, 182, 92), (240, 122, 120));
-        assert_eq!(p.accent, "\x1B[38;2;125;211;184m");
-        assert_eq!(p.warn, "\x1B[38;2;233;182;92m");
-        assert_eq!(p.danger, "\x1B[38;2;240;122;120m");
+        assert_eq!(p.accent.fg, Some(Color::Rgb(125, 211, 184)));
+        assert_eq!(p.warn.fg, Some(Color::Rgb(233, 182, 92)));
+        assert_eq!(p.danger.fg, Some(Color::Rgb(240, 122, 120)));
         assert_eq!((p.fg, p.dim, p.rule), (CLASSIC_PAL.fg, CLASSIC_PAL.dim, CLASSIC_PAL.rule));
         // The cursor text flips with the highlight's brightness.
-        assert!(p.cursor_hl.ends_with("\x1B[38;2;14;16;20m"), "light highlight, dark text");
+        assert_eq!(p.cursor_hl.fg, Some(Color::Rgb(14, 16, 20)), "light highlight, dark text");
         let dark = classic_truecolor_palette((40, 60, 140), (0, 0, 0), (0, 0, 0));
-        assert!(dark.cursor_hl.ends_with("\x1B[38;2;245;245;245m"), "dark highlight, light text");
+        assert_eq!(dark.cursor_hl.fg, Some(Color::Rgb(245, 245, 245)), "dark highlight, light text");
     }
 
     #[test]
@@ -305,23 +257,10 @@ mod theme_tests {
     }
 
     #[test]
-    fn cursor_row_highlights_the_whole_width_in_the_accent() {
-        for kind in [ThemeKind::Classic, ThemeKind::Minimal, ThemeKind::HiFi] {
-            let p = palette(kind);
-            // Coloured input: an inner reset used to end the highlight after
-            // the first cell, leaving only the number tinted.
-            let row = cursor_row(p, "\x1B[2m07\x1B[0m  Title  \x1B[2mArtist\x1B[0m", 30);
-            assert_eq!(crate::ansi::visible_len(&row), 30, "{kind:?}: {row:?}");
-            let body = row.trim_end_matches("\x1B[27m").trim_end_matches(p.reset);
-            assert!(!body.contains("\x1B[0m"), "{kind:?}: reset inside the highlight: {row:?}");
-            assert!(row.contains("07  Title  Artist"), "{kind:?}: {row:?}");
-            // Too long: cut, never wider than the row.
-            let long = cursor_row(p, &"x".repeat(50), 30);
-            assert_eq!(crate::ansi::visible_len(&long), 30);
-        }
-        // Minimal and HiFi highlight in their accent colour as a background.
-        assert!(palette(ThemeKind::Minimal).cursor_hl.contains("48;2;154;220;208"));
-        assert!(palette(ThemeKind::HiFi).cursor_hl.contains("48;2;255;179;71"));
+    fn the_cursor_highlight_is_the_accent_as_a_background() {
+        assert_eq!(palette(ThemeKind::Minimal).cursor_hl.bg, Some(Color::Rgb(154, 220, 208)));
+        assert_eq!(palette(ThemeKind::HiFi).cursor_hl.bg, Some(Color::Rgb(255, 179, 71)));
+        assert_eq!(palette(ThemeKind::Classic).cursor_hl.bg, Some(Color::Green));
     }
 
     #[test]
