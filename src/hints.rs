@@ -27,6 +27,9 @@ pub type Key = (KeyCode, KeyModifiers);
 pub struct Bar {
     pub line: Line<'static>,
     pub keys: Vec<(usize, usize, Hit)>,
+    /// Hints that name their own target, by the keys their text reads as:
+    /// lit when one is pressed (`light`) though no click sends it.
+    pub named: Vec<(usize, usize, KeyCode)>,
     /// The columns it was laid out for (what is drawn of it): no target is
     /// registered past them.
     pub width: usize,
@@ -43,6 +46,29 @@ impl Bar {
             if width > 0 {
                 hits.push((Rect::new(x + start as u16, y, width as u16, 1), hit));
             }
+        }
+    }
+
+    /// Light the hint of `key` (`patch` over its key text, and over its
+    /// label when the label is a target too): the key just pressed.
+    pub fn light(&mut self, key: KeyCode, patch: Style) {
+        // The key text and its label are two targets: lit as one, the
+        // space between them included. Each hint on its own: one span from
+        // the first spot to the last lit every hint between two of a key.
+        let spots = self.keys.iter().filter_map(|&(start, width, hit)| matches!(hit, Hit::Key(code, _) if code == key).then_some((start, width)));
+        let named = self.named.iter().filter_map(|&(start, width, code)| (code == key).then_some((start, width)));
+        let mut spots: Vec<(usize, usize)> = spots.chain(named).map(|(start, width)| (start, start + width)).collect();
+        spots.sort_unstable();
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        for (from, to) in spots {
+            match runs.last_mut() {
+                // A key and its label, one space apart.
+                Some(run) if from <= run.1 + 1 => run.1 = run.1.max(to),
+                _ => runs.push((from, to)),
+            }
+        }
+        for (from, to) in runs {
+            self.line = tui::patch_columns(std::mem::take(&mut self.line), from, to, patch);
         }
     }
 }
@@ -156,6 +182,7 @@ impl<K: AsRef<str>, L: AsRef<str>> Hint for (K, L, Option<Hit>) {
 fn bar_taking<H: Hint>(items: &[H], look: &Look, width: usize) -> (Bar, usize) {
     let mut line = LineBuf::new();
     let mut keys = Vec::new();
+    let mut named = Vec::new();
     let mut taken = 0;
     let sep_cols = look.sep.cols();
     for (i, (key, label, target)) in items.iter().map(Hint::parts).enumerate() {
@@ -174,7 +201,10 @@ fn bar_taking<H: Hint>(items: &[H], look: &Look, width: usize) -> (Bar, usize) {
         match target {
             // A hint that names its own target is that target, all of it,
             // whatever its key text reads as.
-            Some(hit) => keys.push((x, item_w, hit)),
+            Some(hit) => {
+                keys.push((x, item_w, hit));
+                named.extend(keys_of(key).into_iter().map(|(_, _, (code, _))| (x, item_w, code)));
+            }
             None => {
                 let ks = keys_of(key);
                 for &(off, w, (code, mods)) in &ks {
@@ -192,7 +222,7 @@ fn bar_taking<H: Hint>(items: &[H], look: &Look, width: usize) -> (Bar, usize) {
             line.reset().push(' ').styled(label, look.label);
         }
     }
-    (Bar { line: line.into_line(), keys, width }, taken)
+    (Bar { line: line.into_line(), keys, named, width }, taken)
 }
 
 /// All of `items`, as many whole hints per line as fit in `width` columns:
@@ -226,6 +256,9 @@ pub fn indent(mut b: Bar, n: usize) -> Bar {
     line.spaces(n).append(b.line);
     b.line = line.into_line();
     for k in &mut b.keys {
+        k.0 += n;
+    }
+    for k in &mut b.named {
         k.0 += n;
     }
     b.width = b.width.saturating_add(n);
@@ -311,6 +344,27 @@ mod tests {
         // Unchanged: ⇧R is one target, w/s two.
         assert_eq!(keys_of("⇧R").len(), 1);
         assert_eq!(keys_of("w/s").iter().map(|&(x, w, _)| (x, w)).collect::<Vec<_>>(), [(0, 1), (2, 1)]);
+    }
+
+    #[test]
+    fn a_key_in_two_hints_lights_each_and_nothing_between() {
+        let look = Look { key: Style::new(), label: Style::new(), sep: Line::raw("  ") };
+        let mut b = bar(&[("e", "edit"), ("q", "quit"), ("e", "again")], &look, 40);
+        let lit = Style::new().add_modifier(ratatui::style::Modifier::REVERSED);
+        b.light(KeyCode::Char('e'), lit);
+        let reversed: String = b.line.spans.iter().filter(|s| s.style.add_modifier.contains(ratatui::style::Modifier::REVERSED)).map(|s| s.content.as_ref()).collect();
+        assert_eq!(reversed, "e edite again");
+    }
+
+    #[test]
+    fn a_hint_with_its_own_target_lights_for_its_key() {
+        // HiFi's `e EDIT` is a click on the EQ unit: `e` pressed never lit it.
+        let look = Look { key: Style::new(), label: Style::new(), sep: Line::raw("  ") };
+        let mut b = bar(&[("e", "EDIT".to_string(), Some(Hit::Panel(crate::state::ViewMode::Eq)))], &look, 20);
+        let lit = Style::new().add_modifier(ratatui::style::Modifier::REVERSED);
+        b.light(KeyCode::Char('e'), lit);
+        let reversed: String = b.line.spans.iter().filter(|s| s.style.add_modifier.contains(ratatui::style::Modifier::REVERSED)).map(|s| s.content.as_ref()).collect();
+        assert_eq!(reversed, "e EDIT");
     }
 
     #[test]

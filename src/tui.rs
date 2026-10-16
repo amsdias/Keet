@@ -409,6 +409,25 @@ pub fn pad(line: Line<'static>, width: usize) -> Line<'static> {
     line
 }
 
+/// `line` with `patch` over its columns `from..to` (graphemes measured as
+/// drawn, `width`), every span split where the range starts and ends.
+pub fn patch_columns(line: Line<'static>, from: usize, to: usize, patch: Style) -> Line<'static> {
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut out = LineBuf::new();
+    let mut col = 0;
+    for span in line.spans {
+        for g in span.content.graphemes(true) {
+            let style = if col >= from && col < to { span.style.patch(patch) } else { span.style };
+            out.styled(g, style);
+            col += width(g);
+        }
+    }
+    let mut l = out.into_line();
+    l.style = line.style;
+    l.alignment = line.alignment;
+    l
+}
+
 /// As many whole items as fit in `width`, joined by `sep`; the first is cut
 /// with an ellipsis when not even it fits (`ansi::fit_segments` for styled
 /// lines: a narrow window drops whole items from the end).

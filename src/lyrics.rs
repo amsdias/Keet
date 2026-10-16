@@ -6,13 +6,14 @@
 //! - LRC (synced) lyrics — `[MM:SS.xx]Line text` with auto-scroll by playback position
 
 /// A single synced lyrics line: timestamp in seconds + text.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct LrcLine {
     pub time: f64,
     pub text: String,
 }
 
 /// Parsed lyrics: either synced (with timestamps) or plain text lines.
+#[derive(PartialEq)]
 pub enum Lyrics {
     Synced(Vec<LrcLine>),
     Plain(Vec<String>),
@@ -325,17 +326,21 @@ pub fn fetch_lrclib(artist: &str, title: &str, duration_secs: Option<u32>) -> Lo
 }
 
 
+/// The wait after a 429 that gave no Retry-After: LRCLIB sends none, and
+/// its limit lasts several seconds (5 s often asked again inside it).
+const BUSY_WAIT_SECS: u64 = 10;
+
 /// `fetch` (LRCLIB), asked once more after a wait when it was busy (429:
-/// its Retry-After, capped at 30 s) or failed (5 s). `wait` sleeps up to the
-/// given time and says whether to go on (false: the track changed). Found
-/// and not found are answers: no retry.
+/// its Retry-After, capped at 30 s, else `BUSY_WAIT_SECS`) or failed (5 s).
+/// `wait` sleeps up to the given time and says whether to go on (false: the
+/// track changed). Found and not found are answers: no retry.
 pub fn fetch_with_retry(
     mut fetch: impl FnMut() -> Lookup<String>,
     wait: impl FnOnce(std::time::Duration) -> bool,
 ) -> Lookup<String> {
     let first = fetch();
     let secs = match first {
-        Lookup::Busy(after) => after.unwrap_or(5).clamp(1, 30),
+        Lookup::Busy(after) => after.unwrap_or(BUSY_WAIT_SECS).clamp(1, 30),
         Lookup::Failed => 5,
         answered => return answered,
     };
@@ -348,14 +353,15 @@ pub fn fetch_with_retry(
 /// LRCLIB's answers kept on disk (`<config>/lyrics`), so a restart does not
 /// ask again: it rate-limits (429), and every launch asking for the same
 /// track hit it — the lyrics then failed on most runs. Found lyrics are kept
-/// for good; "LRCLIB has none" for `MISSING_KEEP` (lyrics get added there).
+/// for good; "LRCLIB has none" for `MISSING_KEEP` (lyrics get added there,
+/// and a week hid them for a week).
 /// Keyed by artist, title and duration (another duration, another version).
 pub struct LyricsDisk {
     dir: std::path::PathBuf,
 }
 
 /// How long a "not on LRCLIB" answer is trusted.
-const MISSING_KEEP: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+const MISSING_KEEP: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 
 impl LyricsDisk {
     pub fn in_config() -> Option<Self> {
@@ -402,7 +408,7 @@ impl LyricsDisk {
         name.into()
     }
 
-    /// `Some(Some(lyrics))` found, `Some(None)` known missing (this week),
+    /// `Some(Some(lyrics))` found, `Some(None)` known missing (today),
     /// `None` unknown.
     pub fn load(&self, artist: &str, title: &str, dur: Option<u32>) -> Option<Option<String>> {
         let base = self.base(artist, title, dur)?;
@@ -476,6 +482,8 @@ pub enum LyricsAnswer {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LyricsSource {
     Embedded,
+    /// A `.lrc` file beside the track (`sidecar`).
+    File,
     Lrclib,
 }
 
@@ -483,9 +491,101 @@ impl LyricsSource {
     pub fn label(self) -> &'static str {
         match self {
             LyricsSource::Embedded => "embedded",
+            LyricsSource::File => "file",
             LyricsSource::Lrclib => "LRCLIB",
         }
     }
+}
+
+/// The `.lrc` file beside a track (`song.flac` → `song.lrc`): what players
+/// and tools such as LRCGET write, and the user's own choice, so it comes
+/// before the tags and LRCLIB.
+pub fn sidecar_path(audio: &std::path::Path) -> std::path::PathBuf {
+    audio.with_extension("lrc")
+}
+
+/// Whether two lyrics texts read the same once parsed (header tags, spaces
+/// and blank lines at the ends, line endings aside).
+pub fn same_lyrics(a: &str, b: &str) -> bool {
+    parse_lyrics(a.trim()) == parse_lyrics(b.trim())
+}
+
+/// The `.lrc` files beside `audio` that exist, `.LRC` too: older Windows tools
+/// write it in capitals, and on a case-sensitive file system (Linux) it was
+/// missed — and `save_lyrics_lrc` then wrote a second one beside it.
+fn existing_sidecars(audio: &std::path::Path) -> impl Iterator<Item = std::path::PathBuf> {
+    [sidecar_path(audio), audio.with_extension("LRC")].into_iter().filter(|p| p.is_file())
+}
+
+/// A `.lrc` file is lyrics, never this big.
+const SIDECAR_MAX_BYTES: u64 = 1 << 20;
+
+/// The lyrics in the `.lrc` file beside `audio`, if there is one with any
+/// text: UTF-8 (a BOM dropped), UTF-16 with its BOM (Notepad's "Unicode"),
+/// else Windows-1252 — older LRC files are seldom UTF-8.
+/// Each spelling in turn: an empty `.lrc` hid a `.LRC` with lyrics.
+pub fn read_sidecar(audio: &std::path::Path) -> Option<String> {
+    existing_sidecars(audio).find_map(|path| {
+        if std::fs::metadata(&path).ok()?.len() > SIDECAR_MAX_BYTES {
+            return None;
+        }
+        let text = decode_text(&std::fs::read(&path).ok()?);
+        (!text.trim().is_empty()).then_some(text)
+    })
+}
+
+fn decode_text(bytes: &[u8]) -> String {
+    let utf16 = |be: bool| {
+        let units = bytes[2..].as_chunks::<2>().0.iter().map(|&c| if be { u16::from_be_bytes(c) } else { u16::from_le_bytes(c) });
+        char::decode_utf16(units).map(|c| c.unwrap_or('\u{FFFD}')).collect()
+    };
+    match bytes {
+        [0xEF, 0xBB, 0xBF, rest @ ..] => String::from_utf8_lossy(rest).into_owned(),
+        [0xFF, 0xFE, ..] => utf16(false),
+        [0xFE, 0xFF, ..] => utf16(true),
+        _ => match std::str::from_utf8(bytes) {
+            Ok(s) => s.to_string(),
+            Err(_) => bytes.iter().map(|&b| crate::playlist::windows_1252(b)).collect(),
+        },
+    }
+}
+
+/// Save LRCLIB's `text` as the `.lrc` beside `audio` (config.json
+/// `save_lyrics_lrc`), so other players find it too: synced lyrics only (an
+/// LRC file is timed lines), and never over a file already there. A failure
+/// (a read-only folder, a share) is said once a session (`take_save_note`), and
+/// that folder is not tried again.
+pub fn save_sidecar(audio: &std::path::Path, text: &str) {
+    if !parse_lyrics(text).is_synced() || existing_sidecars(audio).next().is_some() {
+        return;
+    }
+    // A folder that refused once (read-only, a share) is not asked again
+    // this session: each try is a failed write, slow over SMB.
+    static REFUSED: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
+    let folder = audio.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
+    if REFUSED.lock().is_ok_and(|r| r.contains(&folder)) {
+        return;
+    }
+    let path = sidecar_path(audio);
+    if let Err(e) = crate::playlist::write_atomic(&path, text.as_bytes()) {
+        if let Ok(mut r) = REFUSED.lock() {
+            r.push(folder);
+        }
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static SAID: AtomicBool = AtomicBool::new(false);
+        if !SAID.swap(true, Ordering::Relaxed) {
+            if let Ok(mut n) = SAVE_NOTE.lock() {
+                *n = Some(format!("lyrics not saved beside the track: {e}"));
+            }
+        }
+    }
+}
+
+/// `save_sidecar`'s failure, for the status line (it runs on a worker).
+static SAVE_NOTE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+pub fn take_save_note() -> Option<String> {
+    SAVE_NOTE.lock().ok().and_then(|mut n| n.take())
 }
 
 /// "synced · LRCLIB" — the kind and origin of the lyrics on screen.
@@ -561,6 +661,92 @@ mod tests {
     use super::*;
 
     #[test]
+    fn lrclib_lyrics_are_saved_beside_the_track_only_when_synced_and_new() {
+        let dir = std::env::temp_dir().join(format!("keet-sidecar-save-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let audio = dir.join("t.flac");
+        save_sidecar(&audio, "just words\nno timing");
+        assert!(!sidecar_path(&audio).exists(), "plain lyrics are not an LRC file");
+        save_sidecar(&audio, "[00:01.00]one");
+        assert_eq!(read_sidecar(&audio).as_deref(), Some("[00:01.00]one"));
+        save_sidecar(&audio, "[00:01.00]other");
+        assert_eq!(read_sidecar(&audio).as_deref(), Some("[00:01.00]one"), "never over a file there");
+        // One in capitals (an old Windows tool's) is read, and none is
+        // written beside it.
+        let caps = dir.join("u.flac");
+        std::fs::write(caps.with_extension("LRC"), "[00:01.00]caps").unwrap();
+        assert_eq!(read_sidecar(&caps).as_deref(), Some("[00:01.00]caps"));
+        save_sidecar(&caps, "[00:01.00]other");
+        assert_eq!(read_sidecar(&caps).as_deref(), Some("[00:01.00]caps"));
+        let names: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).filter(|n| n.starts_with("u.")).collect();
+        assert_eq!(names.len(), 1, "{names:?}");
+        // An empty `.lrc` (a failed download) does not hide a `.LRC` with
+        // lyrics — only where the two are different files (Linux).
+        let both = dir.join("v.flac");
+        std::fs::write(both.with_extension("LRC"), "[00:01.00]caps").unwrap();
+        std::fs::write(both.with_extension("lrc"), "").unwrap();
+        if std::fs::read(both.with_extension("LRC")).unwrap().is_empty() {
+            eprintln!("case-insensitive file system: one file, nothing to check");
+        } else {
+            assert_eq!(read_sidecar(&both).as_deref(), Some("[00:01.00]caps"));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_folder_that_refused_a_save_is_not_asked_again() {
+        // A read-only share: a failed write on every track change.
+        let dir = std::env::temp_dir().join(format!("keet-sidecar-ro-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let audio = dir.join("a.flac");
+        save_sidecar(&audio, "[00:01.00]one"); // the folder is not there: fails
+        std::fs::create_dir_all(&dir).unwrap();
+        save_sidecar(&audio, "[00:01.00]one");
+        assert!(!sidecar_path(&audio).exists(), "not tried again");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lyrics_are_the_same_when_they_read_the_same() {
+        // A tagger writes both; the file has headers and spaces at line ends.
+        let tag = "[00:01.00]One\n[00:02.50]Two";
+        let file = "[ar:Someone]\r\n[ti:Song]\r\n[00:01.00] One  \r\n[00:02.50]Two \r\n";
+        assert!(same_lyrics(tag, file));
+        assert!(!same_lyrics(tag, "[00:01.00]One\n[00:02.60]Two"), "another timing");
+        assert!(same_lyrics("One\nTwo", "One \r\n Two\r\n"));
+        assert!(!same_lyrics("One\nTwo", "[00:01.00]One\n[00:02.00]Two"), "plain and synced");
+        assert!(same_lyrics("One\nTwo", "\nOne\nTwo\n\n"), "blank lines at the ends");
+        assert!(!same_lyrics("One\nTwo", "One\n\nTwo"), "one between verses is not");
+    }
+
+    #[test]
+    fn a_lrc_beside_the_track_is_read_in_its_encoding() {
+        let dir = std::env::temp_dir().join(format!("keet-sidecar-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // "01. Mr. Brightside.flac": only the extension is replaced.
+        let audio = dir.join("01. Mr. Brightside.flac");
+        assert_eq!(sidecar_path(&audio), dir.join("01. Mr. Brightside.lrc"));
+        assert_eq!(read_sidecar(&audio), None, "no file");
+        let lrc = "[00:01.00]Café “one”";
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("utf-8", lrc.as_bytes().to_vec()),
+            ("utf-8 bom", [&[0xEF, 0xBB, 0xBF][..], lrc.as_bytes()].concat()),
+            ("utf-16le", [vec![0xFF, 0xFE], lrc.encode_utf16().flat_map(u16::to_le_bytes).collect()].concat()),
+            ("utf-16be", [vec![0xFE, 0xFF], lrc.encode_utf16().flat_map(u16::to_be_bytes).collect()].concat()),
+            ("windows-1252", b"[00:01.00]Caf\xe9 \x93one\x94".to_vec()),
+        ];
+        for (name, bytes) in cases {
+            std::fs::write(sidecar_path(&audio), bytes).unwrap();
+            assert_eq!(read_sidecar(&audio).as_deref(), Some(lrc), "{name}");
+        }
+        // An empty one is no lyrics (it would hide the tags' and LRCLIB's).
+        std::fs::write(sidecar_path(&audio), " \n").unwrap();
+        assert_eq!(read_sidecar(&audio), None);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(source_line(&parse_lyrics(lrc), Some(LyricsSource::File)), "synced · file");
+    }
+
+    #[test]
     fn a_busy_or_failed_lrclib_is_asked_once_more_after_a_wait() {
         use std::cell::RefCell;
         use std::time::Duration;
@@ -571,7 +757,7 @@ mod tests {
         assert!(matches!(got, Lookup::Found(_)));
         assert_eq!(*waited.borrow(), [Duration::from_secs(2)]);
         // A failure with no hint: a few seconds; a huge Retry-After: capped.
-        for (first, wait) in [(Lookup::Failed, 5), (Lookup::Busy(None), 5), (Lookup::Busy(Some(3600)), 30)] {
+        for (first, wait) in [(Lookup::Failed, 5), (Lookup::Busy(None), 10), (Lookup::Busy(Some(3600)), 30)] {
             let answers = RefCell::new(vec![Lookup::NotFound, first]);
             let waited = RefCell::new(Vec::new());
             let got = fetch_with_retry(|| answers.borrow_mut().pop().unwrap(), |d| { waited.borrow_mut().push(d); true });

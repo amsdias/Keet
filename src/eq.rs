@@ -662,6 +662,35 @@ pub fn load_custom_presets() -> Vec<EqPreset> {
     crate::config::load_presets("eq", |p: &mut EqPreset| &mut p.name)
 }
 
+/// `headroom` for what was last asked, worked out again only when the
+/// bands, preamp or rate change: HiFi's EQ unit and the EQ dialog show it on
+/// every frame, and each call builds every band's coefficients at ~250
+/// frequencies.
+#[derive(Default)]
+pub struct HeadroomCache(Option<(HeadroomKey, Headroom)>);
+
+/// What `headroom` depends on: the bands, the preamp, the rate.
+type HeadroomKey = ([BandSettings; EQ_BANDS], f32, f32);
+
+impl HeadroomCache {
+    #[cfg(test)]
+    pub fn is_filled(&self) -> bool {
+        self.0.is_some()
+    }
+
+    pub fn get(&mut self, bands: &[BandSettings; EQ_BANDS], preamp_db: f32, sample_rate: f32) -> Headroom {
+        let key = (*bands, preamp_db, sample_rate);
+        match &self.0 {
+            Some((k, h)) if *k == key => *h,
+            _ => {
+                let h = headroom(bands, preamp_db, sample_rate);
+                self.0 = Some((key, h));
+                h
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod denormal_tests {
     use super::*;
@@ -1109,5 +1138,17 @@ mod parametric_tests {
         assert_eq!(format_freq(1000.0), "1k");
         assert_eq!(format_freq(3300.0), "3.3k");
         assert_eq!(format_freq(16000.0), "16k");
+    }
+
+    #[test]
+    fn the_headroom_cache_follows_every_input() {
+        let mut bands: [BandSettings; EQ_BANDS] = std::array::from_fn(BandSettings::inert);
+        let mut cache = HeadroomCache::default();
+        assert_eq!(cache.get(&bands, 0.0, 48_000.0), headroom(&bands, 0.0, 48_000.0));
+        assert!(cache.0.is_some(), "kept");
+        bands[3].gain = 6.0;
+        assert_eq!(cache.get(&bands, 0.0, 48_000.0), headroom(&bands, 0.0, 48_000.0), "a band changed");
+        assert_eq!(cache.get(&bands, -3.0, 48_000.0), headroom(&bands, -3.0, 48_000.0), "the preamp");
+        assert_eq!(cache.get(&bands, -3.0, 44_100.0), headroom(&bands, -3.0, 44_100.0), "the rate");
     }
 }

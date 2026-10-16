@@ -48,7 +48,18 @@ pub fn draw(f: &mut Frame, cx: &mut Ctx, area: Rect) {
     let footer_h = (footer.len() as u16).min(area.height.saturating_sub(2)).max(1);
     let body = Rect { height: area.height - footer_h, ..area };
     let tree = cx.ui.library_tree_mode;
-    if two {
+    if two && kind == ThemeKind::HiFi {
+        // A tape deck's library: the artists down a narrow column on the
+        // left, the tracks as a table beside them.
+        let tree_w = (area.width / 4).clamp(24, 36);
+        let tree_area = Rect { width: tree_w, ..body };
+        let rule = Rect { x: body.x + tree_w, width: 1, ..body };
+        let list = Rect { x: body.x + tree_w + 2, width: body.width.saturating_sub(tree_w + 2), ..body };
+        tree_pane(f, cx.ui, kind, p, tree_area, Some(tree));
+        let col: Vec<Line> = (0..rule.height).map(|_| tui::line("│", p.rule)).collect();
+        tui::draw_lines(f.buffer_mut(), rule, &col);
+        flat_pane(f, cx, kind, p, list, Some(!tree));
+    } else if two {
         // The list takes about three fifths; a rule column between.
         let list_w = area.width * 3 / 5;
         let list = Rect { width: list_w, ..body };
@@ -109,27 +120,38 @@ fn flat_pane(f: &mut Frame, cx: &mut Ctx, kind: ThemeKind, p: &Palette, area: Re
     let width = area.width as usize;
     let rows = (area.height as usize).saturating_sub(1).max(1);
     ui.last_visible_rows = rows;
-    let upper = kind == ThemeKind::HiFi;
+    let hifi = kind == ThemeKind::HiFi;
     let num_w = playlist.len().to_string().len().max(2);
     let time_w = format_time(ui.metadata_cache.max_duration()).len().max(5);
-    // marker, number, title, album (Classic and Minimal, when wide), time,
-    // a column of margin and the scrollbar's.
+    // marker, number, title, album (when wide; HiFi's artist too: a table,
+    // a tape deck's index), time, a column of margin and the scrollbar's.
     let fixed = 2 + 1 + 2 + num_w + 2 + 2 + time_w + 2;
     let content = width.saturating_sub(fixed);
-    let album_w = if !upper && content >= 50 { (content * 30 / 100).clamp(12, 32) } else { 0 };
-    let title_w = content.saturating_sub(album_w);
+    let (artist_w, album_w) = if hifi {
+        match content {
+            c if c >= 60 => (c * 28 / 100, c * 28 / 100),
+            c if c >= 40 => (c * 40 / 100, 0),
+            _ => (0, 0),
+        }
+    } else if content >= 50 {
+        (0, (content * 30 / 100).clamp(12, 32))
+    } else {
+        (0, 0)
+    };
+    let title_w = content.saturating_sub(album_w + artist_w);
     let cell = |s: &str, w: usize| {
         let t = truncate_plain(s, w.saturating_sub(1));
         let pad = w.saturating_sub(tui::width(&t));
         format!("{t}{}", " ".repeat(pad))
     };
-    let heading = if upper {
-        format!("     {:>num_w$}  {}  {:>time_w$}", "#", cell("TITLE", title_w), "TIME")
-    } else {
-        let (t, a, d) = if kind == ThemeKind::Minimal { ("TITLE", "ALBUM", "TIME") } else { ("Title", "Album", "Time") };
+    let heading = {
+        let (t, ar, a, d) = match kind {
+            ThemeKind::Classic => ("Title", "Artist", "Album", "Time"),
+            _ => ("TITLE", "ARTIST", "ALBUM", "TIME"),
+        };
         format!(
-            "     {:>num_w$}  {}{}  {:>time_w$}",
-            "#", cell(t, title_w), cell(if album_w > 0 { a } else { "" }, album_w), d,
+            "     {:>num_w$}  {}{}{}  {:>time_w$}",
+            "#", cell(t, title_w), cell(if artist_w > 0 { ar } else { "" }, artist_w), cell(if album_w > 0 { a } else { "" }, album_w), d,
         )
     };
     let mut lines = vec![tui::line(heading, heading_style(p, focused))];
@@ -159,11 +181,8 @@ fn flat_pane(f: &mut Frame, cx: &mut Ctx, kind: ThemeKind, p: &Palette, area: Re
         let playing = idx == ui.current;
         let cursor = show_cursor && pos == ui.cursor;
         let is_queued = ui.enqueue_count > 0 && queued.contains(&idx);
-        let mut title = ui.metadata_cache.title(idx).unwrap_or_else(|| ui.metadata_cache.display_name(idx, &playlist[idx]));
+        let title = ui.metadata_cache.title(idx).unwrap_or_else(|| ui.metadata_cache.display_name(idx, &playlist[idx]));
         let artist = ui.metadata_cache.artist_album(idx).0.unwrap_or_default();
-        if upper {
-            title = title.to_uppercase();
-        }
         let album = ui.metadata_cache.album(idx).unwrap_or_default();
         let dur = ui.metadata_cache.duration(idx).map(format_time).unwrap_or_default();
         let marker = if playing { "▶" } else if is_queued { "+" } else { " " };
@@ -178,6 +197,9 @@ fn flat_pane(f: &mut Frame, cx: &mut Ctx, kind: ThemeKind, p: &Palette, area: Re
             t.reset().push_str("  ").styled(&artist, p.dim);
         }
         l.append(tui::pad(tui::truncate_ellipsis(t.into_line(), title_w.saturating_sub(1)), title_w));
+        if artist_w > 0 {
+            l.styled(&cell(&artist, artist_w), if playing { p.accent } else { p.fg });
+        }
         if album_w > 0 {
             l.styled(&cell(&album, album_w), p.dim);
         }

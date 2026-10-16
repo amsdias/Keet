@@ -154,7 +154,7 @@ fn m3u_entry_candidates(line: &[u8]) -> Vec<PathBuf> {
 /// where it keeps its punctuation (’ “ ” – — … €): read as Latin-1 those
 /// are control characters, and the entry would silently miss its file. The five
 /// unassigned bytes keep their Latin-1 meaning.
-fn windows_1252(b: u8) -> char {
+pub(crate) fn windows_1252(b: u8) -> char {
     const HIGH: [char; 32] = [
         '€', '\u{81}', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '\u{8D}', 'Ž', '\u{8F}',
         '\u{90}', '‘', '’', '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ', '\u{9D}', 'ž', 'Ÿ',

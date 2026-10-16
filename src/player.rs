@@ -161,7 +161,11 @@ impl Player {
             buffer_size: s.buffer_size,
             host: s.host,
             state: s.state,
-            ui: s.ui,
+            ui: {
+                let mut ui = s.ui;
+                ui.eq_preset_names = s.eq_presets.iter().map(|p| p.name.clone()).collect();
+                ui
+            },
             playlist: s.playlist,
             eq_presets: s.eq_presets,
             fx_presets: s.fx_presets,
@@ -855,10 +859,13 @@ impl Player {
         if !self.state.is_paused() {
             self.last_playing = now;
         }
+        // HiFi's peak meter falls for several seconds after a pause, longer
+        // than `VIZ_SETTLE`: at the idle rate it fell in visible steps.
+        let meter_falling = self.state.theme_kind() == crate::theme::ThemeKind::HiFi && !self.ui.hifi_meter.settled();
         let interval = frame_interval(
             &self.state,
             self.ui.viz_on_screen(),
-            now.duration_since(self.last_playing) < VIZ_SETTLE,
+            now.duration_since(self.last_playing) < VIZ_SETTLE || meter_falling,
         );
         if self.ui.dirty || self.ui.terminal_resized || self.full_repaint || self.last_ui.elapsed() >= interval {
             self.ui.dirty = false;
@@ -1232,6 +1239,10 @@ impl Player {
             self.ui.queue_notice(msg, Duration::from_secs(4));
             self.ui.dirty = true;
         }
+        if let Some(msg) = crate::lyrics::take_save_note() {
+            self.ui.queue_notice(msg, Duration::from_secs(4));
+            self.ui.dirty = true;
+        }
         if let Some(msg) = audio::take_notice() {
             self.ui.queue_notice(msg, Duration::from_secs(5));
             self.ui.dirty = true;
@@ -1459,6 +1470,7 @@ fn default_values(
     let docked: Vec<&str> = ui
         .docked
         .iter()
+        .filter(|&&v| !(v == ViewMode::Playlist && ui.library_auto_docked))
         .filter_map(|v| match v {
             ViewMode::Playlist => Some("playlist"),
             ViewMode::Lyrics => Some("lyrics"),
@@ -1511,6 +1523,17 @@ mod tests {
         st.note_remote_change();
         pump_media_keys(&st, &mut ui);
         assert!(ui.dirty, "a media key's change is drawn at once");
+    }
+
+    #[test]
+    fn a_library_hifi_docked_by_itself_is_not_saved_as_docked() {
+        let st = PlayerState::new();
+        let mut ui = UiState::new(Vec::new(), crate::metadata::MetadataCache::new(0));
+        ui.docked = vec![ViewMode::Lyrics, ViewMode::Playlist];
+        ui.library_auto_docked = true;
+        let values = default_values(&st, &ui, None, "Medium");
+        let docked = values.iter().find(|(k, _)| *k == "docked").map(|(_, v)| v.clone());
+        assert_eq!(docked, Some(serde_json::json!(["lyrics"])));
     }
 
     #[test]

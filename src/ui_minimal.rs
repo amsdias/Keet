@@ -110,10 +110,7 @@ fn draw_player(f: &mut Frame, cx: &mut Ctx) {
     // Build the SIGNAL pairs up front.
     let out_rate = state.output_rate.load(Ordering::Relaxed) as u32;
     let vol = state.volume.load(Ordering::Relaxed);
-    let bal = state.balance_value();
-    let bal_str = if bal == 0 { "centred".to_string() }
-                  else if bal < 0 { format!("L{}%", -bal) }
-                  else { format!("R{}%", bal) };
+    let bal_str = crate::ui::balance_label(state.balance_value());
     let fader = if state.is_pre_fader() { "pre" } else { "post" };
     let signal_rows: Vec<(&'static str, String, bool /*good*/)> = vec![
         // Exclusive mode also shows the DAC's format ("96.0k · 24-bit").

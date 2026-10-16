@@ -52,6 +52,11 @@ pub struct Config {
     /// palette, light backgrounds included.
     #[serde(default)]
     pub classic_use_truecolor: bool,
+    /// Save lyrics found on LRCLIB as a `.lrc` beside the track (synced
+    /// ones, never over a file there). Off by default: Keet does not write
+    /// into music folders unless asked.
+    #[serde(default)]
+    pub save_lyrics_lrc: bool,
     #[serde(default)]
     pub classic_colors: ClassicColors,
     /// Keys that were present but unreadable (wrong type), skipped one by
@@ -136,6 +141,7 @@ fn parse(contents: &str) -> Config {
     c.eq = field(&obj, "eq", "", &mut problems);
     c.crossfeed = field(&obj, "crossfeed", "", &mut problems);
     c.classic_use_truecolor = field(&obj, "classic_use_truecolor", "", &mut problems).unwrap_or(false);
+    c.save_lyrics_lrc = field(&obj, "save_lyrics_lrc", "", &mut problems).unwrap_or(false);
     match obj.get("classic_colors") {
         Some(serde_json::Value::Object(colors)) => {
             c.classic_colors = ClassicColors {
@@ -363,6 +369,14 @@ mod tests {
             Some(crate::state::RgMode::Album)
         ));
         assert!(crate::state::VizMode::from_str("nope").is_none());
+    }
+
+    #[test]
+    fn saving_lyrics_beside_tracks_is_off_unless_asked() {
+        assert!(!parse("{}").save_lyrics_lrc);
+        assert!(parse("{\"save_lyrics_lrc\": true}").save_lyrics_lrc);
+        let c = parse("{\"save_lyrics_lrc\": \"yes\"}");
+        assert!(!c.save_lyrics_lrc && c.problems.iter().any(|p| p.contains("save_lyrics_lrc")), "{:?}", c.problems);
     }
 
     #[test]

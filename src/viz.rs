@@ -531,6 +531,11 @@ impl VizAnalyser {
         // once per call would make the meter fall faster or slower with the
         // frame rate (the waits paint at another pace than the main loop).
         let steps = frames as f32 / self.sample_rate.max(1) as f32 / VU_FRAME_SECS;
+        // Only HiFi's meter takes them; kept elsewhere, the loudest of the
+        // session met it on its first frame.
+        if state.theme_kind() == crate::theme::ThemeKind::HiFi {
+            state.note_raw_peaks(peak_l, peak_r);
+        }
         let (l, r) = (self.smoothed_peak_l, self.smoothed_peak_r);
         self.smoothed_peak_l = vu_smooth(l, peak_l, steps);
         self.smoothed_peak_r = vu_smooth(r, peak_r, steps);
@@ -3805,5 +3810,19 @@ mod analysis_tests {
         assert_eq!(nice_step(1.2), 1.0);
         assert_eq!(nice_step(3.0), 2.0);
         assert_eq!(nice_step(8.0), 10.0);
+    }
+
+    #[test]
+    fn only_hifi_keeps_raw_peaks_for_its_meter() {
+        // Nothing else takes them: kept in Classic, a transient minutes old
+        // filled HiFi's meter on its first frame.
+        let state = PlayerState::new();
+        let mut analyser = VizAnalyser::new(48000);
+        state.set_theme(crate::theme::ThemeKind::Classic);
+        analyser.process(&[0.9, -0.8, 0.1, 0.1], 2, &state);
+        assert_eq!(state.take_raw_peaks(), (0.0, 0.0), "Classic keeps none");
+        state.set_theme(crate::theme::ThemeKind::HiFi);
+        analyser.process(&[0.9, -0.8, 0.1, 0.1], 2, &state);
+        assert_eq!(state.take_raw_peaks(), (0.9, 0.8));
     }
 }

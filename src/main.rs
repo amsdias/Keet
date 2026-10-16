@@ -626,9 +626,22 @@ fn spawn_lyrics_worker(ui: &mut state::UiState, path: std::path::PathBuf, dur: O
     // asked LRCLIB again after its retry wait for a track gone.
     let gen_snap = ui.lyrics_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     if let Some(l) = ui.metadata_cache.lyrics(ui.current) {
+        // Shown at once; a `.lrc` beside the track still wins, looked for on
+        // a worker (a file system call, on a network share perhaps).
         ui.set_lyrics(Some(lyrics::parse_lyrics(&l)));
         ui.lyrics_source = Some(lyrics::LyricsSource::Embedded);
-        ui.lyrics_receiver = None;
+        let (tx, rx) = std::sync::mpsc::channel();
+        ui.lyrics_receiver = Some(rx);
+        std::thread::spawn(move || {
+            // The same lyrics in the file (tools write both) change nothing:
+            // taken, they reset a view the user had already scrolled.
+            // Compared parsed: header tags or spaces at line ends are no change.
+            let answer = match lyrics::read_sidecar(&path) {
+                Some(text) if !lyrics::same_lyrics(&text, &l) => lyrics::LyricsAnswer::Found(lyrics::parse_lyrics(&text), lyrics::LyricsSource::File),
+                _ => lyrics::LyricsAnswer::Missing,
+            };
+            let _ = tx.send(answer);
+        });
         return;
     }
     let (cached_artist, cached_title) = ui.metadata_cache.artist_title(ui.current);
@@ -639,8 +652,15 @@ fn spawn_lyrics_worker(ui: &mut state::UiState, path: std::path::PathBuf, dur: O
     ui.lyrics_receiver = Some(rx);
     let gen_ref = std::sync::Arc::clone(&ui.lyrics_gen);
     let net_cache = ui.lyrics_lookups.clone();
+    let save_lrc = ui.save_lyrics_lrc;
     std::thread::spawn(move || {
         use lyrics::{Lookup, LyricsAnswer, LyricsSource};
+        // The file beside the track first: it wins, and the tag read below
+        // (slow on a share) is then not needed.
+        if let Some(text) = lyrics::read_sidecar(&path) {
+            let _ = tx.send(LyricsAnswer::Found(lyrics::parse_lyrics(&text), LyricsSource::File));
+            return;
+        }
         let (artist, title, embedded) = if cached_artist.is_some() || cached_title.is_some() {
             (cached_artist, cached_title, metadata::read_lyrics(&path))
         } else {
@@ -666,9 +686,21 @@ fn spawn_lyrics_worker(ui: &mut state::UiState, path: std::path::PathBuf, dur: O
             let disk = lyrics::LyricsDisk::in_config();
             // Skip the network round-trip if a newer request has already
             // been issued (what is already known is still read).
-            let fetch = || if current() { lyrics::fetch_lrclib(&a, &t, dur) } else { Lookup::Failed };
+            // Only an answer fresh from LRCLIB is saved beside the track: one
+            // from the caches put back a `.lrc` the user had deleted.
+            let fresh = std::cell::Cell::new(false);
+            let fetch = || {
+                let r = if current() { lyrics::fetch_lrclib(&a, &t, dur) } else { Lookup::Failed };
+                fresh.set(matches!(r, Lookup::Found(_)));
+                r
+            };
             match lyrics::lookup_lrclib(&net_cache, disk.as_ref(), (&a, &t, dur), fetch, wait) {
-                Lookup::Found(text) => found(&text),
+                Lookup::Found(text) => {
+                    if save_lrc && fresh.get() {
+                        lyrics::save_sidecar(&path, &text);
+                    }
+                    found(&text)
+                }
                 Lookup::NotFound => LyricsAnswer::Missing,
                 Lookup::Busy(_) => LyricsAnswer::Unavailable("LRCLIB busy, try again later"),
                 Lookup::Failed => LyricsAnswer::Unavailable("LRCLIB unreachable"),
@@ -1265,6 +1297,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // named, like any other bad value.
     let mut problems = app_config.problems.clone();
     problems.extend(sixel_problem);
+    ui.save_lyrics_lrc = app_config.save_lyrics_lrc;
     let (docked, bad) = ui::docked_from_config(app_config.docked.as_deref().unwrap_or_default());
     ui.docked = docked;
     problems.extend(bad);
@@ -1446,6 +1479,26 @@ mod main_tests {
         assert_eq!(notes.len(), 2, "{notes:?}");
         assert!(notes[1].contains("classic_colors.highlight"));
         assert_eq!(config_notices(&[], &[]).len(), 0);
+    }
+
+    #[test]
+    fn a_lrc_beside_the_track_replaces_embedded_lyrics_only_when_it_differs() {
+        let dir = std::env::temp_dir().join(format!("keet-sidecar-worker-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let audio = dir.join("t.flac");
+        let answer = |sidecar: &str| {
+            std::fs::write(lyrics::sidecar_path(&audio), sidecar).unwrap();
+            let mut ui = UiState::new(Vec::new(), metadata::MetadataCache::new(1));
+            ui.metadata_cache.set_lyrics_for_test(0, "[00:01.00]hello\n[00:02.00]world");
+            spawn_lyrics_worker(&mut ui, audio.clone(), None);
+            assert!(ui.lyrics().is_some(), "the embedded lyrics show at once");
+            ui.lyrics_receiver.take().unwrap().recv_timeout(std::time::Duration::from_secs(5)).unwrap()
+        };
+        // The same text (CRLF and a trailing newline aside): nothing to do,
+        // or the view the user scrolled is reset.
+        assert!(matches!(answer("[00:01.00]hello\r\n[00:02.00]world\r\n"), lyrics::LyricsAnswer::Missing));
+        assert!(matches!(answer("[00:01.00]other"), lyrics::LyricsAnswer::Found(_, lyrics::LyricsSource::File)));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

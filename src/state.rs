@@ -412,6 +412,10 @@ pub struct PlayerState {
     pub(crate) viz_mode: AtomicU8,
     pub(crate) peak_left: AtomicU32,
     pub(crate) peak_right: AtomicU32,
+    /// The raw peaks since HiFi's meter last read them (`note_raw_peaks`,
+    /// `take_raw_peaks`): its own ballistics, not the VU's smoothed ones.
+    raw_peak_left: AtomicU32,
+    raw_peak_right: AtomicU32,
     pub(crate) spectrum: [AtomicU32; SPECTRUM_BANDS],   // L channel (or mono for vertical)
     pub(crate) spectrum_r: [AtomicU32; SPECTRUM_BANDS], // R channel
     pub(crate) peak_dots: [AtomicU32; SPECTRUM_BANDS],
@@ -577,6 +581,8 @@ impl PlayerState {
             viz_mode: AtomicU8::new(VizMode::None as u8),
             peak_left: AtomicU32::new(0),
             peak_right: AtomicU32::new(0),
+            raw_peak_left: AtomicU32::new(0),
+            raw_peak_right: AtomicU32::new(0),
             spectrum: std::array::from_fn(|_| AtomicU32::new(0)),
             spectrum_r: std::array::from_fn(|_| AtomicU32::new(0)),
             peak_dots: std::array::from_fn(|_| AtomicU32::new(0)),
@@ -750,10 +756,17 @@ impl PlayerState {
         let count = self.eq_preset_count.load(Ordering::Relaxed);
         if count == 0 { return; }
         let cur = self.eq_preset_index.load(Ordering::Relaxed) as i32;
-        let next = (cur + dir).rem_euclid(count as i32) as usize;
-        self.eq_preset_index.store(next, Ordering::Relaxed);
-        self.eq_custom.store(false, Ordering::Relaxed);
-        self.eq_changed.store(true, Ordering::Relaxed);
+        self.select_eq_preset((cur + dir).rem_euclid(count as i32) as usize);
+    }
+
+    /// Select preset `index` (out of range: nothing): the `[`/`]` keys and
+    /// a click on HiFi's preset list.
+    pub fn select_eq_preset(&self, index: usize) {
+        if index < self.eq_preset_count.load(Ordering::Relaxed) {
+            self.eq_preset_index.store(index, Ordering::Relaxed);
+            self.eq_custom.store(false, Ordering::Relaxed);
+            self.eq_changed.store(true, Ordering::Relaxed);
+        }
     }
 
     pub fn eq_index(&self) -> usize {
@@ -1108,6 +1121,25 @@ impl PlayerState {
         self.peak_right.store(right.to_bits(), Ordering::Relaxed);
     }
 
+    /// Raise the raw peaks HiFi's meter takes next (several analyser calls
+    /// can fall between two of its reads: the loudest counts). Peaks are
+    /// magnitudes: for a float > 0 the bits order as the values, so
+    /// `fetch_max` on them is the max (a non-finite one is left out, and
+    /// -0.0, whose sign bit beats every positive float).
+    pub fn note_raw_peaks(&self, left: f32, right: f32) {
+        for (a, v) in [(&self.raw_peak_left, left), (&self.raw_peak_right, right)] {
+            if v.is_finite() && v > 0.0 {
+                a.fetch_max(v.to_bits(), Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// The raw peaks since the last call, reset to zero.
+    pub fn take_raw_peaks(&self) -> (f32, f32) {
+        let take = |a: &AtomicU32| f32::from_bits(a.swap(0, Ordering::Relaxed));
+        (take(&self.raw_peak_left), take(&self.raw_peak_right))
+    }
+
     pub fn get_peaks(&self) -> (f32, f32) {
         let left = f32::from_bits(self.peak_left.load(Ordering::Relaxed));
         let right = f32::from_bits(self.peak_right.load(Ordering::Relaxed));
@@ -1184,6 +1216,11 @@ pub enum Hit {
     Panel(ViewMode),
     /// A key hint: a click presses that key.
     Key(crossterm::event::KeyCode, crossterm::event::KeyModifiers),
+    /// A band of HiFi's EQ unit: a click selects it (and gives the EQ the
+    /// keys).
+    EqBand(usize),
+    /// A preset in HiFi's EQ unit's list: a click selects it.
+    EqPreset(usize),
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -1313,6 +1350,8 @@ pub struct UiState {
     /// which drops `lyrics_wrap` with them (kept, the old song's rows showed
     /// under the new song's line numbers).
     lyrics: Option<crate::lyrics::Lyrics>,
+    /// config.json `save_lyrics_lrc`: LRCLIB's lyrics saved beside the track.
+    pub save_lyrics_lrc: bool,
     pub lyrics_receiver: Option<std::sync::mpsc::Receiver<crate::lyrics::LyricsAnswer>>,
     /// Why the lyrics could not be looked up (LRCLIB busy or unreachable),
     /// shown instead of "no lyrics for this track", which it is not.
@@ -1415,6 +1454,17 @@ pub struct UiState {
     /// The panels (`ViewMode::Playlist`, `ViewMode::Lyrics`) docked into the
     /// player's layout rather than floating (`k`).
     pub docked: Vec<ViewMode>,
+    /// The library is in `docked` because HiFi docked it by itself (room
+    /// under its EQ), not by `k`: it leaves when the room goes, and is not
+    /// saved as a default.
+    pub library_auto_docked: bool,
+    /// The user floated or closed the library HiFi docked by itself: it is
+    /// not docked by itself again this session.
+    pub library_auto_declined: bool,
+    /// The library docked by itself once this session: set up then (the
+    /// cursor on the playing track), as found after that, as a hand-docked
+    /// panel is after a resize took its room for a while.
+    pub library_auto_set_up: bool,
     /// The panels, the one used last first: the order docked panels keep
     /// their room in when the window is short of it.
     pub panel_recent: Vec<ViewMode>,
@@ -1425,6 +1475,21 @@ pub struct UiState {
     /// what was on screen: `ui::open_view` focuses such a panel as it was
     /// and sets up only one that was not.
     pub floating_shown: Option<ViewMode>,
+    /// The last frame showed HiFi's EQ unit in its stack: `e` then gives it
+    /// the keys there instead of opening the EQ dialog.
+    pub eq_in_stack: bool,
+    /// HiFi's peak meter (its own ballistics, `ui_hifi::PeakMeter`).
+    pub hifi_meter: crate::ui_hifi::PeakMeter,
+    /// The EQ's headroom row (HiFi's unit, the dialog), worked out when
+    /// the EQ changes.
+    pub headroom_cache: crate::eq::HeadroomCache,
+    /// The EQ presets' names, in their order (`state.eq_index`), for HiFi's
+    /// preset list. Set once by the player.
+    pub eq_preset_names: Vec<String>,
+    /// The last command key pressed, the view that had the keys, and when:
+    /// HiFi lights its hint for a moment (`ui_hifi::KEY_FLASH`), on that
+    /// view's bar only (↓ in a focused list lit the player's `↑↓ TRACK`).
+    pub key_flash: Option<(crossterm::event::KeyCode, ViewMode, std::time::Instant)>,
     /// This frame's status message, read ONCE by `ui::draw` (`active_status`
     /// advances the notice queue: a second reader in a frame could show
     /// another message), for the theme's status line and a panel's border.
@@ -1535,6 +1600,7 @@ impl UiState {
             spectro_block_intact: false,
             last_viz_block: ratatui::layout::Rect::ZERO,
             lyrics: None,
+            save_lyrics_lrc: false,
             lyrics_receiver: None,
             lyrics_line_seen: None,
             lyrics_unavailable: None,
@@ -1576,8 +1642,16 @@ impl UiState {
             tree_clicked: None,
             pressed: std::collections::VecDeque::new(),
             docked: Vec::new(),
+            library_auto_docked: false,
+            library_auto_declined: false,
+            library_auto_set_up: false,
             panel_recent: vec![ViewMode::Playlist, ViewMode::Lyrics],
             docked_shown: Vec::new(),
+            eq_in_stack: false,
+            hifi_meter: Default::default(),
+            headroom_cache: Default::default(),
+            eq_preset_names: Vec::new(),
+            key_flash: None,
             floating_shown: None,
             frame_status: None,
             status_drawn_at: None,
@@ -1668,6 +1742,15 @@ impl UiState {
 
 #[cfg(test)]
 mod state_tests {
+    #[test]
+    fn the_raw_peaks_keep_the_loudest_until_taken() {
+        let st = PlayerState::new();
+        st.note_raw_peaks(0.5, 0.2);
+        st.note_raw_peaks(0.3, 0.9);
+        assert_eq!(st.take_raw_peaks(), (0.5, 0.9), "two analyser calls between reads");
+        assert_eq!(st.take_raw_peaks(), (0.0, 0.0), "taken");
+    }
+
     use super::*;
 
     #[test]

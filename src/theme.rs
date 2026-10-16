@@ -167,7 +167,9 @@ const HIFI_PAL: Palette = Palette {
     accent: rgb(255, 179, 71).add_modifier(Modifier::BOLD),
     good: rgb(168, 200, 122),
     warn: rgb(224, 122, 74),
-    danger: rgb(224, 122, 74).add_modifier(Modifier::BOLD),
+    // A real red: the peak meter goes amber → orange (warn) → red, and its
+    // danger was the warn orange in bold.
+    danger: rgb(232, 72, 56).add_modifier(Modifier::BOLD),
     bold: BOLD,
     cursor_hl: Style::new().bg(Color::Rgb(255, 179, 71)).fg(Color::Rgb(31, 20, 8)),
 };

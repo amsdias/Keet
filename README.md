@@ -4,12 +4,12 @@ A high-performance, low-CPU terminal audio player with real-time spectrum visual
 
 ## Features
 
-- **Switchable themes**: Three UI themes — **Classic** (the terminal's own colours, or truecolor ones of your choice), **Minimal** (warm-cyan editorial), **Hi-Fi** (amber studio-monitor) — cycled at runtime with `T`, with a launch default via `--theme` or `~/.config/keet/config.json`. Every screen (Player, Library, Lyrics, EQ+FX) is themed
+- **Switchable themes**: Three UI themes — **Classic** (the terminal's own colours, or truecolor ones of your choice), **Minimal** (warm-cyan editorial), **Hi-Fi** (an amber hi-fi stack: transport, peak meters, graphic EQ and tape-deck library, one unit above the other) — cycled at runtime with `T`, with a launch default via `--theme` or `~/.config/keet/config.json`. Every screen (Player, Library, Lyrics, EQ) is themed
 - **Multi-format support**: MP3, FLAC, WAV, OGG, AAC/M4A, ALAC, AIFF — decoded by symphonia 0.6 with SIMD enabled
 - **Any channel layout**: Mono, stereo, quad, 5.1, and 7.1 sources all play correctly — surround is downmixed to stereo (ITU-style: center at -3dB into both sides, LFE dropped)
 - **Low CPU usage**: <0.5% total system CPU (release mode)
 - **64-bit filter math**: EQ and crossfeed biquads run in f64 internally. f32 coefficients disintegrate at low centre frequencies — a 20 Hz Q=10 +12 dB band at 192 kHz lands at +2.4 dB in f32 and +12.0 dB in f64
-- **Synced lyrics**: Embedded LRC lyrics + automatic fetching from LRCLIB (~3M songs), with adjustable sync offset
+- **Synced lyrics**: `.lrc` files beside the tracks, embedded lyrics, and automatic fetching from LRCLIB (~3M songs, optionally saved beside the track), with an adjustable sync offset kept per track
 - **10-band parametric EQ**: A full-screen interactive editor (`E`) — every band has filter type (peak / shelves / cuts), frequency, Q, and gain, adjusted live; starts out as a classic ISO-centre graphic EQ; built-in preset shapes (Flat, Bass Boost, Treble Boost, Vocal, Loudness) + custom JSON presets, including AutoEq-style parametric headphone corrections
 - **Audio effects**: Reverb, chorus, delay with built-in environment presets + custom JSON presets
 - **Gapless playback**: Sample-accurate track transitions with continuous audio stream
@@ -28,11 +28,13 @@ A high-performance, low-CPU terminal audio player with real-time spectrum visual
 - **Clipping indicator**: Persistent dot that turns red when signal exceeds 0dBFS, with peak safety limiter
 - **Smart audio processing**: Automatic sample rate switching (macOS), Bluetooth detection, conditional resampling, seamless device switching
 - **Volume control**: Adjustable 0-150% with per-sample gain
-- **Library browser**: The library view (`L`) has a flat track list *and* an artist → album → track **tree** (`Tab` to switch) with live filtering (`/`), play-node (`Enter` plays a track / album / artist), and remove; folder sources auto-sort into artist → album order once tags load (when not shuffling; files you list keep your order)
+- **Floating and docked panels**: The playlist (`L`) and the lyrics (`Y`) float over the running player, or dock into its layout with `K` (`Shift+K` closes a docked one); Hi-Fi docks the library by itself when the window has room under its EQ
+- **Library browser**: The library (`L`) has a flat track list *and* an artist → album → track **tree** (`Tab` to switch) with live filtering (`/`), play-node (`Enter` plays a track / album / artist), and remove; folder sources auto-sort into artist → album order once tags load (when not shuffling; files you list keep your order)
 - **Playlist features**: Shuffle (toggling off restores the previous order — M3U order survives), repeat (all/one), recursive folder scanning, playlist view with search/sort/track durations/album column, page navigation (Home/End/PgUp/PgDn + vim `g`/`G`/Ctrl+U/D), tag-based sort (artist → album → disc → track), play queue (enqueue tracks after current), M3U import/export, folder rescan, multiple source paths with deduplication
 - **Resume playback**: Save and restore last session (track, position, volume, EQ — including an edited Custom parametric EQ, effects, crossfeed, balance, theme, device, exclusive) automatically
 - **HQ resampler mode**: Optional `--quality` flag for audiophile-grade resampling
 - **Resilient playback**: Skips missing/corrupt files with a status message, recovers from device disconnection (including USB DAC unplug)
+- **Mouse support**: Click or drag the progress bar to seek, click rows, key hints, tabs, EQ bands and presets, double-click to play, scroll with the wheel (`M` toggles it)
 - **Terminal-safe UI**: Output adapts to terminal width, handles terminal resize gracefully
 - **Process stats**: Lightweight CPU/memory monitoring via direct platform syscalls (toggle with `I`)
 
@@ -119,14 +121,16 @@ keet ~/Music/favorites.m3u
 | `Down` | Previous track |
 | `Right` | Seek forward 10s |
 | `Left` | Seek backward 10s |
-| `L` | Toggle playlist view |
-| `Y` | Toggle lyrics view |
+| `L` | Playlist (opens it, or gives a docked one the keys) |
+| `Y` | Lyrics (opens them, or gives docked ones the keys) |
+| `K` | Dock / float the playlist or lyrics that has the keys |
+| `Shift+K` | Close a docked panel |
 | `T` | Cycle UI theme (Classic → Minimal → Hi-Fi) |
 | `V` | Cycle visualization modes |
 | `B` | Toggle visualization style (bars/dots) |
 | `Shift+F` | Toggle full-window visualization (drops the header, gives the viz every spare row) |
 | `Shift+L` | Toggle per-visualization detail: level history on the VU meter, frequency legend on either spectrum |
-| `E` | Open the EQ + FX editor screen |
+| `E` | EQ editor (in Hi-Fi, the EQ unit in its stack takes the keys) |
 | `X` | Cycle effects presets |
 | `Shift+R` | Cycle repeat mode (Off → All → One) |
 | `Z` | Toggle shuffle |
@@ -137,6 +141,8 @@ keet ~/Music/favorites.m3u
 | `F` | Toggle pre/post-fader metering |
 | `C` | Cycle crossfeed presets (Off/Light/Medium/Strong + custom) |
 | `I` | Toggle CPU/memory stats display |
+| `M` | Mouse on / off |
+| `Shift+W` | Save the current settings as defaults in `config.json` |
 | `[` | Balance left (5% steps) |
 | `]` | Balance right (5% steps) |
 | `+` / `=` | Volume up (5%) |
@@ -146,7 +152,7 @@ keet ~/Music/favorites.m3u
 
 ### Library View Controls
 
-Press `L` to open the library, which replaces the visualization area with the track list. `Tab` switches between two presentations of the same library — a **flat list** and an **artist → album → track tree** — each keeping its own position.
+Press `L` to open the library, a panel floating over the running player; `K` docks it into the player's layout (`K` again floats it, `Shift+K` closes it). A docked panel stays on screen when you hand the keys back (`Esc`, or `L` again); `L` or a click gives it the keys again. `Tab` switches between two presentations of the same library — a **flat list** and an **artist → album → track tree** — each keeping its own position; in a wide panel both show side by side and `Tab` moves the keys between them.
 
 **Flat list:**
 
@@ -162,7 +168,7 @@ Press `L` to open the library, which replaces the visualization area with the tr
 | `/` | Search/filter by filename or tags |
 | `D` / `Delete` | Remove selected track |
 | `S` | Save playlist as M3U |
-| `Esc` / `L` | Close library |
+| `Esc` / `L` | Close the library (docked: hand the keys back) |
 
 Album and track durations are shown in right-aligned columns. The cursor follows the currently playing track on transitions. Folder sources auto-sort into artist → album order once tags load (unless shuffling; files listed by hand and M3U playlists keep their order); `Shift+S` re-sorts on demand. Sorting turns shuffle off. Untagged tracks fall to the bottom.
 
@@ -177,22 +183,23 @@ Album and track durations are shown in right-aligned columns. The cursor follows
 | `/` | Filter (matches artist, album, or track names at any level; `Esc` clears) |
 | `D` | Remove — a track immediately; an album/artist after a `[y/n]` confirm |
 | `PgUp` / `PgDn` (or `Ctrl+U` / `Ctrl+D`) | Page up / down |
-| `Esc` / `L` | Close library |
+| `Esc` / `L` | Close the library (docked: hand the keys back) |
 
 ### Lyrics View Controls
 
-Press `Y` to open the lyrics view. Synced lyrics auto-scroll to the current line; plain lyrics show as static text.
+Press `Y` to open the lyrics, a panel floating over the running player (`K` docks it, as for the library). Synced lyrics follow the song, the current line centred; plain lyrics show as static text. Long lines wrap.
 
 | Key | Action |
 |-----|--------|
-| `W` / `S` | Scroll up/down (disables auto-scroll for synced lyrics) |
+| `W` / `S` | Scroll up/down (stops following the song for synced lyrics) |
+| `Enter` | Follow the song again |
 | `A` / `D` | Adjust sync offset -/+0.5s (synced lyrics only; remembered for each track) |
 | `0` | Reset the sync offset |
 | `Up` / `Down` | Next/previous track (global) |
 | `Left` / `Right` | Seek +/-10s (global) |
-| `Esc` / `Y` | Close lyrics view |
+| `Esc` / `Y` | Close the lyrics (docked: hand the keys back) |
 
-Lyrics are loaded from embedded tags first (USLT/ID3v2, Vorbis comments, iTunes atoms), then fetched from [LRCLIB](https://lrclib.net) if not found. LRCLIB matches by artist, title, and duration for accurate results. Synced lyrics (LRC format) are preferred over plain text.
+Lyrics are loaded from a `.lrc` file beside the track first (`song.flac` → `song.lrc`; UTF-8, UTF-16 or Windows-1252), then from embedded tags (USLT/ID3v2, Vorbis comments, iTunes atoms), then fetched from [LRCLIB](https://lrclib.net) if not found. LRCLIB's answers are kept in `~/.config/keet/lyrics` (found lyrics for good, "none" for a day), so a track is not looked up again on every launch; set `save_lyrics_lrc` in `config.json` to also save synced ones beside the track, for other players too. A busy LRCLIB (rate limit) is retried once and shown as "lyrics unavailable", never as "no lyrics". LRCLIB matches by artist, title, and duration for accurate results. Synced lyrics (LRC format) are preferred over plain text.
 
 ## Themes
 
@@ -202,9 +209,23 @@ Three UI themes, cycled at runtime with `T`:
 |-------|------|
 | **Classic** | The original green-on-terminal-default look |
 | **Minimal** | Editorial monochrome with a warm-cyan (`#9adcd0`) accent |
-| **Hi-Fi** | Amber CRT studio-monitor — double-line header, segmented time box, VU panel, knob rack |
+| **Hi-Fi** | An amber hi-fi stack as wide as the window (see below) |
 
-All four screens (Player, Library, Lyrics, EQ + FX) render in each theme. On truecolor terminals the palettes land exactly; 256-color terminals get the nearest colors.
+All screens (Player, Library, Lyrics, EQ) render in each theme. On truecolor terminals the palettes land exactly; 256-color terminals get the nearest colors.
+
+### Hi-Fi
+
+Hi-Fi lays the player out as a vintage hi-fi stack, one unit above the other:
+
+- **Transport** — the play modes and track counter in its frame, a big seven-segment clock (`h:mm:ss` for tracks of an hour or more), the title, artist · album, format, a progress bar and, in exclusive mode, the bit-perfect verdict.
+- **Meter unit** — a peak meter of fixed length (amber, orange from −6 dB, red from −3 dB, with a held peak and its own slow fall), the signal lamps (output rate, bit depth, FX, crossfeed, ReplayGain, balance, buffer), a ten-octave spectrum, and a vertical volume gauge (100% fills two of its three segments).
+- **Graphic EQ** — the EQ editor itself, always on screen when the window has the rows: `E` gives it the keys, `Esc` hands them back; click a band to select it. On a wide window the preset list sits beside it (click to choose).
+- **Key bar** — the key you just pressed lights up.
+- **Library** — under the EQ, docked by itself when the window has room for five tracks (more as it grows taller): a table of `# TITLE ARTIST ALBUM TIME`, with the artist tree down its left on a wide window. `K` floats it and `Shift+K` closes it, and it then stays out of the dock for the session. Docked lyrics go beside it on the right, or under it (the library back to five tracks) when the window is narrow, or in its place when the window is short; on their own they need only four rows, the current line.
+
+`B` switches every level display — meter, spectrum, volume, buffer and the EQ's faders — between an LED dot matrix (the default) and segmented bars.
+
+### Defaults and `config.json`
 
 Set a launch default in priority order — `--theme` flag → config file → last-session (resume) → Classic:
 
@@ -230,22 +251,23 @@ For a *persistent* default that applies on every launch (including with explicit
 | `viz` | `none` \| `vu` \| `spectrum` \| `spectrum-vertical` \| `oscilloscope` \| `lissajous` \| `polar` \| `spectrogram` \| `analysis` \| `galaxy` \| `cymatics` |
 | `viz_fps` | frames per second while a visualization moves, `10`–`60` (default `30`); still screens redraw only when something changes |
 | `mouse` | `true` (default: click or drag the progress bar to seek, click a list row to select it and double-click to play it, the wheel scrolls lists and lyrics, a click outside a dialog closes it; Shift+drag still selects text in most terminals) \| `false`; `m` toggles it |
-| `viz_style` | `bars` \| `dots` (braille) |
+| `viz_style` | `dots` (braille, default) \| `bars`; in Hi-Fi it picks the LED dot matrix or the segmented bars |
 | `sixel_cell` | your terminal's cell size in pixels, `[width, height]`, for Sixel images (the analysis spectrogram, the cover). Keet never asks the terminal, so it assumes `[10, 20]` in Windows Terminal (which scales Sixel to its font) and `[8, 16]` elsewhere; set this when an image fills only part of its space. Never set it larger than the real cell: an image taller than its space makes the screen scroll on every frame |
-| `docked` | the panels docked into the player at startup: a list of `playlist` and/or `lyrics` (each shows only where the window has room for it) |
+| `docked` | the panels docked into the player at startup: a list of `playlist` and/or `lyrics` (each shows only where the window has room for it; Hi-Fi docks the library by itself anyway) |
 | `rg_mode` | `track` \| `album` \| `off` |
 | `eq` | any preset name (built-in or custom) |
 | `crossfeed` | `off` \| `light` \| `medium` \| `strong` \| any custom preset name |
-
-`Shift+W` writes the current theme, visualization and style, docked panels, EQ preset, crossfeed and ReplayGain mode into `config.json` as the defaults, keeping every other key (a Custom EQ is not a preset and is left out). A file that is not valid JSON is never overwritten: fix or remove it first.
 | `classic_use_truecolor` | `false` (default: Classic uses the terminal's ANSI green / yellow / red, which follow its colour scheme) \| `true` (use `classic_colors`) |
 | `classic_colors` | `{"highlight": "#7DD3B8", "warning": "#E9B65C", "error": "#F07A78"}` — any left out keep these defaults |
+| `save_lyrics_lrc` | `false` (default) \| `true`: save synced lyrics found on LRCLIB as a `.lrc` beside the track (`song.flac` → `song.lrc`), for other players too; never over a file already there |
+
+`Shift+W` writes the current theme, visualization and style, docked panels, EQ preset, crossfeed and ReplayGain mode into `config.json` as the defaults, keeping every other key (a Custom EQ is not a preset and is left out). A file that is not valid JSON is never overwritten: fix or remove it first.
 
 A value of the wrong type is ignored on its own (and named on the status line at startup); the other keys still apply.
 
-## EQ + FX Editor
+## EQ Editor
 
-Press `E` to open the EQ + FX editor — a full-screen **10-band parametric EQ**, with the current effects / crossfeed / balance / ReplayGain shown beneath. Every band has four parameters:
+Press `E` to open the EQ editor — a **10-band parametric EQ** floating over the running player (in Hi-Fi, the EQ unit in its stack, when the window has room for it). Effects, crossfeed, balance and ReplayGain are shown by the player itself. Every band has four parameters:
 
 | Parameter | Range | Keys |
 |-----------|-------|------|
@@ -254,7 +276,7 @@ Press `E` to open the EQ + FX editor — a full-screen **10-band parametric EQ**
 | Frequency | 20 Hz – 20 kHz, ⅓-octave steps | `<` / `>` |
 | Q (bandwidth) | 0.3 – 10, √2 steps | `,` / `.` |
 
-Plus: `←` / `→` select a band, `[` / `]` cycle presets, `0` reset the selected band to its graphic default, `a` set the preamp the headroom row suggests, `E` / `L` / `Esc` close. All changes apply live, delayed by the audio buffer depth (a few seconds).
+Plus: `←` / `→` select a band, `[` / `]` cycle presets, `0` reset the selected band to its graphic default, `a` set the preamp the headroom row suggests, `E` / `Esc` close. All changes apply live, delayed by the audio buffer depth (a few seconds).
 
 Bands start out as the classic graphic-EQ layout — peaking filters at the ISO octave centres (31 62 125 250 500 1k 2k 4k 8k 16k Hz) — so until you reach for the parametric keys it behaves exactly like a 10-band graphic EQ. The filters are standard RBJ-cookbook biquads. **Low Cut** (high-pass) and **High Cut** (low-pass) ignore gain: they filter by frequency and resonance (Q above 0.7 adds a resonant bump at the corner — a Low Cut at 20–30 Hz makes a clean subsonic/rumble filter). The response curve drawn in the editor is the exact summed magnitude response of the active filters, so shelves and cuts render truthfully.
 
@@ -500,7 +522,7 @@ src/
 ├── gapless.rs      AAC-in-MP4 encoder delay and padding (iTunSMPB, edit list)
 ├── signal.rs       The bit-perfect verdict (which stages alter the samples)
 ├── eq.rs           10-band parametric EQ (RBJ biquads: peak/shelf/cut), response curve, headroom
-├── eq_ui.rs        EQ + FX editor screen renderer (shared across themes)
+├── eq_ui.rs        EQ editor renderer (the dialog, and Hi-Fi's EQ unit)
 ├── effects.rs      Reverb, chorus, delay effects with preset loading
 ├── crossfeed.rs    Meier-style headphone crossfeed (level/cutoff/ITD, JSON presets)
 ├── fade.rs         Click-free preset changes for the DSP stages

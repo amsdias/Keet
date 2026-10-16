@@ -1,6 +1,5 @@
 //! Library tree view — artist → album → track browser (a second presentation
-//! inside the `L` library view, toggled with Tab). See the design spec at
-//! `docs/superpowers/specs/2026-07-03-library-tree-view-design.md`.
+//! inside the `L` library view, toggled with Tab).
 //!
 //! This module holds the *pure* logic — building the tree from tag data,
 //! projecting fold state into visible rows, and navigation — so it is unit

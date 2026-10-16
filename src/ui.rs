@@ -213,6 +213,7 @@ pub fn draw(f: &mut Frame, cx: &mut Ctx) {
     // meanwhile reset the panel it only focuses.
     if !cx.ui.too_small {
         cx.ui.floating_shown = None;
+        cx.ui.eq_in_stack = false;
     }
     draw_frame(f, cx);
     let ui = &mut *cx.ui;
@@ -323,8 +324,12 @@ fn draw_frame(f: &mut Frame, cx: &mut Ctx) {
         draw_too_small(f, cx);
         return;
     }
+    auto_dock_library(state, ui, f.area());
     ui.docked_shown.clear();
-    if base == ViewMode::Eq {
+    if base == ViewMode::Eq && eq_stacked(cx.state, cx.ui, f.area()) {
+        // HiFi's EQ unit, in its stack: the player, the EQ with the keys.
+        draw_view(f, cx, ViewMode::Player);
+    } else if base == ViewMode::Eq {
         draw_eq_panel(f, cx);
     } else {
         draw_view(f, cx, base);
@@ -405,6 +410,27 @@ fn quit_armed(ui: &UiState) -> bool {
     ui.esc_quit_until.is_some_and(|t| std::time::Instant::now() < t)
 }
 
+/// Whether the EQ editor is HiFi's EQ unit in a window `area` (not the
+/// dialog): opened from the player, no panel docked, and the rows for it.
+fn eq_stacked(state: &PlayerState, ui: &UiState, area: Rect) -> bool {
+    state.theme_kind() == crate::theme::ThemeKind::HiFi && eq_returns_to_stack(ui) && crate::ui_hifi::eq_fits(area, ui)
+}
+
+/// Where the EQ, opened from `view`, hands the keys back: in HiFi's stack
+/// (`stacked`) the player, or the docked panel that had them (a floating
+/// panel closes); as a dialog, the view under it. The `e` key and a click
+/// on the unit both go through here.
+fn eq_return_from(ui: &UiState, view: ViewMode, stacked: bool) -> ViewMode {
+    if stacked && !ui.docked_shown.contains(&view) { ViewMode::Player } else { view }
+}
+
+/// Whether the EQ, closed, hands the keys back to the player or a docked
+/// panel (HiFi's stack edits it in place) rather than to a floating panel
+/// under its dialog.
+pub(crate) fn eq_returns_to_stack(ui: &UiState) -> bool {
+    ui.eq_return == ViewMode::Player || ui.docked.contains(&ui.eq_return)
+}
+
 /// Whether a dialog floats over the frame (no image goes under one, see
 /// `tui::withhold_images`). The frame loop repaints when this changes, so the
 /// images go when one opens and come back when it closes.
@@ -412,7 +438,8 @@ pub(crate) fn overlay_open(ui: &UiState) -> bool {
     let floating_panel = matches!(ui.view_mode, ViewMode::Playlist | ViewMode::Lyrics) && !ui.docked_shown.contains(&ui.view_mode);
     ui.input_mode.is_overlay()
         || floating_panel
-        || matches!(ui.view_mode, ViewMode::Help | ViewMode::Eq)
+        || ui.view_mode == ViewMode::Help
+        || (ui.view_mode == ViewMode::Eq && !(ui.eq_in_stack && eq_returns_to_stack(ui)))
         || ui.tree_pending_remove.is_some()
         || quit_armed(ui)
 }
@@ -430,14 +457,64 @@ pub(crate) struct Dock {
 /// was checked: `k` said "docked" for a panel `dock` could never place).
 /// Classic and Minimal dock into the visualization slot, where `dock` hides
 /// what does not fit for now.
-fn dock_room(state: &PlayerState, view: ViewMode, window: Rect) -> bool {
+fn dock_room(state: &PlayerState, ui: &UiState, view: ViewMode, window: Rect) -> bool {
     if state.theme_kind() != crate::theme::ThemeKind::HiFi {
         return true;
     }
-    crate::ui_hifi::dock_region(window).is_some_and(|r| r.width >= dock_min_width(Some(view)))
+    let mut docked = ui.docked.clone();
+    docked.push(view);
+    let mut recent = vec![view];
+    recent.extend(ui.panel_recent.iter().copied().filter(|&v| v != view));
+    crate::ui_hifi::dock_region(window, &docked)
+        .is_some_and(|r| crate::ui_hifi::dock_panels(&docked, &recent, r).iter().any(|&(v, _)| v == view))
 }
 
-fn dock_min_width(item: Option<ViewMode>) -> u16 {
+/// HiFi docks the library by itself when the window has the rows for it
+/// under the EQ (`ui_hifi::library_fits`), and takes it out again when it
+/// has not, or in another theme — unless the user floated or closed it
+/// (`library_auto_declined`), or docked it by hand (then it is theirs).
+fn auto_dock_library(state: &PlayerState, ui: &mut UiState, area: Rect) {
+    let pl = ViewMode::Playlist;
+    if ui.docked.contains(&pl) && !ui.library_auto_docked {
+        return;
+    }
+    let hifi = state.theme_kind() == crate::theme::ThemeKind::HiFi;
+    // Out of HiFi it goes at once, keys or not (it floats with them): kept
+    // while focused, it vanished from Classic's dock once they left it.
+    if !hifi && ui.library_auto_docked {
+        ui.docked.retain(|&v| v != pl);
+        ui.library_auto_docked = false;
+        return;
+    }
+    // Not while it has the keys, or is the view under the key list or the
+    // EQ dialog: a resize pulled a floating library the user was in into
+    // the dock (and pushed a focused docked one out to float). Docked, it
+    // floats for want of room as any docked panel does.
+    if base_view(ui) == pl {
+        return;
+    }
+    let others: Vec<ViewMode> = ui.docked.iter().copied().filter(|&v| v != pl).collect();
+    let want = hifi
+        && !ui.library_auto_declined
+        && crate::ui_hifi::library_fits(area, &others);
+    if want != ui.library_auto_docked {
+        if want {
+            // Set up the first time, as `l` opens it: shown from now on, `l`
+            // only focuses it, and its cursor stayed on track 1. Back after a
+            // resize, as it was left (the cursor jumped from the user's place).
+            ui.docked.push(pl);
+            if !ui.library_auto_set_up {
+                cursor_to_playing(ui);
+                ui.library_auto_set_up = true;
+            }
+        } else {
+            ui.docked.retain(|&v| v != pl);
+        }
+        ui.library_auto_docked = want;
+    }
+}
+
+pub(crate) fn dock_min_width(item: Option<ViewMode>) -> u16 {
     match item {
         None => 40, // the visualization
         Some(ViewMode::Playlist) => 50,
@@ -542,10 +619,15 @@ pub(crate) fn draw_docked(f: &mut Frame, cx: &mut Ctx, panels: &[(ViewMode, Rect
         } else {
             crate::lyrics_panel::title(kind, cx.ui)
         };
-        let border = if focused { p.accent } else { p.rule };
-        let block = Block::bordered()
-            .border_style(border)
-            .title(ratatui::text::Span::styled(format!(" {title} "), if focused { p.bold.patch(p.accent) } else { p.dim }));
+        let title_style = if focused { p.bold.patch(p.accent) } else { p.dim };
+        let block = if kind == crate::theme::ThemeKind::HiFi {
+            // A unit of the stack, boxed and titled as the others are.
+            let border = if focused { p.accent } else { p.fg };
+            Block::bordered().border_style(border).title_top(crate::ui_hifi::border_title("─", border, &title, title_style))
+        } else {
+            let border = if focused { p.accent } else { p.rule };
+            Block::bordered().border_style(border).title(ratatui::text::Span::styled(format!(" {title} "), title_style))
+        };
         let inner = tui::indent(block.inner(at), 1);
         f.render_widget(Clear, at);
         f.render_widget(block, at);
@@ -777,7 +859,15 @@ fn draw_eq_panel(f: &mut Frame, cx: &mut Ctx) {
     draw_view(f, cx, cx.ui.eq_return);
     let area = f.area();
     let inner = dialog(f, &mut cx.ui.hits, area.width.saturating_sub(4).min(104), area.height.saturating_sub(2).min(28), "EQ · e or Esc closes", p);
-    let (lines, keys) = eq_lines(cx, p, inner.width as usize, inner.height as usize);
+    let headroom = {
+        let state = cx.state;
+        let rate = match state.output_rate.load(Ordering::Relaxed) {
+            0 => 48_000.0,
+            r => r as f32,
+        };
+        cx.ui.headroom_cache.get(&state.eq_bands_array(), state.eq_preamp_db(), rate)
+    };
+    let (lines, keys) = eq_lines(cx, p, inner.width as usize, inner.height as usize, &headroom);
     if let Some(row) = lines.len().checked_sub(1) {
         keys.register(&mut cx.ui.hits, inner.x, inner.y + row as u16);
     }
@@ -787,7 +877,7 @@ fn draw_eq_panel(f: &mut Frame, cx: &mut Ctx) {
 /// The EQ editor's lines for a `w`×`h` space: sliders, labels, the selected
 /// band, the readouts, the headroom row and the key line (last; its keys
 /// returned to register where it is drawn).
-fn eq_lines(cx: &Ctx, p: &crate::theme::Palette, w: usize, h: usize) -> (Vec<Line<'static>>, crate::hints::Bar) {
+fn eq_lines(cx: &Ctx, p: &crate::theme::Palette, w: usize, h: usize, headroom: &crate::eq::Headroom) -> (Vec<Line<'static>>, crate::hints::Bar) {
     let state = cx.state;
     let knob = match state.theme_kind() {
         crate::theme::ThemeKind::Minimal => '●',
@@ -795,30 +885,24 @@ fn eq_lines(cx: &Ctx, p: &crate::theme::Palette, w: usize, h: usize) -> (Vec<Lin
         crate::theme::ThemeKind::Classic => '█',
     };
     let title = if state.is_eq_custom() { "Custom".to_string() } else { cx.eq_preset.name.clone() };
-    let bal = state.balance_value();
-    let bal_str = if bal == 0 {
-        "centred".to_string()
-    } else if bal < 0 {
-        format!("L{}%", -bal)
-    } else {
-        format!("R{}%", bal)
-    };
-    let rg_str = match state.rg_mode() {
-        crate::state::RgMode::Album => "album",
-        crate::state::RgMode::Off => "off",
-        crate::state::RgMode::Track => "track",
-    };
     let pre_db = state.eq_preamp_db();
     // The preamp is on the headroom row, beside the boost it has to cover.
-    let readouts = vec![("FX", cx.fx_name), ("XFEED", cx.cf_name), ("BAL", bal_str.as_str()), ("RG", rg_str)];
     let bands = state.eq_bands_array();
-    let mut body = crate::eq_ui::render_eq_screen(&bands, cx.ui.eq_band, &title, &readouts, knob, p, w, h.saturating_sub(2));
-    let out_rate = match state.output_rate.load(Ordering::Relaxed) {
-        0 => 48_000.0,
-        r => r as f32,
+    // Effects, crossfeed, balance and ReplayGain, a row under a blank: the
+    // dialog covers the player's rows that show them (Classic's header and
+    // status rows, HiFi's SIGNAL section), and Minimal has ReplayGain on none.
+    let readouts = match state.theme_kind() {
+        crate::theme::ThemeKind::HiFi => {
+            let mut l = LineBuf::new();
+            l.push_str("  ").append(crate::ui_hifi::dsp_line(cx, p, w.saturating_sub(2), true));
+            l.into_line()
+        }
+        _ => dsp_readouts(cx, p, w),
     };
-    let headroom = crate::eq::headroom(&bands, pre_db, out_rate);
-    body.push(crate::eq_ui::headroom_line(&headroom, pre_db, p));
+    let mut body = crate::eq_ui::render_eq_screen(&bands, cx.ui.eq_band, &title, knob, p, h.saturating_sub(4));
+    body.push(Line::default());
+    body.push(readouts);
+    body.push(crate::eq_ui::headroom_line(headroom, pre_db, true, p));
     const KEYS: &[(&str, &str)] = &[
         ("←→", "band"),
         ("↑↓", "gain (⇧ fine)"),
@@ -832,6 +916,39 @@ fn eq_lines(cx: &Ctx, p: &crate::theme::Palette, w: usize, h: usize) -> (Vec<Lin
     let look = key_look(cx.state.theme_kind(), p);
     let keys = crate::hints::indent(crate::hints::bar(KEYS, &look, w.saturating_sub(2)), 2);
     (fit_eq_screen(body, keys.line.clone(), w, h), keys)
+}
+
+/// The balance as Minimal words it: `centred`, `L20%`, `R20%`.
+pub(crate) fn balance_label(bal: i32) -> String {
+    match bal {
+        0 => "centred".to_string(),
+        b if b < 0 => format!("L{}%", -b),
+        b => format!("R{b}%"),
+    }
+}
+
+/// `FX None · XFEED Off · BAL centred · RG track`, whole items fitted to `w`.
+fn dsp_readouts(cx: &Ctx, p: &crate::theme::Palette, w: usize) -> Line<'static> {
+    let state = cx.state;
+    let bal = balance_label(state.balance_value());
+    let rg = match state.rg_mode() {
+        crate::state::RgMode::Album => "album",
+        crate::state::RgMode::Off => "off",
+        crate::state::RgMode::Track => "track",
+    };
+    let items: Vec<Line<'static>> = [("FX", cx.fx_name), ("XFEED", cx.cf_name), ("BAL", bal.as_str()), ("RG", rg)]
+        .iter()
+        .map(|(label, value)| {
+            let mut l = LineBuf::new();
+            l.styled(label, p.dim).reset().push(' ').styled(value, p.fg);
+            l.into_line()
+        })
+        .collect();
+    let mut sep = LineBuf::new();
+    sep.push_str("  ").styled("·", p.rule).reset().push_str("  ");
+    let mut out = LineBuf::new();
+    out.push_str("  ").append(tui::fit_segments(&items, &sep.into_line(), w.saturating_sub(2)));
+    out.into_line()
 }
 
 /// The `?` screen: every key (`cli::KEYS`), sections flowed into as many
@@ -1075,6 +1192,11 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
             }
             // Commands only (a field above takes keys as they came).
             let k = shift_to_capital(k);
+            // Lit for the key that acts: not one with Ctrl or Alt (Ctrl+E lit
+            // `e EQ`), nor a removal prompt's answer (`y` lit `y LYRICS`).
+            if !k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) && ui.tree_pending_remove.is_none() {
+                ui.key_flash = Some((k.code, ui.view_mode, std::time::Instant::now()));
+            }
 
             // A staged bulk remove is awaiting confirmation: `y` removes, any
             // other key cancels — but Ctrl+C still quits. Answered before any
@@ -1404,11 +1526,16 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
                     // view under the list, and the list closes: recording
                     // Help as the EQ's way back (and the EQ as the list's)
                     // made Esc bounce between the two forever.
+                    // In HiFi's stack (the last frame showed its EQ unit) it
+                    // is a unit of the player: a floating panel closes, a
+                    // docked one gets the keys back after. Still HiFi: a `t`
+                    // in the same pass left the flag for Classic.
                     let under = under_help(ui);
+                    let stacked = ui.eq_in_stack && state.theme_kind() == crate::theme::ThemeKind::HiFi;
                     ui.view_mode = match under {
                         ViewMode::Eq => ui.eq_return,
                         view => {
-                            ui.eq_return = view;
+                            ui.eq_return = eq_return_from(ui, view, stacked);
                             ViewMode::Eq
                         }
                     };
@@ -1813,12 +1940,28 @@ fn mouse(state: &PlayerState, ui: &mut UiState, playlist: &[PathBuf], m: event::
     // docked list's cursor).
     if matches!(m.kind, K::Down(MouseButton::Left)) {
         match panel_under {
+            // HiFi's EQ unit, a unit of the player.
+            // As `e`: a focused docked panel gets the keys back after.
+            Some(ViewMode::Eq) => {
+                if ui.view_mode != ViewMode::Eq {
+                    ui.eq_return = eq_return_from(ui, ui.view_mode, true);
+                }
+                ui.view_mode = ViewMode::Eq;
+            }
             // Docked: it takes the keys, as it was left.
             Some(v) => open_view(ui, v),
             // (A floating panel is a dialog: handled above.)
             // In the player itself (no dialog over it: a click inside one
             // is the dialog's, and took the keys from the panel).
-            None if !overlay_open(ui) && ui.docked_shown.contains(&ui.view_mode) => ui.view_mode = ViewMode::Player,
+            // Not for the key that view's keys toggle (`e`, `l`, `y`): the
+            // key hands them back itself, and after the click took them it
+            // gave them straight back.
+            None if !overlay_open(ui)
+                && (ui.docked_shown.contains(&ui.view_mode) || ui.view_mode == ViewMode::Eq)
+                && !matches!(hit, Some((_, Hit::Key(KeyCode::Char(c), _))) if Some(c) == toggle_key(ui.view_mode)) =>
+            {
+                ui.view_mode = ViewMode::Player
+            }
             None => {}
         }
     }
@@ -1851,6 +1994,8 @@ fn mouse(state: &PlayerState, ui: &mut UiState, playlist: &[PathBuf], m: event::
                     }
                 }
                 Some((_, Hit::Tab(view))) if matches!(m.kind, K::Down(_)) => open_view(ui, view),
+                Some((_, Hit::EqBand(b))) if matches!(m.kind, K::Down(_)) => ui.eq_band = b,
+                Some((_, Hit::EqPreset(i))) if matches!(m.kind, K::Down(_)) => state.select_eq_preset(i),
                 Some((r, Hit::List { first })) if matches!(m.kind, K::Down(_)) => {
                     // A click in a pane gives it the keys.
                     set_pane(ui, false);
@@ -1943,14 +2088,19 @@ fn toggle_dock(state: &PlayerState, ui: &mut UiState) {
     let name = if v == ViewMode::Playlist { "playlist" } else { "lyrics" };
     if let Some(i) = ui.docked.iter().position(|&d| d == v) {
         ui.docked.remove(i);
+        decline_auto_dock(ui, v);
         ui.set_status(format!("{name} floating"));
     } else {
         let (w, h) = tui::window();
-        if !dock_room(state, v, Rect::new(0, 0, w, h)) {
+        if !dock_room(state, ui, v, Rect::new(0, 0, w, h)) {
             ui.set_status("no room to dock here: make the window bigger".to_string());
             return;
         }
         ui.docked.push(v);
+        if v == ViewMode::Playlist {
+            // Docked by hand: the user's, not HiFi's to take back.
+            ui.library_auto_declined = false;
+        }
         ui.set_status(format!("{name} docked (k floats it again)"));
     }
     // The layout changes: images move.
@@ -1967,11 +2117,21 @@ fn close_docked(ui: &mut UiState) {
         return;
     };
     ui.docked.remove(i);
+    decline_auto_dock(ui, v);
     ui.view_mode = ViewMode::Player;
     let name = if v == ViewMode::Playlist { "playlist" } else { "lyrics" };
     ui.set_status(format!("{name} closed"));
     // The layout changes: images move.
     ui.terminal_resized = true;
+}
+
+/// The library left the dock by the user's hand (`k`, `Shift+K`): HiFi does
+/// not dock it by itself again this session.
+fn decline_auto_dock(ui: &mut UiState, v: ViewMode) {
+    if v == ViewMode::Playlist {
+        ui.library_auto_declined = true;
+        ui.library_auto_docked = false;
+    }
 }
 
 /// The first keys of a panel's footer, each with what a click on it does
@@ -2029,26 +2189,38 @@ fn open_view(ui: &mut UiState, view: ViewMode) {
     let shown = up && (ui.docked_shown.contains(&view) || ui.floating_shown == Some(view));
     let opening = ui.view_mode != view && !shown;
     match view {
-        ViewMode::Playlist if opening => {
-            // On the playing track. With a search's filter showing, the
-            // cursor is a position among the matches: the track's there, or
-            // the first (its playlist index pointed at another match, or past
-            // them, and Enter played that).
-            ui.cursor = if list_filtered(ui) {
-                ui.filtered_indices.iter().position(|&i| i == ui.current).unwrap_or(0)
-            } else {
-                ui.current
-            };
-        }
+        ViewMode::Playlist if opening => cursor_to_playing(ui),
         ViewMode::Lyrics if opening => ui.reset_lyrics_view(),
         _ => {}
     }
     ui.view_mode = view;
 }
 
+/// The list's cursor on the playing track, as the library opens set up.
+/// With a search's filter showing, the cursor is a position among the
+/// matches: the track's there, or the first (its playlist index pointed at
+/// another match, or past them, and Enter played that).
+fn cursor_to_playing(ui: &mut UiState) {
+    ui.cursor = if list_filtered(ui) {
+        ui.filtered_indices.iter().position(|&i| i == ui.current).unwrap_or(0)
+    } else {
+        ui.current
+    };
+}
+
 /// The view the key list floats over (the EQ editor, perhaps).
 fn under_help(ui: &UiState) -> ViewMode {
     if ui.view_mode == ViewMode::Help { ui.help_return } else { ui.view_mode }
+}
+
+/// The key that opens a view and, pressed in it, hands the keys back.
+fn toggle_key(view: ViewMode) -> Option<char> {
+    match view {
+        ViewMode::Eq => Some('e'),
+        ViewMode::Playlist => Some('l'),
+        ViewMode::Lyrics => Some('y'),
+        _ => None,
+    }
 }
 
 /// The view the key list and the EQ editor float over (the key list can be
@@ -4051,13 +4223,10 @@ mod ui_tests {
         let st = PlayerState::new();
         let bands = st.eq_bands_array();
         let p = crate::theme::palette(crate::theme::ThemeKind::Classic);
-        let readouts = [("FX", "None"), ("XFEED", "Off"), ("BAL", "centred"), ("RG", "off")];
         let footer = "  [←→] band  [↑↓] gain (⇧ fine)  [t] type  [,.] Q  [<>] freq  [[]] preset  [0] reset  [e/Esc] close";
         for term_w in 10usize..130 {
             for avail in 0usize..45 {
-                let body = crate::eq_ui::render_eq_screen(
-                    &bands, 0, "Flat", &readouts, '█', p, term_w, avail.saturating_sub(1),
-                );
+                let body = crate::eq_ui::render_eq_screen(&bands, 0, "Flat", '█', p, avail.saturating_sub(1));
                 let lines = fit_eq_screen(body, Line::raw(footer), term_w, avail);
                 assert!(lines.len() <= avail, "{} rows in a {avail}-row budget at width {term_w}", lines.len());
                 for l in &lines {
@@ -4230,7 +4399,7 @@ mod ui_tests {
         for (kind, expect) in [
             (ThemeKind::Classic, ["Undertow", "pause", "clip ○"]),
             (ThemeKind::Minimal, ["K  E  E  T", "Undertow", "NOW PLAYING"]),
-            (ThemeKind::HiFi, ["K E E T", "UNDERTOW", "VU METER"]),
+            (ThemeKind::HiFi, ["╔═ K E E T", "UNDERTOW", "┌─ PEAK METER"]),
         ] {
             state.set_theme(kind);
             let buf = tui::testing::draw(120, 40, |f| {
@@ -4428,6 +4597,8 @@ mod ui_tests {
         for kind in [crate::theme::ThemeKind::Classic, crate::theme::ThemeKind::Minimal, crate::theme::ThemeKind::HiFi] {
             state.set_theme(kind);
             let mut ui = UiState::new(playlist.clone(), crate::metadata::MetadataCache::new(1));
+            // The playlist floating (HiFi would dock it by itself).
+            ui.library_auto_declined = true;
             frame(&state, &mut ui, &playlist, 120, 50);
             assert!(ui.viz_on_screen(), "{kind:?}: the player shows it");
             // The EQ editor floats over part of it: in a wide window most of
@@ -4453,6 +4624,497 @@ mod ui_tests {
 
     fn click(kind: event::MouseEventKind, column: u16, row: u16) -> event::MouseEvent {
         event::MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE }
+    }
+
+    fn hifi(len: usize) -> (PlayerState, UiState, Vec<PathBuf>) {
+        let state = PlayerState::new();
+        state.set_theme(crate::theme::ThemeKind::HiFi);
+        let playlist: Vec<PathBuf> = (0..len).map(|i| p(&format!("/m/{i}.flac"))).collect();
+        let ui = UiState::new(playlist.clone(), crate::metadata::MetadataCache::new(len));
+        (state, ui, playlist)
+    }
+
+    fn type_keys(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<PathBuf>, keys: &[KeyCode]) {
+        for &k in keys {
+            ui.pressed.push_back(KeyEvent::new(k, KeyModifiers::NONE));
+        }
+        poll_input(state, ui, playlist);
+    }
+
+    #[test]
+    fn hifi_is_a_stack_as_wide_as_the_window_with_a_fixed_meter() {
+        let (state, mut ui, playlist) = hifi(1);
+        // `b`: the LED dot matrix (the default) and the bars.
+        for (style, cell) in [(crate::state::VizStyle::Dots, '⣿'), (crate::state::VizStyle::Bars, '▊')] {
+            state.viz_style.store(style as u8, Ordering::Relaxed);
+            let rows = tui::testing::rows(&frame(&state, &mut ui, &playlist, 150, 40));
+            assert!(rows[0].starts_with('╔') && rows[0].ends_with('╗'), "{}", rows[0]);
+            // The meter unit under the transport: L, the dB scale between
+            // the channels, R; 40 cells each (in the meter's section, up to
+            // the divider after it), ghosts at silence.
+            let m = rows.iter().position(|r| r.starts_with("┌─ PEAK METER")).expect("the meter unit");
+            assert!(rows[m].ends_with('┐'), "{}", rows[m]);
+            let segments = |r: &str| r.split('│').nth(1).unwrap_or("").chars().filter(|&c| c == cell).count();
+            assert!(rows[m + 2].starts_with("│  L "), "{}", rows[m + 2]);
+            assert!(rows[m + 3].contains("0dB"), "{}", rows[m + 3]);
+            assert!(rows[m + 4].starts_with("│  R "), "{}", rows[m + 4]);
+            assert_eq!(segments(&rows[m + 2]), crate::ui_hifi::METER_SEGMENTS, "{style:?} {}", rows[m + 2]);
+            assert_eq!(segments(&rows[m + 4]), crate::ui_hifi::METER_SEGMENTS, "{style:?} {}", rows[m + 4]);
+            if style == crate::state::VizStyle::Bars {
+                // The EQ's bands are dots on rails.
+                assert!(rows.iter().any(|r| r.matches('●').count() == 10), "ten knobs on 0 dB");
+                assert!(rows.iter().any(|r| r.matches('│').count() == 12), "ten rails between the borders");
+            } else {
+                // LED columns: a knob dot row each on 0 dB.
+                assert!(rows.iter().any(|r| r.matches('⠒').count() == 10 || r.matches('⠤').count() == 10), "ten knobs on 0 dB");
+            }
+            assert!(rows.iter().any(|r| r.contains("SIGNAL")) && rows.iter().any(|r| r.contains("VOL")));
+            assert!(rows.iter().any(|r| r.contains("GRAPHIC EQUALIZER")));
+            assert!(rows.iter().any(|r| r.contains("HEADROOM")));
+        }
+    }
+
+    #[test]
+    fn hifis_eq_takes_the_keys_in_the_stack_and_esc_hands_them_back() {
+        let (state, mut ui, mut playlist) = hifi(1);
+        let shown = |state: &PlayerState, ui: &mut UiState, playlist: &[PathBuf]| tui::testing::rows(&frame(state, ui, playlist, 120, 40)).join("\n");
+        let before = shown(&state, &mut ui, &playlist);
+        assert!(ui.eq_in_stack && !before.contains("BAND 1"), "no band lit without the keys");
+        type_keys(&state, &mut ui, &mut playlist, &[KeyCode::Char('e')]);
+        assert_eq!(ui.view_mode, ViewMode::Eq);
+        assert!(!overlay_open(&ui), "in the stack, not a dialog");
+        let editing = shown(&state, &mut ui, &playlist);
+        assert!(!ui.hits.iter().any(|(_, h)| *h == Hit::Dialog), "no EQ dialog over the stack");
+        assert!(editing.contains("BAND 1") && editing.contains("PLAYER"), "{editing}");
+        type_keys(&state, &mut ui, &mut playlist, &[KeyCode::Right]);
+        assert_eq!(ui.eq_band, 1, "the editor's keys work on it");
+        type_keys(&state, &mut ui, &mut playlist, &[KeyCode::Esc]);
+        assert_eq!(ui.view_mode, ViewMode::Player);
+        assert!(!quit_armed(&ui), "Esc handed the keys back, it did not ask to quit");
+    }
+
+    #[test]
+    fn a_click_on_a_preset_in_hifis_list_selects_it() {
+        let (state, mut ui, playlist) = hifi(1);
+        ui.eq_preset_names = (0..12).map(|i| format!("Preset {i}")).collect();
+        state.eq_preset_count.store(12, Ordering::Relaxed);
+        let rows = tui::testing::rows(&frame(&state, &mut ui, &playlist, 150, 40));
+        assert!(rows.iter().any(|r| r.contains("PRESETS")) && rows.iter().any(|r| r.contains("▸ PRESET 0")));
+        let at = ui.hits.iter().find_map(|(r, h)| (*h == Hit::EqPreset(4)).then_some(*r)).expect("preset 4 clickable");
+        mouse(&state, &mut ui, &playlist, click(event::MouseEventKind::Down(event::MouseButton::Left), at.x + 4, at.y));
+        assert_eq!(state.eq_index(), 4);
+        // Too narrow for the list beside the faders: none.
+        frame(&state, &mut ui, &playlist, 90, 40);
+        assert!(!ui.hits.iter().any(|(_, h)| matches!(h, Hit::EqPreset(_))));
+    }
+
+    #[test]
+    fn a_docked_playlist_sits_under_hifis_eq_when_there_are_rows_for_both() {
+        let (state, mut ui, playlist) = hifi(40);
+        ui.docked = vec![ViewMode::Playlist];
+        let tracks = |rows: &[String]| rows.iter().filter(|r| r.to_lowercase().contains(".flac")).count();
+        // Smallest window with both: the EQ at its least, five tracks.
+        let both = (0..80u16).find(|&h| crate::ui_hifi::stack(Rect::new(0, 0, 150, h), crate::ui_hifi::DOCK_ROWS).eq.is_some()).unwrap();
+        let rows = tui::testing::rows(&frame(&state, &mut ui, &playlist, 150, both));
+        assert!(rows.iter().any(|r| r.contains("GRAPHIC EQUALIZER")) && ui.docked_shown == vec![ViewMode::Playlist]);
+        assert!(tracks(&rows) >= 5, "five tracks at the least:\n{}", rows.join("\n"));
+        // Narrower, the footer wraps: still five.
+        for w in [70u16, 90, 110] {
+            let rows = tui::testing::rows(&frame(&state, &mut ui, &playlist, w, both));
+            if ui.docked_shown == vec![ViewMode::Playlist] {
+                assert!(tracks(&rows) >= 5, "{w} columns:\n{}", rows.join("\n"));
+            }
+        }
+        // Taller: the EQ grows to its cap first, then the playlist.
+        let rows = tui::testing::rows(&frame(&state, &mut ui, &playlist, 150, both + 30));
+        assert!(tracks(&rows) > 20, "the playlist takes the rest");
+        let eq = crate::ui_hifi::stack(Rect::new(0, 0, 150, both + 30), crate::ui_hifi::DOCK_ROWS).eq.unwrap();
+        assert_eq!(eq.height, crate::ui_hifi::stack(Rect::new(0, 0, 150, 80), 0).eq.unwrap().height, "the EQ at its cap");
+        // One row short: the EQ gives way, the playlist stays (in its place).
+        let rows = tui::testing::rows(&frame(&state, &mut ui, &playlist, 150, both - 1));
+        assert!(!rows.iter().any(|r| r.contains("GRAPHIC EQUALIZER")));
+        assert_eq!(ui.docked_shown, vec![ViewMode::Playlist]);
+    }
+
+    #[test]
+    fn hifi_docks_the_library_by_itself_under_the_eq_and_only_there() {
+        let (state, mut ui, mut playlist) = hifi(40);
+        // The EQ and five tracks under it: docked, without the keys — a
+        // table, the artists down its left.
+        let rows = tui::testing::rows(&frame(&state, &mut ui, &playlist, 150, 50));
+        let heading = rows.iter().find(|r| r.contains("TITLE")).expect("the column headings");
+        let at = |w: &str| heading.find(w).unwrap_or_else(|| panic!("{w} in {heading:?}"));
+        assert!(at("ARTISTS") < at("TITLE") && at("TITLE") < at("ARTIST ") && at("ARTIST ") < at("ALBUM") && at("ALBUM") < at("TIME"));
+        assert_eq!((ui.docked_shown.clone(), ui.library_auto_docked), (vec![ViewMode::Playlist], true));
+        assert!(ui.eq_in_stack && ui.view_mode == ViewMode::Player);
+        // Never in the EQ's place: a window with the rows for one of them.
+        frame(&state, &mut ui, &playlist, 150, 36);
+        assert!(ui.eq_in_stack && ui.docked.is_empty() && ui.docked_shown.is_empty());
+        frame(&state, &mut ui, &playlist, 150, 50);
+        assert_eq!(ui.docked, vec![ViewMode::Playlist]);
+        // Not a saved default, and not in another theme.
+        state.set_theme(crate::theme::ThemeKind::Classic);
+        frame(&state, &mut ui, &playlist, 150, 50);
+        assert!(ui.docked.is_empty() && !ui.library_auto_docked);
+        state.set_theme(crate::theme::ThemeKind::HiFi);
+        frame(&state, &mut ui, &playlist, 150, 50);
+        // `l` focuses it; `k` floats it, and it stays floating.
+        type_keys(&state, &mut ui, &mut playlist, &[KeyCode::Char('l')]);
+        frame(&state, &mut ui, &playlist, 150, 50);
+        assert_eq!((ui.focus, ui.docked_shown.clone()), (ViewMode::Playlist, vec![ViewMode::Playlist]));
+        type_keys(&state, &mut ui, &mut playlist, &[KeyCode::Char('k')]);
+        frame(&state, &mut ui, &playlist, 150, 50);
+        assert_eq!(ui.floating_shown, Some(ViewMode::Playlist));
+        type_keys(&state, &mut ui, &mut playlist, &[KeyCode::Esc]);
+        frame(&state, &mut ui, &playlist, 150, 50);
+        assert!(ui.docked.is_empty() && ui.docked_shown.is_empty(), "declined for the session");
+        // A floating library with the keys stays floating when the window
+        // grows (a resize pulled it into the dock).
+        let (state, mut ui, mut playlist) = hifi(40);
+        frame(&state, &mut ui, &playlist, 150, 36);
+        type_keys(&state, &mut ui, &mut playlist, &[KeyCode::Char('l')]);
+        frame(&state, &mut ui, &playlist, 150, 36);
+        assert_eq!(ui.floating_shown, Some(ViewMode::Playlist));
+        frame(&state, &mut ui, &playlist, 150, 50);
+        assert_eq!((ui.floating_shown, ui.docked.clone()), (Some(ViewMode::Playlist), vec![]));
+        // Nor under the key list opened over it.
+        type_keys(&state, &mut ui, &mut playlist, &[KeyCode::Char('?')]);
+        frame(&state, &mut ui, &playlist, 150, 50);
+        assert!(ui.docked.is_empty(), "docked from under the key list");
+        type_keys(&state, &mut ui, &mut playlist, &[KeyCode::Char('?')]);
+        frame(&state, &mut ui, &playlist, 150, 50);
+        assert_eq!(ui.floating_shown, Some(ViewMode::Playlist));
+        // Handed back (Esc closes it), the room docks it.
+        type_keys(&state, &mut ui, &mut playlist, &[KeyCode::Esc]);
+        frame(&state, &mut ui, &playlist, 150, 50);
+        assert_eq!(ui.docked_shown, vec![ViewMode::Playlist]);
+        // Shift+K on it declines it too.
+        let (state, mut ui, mut playlist) = hifi(40);
+        frame(&state, &mut ui, &playlist, 150, 50);
+        type_keys(&state, &mut ui, &mut playlist, &[KeyCode::Char('l'), KeyCode::Char('K')]);
+        frame(&state, &mut ui, &playlist, 150, 50);
+        assert!(ui.docked.is_empty() && ui.library_auto_declined);
+    }
+
+    #[test]
+    fn hifis_display_drops_the_album_whole_when_narrow() {
+        // Joined with the artist into one item, it was cut mid-word.
+        let (state, mut ui, playlist) = hifi(1);
+        ui.metadata_cache.set_artist_album_for_test(0, "Arctic Monkeys", "Favourite Worst Nightmare");
+        let rows = tui::testing::rows(&frame(&state, &mut ui, &playlist, 50, 30));
+        let meta = rows.iter().find(|r| r.contains("ARCTIC MONKEYS")).expect("the artist shows");
+        assert!(!meta.contains('…') && !meta.contains("FAVOURITE"), "{meta:?}");
+        let rows = tui::testing::rows(&frame(&state, &mut ui, &playlist, 120, 30));
+        assert!(rows.iter().any(|r| r.contains("ARCTIC MONKEYS") && r.contains("FAVOURITE WORST NIGHTMARE")), "wide: both");
+    }
+
+    #[test]
+    fn a_panel_too_narrow_to_dock_reserves_no_rows() {
+        // Kept, the EQ gave way to a dock area left blank.
+        use crate::ui_hifi::{dock_need, DOCK_ROWS, LYRICS_DOCK_ROWS};
+        assert_eq!(dock_need(&[ViewMode::Playlist], 45), 0);
+        assert_eq!(dock_need(&[ViewMode::Playlist, ViewMode::Lyrics], 45), LYRICS_DOCK_ROWS);
+        assert_eq!(dock_need(&[ViewMode::Playlist, ViewMode::Lyrics], 80), DOCK_ROWS);
+    }
+
+    #[test]
+    fn docked_lyrics_go_beside_the_library_else_under_it_else_in_its_place() {
+        let (state, mut ui, playlist) = hifi(40);
+        ui.set_lyrics(Some(crate::lyrics::parse_lyrics("[00:01.00]one\n[00:02.00]two\n[00:03.00]three")));
+        ui.docked = vec![ViewMode::Lyrics];
+        ui.panel_recent = vec![ViewMode::Lyrics, ViewMode::Playlist];
+        let placed = |ui: &UiState| {
+            let mut v: Vec<(ViewMode, Rect)> = ui.hits.iter().filter_map(|(r, h)| match h {
+                Hit::Panel(v @ (ViewMode::Playlist | ViewMode::Lyrics)) => Some((*v, *r)),
+                _ => None,
+            }).collect();
+            // The box is a panel's first (its footer's focus hint is one too).
+            let mut seen = Vec::new();
+            v.retain(|(p, _)| if seen.contains(p) { false } else { seen.push(*p); true });
+            v.sort_by_key(|(v, _)| *v != ViewMode::Playlist);
+            v
+        };
+        // Wide: side by side, the lyrics on the right.
+        frame(&state, &mut ui, &playlist, 160, 50);
+        let p = placed(&ui);
+        assert_eq!(p.len(), 2);
+        assert!(p[1].1.x > p[0].1.right() - 1 && p[1].1.y == p[0].1.y, "{p:?}");
+        // Narrow and tall: under it, the library back to its five tracks.
+        frame(&state, &mut ui, &playlist, 84, 50);
+        let p = placed(&ui);
+        assert_eq!(p.len(), 2, "{p:?}");
+        assert_eq!(p[0].1.height, crate::ui_hifi::DOCK_ROWS);
+        assert!(p[1].1.y >= p[0].1.bottom(), "{p:?}");
+        // Narrow and short: the lyrics alone, the library not docked (the EQ
+        // keeps its rows).
+        frame(&state, &mut ui, &playlist, 84, 40);
+        assert_eq!(ui.docked_shown, vec![ViewMode::Lyrics]);
+        assert!(!ui.library_auto_docked && ui.eq_in_stack);
+        // Shorter still: the lyrics' current line under the EQ.
+        let rows = tui::testing::rows(&frame(&state, &mut ui, &playlist, 84, 36));
+        assert!(ui.eq_in_stack && ui.docked_shown == vec![ViewMode::Lyrics], "{}", rows.join("\n"));
+        let p = placed(&ui);
+        assert_eq!(p[0].1.height, crate::ui_hifi::LYRICS_DOCK_ROWS);
+    }
+
+    #[test]
+    fn a_docked_panel_takes_hifis_eq_place_and_e_opens_the_dialog() {
+        // Too few rows for both (the EQ and the lyrics' current line).
+        let (state, mut ui, mut playlist) = hifi(1);
+        ui.docked = vec![ViewMode::Lyrics];
+        let rows = tui::testing::rows(&frame(&state, &mut ui, &playlist, 120, 28)).join("\n");
+        assert!(!rows.contains("GRAPHIC EQUALIZER") && !ui.eq_in_stack);
+        assert_eq!(ui.docked_shown, vec![ViewMode::Lyrics]);
+        type_keys(&state, &mut ui, &mut playlist, &[KeyCode::Char('e')]);
+        frame(&state, &mut ui, &playlist, 120, 28);
+        assert!(ui.hits.iter().any(|(_, h)| *h == Hit::Dialog), "the EQ dialog");
+        assert!(overlay_open(&ui));
+        // Too short a window for the unit: the dialog too.
+        let (state, mut ui, mut playlist) = hifi(1);
+        frame(&state, &mut ui, &playlist, 120, 24);
+        assert!(!ui.eq_in_stack);
+        type_keys(&state, &mut ui, &mut playlist, &[KeyCode::Char('e')]);
+        frame(&state, &mut ui, &playlist, 120, 24);
+        assert!(ui.hits.iter().any(|(_, h)| *h == Hit::Dialog));
+    }
+
+    #[test]
+    fn e_over_a_floating_panel_in_hifi_closes_it_for_the_stacked_eq() {
+        // A window with the EQ but not the library under it (it would dock).
+        let (state, mut ui, mut playlist) = hifi(3);
+        frame(&state, &mut ui, &playlist, 120, 36);
+        type_keys(&state, &mut ui, &mut playlist, &[KeyCode::Char('l')]);
+        frame(&state, &mut ui, &playlist, 120, 36);
+        assert_eq!(ui.floating_shown, Some(ViewMode::Playlist));
+        type_keys(&state, &mut ui, &mut playlist, &[KeyCode::Char('e')]);
+        assert_eq!((ui.view_mode, ui.eq_return), (ViewMode::Eq, ViewMode::Player));
+        frame(&state, &mut ui, &playlist, 120, 36);
+        assert!(!ui.hits.iter().any(|(_, h)| *h == Hit::Dialog), "the panel closed, no dialog");
+    }
+
+    #[test]
+    fn a_click_on_a_band_of_hifis_eq_selects_it_and_one_elsewhere_hands_the_keys_back() {
+        let (state, mut ui, playlist) = hifi(1);
+        frame(&state, &mut ui, &playlist, 120, 40);
+        let band = ui.hits.iter().find_map(|(r, h)| (*h == Hit::EqBand(3)).then_some(*r)).expect("band 3 clickable");
+        mouse(&state, &mut ui, &playlist, click(event::MouseEventKind::Down(event::MouseButton::Left), band.x + 1, band.y + 2));
+        assert_eq!((ui.view_mode, ui.eq_band, ui.eq_return), (ViewMode::Eq, 3, ViewMode::Player));
+        frame(&state, &mut ui, &playlist, 120, 40);
+        // Elsewhere in the player (the transport's title row).
+        mouse(&state, &mut ui, &playlist, click(event::MouseEventKind::Down(event::MouseButton::Left), 30, 1));
+        assert_eq!(ui.view_mode, ViewMode::Player);
+    }
+
+    #[test]
+    fn e_after_t_in_one_pass_opens_classics_dialog_over_the_panel() {
+        // `t` then `e` before a frame: the last frame's "EQ in the stack"
+        // was HiFi's, and the floating playlist closed in Classic.
+        let (state, mut ui, mut playlist) = hifi(3);
+        ui.library_auto_declined = true;
+        frame(&state, &mut ui, &playlist, 120, 40);
+        type_keys(&state, &mut ui, &mut playlist, &[KeyCode::Char('l')]);
+        frame(&state, &mut ui, &playlist, 120, 40);
+        assert!(ui.eq_in_stack);
+        type_keys(&state, &mut ui, &mut playlist, &[KeyCode::Char('t'), KeyCode::Char('e')]);
+        assert_ne!(state.theme_kind(), crate::theme::ThemeKind::HiFi);
+        assert_eq!((ui.view_mode, ui.eq_return), (ViewMode::Eq, ViewMode::Playlist));
+    }
+
+    #[test]
+    fn the_eq_dialog_over_a_panel_leaves_hifis_eq_unit_without_the_keys() {
+        // Opened over a floating panel in Classic, then `t` to HiFi: the
+        // dialog edits the EQ, the unit in the stack under it must not too.
+        let (state, mut ui, playlist) = hifi(3);
+        ui.library_auto_declined = true;
+        ui.view_mode = ViewMode::Eq;
+        ui.eq_return = ViewMode::Playlist;
+        frame(&state, &mut ui, &playlist, 120, 40);
+        assert!(ui.hits.iter().any(|(_, h)| *h == Hit::Dialog), "the dialog");
+        // Its `e EDIT` hint (a click on the unit) shows only without the keys.
+        let unit = ui.hits.iter().filter(|(_, h)| *h == Hit::Panel(ViewMode::Eq)).count();
+        assert_eq!(unit, 2, "the unit and its `e EDIT` hint");
+    }
+
+    #[test]
+    fn esc_from_hifis_stacked_eq_gives_the_keys_back_to_the_docked_panel_it_came_from() {
+        let (state, mut ui, mut playlist) = hifi(3);
+        ui.docked = vec![ViewMode::Playlist];
+        frame(&state, &mut ui, &playlist, 120, 40);
+        type_keys(&state, &mut ui, &mut playlist, &[KeyCode::Char('l')]);
+        frame(&state, &mut ui, &playlist, 120, 40);
+        assert!(ui.eq_in_stack && ui.view_mode == ViewMode::Playlist && ui.docked_shown == vec![ViewMode::Playlist]);
+        type_keys(&state, &mut ui, &mut playlist, &[KeyCode::Char('e')]);
+        frame(&state, &mut ui, &playlist, 120, 40);
+        assert_eq!(ui.view_mode, ViewMode::Eq);
+        assert!(!ui.hits.iter().any(|(_, h)| *h == Hit::Dialog) && !overlay_open(&ui), "edited in the stack");
+        assert_eq!(ui.docked_shown, vec![ViewMode::Playlist], "the library stays docked");
+        type_keys(&state, &mut ui, &mut playlist, &[KeyCode::Esc]);
+        assert_eq!(ui.view_mode, ViewMode::Playlist, "back to the list");
+        // And `e` again, as Esc.
+        type_keys(&state, &mut ui, &mut playlist, &[KeyCode::Char('e')]);
+        frame(&state, &mut ui, &playlist, 120, 40);
+        type_keys(&state, &mut ui, &mut playlist, &[KeyCode::Char('e')]);
+        assert_eq!(ui.view_mode, ViewMode::Playlist);
+        // A click on a band, as `e`.
+        frame(&state, &mut ui, &playlist, 120, 40);
+        let band = ui.hits.iter().find_map(|(r, h)| (*h == Hit::EqBand(3)).then_some(*r)).expect("band 3 clickable");
+        mouse(&state, &mut ui, &playlist, click(event::MouseEventKind::Down(event::MouseButton::Left), band.x + 1, band.y + 2));
+        assert_eq!((ui.view_mode, ui.eq_return), (ViewMode::Eq, ViewMode::Playlist));
+    }
+
+    #[test]
+    fn a_click_on_the_key_of_the_view_with_the_keys_hands_them_back_as_the_key() {
+        // The click handed the keys to the player, then its key took them
+        // straight back.
+        let key_at = |ui: &UiState, c: char| {
+            ui.hits.iter().rev().find_map(|(r, h)| matches!(h, Hit::Key(KeyCode::Char(k), _) if *k == c).then_some(*r)).expect("the hint")
+        };
+        let (state, mut ui, mut playlist) = hifi(3);
+        ui.library_auto_declined = true;
+        frame(&state, &mut ui, &playlist, 120, 40);
+        type_keys(&state, &mut ui, &mut playlist, &[KeyCode::Char('e')]);
+        frame(&state, &mut ui, &playlist, 120, 40);
+        assert_eq!(ui.view_mode, ViewMode::Eq);
+        let r = key_at(&ui, 'e');
+        mouse(&state, &mut ui, &playlist, click(event::MouseEventKind::Down(event::MouseButton::Left), r.x, r.y));
+        type_keys(&state, &mut ui, &mut playlist, &[]);
+        assert_eq!(ui.view_mode, ViewMode::Player, "`e EQ` closes the EQ");
+        // A docked library with the keys and the player's `l`.
+        let (state, mut ui, mut playlist) = hifi(3);
+        ui.docked = vec![ViewMode::Playlist];
+        frame(&state, &mut ui, &playlist, 120, 40);
+        type_keys(&state, &mut ui, &mut playlist, &[KeyCode::Char('l')]);
+        frame(&state, &mut ui, &playlist, 120, 40);
+        let r = key_at(&ui, 'l');
+        mouse(&state, &mut ui, &playlist, click(event::MouseEventKind::Down(event::MouseButton::Left), r.x, r.y));
+        type_keys(&state, &mut ui, &mut playlist, &[]);
+        assert_eq!(ui.view_mode, ViewMode::Player, "`l` hands the list's keys back");
+    }
+
+    #[test]
+    fn leaving_hifi_floats_the_auto_docked_library_that_has_the_keys() {
+        // It stayed docked in Classic, then went once the keys left it.
+        let (state, mut ui, mut playlist) = hifi(3);
+        frame(&state, &mut ui, &playlist, 150, 50);
+        assert!(ui.library_auto_docked);
+        type_keys(&state, &mut ui, &mut playlist, &[KeyCode::Char('l')]);
+        frame(&state, &mut ui, &playlist, 150, 50);
+        assert_eq!(ui.view_mode, ViewMode::Playlist);
+        type_keys(&state, &mut ui, &mut playlist, &[KeyCode::Char('t')]);
+        frame(&state, &mut ui, &playlist, 150, 50);
+        assert!(!ui.library_auto_docked && !ui.docked.contains(&ViewMode::Playlist));
+        assert_eq!((ui.view_mode, ui.floating_shown), (ViewMode::Playlist, Some(ViewMode::Playlist)), "floating, with the keys");
+    }
+
+    #[test]
+    fn hifis_play_modes_drop_whole_from_a_narrow_top_border() {
+        let (state, mut ui, playlist) = hifi(3);
+        for w in 40..70 {
+            let rows = tui::testing::rows(&frame(&state, &mut ui, &playlist, w, 30));
+            let top = rows[0].trim_end_matches(['═', '╗', ' ']);
+            for item in ["▶ PLAY", "SHUF-OFF", "RPT-OFF"] {
+                let cut = &item[..item.len() - 1];
+                assert!(!top.contains(cut) || top.contains(item), "{w}: {top}");
+            }
+            assert!(!top.ends_with('·') && !top.ends_with('│'), "{w}: a separator dangles: {top}");
+        }
+    }
+
+    #[test]
+    fn the_eq_dialog_takes_its_headroom_from_the_cache() {
+        let (state, mut ui, playlist) = hifi(1);
+        state.set_theme(crate::theme::ThemeKind::Classic);
+        ui.view_mode = ViewMode::Eq;
+        frame(&state, &mut ui, &playlist, 120, 40);
+        assert!(ui.headroom_cache.is_filled(), "worked out once, kept");
+    }
+
+    #[test]
+    fn every_eq_dialog_shows_the_dsp_readouts() {
+        // The dialog covers the player's rows that show them (Classic at
+        // 80×24, a short HiFi with its SIGNAL section), and Minimal has
+        // ReplayGain on none.
+        for (kind, shown) in [(crate::theme::ThemeKind::Minimal, true), (crate::theme::ThemeKind::Classic, true)] {
+            let (state, mut ui, playlist) = hifi(1);
+            state.set_theme(kind);
+            ui.view_mode = ViewMode::Eq;
+            let rows = tui::testing::rows(&frame(&state, &mut ui, &playlist, 120, 40)).join("\n");
+            assert!(rows.contains("E Q U A L I Z E R"));
+            for label in ["FX", "XFEED", "BAL", "RG"] {
+                assert_eq!(rows.contains(&format!("{label} ")), shown, "{kind:?} {label}:\n{rows}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_library_hifi_docks_by_itself_opens_on_the_playing_track() {
+        // `l` then focuses it as it was left: on track 1, Enter played it.
+        let (state, mut ui, playlist) = hifi(60);
+        ui.current = 56;
+        ui.cursor = 0;
+        frame(&state, &mut ui, &playlist, 150, 50);
+        assert!(ui.library_auto_docked);
+        assert_eq!(ui.cursor, 56);
+        // A resize that takes the room and gives it back keeps the user's place.
+        ui.cursor = 10;
+        frame(&state, &mut ui, &playlist, 150, 30);
+        assert!(!ui.library_auto_docked, "no room");
+        frame(&state, &mut ui, &playlist, 150, 50);
+        assert!(ui.library_auto_docked);
+        assert_eq!(ui.cursor, 10, "kept");
+    }
+
+    #[test]
+    fn hifi_shows_the_dsp_readouts_in_the_eq_when_its_signal_section_is_gone() {
+        let (state, mut ui, playlist) = hifi(1);
+        ui.library_auto_declined = true;
+        // Wide: the SIGNAL section has them, the EQ unit's border does not.
+        let rows = tui::testing::rows(&frame(&state, &mut ui, &playlist, 140, 40));
+        assert!(rows.iter().any(|r| r.contains("SIGNAL")));
+        let eq_bottom = |rows: &[String]| {
+            let top = rows.iter().position(|r| r.contains("GRAPHIC EQUALIZER")).expect("the unit");
+            rows[top + 1..].iter().find(|r| r.contains('└')).cloned().unwrap()
+        };
+        assert!(!eq_bottom(&rows).contains("XFEED"), "{}", eq_bottom(&rows));
+        // Narrow, the unit still stacked: in its bottom border.
+        let rows = tui::testing::rows(&frame(&state, &mut ui, &playlist, 74, 40));
+        assert!(ui.eq_in_stack && !rows.iter().any(|r| r.contains("SIGNAL")));
+        let b = eq_bottom(&rows);
+        assert!(b.contains("FX NONE") && b.contains("XFEED OFF") && b.contains("BAL C"), "{b}");
+        // A dialog (no rows for the unit) over a SIGNAL section: a row too.
+        ui.view_mode = ViewMode::Eq;
+        let rows = tui::testing::rows(&frame(&state, &mut ui, &playlist, 140, 24)).join("\n");
+        assert!(rows.contains("E Q U A L I Z E R") && rows.contains("XFEED"), "{rows}");
+        ui.view_mode = ViewMode::Player;
+        // Narrower, the EQ a dialog: a row of it.
+        ui.view_mode = ViewMode::Eq;
+        let rows = tui::testing::rows(&frame(&state, &mut ui, &playlist, 60, 40)).join("\n");
+        assert!(rows.contains("E Q U A L I Z E R") && rows.contains("XFEED"), "{rows}");
+    }
+
+    #[test]
+    fn only_a_key_that_acts_flashes_its_hint() {
+        // Ctrl+E lit `e EQ`; the `y` answering a removal lit `y LYRICS`.
+        let (state, mut ui, mut playlist) = hifi(3);
+        ui.pressed.push_back(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        poll_input(&state, &mut ui, &mut playlist);
+        assert!(ui.key_flash.is_none(), "Ctrl+E");
+        ui.tree_pending_remove = Some(("x".to_string(), Vec::new()));
+        type_keys(&state, &mut ui, &mut playlist, &[KeyCode::Char('y')]);
+        assert!(ui.key_flash.is_none(), "the prompt's answer");
+        type_keys(&state, &mut ui, &mut playlist, &[KeyCode::Char('y')]);
+        assert!(ui.key_flash.is_some_and(|(k, _, _)| k == KeyCode::Char('y')), "a plain y");
+    }
+
+    #[test]
+    fn a_click_on_hifis_e_edit_hint_gives_the_eq_the_keys() {
+        // As the `e` key, the click gave the keys and the key took them back.
+        let (state, mut ui, mut playlist) = hifi(1);
+        let rows = tui::testing::rows(&frame(&state, &mut ui, &playlist, 120, 40));
+        let (y, x) = rows.iter().enumerate().find_map(|(y, r)| r.find("e EDIT").map(|b| (y, r[..b].chars().count()))).expect("the hint");
+        mouse(&state, &mut ui, &playlist, click(event::MouseEventKind::Down(event::MouseButton::Left), x as u16, y as u16));
+        type_keys(&state, &mut ui, &mut playlist, &[]); // what the click queued
+        assert_eq!((ui.view_mode, ui.eq_return), (ViewMode::Eq, ViewMode::Player));
     }
 
     #[test]
@@ -4997,6 +5659,9 @@ mod ui_tests {
                 ui.focus = view;
                 if docked {
                     ui.docked = vec![view];
+                } else {
+                    // Floating (HiFi would dock the library by itself).
+                    ui.library_auto_declined = true;
                 }
                 frame(&state, &mut ui, &playlist, 100, 50);
                 // The playlist's cursor down the list, until it scrolls.
@@ -5097,14 +5762,15 @@ mod ui_tests {
         // "docked" for a panel `dock` could never place.
         let state = PlayerState::new();
         state.set_theme(crate::theme::ThemeKind::HiFi);
+        let ui = UiState::new(Vec::new(), crate::metadata::MetadataCache::new(0));
         let narrow = Rect::new(0, 0, 48, 40);
-        assert!(crate::ui_hifi::dock_region(narrow).is_some(), "a dock area, too narrow");
-        assert!(!dock_room(&state, ViewMode::Playlist, narrow));
-        assert!(dock_room(&state, ViewMode::Lyrics, narrow), "the lyrics need less");
-        assert!(dock_room(&state, ViewMode::Playlist, Rect::new(0, 0, 120, 40)));
+        assert!(crate::ui_hifi::dock_region(narrow, &[ViewMode::Lyrics]).is_some(), "a dock area, too narrow for the library");
+        assert!(!dock_room(&state, &ui, ViewMode::Playlist, narrow));
+        assert!(dock_room(&state, &ui, ViewMode::Lyrics, Rect::new(0, 0, 40, 40)), "the lyrics need less");
+        assert!(dock_room(&state, &ui, ViewMode::Playlist, Rect::new(0, 0, 120, 40)));
         // Classic and Minimal dock into their visualization slot: no check here.
         state.set_theme(crate::theme::ThemeKind::Classic);
-        assert!(dock_room(&state, ViewMode::Playlist, narrow));
+        assert!(dock_room(&state, &ui, ViewMode::Playlist, narrow));
     }
 
     #[test]
@@ -5550,7 +6216,8 @@ mod ui_tests {
     #[test]
     fn a_new_source_closes_a_search_left_open() {
         let state = PlayerState::new();
-        let dir = std::env::temp_dir().join(format!("keet-src-{}", std::process::id()));
+        // Its own folder: shared with another test, each saw the other's files.
+        let dir = std::env::temp_dir().join(format!("keet-src-search-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         for n in ["a.flac", "b.flac"] {
             std::fs::write(dir.join(n), b"").unwrap();

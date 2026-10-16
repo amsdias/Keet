@@ -145,6 +145,26 @@ impl MetadataCache {
         });
     }
 
+    /// Tests: a track tagged with this artist and album.
+    #[cfg(test)]
+    pub fn set_artist_album_for_test(&self, index: usize, artist: &str, album: &str) {
+        self.set(index, CachedMeta {
+            display: String::new(),
+            search_text: String::new(),
+            artist: Some(artist.to_string()),
+            title: None,
+            album: Some(album.to_string()),
+            rg_track_gain: None,
+            rg_track_peak: None,
+            rg_album_gain: None,
+            rg_album_peak: None,
+            lyrics: None,
+            duration_secs: None,
+            track_number: None,
+            disc_number: None,
+        });
+    }
+
     fn set(&self, index: usize, meta: CachedMeta) {
         let mut entries = self.entries.write().unwrap();
         if index < entries.len() {
