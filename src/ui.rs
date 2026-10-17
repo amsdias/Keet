@@ -817,7 +817,7 @@ pub(crate) fn too_small_lines(
     time: (f64, f64),
     p: &crate::theme::Palette,
 ) -> Vec<Line<'static>> {
-    let icon = if paused { "⏸" } else { "▶" };
+    let icon = if paused { "‖" } else { "▶" };
     let rows: [(String, ratatui::style::Style); 7] = [
         ("▲ window too small".into(), p.warn),
         (format!("{w}×{h} · Keet needs {}×{}", MIN_WINDOW.0, MIN_WINDOW.1), p.dim),
@@ -3883,7 +3883,7 @@ mod ui_tests {
         let lines = too_small_lines(39, 9, true, "Undertow", (161.0, 372.0), p);
         let text: Vec<String> = lines.iter().map(|l| tui::plain(l).trim().to_string()).collect();
         assert!(text.contains(&"39×9 · Keet needs 40×10".to_string()), "{text:?}");
-        assert!(text.contains(&"⏸ Undertow".to_string()), "{text:?}");
+        assert!(text.contains(&"‖ Undertow".to_string()), "{text:?}");
     }
 
     #[test]
@@ -5104,6 +5104,23 @@ mod ui_tests {
         assert!(ui.key_flash.is_none(), "the prompt's answer");
         type_keys(&state, &mut ui, &mut playlist, &[KeyCode::Char('y')]);
         assert!(ui.key_flash.is_some_and(|(k, _, _)| k == KeyCode::Char('y')), "a plain y");
+    }
+
+    #[test]
+    fn pausing_moves_nothing_in_hifis_top_border() {
+        // ⏸ is also an emoji (a blue square, wider than its cell), and PAUSE
+        // is a letter longer than PLAY: SHUF and RPT moved right.
+        let (state, mut ui, playlist) = hifi(3);
+        let at = |state: &PlayerState, ui: &mut UiState| {
+            let rows = tui::testing::rows(&frame(state, ui, &playlist, 120, 40));
+            let top = rows[0].clone();
+            (top[..top.find("SHUF").unwrap()].chars().count(), top)
+        };
+        let (playing, _) = at(&state, &mut ui);
+        state.set_paused(true);
+        let (paused, top) = at(&state, &mut ui);
+        assert_eq!(paused, playing, "{top}");
+        assert!(top.contains("‖ PAUSE") && !top.contains('⏸'), "{top}");
     }
 
     #[test]

@@ -194,7 +194,10 @@ fn draw_transport(f: &mut Frame, cx: &mut Ctx, r: Rect, p: &Palette) {
     let track_total = state.total_tracks.load(Ordering::Relaxed);
     let shuffle_on = cx.ui.shuffle;
     let repeat_label = repeat_short(state.repeat_mode());
-    let play_label = if state.is_paused() { "⏸ PAUSE" } else { "▶ PLAY" };
+    // `‖`, not ⏸: that is also an emoji (a blue square, wider than its cell,
+    // which ran into the word and pushed the modes right). PLAY padded to
+    // PAUSE's width, so SHUF and RPT stay where they are.
+    let play_label = if state.is_paused() { "‖ PAUSE" } else { "▶ PLAY " };
     let mut head = LineBuf::new();
     head.styled("═", p.fg).reset().push(' ').styled("K E E T", p.accent.patch(p.bold)).reset().push_str("  ").styled("│", p.dim).reset().push_str("  ");
     let head = head.into_line();
@@ -1266,30 +1269,25 @@ fn hifi_marquee_keys(p: &Palette, term_w: usize) -> crate::hints::Bar {
 /// The dim amber of the progress rail.
 const RAIL: Color = Color::Rgb(122, 94, 58);
 
-/// Two-tone bar: bright accent fill meeting a solid dim-amber rail. The
-/// rail's colour is used both as its own foreground AND as the boundary cell's
-/// background, so the bright fill and dim rail always meet seamlessly — a
-/// left-partial block only inks its left `frac/8`, so its empty right must be
-/// painted the rail colour or the terminal background (black) shows through
-/// as a notch that oscillates as the cell fills.
+/// The progress bar: lit braille cells meeting a rail of unlit (dim) ones,
+/// the cell being filled lit one dot column at a time — half a cell a step.
+/// All glyphs, no background: the partial blocks it had, on the rail's
+/// colour as background, dented the cell being filled in Windows Terminal
+/// (a cell's background and a block glyph are not the same height there).
 fn render_solid_bar(progress: f64, width: usize, p: &Palette) -> Line<'static> {
-    const PARTIALS: &[char] = &['▏', '▎', '▍', '▌', '▋', '▊', '▉', '█'];
     let sub = (progress * width as f64).max(0.0);
-    let full = sub as usize;
-    let frac = ((sub - full as f64) * 8.0) as usize;
-    let has_partial = full < width && frac > 0;
+    let full = (sub as usize).min(width);
+    // Half a cell lit: its left column (one colour a cell, so the right one
+    // is dark, as a part-lit cell of the dot meter is).
+    let half = full < width && sub - full as f64 >= 0.5;
     let mut s = LineBuf::new();
-    // Bright fill.
-    s.styled(&"█".repeat(full.min(width)), p.accent);
-    // Boundary cell: bright fill on the left, the rail on its right.
-    if has_partial {
-        s.style(p.accent.bg(RAIL)).push(PARTIALS[(frac - 1).min(PARTIALS.len() - 1)]);
+    s.styled(&"⣿".repeat(full), p.accent);
+    if half {
+        s.styled("⡇", p.accent);
     }
-    // Dim rail: solid blocks in the rail colour (shrinks as the fill grows).
-    // Without colour a solid rail is indistinguishable from the fill: a line.
-    let tail = width.saturating_sub(full + if has_partial { 1 } else { 0 });
-    let rail = if crate::term::no_color() { '─' } else { '█' };
-    s.style(Style::new().fg(RAIL)).push_str(&rail.to_string().repeat(tail));
+    // Without colour, unlit dots would read as lit: a dotted line.
+    let rail = if crate::term::no_color() { '⠤' } else { '⣿' };
+    s.style(Style::new().fg(RAIL)).push_str(&rail.to_string().repeat(width - full - usize::from(half)));
     s.into_line()
 }
 
@@ -1311,26 +1309,23 @@ mod hifi_tests {
     use super::*;
 
     #[test]
-    fn solid_bar_partial_meets_rail_seamlessly_no_black_notch() {
-        // A fractional progress produces a leading partial block. Its empty
-        // (right) portion must be painted the EXACT rail colour so the bright
-        // fill grows into the dim rail with no black gap between them.
-        // width=20, progress=0.51 → full=10, frac=1 → one partial cell.
+    fn the_dotted_bar_steps_by_dot_columns_and_paints_no_background() {
+        // No background (Windows Terminal drew a cell's background lower
+        // than the block glyphs beside it: a dent in the cell being filled).
         let p = palette(ThemeKind::HiFi);
-        let bar = render_solid_bar(0.51, 20, p);
-        assert_eq!(crate::tui::Cols::cols(&bar), 20);
-        let partial = bar
-            .spans
-            .iter()
-            .find(|s| s.content.chars().any(|c| "▏▎▍▌▋▊▉".contains(c)))
-            .expect("a partial block");
-        // The rail is drawn solid in the rail colour…
-        let rail = bar.spans.last().expect("a rail");
-        assert_eq!(rail.style.fg, Some(RAIL));
-        // …and the boundary cell's background is that SAME colour.
-        assert_eq!(partial.style.bg, Some(RAIL), "the boundary must sit on the rail colour");
-        // The rail's own cells carry no background.
-        assert_eq!(rail.style.bg, None);
+        let text = |l: &Line| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>();
+        let lit = |l: &Line| l.spans.iter().filter(|s| s.style.fg == p.accent.fg).map(|s| s.content.as_ref()).collect::<String>();
+        for (progress, shown) in [(0.51, "⣿".repeat(10)), (0.53, "⣿".repeat(10) + "⡇"), (0.55, "⣿".repeat(11))] {
+            let bar = render_solid_bar(progress, 20, p);
+            assert_eq!(crate::tui::Cols::cols(&bar), 20, "{progress}");
+            assert!(bar.spans.iter().all(|s| s.style.bg.is_none()), "{bar:?}");
+            assert_eq!(lit(&bar), shown, "{progress}");
+            assert!(text(&bar).chars().all(|c| matches!(c, '⣿' | '⡇')), "{}", text(&bar));
+        }
+        // The rail: dim dots, every cell not lit.
+        let bar = render_solid_bar(0.53, 20, p);
+        let rail: String = bar.spans.iter().filter(|s| s.style.fg == Some(RAIL)).map(|s| s.content.as_ref()).collect();
+        assert_eq!(rail, "⣿".repeat(9));
     }
 
     #[test]

@@ -253,7 +253,7 @@ fn info_lines(
 /// when there is room for one.
 fn transport_line(state: &PlayerState, p: &Palette, width: usize) -> (Line<'static>, Option<(usize, usize)>) {
     let (t, total) = (state.time_secs(), state.total_secs());
-    let (icon, icon_style) = if state.is_paused() { ("⏸", p.fg) } else { ("▶", p.accent) };
+    let (icon, icon_style) = if state.is_paused() { ("‖", p.fg) } else { ("▶", p.accent) };
     let mut l = LineBuf::new();
     l.push_str("  ").styled(icon, icon_style).reset().push(' ').styled(&format_time(t), p.bold).reset();
     let right_w = 2 + format_time(total).len() + 2 + 1 + format_time((total - t).max(0.0)).len();
@@ -458,7 +458,7 @@ pub fn draw(f: &mut Frame, cx: &mut Ctx) {
         let state = cx.state;
         let track = state.current_track.load(Ordering::Relaxed) + 1;
         let total = state.total_tracks.load(Ordering::Relaxed);
-        let (icon, icon_style) = if state.is_paused() { ("⏸", p.fg) } else { ("▶", p.accent) };
+        let (icon, icon_style) = if state.is_paused() { ("‖", p.fg) } else { ("▶", p.accent) };
         let mut head = LineBuf::new();
         head.styled(&format!("[{track}/{total}]"), p.dim).reset().push(' ').styled(icon, icon_style).reset().push(' ');
         head.styled(&truncate_plain(cx.name, 35), p.bold).reset().push_str("  ");

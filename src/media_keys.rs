@@ -53,7 +53,7 @@ fn handle_event(state: &PlayerState, event: MediaControlEvent) {
         }
         _ => return,
     }
-    // The screen changes (▶/⏸, the clock): a frame at once, not at the idle
+    // The screen changes (▶/‖, the clock): a frame at once, not at the idle
     // rate. (This runs inside the OS event pump, or on D-Bus's thread.)
     state.note_remote_change();
 }
@@ -237,7 +237,7 @@ mod tests {
 
     #[test]
     fn a_media_key_asks_for_a_frame() {
-        // Its change (▶/⏸, the clock after a seek) showed up to 250 ms late
+        // Its change (▶/‖, the clock after a seek) showed up to 250 ms late
         // on a still screen.
         let state = PlayerState::new();
         assert!(!state.take_remote_change());

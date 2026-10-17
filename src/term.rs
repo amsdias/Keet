@@ -92,7 +92,7 @@ pub fn flush() {
 
 /// `NO_COLOR` (https://no-color.org): set to anything non-empty, Keet draws
 /// no colour. Bold, dim and reverse stay — with colour gone they, and the
-/// state glyphs (▶ ⏸ ● ○ ✓ ▲), carry every state.
+/// state glyphs (▶ ‖ ● ○ ✓ ▲), carry every state.
 pub fn no_color() -> bool {
     static NO_COLOR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *NO_COLOR.get_or_init(|| std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()))
