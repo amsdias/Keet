@@ -267,7 +267,7 @@ A value of the wrong type is ignored on its own (and named on the status line at
 
 ## EQ Editor
 
-Press `E` to open the EQ editor — a **10-band parametric EQ** floating over the running player (in Hi-Fi, the EQ unit in its stack, when the window has room for it). Effects, crossfeed, balance and ReplayGain are shown by the player itself. Every band has four parameters:
+Press `E` to open the EQ editor — a **10-band parametric EQ** floating over the running player (in Hi-Fi, the EQ unit in its stack, when the window has room for it). The current effects, crossfeed, balance and ReplayGain are shown beneath the bands (in Hi-Fi's stack, in the EQ unit's bottom border when the window is too narrow for the signal lamps). Every band has four parameters:
 
 | Parameter | Range | Keys |
 |-----------|-------|------|
