@@ -1081,6 +1081,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         cli::print_help();
         return Ok(());
     }
+    if opts.version {
+        println!("keet {}", cli::VERSION);
+        return Ok(());
+    }
     if opts.list_devices {
         let host = cpal::default_host();
         audio::list_output_devices(&host, opts.verbose);

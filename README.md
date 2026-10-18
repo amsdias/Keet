@@ -576,6 +576,8 @@ Options:
   --exclusive       Exclusive mode: per-track rate matching, device lock (macOS)
   --no-cover        Disable album cover display
   --theme <name>    UI theme: classic (default), minimal, hifi
+  --help, -h        Show the help (options and keys)
+  --version, -V     Show the version
 ```
 
 Multiple files, folders, and M3U playlists can be passed as arguments. Duplicates are removed automatically. Running `keet` with no arguments resumes the last session; on the very first run it opens a welcome screen that asks for a folder (its animation is inspired by [nebula](https://github.com/agentSystemLabs/nebula)'s splash screen).
@@ -656,4 +658,10 @@ The `.exe` automatically includes the app icon and version metadata (from git ta
 
 ## License
 
-GPL-3.0
+Copyright (C) 2026 Angelo Dias
+
+Keet is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+
+Keet is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the [LICENSE](LICENSE) file for the full terms.
+
+`SPDX-License-Identifier: AGPL-3.0-or-later`

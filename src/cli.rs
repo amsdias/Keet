@@ -5,11 +5,17 @@ use std::path::PathBuf;
 use crate::state::RgMode;
 use crate::theme::ThemeKind;
 
+/// The version this binary was built from: `git describe --tags --always`
+/// (`v2.0.0`, or `v2.0.0-3-gabc1234` past the tag), else Cargo.toml's (build.rs).
+pub const VERSION: &str = env!("GIT_VERSION");
+
 /// What the command line asked for.
 #[derive(Debug, PartialEq)]
 pub struct Options {
     /// `--help`: print usage and exit.
     pub help: bool,
+    /// `--version`: print the version and exit.
+    pub version: bool,
     /// `--list-devices` (with `--verbose`): print the output devices and exit.
     pub list_devices: bool,
     pub verbose: bool,
@@ -37,6 +43,7 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             help: false,
+            version: false,
             list_devices: false,
             verbose: false,
             resume: false,
@@ -59,16 +66,18 @@ impl Default for Options {
 
 /// Parse `args` (including the program name at index 0). Sequential: an
 /// option's value is consumed with it and never read as a flag itself.
-/// `--help` and `--list-devices` win wherever they appear, mistakes and all.
+/// `--help`, `--version` and `--list-devices` win wherever they appear,
+/// mistakes and all.
 pub fn parse(args: &[String]) -> Result<Options, String> {
     let rest = args.get(1..).unwrap_or_default();
     let mut o = Options {
         help: rest.iter().any(|a| a == "--help" || a == "-h"),
+        version: rest.iter().any(|a| a == "--version" || a == "-V"),
         list_devices: rest.iter().any(|a| a == "--list-devices"),
         verbose: rest.iter().any(|a| a == "--verbose"),
         ..Options::default()
     };
-    if o.help || o.list_devices {
+    if o.help || o.version || o.list_devices {
         return Ok(o);
     }
 
@@ -180,7 +189,7 @@ pub const KEYS: &[(&str, &[(&str, &str)])] = &[
 
 /// The `--help` text.
 pub fn print_help() {
-    println!("\x1B[1mKeet\x1B[0m — Terminal audio player with real-time visualization and parametric EQ");
+    println!("\x1B[1mKeet\x1B[0m {VERSION} — Terminal audio player with real-time visualization and parametric EQ");
     println!();
     println!("\x1B[1mUSAGE\x1B[0m");
     println!("  keet <file|folder|playlist>... [options]");
@@ -203,6 +212,7 @@ pub fn print_help() {
     println!("      --list-devices     List available output devices and exit");
     println!("      --verbose          With --list-devices: every device, with its formats");
     println!("  -h, --help             Show this help");
+    println!("  -V, --version          Show the version");
     println!();
     println!("\x1B[1mFORMATS\x1B[0m  MP3, FLAC, WAV, OGG, AAC/M4A, ALAC, AIFF");
     println!();
@@ -303,5 +313,13 @@ mod tests {
         assert!(opts("--bogus --help").unwrap().help, "help even beside a mistake");
         let o = opts("--list-devices --verbose").unwrap();
         assert!(o.list_devices && o.verbose);
+    }
+
+    #[test]
+    fn version_wins_wherever_it_appears() {
+        assert!(opts("--version").unwrap().version);
+        assert!(opts("a.mp3 -V").unwrap().version);
+        assert!(opts("--bogus --version").unwrap().version, "version even beside a mistake");
+        assert!(!opts("-v").is_ok_and(|o| o.version), "-v is not -V");
     }
 }
