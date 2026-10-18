@@ -94,20 +94,23 @@ jobs:
         run: |
           mkdir dist
           cp target/${{ matrix.target }}/release/${{ matrix.bin }} dist/${{ matrix.bin }}
-          # The AGPL travels with the binary.
+          # The AGPL and the crates' licences travel with the binary. One file a
+          # line: on Windows `cp` is PowerShell's Copy-Item (one source, then
+          # the destination).
           cp LICENSE dist/LICENSE
+          cp THIRD_PARTY_LICENSES dist/THIRD_PARTY_LICENSES
 
       - name: Compress (Linux/macOS)
         if: matrix.os != 'windows-latest'
         run: |
           cd dist
-          tar -czf ${{ matrix.out }}.tar.gz ${{ matrix.bin }} LICENSE
+          tar -czf ${{ matrix.out }}.tar.gz ${{ matrix.bin }} LICENSE THIRD_PARTY_LICENSES
 
       - name: Compress (Windows)
         if: matrix.os == 'windows-latest'
         run: |
           cd dist
-          Compress-Archive -Path ${{ matrix.bin }},LICENSE -DestinationPath ${{ matrix.out }}.zip
+          Compress-Archive -Path ${{ matrix.bin }},LICENSE,THIRD_PARTY_LICENSES -DestinationPath ${{ matrix.out }}.zip
 
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

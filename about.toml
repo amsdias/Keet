@@ -1,0 +1,31 @@
+# cargo-about: generates THIRD_PARTY_LICENSES (`cargo about generate about.hbs -o THIRD_PARTY_LICENSES`).
+# Licences in order of preference: a crate offering several is listed under the first it offers.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "Zlib",
+    "BSD-3-Clause",
+    "BSD-2-Clause",
+    "ISC",
+    "0BSD",
+    "Unlicense",
+    "BSL-1.0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+]
+# Every platform a release is built for: the Windows, Linux and macOS crates differ.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+# Only what is compiled into the binary.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# Keet's own licence: accepted so the scan passes, left out of the output (it is LICENSE).
+[keet]
+accepted = ["AGPL-3.0-or-later"]

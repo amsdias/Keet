@@ -1,0 +1,20 @@
+Third-party software in Keet
+============================
+
+Keet is licensed under the GNU Affero General Public License v3.0 or later
+(see LICENSE). It is built with the open-source crates below, under these
+licences:
+{{#each overview}}{{#unless (eq id "AGPL-3.0-or-later")}}
+  {{name}}: {{count}}{{/unless}}{{/each}}
+
+Each licence text follows with the crates it covers. A crate offering a
+choice of licences is listed under the one taken here.
+{{#each licenses}}{{#unless (eq id "AGPL-3.0-or-later")}}
+
+--------------------------------------------------------------------------------
+{{name}}
+Used by:
+{{#each used_by}}  {{crate.name}} {{crate.version}}{{#if crate.repository}} ({{crate.repository}}){{/if}}
+{{/each}}
+
+{{{text}}}{{/unless}}{{/each}}

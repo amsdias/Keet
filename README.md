@@ -665,3 +665,5 @@ Keet is free software: you can redistribute it and/or modify it under the terms 
 Keet is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the [LICENSE](LICENSE) file for the full terms.
 
 `SPDX-License-Identifier: AGPL-3.0-or-later`
+
+Keet is built on open-source Rust crates under their own licences (MIT, Apache-2.0, MPL-2.0 and others); their licence texts are in [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES), which every release archive includes.
