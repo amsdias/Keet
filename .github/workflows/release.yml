@@ -20,6 +20,10 @@ jobs:
   # A tag is no reason to ship untested code.
   test:
     name: Test
+    # Only in the public repo: Actions there are free, and every change lands
+    # there. The private copy would spend its minutes (macOS counts 10x) on
+    # the same runs. Build and publish need this job, so they are skipped with it.
+    if: github.repository == 'amsdias/Keet'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

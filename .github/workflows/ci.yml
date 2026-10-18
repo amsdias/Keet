@@ -25,6 +25,10 @@ jobs:
   # macOS format ranking) that only compiles where it runs.
   test:
     name: Test (${{ matrix.os }})
+    # Only in the public repo: Actions there are free, and every change lands
+    # there. The private copy would spend its minutes (macOS counts 10x) on
+    # the same runs. Jobs that need this one are skipped with it.
+    if: github.repository == 'amsdias/Keet'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -54,6 +58,7 @@ jobs:
   # Linux-only lint never saw it.
   clippy:
     name: Clippy (${{ matrix.os }})
+    if: github.repository == 'amsdias/Keet' # as test
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
