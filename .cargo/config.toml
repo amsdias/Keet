@@ -1,0 +1,6 @@
+# Link the C runtime statically on Windows: a default MSVC build imports
+# VCRUNTIME140.dll, which a clean Windows does not have (only the Visual C++
+# Redistributable installs it), so keet.exe failed to start there with
+# STATUS_DLL_NOT_FOUND (0xC0000135) — winget's validation VM caught it.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

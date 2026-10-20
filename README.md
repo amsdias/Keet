@@ -40,7 +40,39 @@ A high-performance, low-CPU terminal audio player with real-time spectrum visual
 
 ## Installation
 
-Keet builds from source with a stable Rust toolchain (install one from [rustup.rs](https://rustup.rs) if you don't have it).
+**Windows** ([winget](https://learn.microsoft.com/windows/package-manager/)):
+
+```powershell
+winget install amsdias.Keet
+```
+
+**macOS and Linux** ([Homebrew](https://brew.sh)):
+
+```bash
+brew install amsdias/tap/keet-player
+```
+
+**Arch Linux** ([AUR](https://aur.archlinux.org)): `keet-player` builds from source, `keet-player-bin` is the release binary. With an AUR helper:
+
+```bash
+yay -S keet-player
+```
+
+**With Cargo**, from [crates.io](https://crates.io/crates/keet) (a stable Rust toolchain from [rustup.rs](https://rustup.rs)):
+
+```bash
+cargo install keet
+```
+
+On Linux/WSL, building needs the ALSA, D-Bus and OpenSSL headers first (see [Building](#building)):
+
+```bash
+sudo apt install pkg-config libasound2-dev libdbus-1-dev libssl-dev
+```
+
+Every package installs the same `keet` command. The packages are named `keet-player` where `keet` is already taken by an unrelated chat app. Ready-made binaries for every platform are also on the [releases page](https://github.com/amsdias/Keet/releases).
+
+**From a clone of this repository:**
 
 ```bash
 git clone https://github.com/amsdias/Keet.git
@@ -54,15 +86,7 @@ That puts a release-optimized `keet` on your `PATH` (in `~/.cargo/bin`), so you 
 keet ~/Music/
 ```
 
-To update later, `git pull` and re-run `cargo install --path .`. To remove it, `cargo uninstall keet`.
-
-**Linux/WSL** needs ALSA and D-Bus headers before building — see [Building](#building):
-
-```bash
-sudo apt install libasound2-dev libdbus-1-dev
-```
-
-Prefer not to install system-wide? `cargo build --release` leaves the binary at `target/release/keet`.
+To update later, `git pull` and re-run `cargo install --path .`. To remove it, `cargo uninstall keet`. Prefer not to install system-wide? `cargo build --release` leaves the binary at `target/release/keet`.
 
 ## Quick Start
 
@@ -611,12 +635,13 @@ Multiple files, folders, and M3U playlists can be passed as arguments. Duplicate
 ### Linux/WSL Dependencies
 
 ```bash
-sudo apt install libasound2-dev libdbus-1-dev
+sudo apt install pkg-config libasound2-dev libdbus-1-dev libssl-dev
 ```
 
 - `libasound2-dev` -- ALSA headers (required by cpal)
 - `libasound2-plugins` -- ALSA-to-PulseAudio plugin (automatic ALSA apps routing)
 - `libdbus-1-dev` -- D-Bus headers (required by souvlaki for MPRIS media keys)
+- `libssl-dev`, `pkg-config` -- OpenSSL, the system TLS library the LRCLIB lyrics lookup uses
 
 Create/edit ~/.asoundrc:
 

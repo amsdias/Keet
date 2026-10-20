@@ -1,8 +1,33 @@
 [package]
 name = "keet"
-version = "2.0.0"
+version = "2.0.3"
 edition = "2021"
 license = "AGPL-3.0-or-later"
+description = "A low-CPU terminal audio player with real-time visualizations, a parametric EQ and synced lyrics"
+repository = "https://github.com/amsdias/Keet"
+homepage = "https://github.com/amsdias/Keet"
+readme = "README.md"
+keywords = ["audio", "music", "player", "terminal", "tui"]
+categories = ["multimedia::audio", "command-line-utilities"]
+# What `cargo publish` uploads: the source, what the build and tests read,
+# the licences. Named one by one so nothing else in the tree can slip in
+# (an `include` ignores .gitignore: `tests/**` took a Finder .DS_Store).
+include = [
+    "/src/**",
+    "/build.rs",
+    "/tests/fixtures/generate.sh",
+    "/tests/fixtures/*.flac",
+    "/tests/fixtures/*.m4a",
+    "/tests/fixtures/*.mp3",
+    "/tests/fixtures/*.ogg",
+    "/assets/*.json",
+    "/assets/eq/**",
+    "/assets/icon.ico",
+    "/README.md",
+    "/LICENSE",
+    "/THIRD_PARTY_LICENSES",
+    "/Cargo.lock",
+]
 
 [dependencies]
 # cpal - Cross-platform audio I/O library
