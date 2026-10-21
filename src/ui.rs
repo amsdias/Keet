@@ -129,7 +129,7 @@ pub(crate) fn draw_viz(f: &mut Frame, area: Rect, cx: &mut Ctx, block_was_intact
         VizMode::Polar => crate::viz_polar::render_polar(state, &analyser.polar_trail, style, w, rows, extras),
         VizMode::Galaxy => crate::viz_galaxy::render_galaxy(&analyser.galaxy, state.theme_kind(), style, w, rows),
         VizMode::Cymatics => {
-            crate::viz_cymatics::render_cymatics(&analyser.cymatics, state.theme_kind(), style, w, rows, extras)
+            crate::viz_cymatics::render_cymatics(&analyser.cymatics, state.theme_kind(), style, w, rows, extras, !state.is_paused())
         }
         VizMode::SpectrogramAnalysis => {
             // viz_style selects the frequency axis here: Dots = log, Bars = linear.
@@ -208,6 +208,7 @@ pub fn draw(f: &mut Frame, cx: &mut Ctx) {
     // next queued notice and starts its time, and it ran out unseen.
     cx.ui.frame_status = if cx.ui.too_small { None } else { cx.ui.active_status() };
     cx.ui.status_drawn_at = None;
+    cx.ui.status_in_border = false;
     // The too-small screen shows no panel, but it is not a layout: what was
     // on screen before it stays the record (`open_view`), or a key pressed
     // meanwhile reset the panel it only focuses.
@@ -217,6 +218,11 @@ pub fn draw(f: &mut Frame, cx: &mut Ctx) {
     }
     draw_frame(f, cx);
     let ui = &mut *cx.ui;
+    // A notice nothing on screen showed waits to be seen (see
+    // `hold_unseen_notice`).
+    if ui.frame_status.is_some() && ui.status_drawn_at.is_none() && !ui.status_in_border {
+        ui.hold_unseen_notice();
+    }
     // Whether the visualization showed: drawn, and at least a quarter of it
     // left in view by the dialogs (a floating playlist leaves only a margin
     // of it — not worth an FFT and 30 frames a second).
@@ -373,6 +379,18 @@ fn draw_frame(f: &mut Frame, cx: &mut Ctx) {
         keys.register(&mut cx.ui.hits, inner.x, inner.y + 3);
         tui::draw_lines(f.buffer_mut(), inner, &lines);
     }
+    if cx.ui.save_defaults_asked {
+        let keys = key_hints(state.theme_kind(), p, &[("y", "save"), ("any other key", "keep the saved ones")]);
+        let lines = [
+            tui::line("Save these settings as the defaults?", p.bold.patch(p.fg)),
+            tui::line("Written to config.json, used at every launch", p.fg),
+            Line::default(),
+            keys.line.clone(),
+        ];
+        let inner = dialog(f, &mut cx.ui.hits, 56, 6, "Save defaults", p);
+        keys.register(&mut cx.ui.hits, inner.x, inner.y + 3);
+        tui::draw_lines(f.buffer_mut(), inner, &lines);
+    }
     if quit_armed(cx.ui) {
         let keys = key_hints(state.theme_kind(), p, &[("Esc", "or q quits"), ("any other key", "stays")]);
         let lines = [tui::line("Quit Keet?", p.bold.patch(p.fg)), Line::default(), keys.line.clone()];
@@ -441,6 +459,7 @@ pub(crate) fn overlay_open(ui: &UiState) -> bool {
         || ui.view_mode == ViewMode::Help
         || (ui.view_mode == ViewMode::Eq && !(ui.eq_in_stack && eq_returns_to_stack(ui)))
         || ui.tree_pending_remove.is_some()
+        || ui.save_defaults_asked
         || quit_armed(ui)
 }
 
@@ -669,7 +688,7 @@ pub(crate) fn draw_status_line(f: &mut Frame, ui: &mut UiState, row: Rect, p: &c
 /// the list and the lyrics jumped. Also while a field is open (the border is
 /// not its row; skipped, a notice ran out unseen while a search was typed).
 /// Not in a box with no inside (its bottom border is not below it).
-fn border_status(f: &mut Frame, ui: &UiState, boxed: Rect, inner: Rect, p: &crate::theme::Palette) {
+fn border_status(f: &mut Frame, ui: &mut UiState, boxed: Rect, inner: Rect, p: &crate::theme::Palette) {
     let Some(msg) = ui.frame_status.as_deref() else { return };
     if inner.width < 4 || inner.height == 0 {
         return;
@@ -683,6 +702,7 @@ fn border_status(f: &mut Frame, ui: &UiState, boxed: Rect, inner: Rect, p: &crat
     }
     let line = tui::truncate_ellipsis(tui::line(format!(" {msg} "), p.bold.patch(p.accent)), row.width as usize);
     tui::draw_lines(f.buffer_mut(), row, &[line]);
+    ui.status_in_border = true;
 }
 
 /// The theme's renderer for `view`, as if it were the current view (the key
@@ -734,7 +754,7 @@ fn draw_view(f: &mut Frame, cx: &mut Ctx, view: ViewMode) {
 /// The status message in the border of the docked panel with the keys, when
 /// nothing else showed it (the theme's status line not on the screen). The
 /// footers used to carry it; without this a notice could run out unseen.
-fn docked_status(f: &mut Frame, ui: &UiState, p: &crate::theme::Palette) {
+fn docked_status(f: &mut Frame, ui: &mut UiState, p: &crate::theme::Palette) {
     if ui.status_drawn_at.is_some() || !ui.docked_shown.contains(&ui.view_mode) {
         return;
     }
@@ -1043,6 +1063,9 @@ fn toggle_help(ui: &mut UiState) {
         if let Some((label, _)) = ui.tree_pending_remove.take() {
             ui.set_status(format!("cancelled removing {label}"));
         }
+        if std::mem::take(&mut ui.save_defaults_asked) {
+            ui.set_status("Settings not saved".to_string());
+        }
         ui.help_return = ui.view_mode;
         ui.view_mode = ViewMode::Help;
     }
@@ -1102,8 +1125,8 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
             (Event::Key(k), true)
         } else if let Some(e) = ui.deferred_event.take() {
             (e, false)
-        } else if event::poll(Duration::ZERO).unwrap_or(false) {
-            match event::read() { Ok(e) => (e, false), Err(_) => continue }
+        } else if crate::input::poll(Duration::ZERO) {
+            match crate::input::read() { Ok(e) => (e, false), Err(_) => continue }
         } else {
             break;
         };
@@ -1129,8 +1152,11 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
         if let Event::Paste(text) = &ev {
             // Closes "Quit?" as any other key does: under it, a drop opened
             // the `o` dialog, Esc then cancelled that (losing the path) and
-            // the next Esc quit.
+            // the next Esc quit. "Save as defaults?" too: a paste is no `y`.
             ui.esc_quit_until = None;
+            if std::mem::take(&mut ui.save_defaults_asked) {
+                ui.set_status("Settings not saved".to_string());
+            }
             paste(ui, playlist, text);
             continue;
         }
@@ -1158,9 +1184,9 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
         if k.code == KeyCode::Esc
             && !clicked
             && k.modifiers.is_empty()
-            && event::poll(ESC_SEQUENCE_WAIT).unwrap_or(false)
+            && crate::input::poll(ESC_SEQUENCE_WAIT)
         {
-            if let Ok(next) = event::read() {
+            if let Ok(next) = crate::input::read() {
                 if esc_then(ui, next) {
                     continue;
                 }
@@ -1194,7 +1220,7 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
             let k = shift_to_capital(k);
             // Lit for the key that acts: not one with Ctrl or Alt (Ctrl+E lit
             // `e EQ`), nor a removal prompt's answer (`y` lit `y LYRICS`).
-            if !k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) && ui.tree_pending_remove.is_none() {
+            if !k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) && ui.tree_pending_remove.is_none() && !ui.save_defaults_asked {
                 ui.key_flash = Some((k.code, ui.view_mode, std::time::Instant::now()));
             }
 
@@ -1215,6 +1241,20 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
                     ui.set_status(format!("cancelled removing {label}"));
                 }
                 return false;
+            }
+            // "Save these settings as the defaults?" the same way: `y` saves,
+            // any other key keeps the saved ones and does nothing else.
+            if std::mem::take(&mut ui.save_defaults_asked) {
+                if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
+                    state.quit();
+                    return true;
+                }
+                if k.code == KeyCode::Char('y') && !k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+                    ui.save_defaults = true;
+                } else {
+                    ui.set_status("Settings not saved".to_string());
+                }
+                continue;
             }
 
             // Lyrics view keys (when in Normal input mode), never with Ctrl or
@@ -1584,7 +1624,11 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
                 KeyEvent { code: KeyCode::Char('p'), .. } => {
                     if has_native_picker() {
                         match pick_folder_native() {
-                            Some(p) => switch_source_paths(state, ui, playlist, p),
+                            Some(p) => {
+                                if let Err(why) = switch_source_paths(state, ui, playlist, p) {
+                                    ui.set_status(why);
+                                }
+                            }
                             None => ui.set_status("Cancelled".to_string()),
                         }
                     } else {
@@ -1595,7 +1639,7 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
                 // Shift+K / Shift+W: capitals however reported (`shift_to_capital`).
                 KeyEvent { code: KeyCode::Char('k'), .. } => toggle_dock(state, ui),
                 KeyEvent { code: KeyCode::Char('K'), .. } => close_docked(ui),
-                KeyEvent { code: KeyCode::Char('W'), .. } => ui.save_defaults = true,
+                KeyEvent { code: KeyCode::Char('W'), .. } => ui.save_defaults_asked = true,
                 KeyEvent { code: KeyCode::Char('m'), .. } => {
                     let on = !state.mouse.load(Ordering::Relaxed);
                     state.mouse.store(on, Ordering::Relaxed);
@@ -1777,11 +1821,12 @@ fn handle_text_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<P
         }
         (InputMode::OpenPath(_), Edit::Cancel) => set_input_mode(ui, InputMode::Normal),
         (InputMode::OpenPath(_), Edit::Submit) => match crate::welcome::parse_typed_path(&text) {
-            Some(p) if p.exists() => {
-                set_input_mode(ui, InputMode::Normal);
-                switch_source_paths(state, ui, playlist, p);
-            }
-            // Stay open on a typo: the path is there to fix.
+            // Stay open on a typo, or on a source with nothing to play: the
+            // path is there to fix.
+            Some(p) if p.exists() => match switch_source_paths(state, ui, playlist, p) {
+                Ok(()) => set_input_mode(ui, InputMode::Normal),
+                Err(why) => ui.open_error = Some(why),
+            },
             Some(p) => ui.open_error = Some(format!("Not found: {}", p.display())),
             None => set_input_mode(ui, InputMode::Normal),
         },
@@ -1851,14 +1896,18 @@ const SHIFT_BOUND: &[char] = &['k', 'w', 'l', 'f', 'r', 's', 'g', 't'];
 /// EQ's Shift+T were missed). Only for the letters bound as capitals
 /// (`SHIFT_BOUND`): another Shift+letter is the lowercase key it always
 /// was (Shift+E opens the EQ — most Unix terminals send it as `E` with
-/// Shift, which matched nothing). Only with Shift held: with Caps Lock a
-/// capital comes without it and is left alone. And never what is typed into
-/// a field: with Caps Lock on, Shift+a arrives as `a` with Shift and means `a`.
+/// Shift, which matched nothing). A capital WITHOUT Shift is Caps Lock (Windows
+/// reports it so; Unix terminals send Shift with every capital, so there
+/// it cannot be told from Shift and stays one): the lowercase key — left a
+/// capital, Caps Lock turned `w` into Shift+W, saving the settings. Never
+/// what is typed into a field: with Caps Lock on, Shift+a arrives as `a`
+/// with Shift and means `a`.
 fn shift_to_capital(mut k: KeyEvent) -> KeyEvent {
     if let KeyCode::Char(c) = k.code {
-        if k.modifiers.contains(KeyModifiers::SHIFT) && c.is_ascii_alphabetic() {
+        if c.is_ascii_alphabetic() {
             let lower = c.to_ascii_lowercase();
-            k.code = KeyCode::Char(if SHIFT_BOUND.contains(&lower) { lower.to_ascii_uppercase() } else { lower });
+            let shift = k.modifiers.contains(KeyModifiers::SHIFT);
+            k.code = KeyCode::Char(if shift && SHIFT_BOUND.contains(&lower) { lower.to_ascii_uppercase() } else { lower });
         }
     }
     k
@@ -2240,6 +2289,8 @@ fn close_dialog(ui: &mut UiState) {
         ui.view_mode = ui.eq_return;
     } else if let Some((label, _)) = ui.tree_pending_remove.take() {
         ui.set_status(format!("cancelled removing {label}"));
+    } else if std::mem::take(&mut ui.save_defaults_asked) {
+        ui.set_status("Settings not saved".to_string());
     } else if quit_armed(ui) {
         ui.esc_quit_until = None;
     } else if matches!(ui.view_mode, ViewMode::Playlist | ViewMode::Lyrics) {
@@ -3261,28 +3312,25 @@ pub(crate) fn enqueue_track(state: &PlayerState, ui: &mut UiState, playlist: &mu
 
 /// Replace the current music source with a new path, rebuild the playlist,
 /// reindex the metadata cache, and jump playback to the new first track.
+/// Err (the line to show) changes nothing: a source with nothing to play
+/// (README.md, a folder with no audio) used to replace the playlist, and
+/// with nothing playable the session ended.
 fn switch_source_paths(
     state: &PlayerState,
     ui: &mut UiState,
     playlist: &mut Vec<PathBuf>,
     new_path: PathBuf,
-) {
+) -> Result<(), String> {
     use std::sync::atomic::Ordering;
 
     if !new_path.exists() {
-        ui.set_status(format!("Path not found: {}", new_path.display()));
-        return;
+        return Err(format!("Not found: {}", new_path.display()));
     }
 
     // Honor the current session's shuffle setting. Repeat is preserved implicitly —
     // main.rs's repeat-cycle loop keeps running regardless of source.
-    let new_list = match crate::playlist::build_playlist(&new_path, ui.shuffle) {
-        Ok(list) => list,
-        Err(e) => {
-            ui.set_status(format!("Failed to read source: {}", e));
-            return;
-        }
-    };
+    let new_list = crate::playlist::build_playlist(&new_path, ui.shuffle)
+        .map_err(|e| format!("{e}: {}", new_path.display()))?;
 
     // A search left open belongs to the old source: it goes (with its hits,
     // indices into the old list — kept, the next frame ran past the new
@@ -3323,6 +3371,7 @@ fn switch_source_paths(
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| new_path.display().to_string());
     ui.set_status(format!("Source: {} ({} tracks)", name, playlist.len()));
+    Ok(())
 }
 
 /// Start a rescan of every source. The directory walk and path lookups run on
@@ -3430,9 +3479,13 @@ fn pick_folder_native() -> Option<PathBuf> {
 }
 
 /// Opens a native folder-picker dialog on Windows via PowerShell's Shell.Application COM object.
+/// Its output is set to UTF-8 first: Windows PowerShell writes a pipe in the
+/// console's OEM code page (437 or 850), and read as UTF-8 `D:\Música` came
+/// back garbled ("Not found").
 #[cfg(target_os = "windows")]
 fn pick_folder_native() -> Option<PathBuf> {
-    let script = "$s = New-Object -ComObject Shell.Application; \
+    let script = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; \
+        $s = New-Object -ComObject Shell.Application; \
         $f = $s.BrowseForFolder(0, 'Select a music folder', 0, 0); \
         if ($f) { $f.Self.Path }";
     let output = std::process::Command::new("powershell")
@@ -3451,10 +3504,12 @@ fn has_native_picker() -> bool {
 }
 
 /// The first-launch screen (`welcome.rs`), shown when keet runs with no
-/// sources and no saved session. Returns the chosen folder, or None if the
-/// user quit.
+/// sources and no saved session. Returns the chosen folder — one with
+/// something to play — or None if the user quit.
 pub fn run_first_launch_picker(kind: crate::theme::ThemeKind) -> Option<PathBuf> {
-    crate::welcome::run(kind, has_native_picker(), pick_folder_native)
+    crate::welcome::run(kind, has_native_picker(), pick_folder_native, |p| {
+        crate::playlist::build_playlist(p, false).map(|_| ()).map_err(|e| format!("{e}: {}", p.display()))
+    })
 }
 
 #[cfg(test)]
@@ -3784,10 +3839,12 @@ mod ui_tests {
     }
 
     /// Run `keys` through `poll_input` as if pressed (the click queue, which
-    /// `poll_input` takes before the terminal's events).
+    /// `poll_input` takes before the terminal's events). A capital comes
+    /// with Shift, as terminals report it (no Shift is Caps Lock).
     fn press(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<PathBuf>, keys: &[KeyCode]) {
         for &k in keys {
-            ui.pressed.push_back(KeyEvent::new(k, KeyModifiers::NONE));
+            let m = if matches!(k, KeyCode::Char(c) if c.is_uppercase()) { KeyModifiers::SHIFT } else { KeyModifiers::NONE };
+            ui.pressed.push_back(KeyEvent::new(k, m));
         }
         poll_input(state, ui, playlist);
     }
@@ -3840,7 +3897,7 @@ mod ui_tests {
         ui.rescan_receiver = Some(rx);
         ui.current = 0;
         ui.enqueue_count = 2; // a queue in the OLD list, playing its first track
-        switch_source_paths(&state, &mut ui, &mut playlist, dir.clone());
+        switch_source_paths(&state, &mut ui, &mut playlist, dir.clone()).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         assert!(ui.rescan_receiver.is_none(), "the old folders' result would replace the new list");
         assert_eq!(ui.enqueue_count, 0, "the old queue does not carry into the new list");
@@ -4484,6 +4541,30 @@ mod ui_tests {
         ui.input_mode = InputMode::SavePlaylist(TextInput::with("mix"));
         paste(&mut ui, &[], " 2");
         assert!(matches!(&ui.input_mode, InputMode::SavePlaylist(t) if t.text() == "mix 2"));
+    }
+
+    #[test]
+    fn opening_what_has_nothing_to_play_keeps_the_dialog_and_the_session() {
+        // `o`, README.md, Enter: the playlist became [README.md], playback
+        // stopped and Keet exited. A folder with no audio closed the dialog
+        // and lost what was typed.
+        let dir = std::env::temp_dir().join(format!("keet-open-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("empty")).unwrap();
+        std::fs::write(dir.join("README.md"), b"# Keet\n").unwrap();
+        for (target, why) in [(dir.join("README.md"), "Not an audio file"), (dir.join("empty"), "No audio files found")] {
+            let state = PlayerState::new();
+            let mut ui = test_ui(1);
+            let mut playlist = vec![p("/old/a.mp3")];
+            let typed = target.display().to_string();
+            ui.input_mode = InputMode::OpenPath(TextInput::with(&typed));
+            press(&state, &mut ui, &mut playlist, &[KeyCode::Enter]);
+            assert!(matches!(&ui.input_mode, InputMode::OpenPath(t) if t.text() == typed), "{why}: the dialog stays, the path in it");
+            assert_eq!(ui.open_error.as_deref(), Some(format!("{why}: {typed}").as_str()));
+            assert_eq!(playlist, [p("/old/a.mp3")], "{why}: the session goes on");
+            assert_eq!(state.take_jump(), None, "{why}: nothing to jump to");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -5749,14 +5830,14 @@ mod ui_tests {
         ui.hits = vec![(boxed, Hit::Panel(ViewMode::Lyrics))];
         // The theme drew its status line: the panel leaves it there.
         ui.status_drawn_at = Some(Rect::new(0, 28, 20, 1));
-        let shown = |ui: &UiState| {
+        let shown = |ui: &mut UiState| {
             let buf = tui::testing::draw(40, 30, |f| docked_status(f, ui, p));
             tui::testing::rows(&buf).iter().filter(|r| r.contains("output moved")).count()
         };
-        assert_eq!(shown(&ui), 0);
+        assert_eq!(shown(&mut ui), 0);
         // It did not (its row off the screen): the docked panel shows it.
         ui.status_drawn_at = None;
-        assert_eq!(shown(&ui), 1);
+        assert_eq!(shown(&mut ui), 1);
     }
 
     #[test]
@@ -5768,7 +5849,7 @@ mod ui_tests {
         let buf = tui::testing::draw(40, 10, |f| {
             let (boxed, inner) = dialog_box(f, &mut ui.hits, 30, 1, "t", p);
             assert_eq!(inner.height, 0);
-            border_status(f, &ui, boxed, inner, p);
+            border_status(f, &mut ui, boxed, inner, p);
         });
         assert!(!tui::testing::rows(&buf).iter().any(|r| r.contains("saved")));
     }
@@ -5871,7 +5952,7 @@ mod ui_tests {
         let state = PlayerState::new();
         let mut playlist = vec![p("/a.flac")];
         let shift = KeyModifiers::SHIFT;
-        for k in [KeyEvent::new(KeyCode::Char('K'), shift), KeyEvent::new(KeyCode::Char('k'), shift), KeyEvent::new(KeyCode::Char('K'), KeyModifiers::NONE)] {
+        for k in [KeyEvent::new(KeyCode::Char('K'), shift), KeyEvent::new(KeyCode::Char('k'), shift)] {
             let mut ui = test_ui(1);
             ui.docked = vec![ViewMode::Lyrics];
             ui.docked_shown = vec![ViewMode::Lyrics];
@@ -5881,15 +5962,63 @@ mod ui_tests {
             // Closed, not floated (which empties the dock too, keeping the keys).
             assert!(ui.docked.is_empty() && ui.view_mode == ViewMode::Player, "{k:?} closes the docked panel");
         }
+        // A capital with no Shift is Caps Lock (Windows): `k`, which floats
+        // the panel out of the dock with the keys, never Shift+K's close.
+        let mut ui = test_ui(1);
+        ui.docked = vec![ViewMode::Lyrics];
+        ui.docked_shown = vec![ViewMode::Lyrics];
+        ui.view_mode = ViewMode::Lyrics;
+        ui.pressed.push_back(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::NONE));
+        poll_input(&state, &mut ui, &mut playlist);
+        assert_eq!(ui.view_mode, ViewMode::Lyrics, "Caps Lock K closed the panel");
         for k in [KeyEvent::new(KeyCode::Char('W'), shift), KeyEvent::new(KeyCode::Char('w'), shift)] {
             let mut ui = test_ui(1);
             ui.set_lyrics(Some(crate::lyrics::parse_lyrics(&"line\n".repeat(50))));
             ui.view_mode = ViewMode::Lyrics; // where plain w scrolls
             ui.pressed.push_back(k);
             poll_input(&state, &mut ui, &mut playlist);
-            assert!(ui.save_defaults, "{k:?} saves the defaults");
+            assert!(ui.save_defaults_asked, "{k:?} asks to save the defaults");
             assert_eq!(ui.lyrics_step, 0, "{k:?} does not scroll");
         }
+    }
+
+    #[test]
+    fn shift_w_asks_before_it_saves_the_defaults() {
+        // It rewrote config.json at once: a slip of the finger (or Caps Lock
+        // with `w`, which a Unix terminal cannot tell from Shift+W) replaced
+        // the saved settings with no way back.
+        let state = PlayerState::new();
+        let mut playlist = vec![p("/a.flac")];
+        let mut ui = test_ui(1);
+        press(&state, &mut ui, &mut playlist, &[KeyCode::Char('W')]);
+        assert!(!ui.save_defaults, "not saved yet");
+        assert!(ui.save_defaults_asked && overlay_open(&ui), "asked, in a dialog");
+        let rows = tui::testing::rows(&frame(&state, &mut ui, &playlist, 100, 30));
+        assert!(rows.iter().any(|r| r.contains("Save these settings as the defaults?")), "{rows:#?}");
+        // y saves.
+        press(&state, &mut ui, &mut playlist, &[KeyCode::Char('y')]);
+        assert!(ui.save_defaults && !ui.save_defaults_asked);
+        // Any other key keeps them, and does nothing else (`v` cycles the
+        // visualization otherwise).
+        ui.save_defaults = false;
+        let viz = state.viz_mode.load(Ordering::Relaxed);
+        press(&state, &mut ui, &mut playlist, &[KeyCode::Char('W'), KeyCode::Char('v')]);
+        assert!(!ui.save_defaults && !ui.save_defaults_asked);
+        assert_eq!(state.viz_mode.load(Ordering::Relaxed), viz, "the answer is only an answer");
+        assert_eq!(ui.status_message.as_ref().map(|(m, _)| m.as_str()), Some("Settings not saved"));
+        // So does a click outside the dialog (Esc's way), and a paste.
+        press(&state, &mut ui, &mut playlist, &[KeyCode::Char('W')]);
+        close_dialog(&mut ui);
+        assert!(!ui.save_defaults_asked && !ui.save_defaults);
+        press(&state, &mut ui, &mut playlist, &[KeyCode::Char('W')]);
+        ui.deferred_event = Some(Event::Paste("/Music".into()));
+        poll_input(&state, &mut ui, &mut playlist);
+        assert!(!ui.save_defaults_asked && !ui.save_defaults);
+        // Ctrl+C still quits.
+        press(&state, &mut ui, &mut playlist, &[KeyCode::Char('W')]);
+        ui.pressed.push_back(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(poll_input(&state, &mut ui, &mut playlist));
+        assert!(state.should_quit());
     }
 
     #[test]
@@ -6245,7 +6374,7 @@ mod ui_tests {
         ui.input_mode = InputMode::Search(TextInput::with("3"));
         rebuild_filter(&mut ui, &playlist);
         assert!(ui.filtered_indices.iter().any(|&i| i >= 2));
-        switch_source_paths(&state, &mut ui, &mut playlist, dir.clone());
+        switch_source_paths(&state, &mut ui, &mut playlist, dir.clone()).unwrap();
         assert_eq!(playlist.len(), 2);
         assert!(matches!(ui.input_mode, InputMode::Normal) && ui.filtered_indices.is_empty(), "the old search went");
         // And the docked list draws (it indexed past the new list's end).
@@ -6384,8 +6513,24 @@ mod ui_tests {
         // Bound capitals stay capitals, however reported.
         assert_eq!(code('L', shift), KeyCode::Char('L'));
         assert_eq!(code('l', shift), KeyCode::Char('L'));
-        // No Shift held (Caps Lock): left as it came.
-        assert_eq!(code('E', KeyModifiers::NONE), KeyCode::Char('E'));
+        // No Shift held: Caps Lock (Windows reports the capital without
+        // Shift; Unix terminals send Shift with every capital). It is the
+        // lowercase key: Caps Lock turned `w` (scroll the lyrics) into
+        // Shift+W, which saved the settings, and `k` into Shift+K.
+        assert_eq!(code('E', KeyModifiers::NONE), KeyCode::Char('e'));
+        assert_eq!(code('W', KeyModifiers::NONE), KeyCode::Char('w'));
+        assert_eq!(code('K', KeyModifiers::NONE), KeyCode::Char('k'));
+        // Shift with Caps Lock on: Windows reports the lowercase letter with
+        // Shift. That is the capital the user asked for.
+        assert_eq!(code('w', shift), KeyCode::Char('W'));
+        {
+            let state = PlayerState::new();
+            let mut playlist = vec![p("/a.flac")];
+            let mut ui = test_ui(1);
+            ui.pressed.push_back(KeyEvent::new(KeyCode::Char('W'), KeyModifiers::NONE));
+            poll_input(&state, &mut ui, &mut playlist);
+            assert!(!ui.save_defaults, "Caps Lock W saved the settings");
+        }
         // End to end: Shift+E opens the EQ editor.
         let state = PlayerState::new();
         let mut playlist = vec![p("/a.flac")];
@@ -6515,7 +6660,7 @@ mod ui_tests {
         ui.library_tree_mode = true;
         ui.tree_filter = "beatles".into(); // `/beatles`, then Enter: the field closed, the filter kept
         ui.tree_cursor = 7;
-        switch_source_paths(&state, &mut ui, &mut playlist, dir.clone());
+        switch_source_paths(&state, &mut ui, &mut playlist, dir.clone()).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(playlist.len(), 1);
         assert!(ui.tree_filter.is_empty(), "the new library is not filtered by the old one's query");
@@ -6856,6 +7001,34 @@ mod ui_tests {
         ui.too_small = false;
         let rows = tui::testing::rows(&frame(&state, &mut ui, &playlist, 100, 30));
         assert!(rows.iter().any(|r| r.contains("must be read")), "{rows:#?}");
+    }
+
+    #[test]
+    fn a_notice_no_frame_shows_does_not_run_out() {
+        // HiFi at 80x12 has no row for the status: a "Skip:" notice ran its
+        // time out there and was never seen.
+        let state = PlayerState::new();
+        state.set_theme(crate::theme::ThemeKind::HiFi);
+        let playlist = vec![p("/a.flac")];
+        let mut ui = test_ui(1);
+        ui.set_status_for("Skip: broken.flac".into(), std::time::Duration::from_secs(2));
+        let backdate = |ui: &mut UiState| {
+            if let Some((_, when)) = &mut ui.status_message {
+                *when -= std::time::Duration::from_millis(1500);
+            }
+        };
+        for _ in 0..3 {
+            let rows = tui::testing::rows(&frame(&state, &mut ui, &playlist, 80, 12));
+            assert!(!rows.iter().any(|r| r.contains("Skip:")), "shown at 80x12 after all: {rows:#?}");
+            backdate(&mut ui); // 4.5 s unseen in all
+        }
+        let rows = tui::testing::rows(&frame(&state, &mut ui, &playlist, 100, 30));
+        assert!(rows.iter().any(|r| r.contains("Skip: broken.flac")), "{rows:#?}");
+        // Once seen, its time runs.
+        backdate(&mut ui);
+        backdate(&mut ui);
+        let rows = tui::testing::rows(&frame(&state, &mut ui, &playlist, 100, 30));
+        assert!(!rows.iter().any(|r| r.contains("Skip:")), "{rows:#?}");
     }
 
     #[test]

@@ -40,6 +40,7 @@ mod signal;
 mod term;
 mod tui;
 mod text_input;
+mod input;
 mod hints;
 mod playlist_panel;
 mod lyrics_panel;
@@ -350,7 +351,7 @@ fn load_initial_playlist(source_paths: &[PathBuf], shuffle: bool)
             Ok(tracks) => combined.extend(tracks),
             Err(e) => {
                 if source_paths.len() == 1 {
-                    return Err(e);
+                    return Err(format!("{e}: {}", src.display()).into());
                 }
                 skipped.push(format!("{}: {}", src.display(), e));
             }
@@ -798,7 +799,7 @@ impl Drop for TerminalGuard {
 /// that wiped the user's screen.
 fn enter_alternate_screen(w: &mut impl Write) {
     crate::term::flush();
-    let _ = w.write_all(alt_screen_enter(cfg!(windows)).as_bytes());
+    let _ = w.write_all(ALT_SCREEN_ENTER.as_bytes());
     let _ = w.flush();
     ON_ALTERNATE_SCREEN.store(true, Ordering::Relaxed);
 }
@@ -806,26 +807,21 @@ fn enter_alternate_screen(w: &mut impl Write) {
 /// The bytes that enter the alternate screen. Bracketed paste (?2004): a
 /// paste — or a folder dropped on the terminal — arrives as one Paste event
 /// instead of keystrokes, so it goes into a text field whole and can never
-/// trigger keys. NOT on Windows: crossterm reads console input records
-/// there and never makes a Paste event, so the terminal's paste markers
-/// (`ESC[200~` … `ESC[201~`) arrived as keystrokes — the Esc closed the
-/// field a dropped folder was meant for. Without them a drop types into the
-/// open field, as before bracketed paste.
-fn alt_screen_enter(windows: bool) -> &'static str {
-    if windows { "\x1B[?1049h\x1B[?2026l\x1B[0m\x1B[H\x1B[J" } else { "\x1B[?1049h\x1B[?2026l\x1B[?2004h\x1B[0m\x1B[H\x1B[J" }
-}
+/// trigger keys. On Windows too: crossterm never makes a Paste event there
+/// (it reads console input records, and the markers `ESC[200~` … `ESC[201~`
+/// arrive as keystrokes), so `input::read` puts the paste back together.
+/// Without the markers a drop was typed as commands (its Shift+Q quit).
+const ALT_SCREEN_ENTER: &str = "\x1B[?1049h\x1B[?2026l\x1B[?2004h\x1B[0m\x1B[H\x1B[J";
 
-/// The bytes that leave it (bracketed paste off where it was on).
-fn alt_screen_leave(windows: bool) -> &'static str {
-    if windows { "\x1B[0m\x1B[?1049l" } else { "\x1B[0m\x1B[?2004l\x1B[?1049l" }
-}
+/// The bytes that leave it, bracketed paste off.
+const ALT_SCREEN_LEAVE: &str = "\x1B[0m\x1B[?2004l\x1B[?1049l";
 
 /// Leave it only when in it: `?1049l` also restores a cursor position saved
 /// on entry, and with none saved some terminals jump to the top left.
 fn leave_alternate_screen(w: &mut impl Write) {
     if ON_ALTERNATE_SCREEN.swap(false, Ordering::Relaxed) {
         crate::tui::release_mouse(w);
-        let _ = w.write_all(alt_screen_leave(cfg!(windows)).as_bytes());
+        let _ = w.write_all(ALT_SCREEN_LEAVE.as_bytes());
         let _ = w.flush();
     }
 }
@@ -1135,12 +1131,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let kind = opts.theme
                     .or_else(|| config::load().theme.as_deref().and_then(theme::ThemeKind::from_str))
                     .unwrap_or(theme::ThemeKind::Classic);
+                // Typed --shuffle / --repeat apply to the folder chosen here
+                // too (they were dropped). Quitting the screen is a choice,
+                // not an error: no usage text, exit code 0.
                 match ui::run_first_launch_picker(kind) {
-                    Some(p) => (vec![p], false, state::RepeatMode::Off),
-                    None => {
-                        eprintln!("Usage: {} <file-or-folder>... [options]  (--help for all of them)", args[0]);
-                        std::process::exit(1);
-                    }
+                    Some(p) => (vec![p], opts.shuffle, if opts.repeat { state::RepeatMode::All } else { state::RepeatMode::Off }),
+                    None => return Ok(()),
                 }
             }
         }
@@ -1537,19 +1533,11 @@ mod main_tests {
     }
 
     #[test]
-    fn bracketed_paste_is_never_turned_on_for_windows() {
-        // On Windows crossterm never makes a Paste event: the markers came
-        // through as keys (an Esc first) and broke dropping a folder.
-        for w in [alt_screen_enter(true), alt_screen_leave(true)] {
-            assert!(!w.contains("2004"), "{w:?}");
-        }
-        assert!(alt_screen_enter(false).contains("\x1B[?2004h"));
-        assert!(alt_screen_leave(false).contains("\x1B[?2004l"));
-        // Both enter and leave the alternate screen.
-        for windows in [true, false] {
-            assert!(alt_screen_enter(windows).starts_with("\x1B[?1049h"));
-            assert!(alt_screen_leave(windows).ends_with("\x1B[?1049l"));
-        }
+    fn the_alternate_screen_turns_bracketed_paste_on_and_off() {
+        // On every platform: on Windows `input::read` rebuilds the paste
+        // from its markers (without them a drop was typed as commands).
+        assert!(ALT_SCREEN_ENTER.starts_with("\x1B[?1049h") && ALT_SCREEN_ENTER.contains("\x1B[?2004h"));
+        assert!(ALT_SCREEN_LEAVE.contains("\x1B[?2004l") && ALT_SCREEN_LEAVE.ends_with("\x1B[?1049l"));
     }
 
     #[test]

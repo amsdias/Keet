@@ -2926,7 +2926,7 @@ mod analysis_tests {
                             VizMode::Galaxy => crate::viz_galaxy::render_galaxy(
                                 &analyser.galaxy, state.theme_kind(), style, term_w, rows),
                             VizMode::Cymatics => crate::viz_cymatics::render_cymatics(
-                                &analyser.cymatics, state.theme_kind(), style, term_w, rows, extras),
+                                &analyser.cymatics, state.theme_kind(), style, term_w, rows, extras, true),
                             _ => unreachable!(),
                         };
                         assert_eq!(
@@ -3546,10 +3546,18 @@ mod analysis_tests {
         // edge passes the screen bottom makes the terminal scroll — every
         // frame. Cell metrics are unknowable without querying, so size at a
         // conservative 8×16 px per cell: must underfill, never overflow.
+        // The cell is given, not read from the environment: inside Windows
+        // Terminal (WT_SESSION set) the real lookup is its 10x20 cell, and
+        // the test failed for anyone running the suite there.
         use crate::cover::GraphicsProtocol as GP;
         assert_eq!(
-            analysis_image_geometry(GP::Sixel, 120, 16),
+            analysis_image_geometry_with(GP::Sixel, 120, 16, sixel_cell_for(None, false)),
             Some((960, 256))
+        );
+        assert_eq!(
+            analysis_image_geometry_with(GP::Sixel, 120, 16, sixel_cell_for(None, true)),
+            Some((1200, 320)),
+            "Windows Terminal's virtual cell fills the block exactly"
         );
     }
 
@@ -3578,10 +3586,12 @@ mod analysis_tests {
         // in a fixed screen pattern, so scrolling features alternate fat/thin
         // — visible shimmer. Width must be trimmed to a multiple of k.
         use crate::cover::GraphicsProtocol as GP;
-        for cols in 8..=320 {
-            let (w, _) = analysis_image_geometry(GP::Sixel, cols, 16).unwrap();
-            let k = w.div_ceil(SPECTRO_ANALYSIS_COLS).max(1);
-            assert_eq!(w % k, 0, "cols={}: w={} not a multiple of k={}", cols, w, k);
+        for cell in [sixel_cell_for(None, false), sixel_cell_for(None, true)] {
+            for cols in 8..=320 {
+                let (w, _) = analysis_image_geometry_with(GP::Sixel, cols, 16, cell).unwrap();
+                let k = w.div_ceil(SPECTRO_ANALYSIS_COLS).max(1);
+                assert_eq!(w % k, 0, "{cell:?} cols={}: w={} not a multiple of k={}", cols, w, k);
+            }
         }
     }
 

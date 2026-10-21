@@ -891,7 +891,7 @@ impl Player {
         } else {
             loop_wait(interval.saturating_sub(self.last_ui.elapsed()), self.ui.esc_quit_until, Instant::now())
         };
-        let _ = crossterm::event::poll(wait);
+        let _ = crate::input::poll(wait);
         Flow::Continue
     }
 
@@ -1405,6 +1405,10 @@ const IDLE_FRAME: Duration = Duration::from_millis(250);
 /// and peaks fall smoothly to rest.
 const VIZ_SETTLE: Duration = Duration::from_secs(2);
 
+/// The galaxy's frame interval while paused (when the setting is faster):
+/// it turns on its own, but a pause need not cost a playing frame rate.
+const PAUSED_GALAXY_FRAME: Duration = Duration::from_millis(100);
+
 /// Pump the media keys and, when one changed something (play/pause, a
 /// skip, a seek), ask for a frame at once. Every loop pumps through here:
 /// the main loop used to pump without taking the change, so a media key
@@ -1437,18 +1441,20 @@ fn loop_wait(frame_left: Duration, quit_until: Option<Instant>, now: Instant) ->
 }
 
 /// Time between frames when nothing asked for one: the visualization's frame
-/// rate while one moves on screen — playing, settling after a pause, or a
-/// mode that moves on its own (the galaxy turns, the plate shimmers) —
-/// otherwise `IDLE_FRAME`. The analysis spectrogram keeps its own cadence,
-/// one column per frame, which keeps its scrolling even.
+/// rate while one moves on screen — playing, or settling after a pause —
+/// otherwise `IDLE_FRAME`. The galaxy turns on its own, so a paused one
+/// keeps moving, at `PAUSED_GALAXY_FRAME` at most; the cymatics plate
+/// stands still when paused (its shimmer runs on playing time). The
+/// analysis spectrogram keeps its own cadence, one column per frame, which
+/// keeps its scrolling even.
 fn frame_interval(state: &PlayerState, viz_on_screen: bool, playing_recently: bool) -> Duration {
     // What is on screen, not the setting: HiFi's slot is always the VU panel
     // (a galaxy chosen in another theme kept a paused HiFi at full rate).
     let mode = state.shown_viz();
-    let moving = viz_on_screen
-        && mode != VizMode::None
-        && (playing_recently || matches!(mode, VizMode::Galaxy | VizMode::Cymatics));
-    if !moving {
+    let shown = viz_on_screen && mode != VizMode::None;
+    if shown && !playing_recently && mode == VizMode::Galaxy {
+        state.viz_frame().max(PAUSED_GALAXY_FRAME)
+    } else if !(shown && playing_recently) {
         IDLE_FRAME
     } else if mode == VizMode::SpectrogramAnalysis {
         Duration::from_millis(state::spectro_frame_ms(state.output_rate.load(Ordering::Relaxed)))
@@ -1586,11 +1592,18 @@ mod tests {
         // No visualization: still.
         st.viz_mode.store(VizMode::None as u8, Ordering::Relaxed);
         assert_eq!(frame_interval(&st, true, true), IDLE_FRAME);
-        // The galaxy turns and the plate shimmers even when paused.
-        for mode in [VizMode::Galaxy, VizMode::Cymatics] {
-            st.viz_mode.store(mode as u8, Ordering::Relaxed);
-            assert_eq!(frame_interval(&st, true, false), st.viz_frame(), "{mode:?}");
-        }
+        // Paused, the galaxy keeps turning, at 10 fps at most (at the full
+        // rate it took a fifth of a core at 200x60); the plate settles and
+        // stands still like the rest.
+        st.viz_mode.store(VizMode::Galaxy as u8, Ordering::Relaxed);
+        assert_eq!(frame_interval(&st, true, false), PAUSED_GALAXY_FRAME);
+        assert_eq!(frame_interval(&st, true, true), st.viz_frame(), "playing: the full rate");
+        st.set_viz_fps(5);
+        assert_eq!(frame_interval(&st, true, false), st.viz_frame(), "a rate under the cap is kept");
+        st.set_viz_fps(state::DEFAULT_VIZ_FPS);
+        st.viz_mode.store(VizMode::Cymatics as u8, Ordering::Relaxed);
+        assert_eq!(frame_interval(&st, true, false), IDLE_FRAME);
+        assert_eq!(frame_interval(&st, true, true), st.viz_frame());
         // HiFi never draws them (its slot is the VU panel): paused, still.
         st.set_theme(crate::theme::ThemeKind::HiFi);
         for mode in [VizMode::Galaxy, VizMode::Cymatics] {

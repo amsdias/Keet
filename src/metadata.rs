@@ -389,6 +389,22 @@ fn merge_metadata_tags(fields: &mut TagFields, tags: &[symphonia::core::meta::Ta
     }
 }
 
+/// Whether symphonia finds an audio track in `path` (its content, not its
+/// name): a file given as a source with an extension Keet does not list
+/// (.opus, a renamed file) is still taken, and README.md is not.
+pub fn is_audio_file(path: &Path) -> bool {
+    let Ok(file) = File::open(path) else { return false };
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension() {
+        hint.with_extension(ext.to_str().unwrap_or(""));
+    }
+    let meta_opts = MetadataOptions::default().limit_visual_bytes(Limit::Maximum(0));
+    symphonia::default::get_probe()
+        .probe(&hint, mss, FormatOptions::default(), meta_opts)
+        .is_ok_and(|f| f.default_track(TrackType::Audio).is_some())
+}
+
 fn read_metadata_full(path: &Path) -> Option<CachedMeta> {
     let file = File::open(path).ok()?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());

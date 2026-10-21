@@ -42,6 +42,13 @@ pub fn build_playlist(path: &Path, shuffle: bool) -> Result<Vec<PathBuf>, Box<dy
     let mut list = Vec::new();
 
     if path.is_file() {
+        // A supported extension is taken as it is (a damaged file is a
+        // "Skip:" when it plays); another is looked into. Taken whatever it
+        // was, README.md became the playlist, played nothing, and Keet ended.
+        let listed = path.extension().is_some_and(|e| SUPPORTED_EXTENSIONS.contains(&e.to_string_lossy().to_lowercase().as_str()));
+        if !listed && !crate::metadata::is_audio_file(path) {
+            return Err("Not an audio file".into());
+        }
         list.push(path.to_path_buf());
     } else if path.is_dir() {
         // Track visited directories by canonical path so a symlink pointing back up
@@ -386,6 +393,25 @@ mod m3u_tests {
             fs::write(dir.join(f), b"").unwrap();
         }
         dir
+    }
+
+    #[test]
+    fn a_file_that_is_not_audio_is_not_a_playlist() {
+        // `o`, README.md, Enter: the playlist became [README.md], nothing
+        // played, and Keet exited.
+        let dir = tmp_lib("not_audio", &[]);
+        fs::write(dir.join("README.md"), b"# Keet\n").unwrap();
+        let err = build_playlist(&dir.join("README.md"), false).unwrap_err().to_string();
+        assert_eq!(err, "Not an audio file");
+        // A supported extension is taken as it is (a damaged one is a
+        // "Skip:" when it plays, as before), and an audio file with another
+        // extension is found by its content.
+        fs::write(dir.join("x.mp3"), b"").unwrap();
+        assert_eq!(build_playlist(&dir.join("x.mp3"), false).unwrap(), [dir.join("x.mp3")]);
+        let flac = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sine_lr.flac");
+        fs::copy(&flac, dir.join("song.audio")).unwrap();
+        assert_eq!(build_playlist(&dir.join("song.audio"), false).unwrap(), [dir.join("song.audio")]);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

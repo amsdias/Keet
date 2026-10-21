@@ -52,12 +52,6 @@ winget install amsdias.Keet
 brew install amsdias/tap/keet-player
 ```
 
-**Arch Linux** ([AUR](https://aur.archlinux.org)): `keet-player` builds from source, `keet-player-bin` is the release binary. With an AUR helper:
-
-```bash
-yay -S keet-player
-```
-
 **With Cargo**, from [crates.io](https://crates.io/crates/keet) (a stable Rust toolchain from [rustup.rs](https://rustup.rs)):
 
 ```bash

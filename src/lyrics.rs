@@ -353,8 +353,8 @@ pub fn fetch_with_retry(
 /// LRCLIB's answers kept on disk (`<config>/lyrics`), so a restart does not
 /// ask again: it rate-limits (429), and every launch asking for the same
 /// track hit it — the lyrics then failed on most runs. Found lyrics are kept
-/// for good; "LRCLIB has none" for `MISSING_KEEP` (lyrics get added there,
-/// and a week hid them for a week).
+/// for good; "LRCLIB has none" for `MISSING_KEEP`, a day (lyrics get added
+/// there, and a week hid them for a week).
 /// Keyed by artist, title and duration (another duration, another version).
 pub struct LyricsDisk {
     dir: std::path::PathBuf,
@@ -805,7 +805,22 @@ mod tests {
     }
 
     #[test]
-    fn lrclib_answers_are_kept_on_disk_found_for_good_missing_for_a_week() {
+    fn a_tag_with_a_control_character_is_still_kept_on_disk() {
+        // Windows refuses control characters in a file name: a title with a
+        // tab in it was never stored, and asked LRCLIB on every launch.
+        let dir = std::env::temp_dir().join(format!("keet-lyrics-ctl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let disk = LyricsDisk::at(dir.clone());
+        disk.store("Band\u{7}", "Song\tTitle", Some(200), Some("words"));
+        let names: Vec<String> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        assert!(names.iter().all(|n| !n.chars().any(char::is_control)), "{names:?}");
+        assert_eq!(disk.load("Band\u{7}", "Song\tTitle", Some(200)), Some(Some("words".to_string())));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lrclib_answers_are_kept_on_disk_found_for_good_missing_for_a_day() {
         let dir = std::env::temp_dir().join(format!("keet-lyrics-cache-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let disk = LyricsDisk::at(dir.clone());
@@ -814,14 +829,14 @@ mod tests {
         assert_eq!(disk.load("A/C", "Song?", Some(200)), Some(Some("[00:01.00]la".to_string())));
         // Another duration is another version.
         assert_eq!(disk.load("A/C", "Song?", Some(201)), None);
-        // Not on LRCLIB: remembered, but only for a week (lyrics get added).
+        // Not on LRCLIB: remembered, but only for a day (lyrics get added).
         disk.store("B", "Other", None, None);
         assert_eq!(disk.load("B", "Other", None), Some(None));
         let marker = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.path())
             .find(|p| p.extension().is_some_and(|e| e == "none")).expect("the missing marker");
-        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(8 * 24 * 3600);
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(25 * 3600);
         std::fs::File::options().write(true).open(&marker).unwrap().set_modified(old).unwrap();
-        assert_eq!(disk.load("B", "Other", None), None, "a week on, asked again");
+        assert_eq!(disk.load("B", "Other", None), None, "a day on, asked again");
         // Found later: the marker goes.
         disk.store("B", "Other", None, Some("words"));
         assert_eq!(disk.load("B", "Other", None), Some(Some("words".to_string())));

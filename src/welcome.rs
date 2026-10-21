@@ -444,9 +444,17 @@ fn dirs_home() -> Option<PathBuf> {
 
 /// Run the screen until a folder is chosen (Some) or the user quits (None).
 /// Owns the terminal while it runs: raw mode, the alternate screen and a
-/// hidden cursor, all given back before it returns.
-pub fn run(kind: ThemeKind, native: bool, pick_folder: impl Fn() -> Option<PathBuf>) -> Option<PathBuf> {
-    use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+/// hidden cursor, all given back before it returns. `check` says why a
+/// path has nothing to play (Err): the screen stays, the path still typed
+/// (it ended Keet with "No audio files found"). The folder dialog runs on
+/// its own thread (`pick_folder`), the screen still drawn meanwhile.
+pub fn run(
+    kind: ThemeKind,
+    native: bool,
+    pick_folder: fn() -> Option<PathBuf>,
+    check: impl Fn(&std::path::Path) -> Result<(), String>,
+) -> Option<PathBuf> {
+    use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
     use crossterm::terminal;
 
     if terminal::enable_raw_mode().is_err() {
@@ -466,6 +474,15 @@ pub fn run(kind: ThemeKind, native: bool, pick_folder: impl Fn() -> Option<PathB
     let opened = Instant::now();
     let mut mode = Mode::Keys;
     let mut note: Option<Note> = None;
+    // The folder dialog's answer, while it is open.
+    let mut picking: Option<std::sync::mpsc::Receiver<Option<PathBuf>>> = None;
+    // A path to play, or the note saying why not.
+    let take = |p: PathBuf| -> Result<PathBuf, Note> {
+        if !p.exists() {
+            return Err(Note { text: format!("Not found: {}", p.display()), error: true });
+        }
+        check(&p).map(|()| p).map_err(|why| Note { text: why, error: true })
+    };
 
     let chosen = 'screen: loop {
         let view = View { kind, palette, native, mode: &mode, note: note.as_ref() };
@@ -483,10 +500,10 @@ pub fn run(kind: ThemeKind, native: bool, pick_folder: impl Fn() -> Option<PathB
         let deadline = Instant::now() + FRAME;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
-            if !event::poll(left).unwrap_or(false) {
+            if !crate::input::poll(left) {
                 break;
             }
-            let Ok(ev) = event::read() else { break 'screen None };
+            let Ok(ev) = crate::input::read() else { break 'screen None };
             // A pasted or dropped path goes into the typed one.
             if let Event::Paste(text) = &ev {
                 match &mut mode {
@@ -504,6 +521,10 @@ pub fn run(kind: ThemeKind, native: bool, pick_folder: impl Fn() -> Option<PathB
             if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
                 break 'screen None;
             }
+            // The dialog has the choice: keys wait for it.
+            if picking.is_some() {
+                continue;
+            }
             match &mut mode {
                 Mode::Keys => match k.code {
                     KeyCode::Char('q' | 'Q') | KeyCode::Esc => break 'screen None,
@@ -513,8 +534,11 @@ pub fn run(kind: ThemeKind, native: bool, pick_folder: impl Fn() -> Option<PathB
                     }
                     KeyCode::Char('p' | 'P') if native => {
                         note = Some(Note { text: "Choosing a folder in the dialog…".into(), error: false });
-                        // Show that before the dialog takes over.
-                        break;
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        std::thread::spawn(move || {
+                            let _ = tx.send(pick_folder());
+                        });
+                        picking = Some(rx);
                     }
                     _ => {}
                 },
@@ -523,19 +547,20 @@ pub fn run(kind: ThemeKind, native: bool, pick_folder: impl Fn() -> Option<PathB
                         mode = Mode::Keys;
                         note = None;
                     }
-                    Edit::Submit => match parse_typed_path(field.text()) {
-                        Some(p) if p.exists() => break 'screen Some(p),
-                        Some(p) => note = Some(Note { text: format!("Not found: {}", p.display()), error: true }),
+                    Edit::Submit => match parse_typed_path(field.text()).map(take) {
+                        Some(Ok(p)) => break 'screen Some(p),
+                        Some(Err(why)) => note = Some(why),
                         None => {}
                     },
                     _ => {}
                 },
             }
         }
-        if note.as_ref().is_some_and(|n| n.text.starts_with("Choosing")) {
-            match pick_folder() {
-                Some(p) if p.exists() => break 'screen Some(p),
-                Some(p) => note = Some(Note { text: format!("Not found: {}", p.display()), error: true }),
+        if let Some(answer) = picking.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            picking = None;
+            match answer.map(take) {
+                Some(Ok(p)) => break 'screen Some(p),
+                Some(Err(why)) => note = Some(why),
                 None => note = Some(Note { text: "No folder chosen.".into(), error: false }),
             }
         }

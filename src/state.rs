@@ -1426,9 +1426,15 @@ pub struct UiState {
     /// Something the screen shows changed (a key, a resize, a background
     /// result): draw now rather than at the next scheduled frame.
     pub dirty: bool,
-    /// `Shift+W` asked to write the settings as defaults (the player has the
+    /// The settings are to be written as defaults: `y` to `Shift+W`'s
+    /// question (`save_defaults_asked`). The player does it (it has the
     /// preset names it takes).
     pub save_defaults: bool,
+    /// `Shift+W` asked "Save these settings as the defaults?": `y` sets
+    /// `save_defaults`, anything else keeps the saved ones (it rewrote
+    /// config.json at once, and a slip — or Caps Lock `w` on a Unix
+    /// terminal, which cannot be told from Shift+W — lost them).
+    pub save_defaults_asked: bool,
     /// Why the `o` dialog's path was not opened ("Not found: …"), shown in
     /// the dialog until the path is edited.
     pub open_error: Option<String>,
@@ -1498,6 +1504,8 @@ pub struct UiState {
     /// a floating panel repeats the message in its border only when it
     /// covers that line.
     pub status_drawn_at: Option<ratatui::layout::Rect>,
+    /// A panel's border showed the status this frame (`ui::border_status`).
+    pub status_in_border: bool,
     /// The view with the keys while the player is being drawn (the themes
     /// draw it with `view_mode` set to the player): a docked panel's border
     /// is lit when it is this one.
@@ -1634,6 +1642,7 @@ impl UiState {
             last_visible_rows: 20,
             dirty: true,
             save_defaults: false,
+            save_defaults_asked: false,
             open_error: None,
             hits: Vec::new(),
             last_click: None,
@@ -1655,6 +1664,7 @@ impl UiState {
             floating_shown: None,
             frame_status: None,
             status_drawn_at: None,
+            status_in_border: false,
             focus: ViewMode::Player,
             viz_drawn_at: None,
             viz_shown: true,
@@ -1716,6 +1726,17 @@ impl UiState {
             }
         } else {
             self.set_status_for(msg, hold);
+        }
+    }
+
+    /// A notice the frame just drawn did not show (HiFi's status row is off
+    /// a short window): its time starts again, so it runs only while it can
+    /// be read — it ran out unseen. A routine message just goes.
+    pub fn hold_unseen_notice(&mut self) {
+        if !self.status_routine {
+            if let Some((_, when)) = &mut self.status_message {
+                *when = Instant::now();
+            }
         }
     }
 

@@ -395,10 +395,13 @@ fn legacy_cache_path_for(track_path: &Path, artist: Option<&str>, album: Option<
     Some(parent.join(format!("{} - {}.cover.jpg", a, al)))
 }
 
+/// A tag made safe as a file name. Control characters too: Windows refuses
+/// them, and a title with a tab was never cached (looked up every launch).
 pub(crate) fn sanitize_fs(s: &str) -> String {
     let mut out: String = s.chars()
         .map(|c| match c {
-            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\0' => '_',
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if c.is_control() => '_',
             _ => c,
         })
         .collect();

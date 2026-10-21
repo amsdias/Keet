@@ -234,16 +234,34 @@ fn hash(x: i32, y: i32, salt: u32) -> u32 {
     h ^ (h >> 16)
 }
 
-/// Wall-clock seconds since the first cymatics frame of this run.
-fn wall_time() -> f32 {
-    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    START.get_or_init(std::time::Instant::now).elapsed().as_secs_f32()
+/// Seconds the plate has been drawn while playing: its shimmer and colour
+/// cycle run on this, so a paused plate stands still (on wall-clock time it
+/// kept shimmering at the full frame rate, for nothing).
+#[derive(Default)]
+struct PlayClock {
+    last: Option<std::time::Instant>,
+    secs: f32,
+}
+
+impl PlayClock {
+    fn at(&mut self, now: std::time::Instant, playing: bool) -> f32 {
+        if let (Some(last), true) = (self.last, playing) {
+            self.secs += now.saturating_duration_since(last).as_secs_f32();
+        }
+        self.last = Some(now);
+        self.secs
+    }
+}
+
+thread_local! {
+    static CLOCK: std::cell::RefCell<PlayClock> = std::cell::RefCell::default();
 }
 
 /// See [`cymatics_body`]; this enforces the width half of the renderer
-/// contract (`fit_width`).
-pub fn render_cymatics(motion: &CymaticsMotion, kind: ThemeKind, style: VizStyle, width: usize, rows: usize, extras: bool) -> Lines {
-    fit_width(cymatics_body(motion, kind, style, width, rows, extras, wall_time()), width)
+/// contract (`fit_width`). `playing`: whether the plate's own time runs.
+pub fn render_cymatics(motion: &CymaticsMotion, kind: ThemeKind, style: VizStyle, width: usize, rows: usize, extras: bool, playing: bool) -> Lines {
+    let t = CLOCK.with(|c| c.borrow_mut().at(std::time::Instant::now(), playing));
+    fit_width(cymatics_body(motion, kind, style, width, rows, extras, t), width)
 }
 
 /// The readout `Shift+L` adds under the plate: the frequency the plate is
@@ -374,6 +392,19 @@ fn cymatics_body(motion: &CymaticsMotion, kind: ThemeKind, style: VizStyle, widt
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_plates_time_stands_still_while_paused() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let mut c = super::PlayClock::default();
+        assert_eq!(c.at(t0, true), 0.0);
+        assert_eq!(c.at(t0 + Duration::from_secs(1), true), 1.0);
+        // Paused for a minute: no time passes, and none is made up after.
+        assert_eq!(c.at(t0 + Duration::from_secs(30), false), 1.0);
+        assert_eq!(c.at(t0 + Duration::from_secs(61), false), 1.0);
+        assert_eq!(c.at(t0 + Duration::from_secs(62), true), 2.0);
+    }
+
     use super::*;
     use crate::tui::plain as strip_ansi;
 
