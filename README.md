@@ -28,13 +28,14 @@ A high-performance, low-CPU terminal audio player with real-time spectrum visual
 - **Clipping indicator**: Persistent dot that turns red when signal exceeds 0dBFS, with peak safety limiter
 - **Smart audio processing**: Automatic sample rate switching (macOS), Bluetooth detection, conditional resampling, seamless device switching
 - **Volume control**: Adjustable 0-150% with per-sample gain
-- **Floating and docked panels**: The playlist (`L`) and the lyrics (`Y`) float over the running player, or dock into its layout with `K` (`Shift+K` closes a docked one); Hi-Fi docks the library by itself when the window has room under its EQ
+- **Floating and docked panels**: The playlist (`L`), the lyrics (`Y`) and the guitar tab (`G`) float over the running player, or dock into its layout with `K` (`Shift+K` closes a docked one); Hi-Fi docks the library by itself when the window has room under its EQ
+- **Guitar tabs**: A tab panel (`G`) draws the guitar or bass part of a Guitar Pro 7/8 file beside the track and scrolls it with the song, following the recording's beat once you mark bar 1; bar loops for practice
 - **Library browser**: The library (`L`) has a flat track list *and* an artist → album → track **tree** (`Tab` to switch) with live filtering (`/`), play-node (`Enter` plays a track / album / artist), and remove; folder sources auto-sort into artist → album order once tags load (when not shuffling; files you list keep your order)
 - **Playlist features**: Shuffle (toggling off restores the previous order — M3U order survives), repeat (all/one), recursive folder scanning, playlist view with search/sort/track durations/album column, page navigation (Home/End/PgUp/PgDn + vim `g`/`G`/Ctrl+U/D), tag-based sort (artist → album → disc → track), play queue (enqueue tracks after current), M3U import/export, folder rescan, multiple source paths with deduplication
 - **Resume playback**: Save and restore last session (track, position, volume, EQ — including an edited Custom parametric EQ, effects, crossfeed, balance, theme, device, exclusive) automatically
 - **HQ resampler mode**: Optional `--quality` flag for audiophile-grade resampling
 - **Resilient playback**: Skips missing/corrupt files with a status message, recovers from device disconnection (including USB DAC unplug)
-- **Mouse support**: Click or drag the progress bar to seek, click rows, key hints, tabs, EQ bands and presets, double-click to play, scroll with the wheel (`M` toggles it)
+- **Mouse support**: Click or drag the progress bar to seek, click rows, key hints, tabs, EQ bands and presets, double-click to play, click / right-click the visualization to switch it, scroll with the wheel (`M` toggles it)
 - **Terminal-safe UI**: Output adapts to terminal width, handles terminal resize gracefully
 - **Process stats**: Lightweight CPU/memory monitoring via direct platform syscalls (toggle with `I`)
 
@@ -46,7 +47,7 @@ A high-performance, low-CPU terminal audio player with real-time spectrum visual
 winget install amsdias.Keet
 ```
 
-Or the `.msi` from the [releases page](https://github.com/amsdias/Keet/releases), which winget also uses for new installs. It installs for your user only (no admin prompt), puts `keet` on your PATH and adds Keet to the Start menu, opening in Windows Terminal when that is installed. The Start menu entry is also what lets Windows's media controls show Keet by name rather than "Unknown app". Uninstalling removes all three.
+Or the `.msi` from the [releases page](https://github.com/amsdias/Keet/releases) (from 2.1.0). It installs for your user only (no admin prompt), puts `keet` on your PATH and adds Keet to the Start menu, opening in Windows Terminal when that is installed. The Start menu entry is also what lets Windows's media controls show Keet by name rather than "Unknown app". Uninstalling removes all three.
 
 **macOS and Linux** ([Homebrew](https://brew.sh)):
 
@@ -233,9 +234,11 @@ The tab does not know where the recording's first bar falls: listen, and press `
 |-----|--------|
 | `Enter` | The bar starts now (the first press marks bar 1) |
 | `Backspace` | Undo the last mark |
+| `,` / `.` | Move the last mark a bar earlier / later |
 | `A` / `D` | Nudge the tab -/+0.05s |
 | `0` | Drop every mark and the nudge (`Backspace` brings them back) |
-| `Left` / `Right` | Previous/next part (guitar, bass…) |
+| `Up` / `Down` | Previous/next part (guitar, bass…); `Left` / `Right` still seek |
+| `R` | Loop bars: first press the start bar, second the end bar, third stops |
 | `N` | Fret numbers / note names |
 | `Esc` / `G` | Close the tab (docked: hand the keys back) |
 
