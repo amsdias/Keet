@@ -35,6 +35,9 @@ mod metadata;
 mod lyrics;
 mod cover;
 mod gapless;
+mod gp;
+mod tab;
+mod tab_sync;
 mod fade;
 mod signal;
 mod term;
@@ -44,6 +47,7 @@ mod input;
 mod hints;
 mod playlist_panel;
 mod lyrics_panel;
+mod tab_panel;
 mod welcome;
 #[cfg(target_os = "windows")]
 mod wasapi_out;
@@ -477,6 +481,9 @@ fn apply_config(
     if let Some(style) = config.viz_style.as_deref().and_then(state::VizStyle::from_str) {
         state.viz_style.store(style as u8, Ordering::Relaxed);
     }
+    if let Some(meter) = config.vu_meter.as_deref().and_then(state::VuKind::from_str) {
+        state.vu_kind.store(meter as u8, Ordering::Relaxed);
+    }
     if !rg_mode_flag {
         if let Some(m) = config.rg_mode.as_deref().and_then(RgMode::from_str) {
             state.rg_mode.store(m as u8, Ordering::Relaxed);
@@ -613,6 +620,44 @@ fn config_notices(problems: &[String], colours: &[&str]) -> Vec<String> {
     notes
 }
 
+/// Decode `audio` on a background thread for the tab's beat tracking: the
+/// answer is its onset curve, under the current tab load's generation (one
+/// for the last track is dropped, `tab_panel::take_beats`). At most 30
+/// minutes are decoded.
+fn spawn_beat_worker(ui: &mut state::UiState, audio: std::path::PathBuf) {
+    let gen = ui.tab_gen;
+    let (tx, rx) = std::sync::mpsc::channel();
+    ui.tab_beat_receiver = Some(rx);
+    std::thread::spawn(move || {
+        let answer = tab_sync::decode_mono(&audio, 30.0 * 60.0).map(|(mono, rate)| tab_sync::onset_curve(&mono, rate));
+        let _ = tx.send((gen, answer));
+    });
+}
+
+/// Look for the playing track's guitar tab on a background thread (find the
+/// file, read it) and install its receiver on `ui`; the answer carries the
+/// load's generation, so one for an earlier track is dropped
+/// (`tab_panel::take_answer`). No file answers an empty reason.
+fn spawn_tab_worker(ui: &mut state::UiState, path: std::path::PathBuf, title: Option<String>, artist: Option<String>) {
+    ui.tab_gen += 1;
+    let gen = ui.tab_gen;
+    ui.tab = None;
+    ui.tab_map = None;
+    ui.tab_path = None;
+    ui.tab_error = None;
+    ui.tab_audio = Some(path.clone());
+    ui.tab_beat_receiver = None;
+    let (tx, rx) = std::sync::mpsc::channel();
+    ui.tab_receiver = Some(rx);
+    std::thread::spawn(move || {
+        let answer = match tab::find_tab(&path, title.as_deref(), artist.as_deref()) {
+            None => Err(String::new()),
+            Some(file) => gp::read_score(&file).map(|score| (file, score)),
+        };
+        let _ = tx.send((gen, answer));
+    });
+}
+
 /// Kick off the lyrics loader on a background thread and install its receiver on `ui`.
 /// Reads embedded tags from the file if not already cached, then falls back to LRCLIB.
 /// The main thread never blocks on disk or HTTP.
@@ -732,6 +777,7 @@ fn spawn_cover_worker(ui: &mut state::UiState, path: std::path::PathBuf, size: c
     ui.cover_receiver = Some(rx);
     let gen_ref = std::sync::Arc::clone(&ui.cover_gen);
     let misses = ui.cover_misses.clone();
+    let os_art = ui.os_art;
     std::thread::spawn(move || {
         // Local sources are cheap — always try them regardless of generation.
         let local = cover::resolve_local(
@@ -739,6 +785,7 @@ fn spawn_cover_worker(ui: &mut state::UiState, path: std::path::PathBuf, size: c
             cached_artist.as_deref(),
             cached_album.as_deref(),
             size,
+            os_art,
         );
         if let Some(img) = local {
             let _ = tx.send(Some(img));
@@ -758,7 +805,7 @@ fn spawn_cover_worker(ui: &mut state::UiState, path: std::path::PathBuf, size: c
                 if misses.known(&key).is_some() {
                     None
                 } else {
-                    match cover::resolve_remote(&a, &al, size) {
+                    match cover::resolve_remote(&a, &al, size, os_art) {
                         lyrics::Lookup::Found(img) => Some(img),
                         lyrics::Lookup::NotFound => {
                             misses.remember(key, None);
@@ -1306,6 +1353,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             problems.push(format!("viz_style ({style:?} is not dots or bars)"));
         }
     }
+    if let Some(meter) = app_config.vu_meter.as_deref() {
+        if state::VuKind::from_str(meter).is_none() {
+            problems.push(format!("vu_meter ({meter:?} is not dorrough, vu or k14)"));
+        }
+    }
     // Unreadable config values: each was skipped on its own (config::parse).
     for adjusted in &app_config.adjusted {
         ui.queue_notice(format!("config.json: {adjusted}"), std::time::Duration::from_secs(8));
@@ -1362,6 +1414,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     crate::term::flush();
 
     ui.cover_enabled = cover_enabled;
+    ui.os_art = media_controls.is_some();
     ui.terminal_resized = false;
     ui.scan_handle = Some(metadata::spawn_metadata_scan(
         playlist.clone(),

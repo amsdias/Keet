@@ -9,6 +9,8 @@ use souvlaki::{
 use crate::state::PlayerState;
 
 pub fn setup(state: Arc<PlayerState>) -> Option<MediaControls> {
+    // Before the window below: the ID is taken when a window is made.
+    set_app_id();
     let config = PlatformConfig {
         dbus_name: "keet",
         display_name: "Keet",
@@ -64,18 +66,24 @@ pub fn update_metadata(
     artist: Option<&str>,
     album: Option<&str>,
     duration_secs: f64,
+    cover_url: Option<&str>,
 ) {
-    let _ = controls.set_metadata(MediaMetadata {
+    let metadata = |cover_url| MediaMetadata {
         title: Some(title),
         artist,
         album,
-        cover_url: None,
+        cover_url,
         duration: if duration_secs > 0.0 {
             Some(Duration::from_secs_f64(duration_secs))
         } else {
             None
         },
-    });
+    };
+    // On Windows a cover that fails ends the call before anything is shown:
+    // the title matters more than the picture.
+    if controls.set_metadata(metadata(cover_url)).is_err() && cover_url.is_some() {
+        let _ = controls.set_metadata(metadata(None));
+    }
 }
 
 pub fn update_playback(controls: &mut MediaControls, paused: bool, position_secs: f64) {
@@ -230,6 +238,25 @@ fn platform_hwnd() -> Option<*mut std::ffi::c_void> {
 fn platform_hwnd() -> Option<*mut std::ffi::c_void> {
     None
 }
+
+/// Give the process an app ID, so Windows's media flyout can name it: without
+/// one it says "Unknown app". The name comes from a Start menu shortcut carrying
+/// the ID (`HKCU\Software\Classes\AppUserModelId`'s `DisplayName` is not read:
+/// tried); winget's portable install makes none.
+/// The console window is the terminal's, so taskbar grouping is unaffected.
+#[cfg(target_os = "windows")]
+fn set_app_id() {
+    #[link(name = "shell32")]
+    extern "system" {
+        fn SetCurrentProcessExplicitAppUserModelID(app_id: *const u16) -> i32;
+    }
+    // As winget names the package.
+    let id: Vec<u16> = "amsdias.Keet".encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe { SetCurrentProcessExplicitAppUserModelID(id.as_ptr()) };
+}
+
+#[cfg(not(target_os = "windows"))]
+fn set_app_id() {}
 
 #[cfg(test)]
 mod tests {

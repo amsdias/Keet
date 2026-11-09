@@ -25,6 +25,9 @@ pub struct Config {
     /// The visualization style: `dots` (braille) or `bars`.
     #[serde(default)]
     pub viz_style: Option<String>,
+    /// The VU visualization's meter: `dorrough`, `vu` or `k14`.
+    #[serde(default)]
+    pub vu_meter: Option<String>,
     /// The panels docked into the player at startup: any of `playlist`,
     /// `lyrics`.
     #[serde(default)]
@@ -136,6 +139,7 @@ fn parse(contents: &str) -> Config {
     c.mouse = field(&obj, "mouse", "", &mut problems);
     c.sixel_cell = field(&obj, "sixel_cell", "", &mut problems);
     c.viz_style = field(&obj, "viz_style", "", &mut problems);
+    c.vu_meter = field(&obj, "vu_meter", "", &mut problems);
     c.docked = field(&obj, "docked", "", &mut problems);
     c.rg_mode = field(&obj, "rg_mode", "", &mut problems);
     c.eq = field(&obj, "eq", "", &mut problems);

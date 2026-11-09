@@ -92,6 +92,7 @@ fn key_of_glyph(c: char) -> Option<KeyCode> {
         '↑' => Some(KeyCode::Up),
         '↓' => Some(KeyCode::Down),
         '↵' => Some(KeyCode::Enter),
+        '⌫' => Some(KeyCode::Backspace),
         '−' => Some(KeyCode::Char('-')),
         // Separators between two keys ("w/s", "w s").
         ' ' | '/' => None,

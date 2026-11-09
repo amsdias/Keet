@@ -1,3 +1,5 @@
 /target
 /files
 .DS_Store
+# Guitar Pro tabs are commercial transcriptions: never in the repo (tests build theirs in code)
+*.gp

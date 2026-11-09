@@ -267,6 +267,97 @@ pub fn viz_image_clear_escape() -> String {
     format!("\x1B_Ga=d,d=i,i={},q=2\x1B\\", VIZ_IMAGE_ID)
 }
 
+/// What the cover worker found: the picture for the terminal and, when asked
+/// for, the file the OS's now-playing widget reads it from.
+pub struct Resolved {
+    pub image: CoverImage,
+    pub art_url: Option<String>,
+}
+
+fn resolved(bytes: &[u8], size: CoverSize, os_art: bool) -> Option<Resolved> {
+    let img = decode_image(bytes)?;
+    let image = fit_to_slot(&img, size)?;
+    Some(Resolved { image, art_url: if os_art { os_artwork(&img) } else { None } })
+}
+
+/// Longest side of the picture the OS gets. Small on purpose as well as being
+/// plenty: souvlaki never releases the image on macOS, so each cover costs what it costs.
+const OS_ART_PX: u32 = 600;
+
+/// The cover as the JPEG the OS gets: one format every OS's widget reads, and
+/// never the 3000-px scan a tag can hold.
+fn encode_os_art(img: &image::DynamicImage) -> Option<Vec<u8>> {
+    let small = if img.width().max(img.height()) > OS_ART_PX { img.thumbnail(OS_ART_PX, OS_ART_PX) } else { img.clone() };
+    let mut jpeg = Vec::new();
+    let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 85);
+    small.to_rgb8().write_with_encoder(encoder).ok()?;
+    Some(jpeg)
+}
+
+/// How long an old picture stays. By age, not "all but the latest": a file another
+/// running Keet just named could go before its OS read it (an empty picture in a
+/// release build; in a debug build souvlaki's nil image aborts the process).
+const OS_ART_KEEP: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Keep `jpeg` in `dir`, named by its content: a Linux desktop caches a cover by
+/// its URL, so another picture must have another name, and the same picture
+/// (the next track of the album) is not written again.
+fn write_os_art(dir: &Path, jpeg: &[u8]) -> Option<PathBuf> {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    jpeg.hash(&mut hash);
+    let path = dir.join(format!("{:016x}.jpg", hash.finish()));
+    if !path.exists() {
+        std::fs::create_dir_all(dir).ok()?;
+        crate::playlist::write_atomic(&path, jpeg).ok()?;
+        for old in std::fs::read_dir(dir).ok()?.flatten() {
+            let age = old.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
+            if age.is_some_and(|a| a > OS_ART_KEEP) {
+                let _ = std::fs::remove_file(old.path());
+            }
+        }
+    }
+    Some(path)
+}
+
+/// A path as the URL souvlaki wants: a real, percent-encoded file URL for Linux's
+/// desktops and macOS's NSURL; on Windows souvlaki strips `file://` and hands the
+/// rest to the OS as a plain path, so it must stay one.
+fn file_url(path: &Path, windows: bool) -> String {
+    if windows {
+        return format!("file://{}", path.display());
+    }
+    let mut url = String::from("file://");
+    for &b in path.as_os_str().as_encoded_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'_' | b'.' | b'~') {
+            url.push(b as char);
+        } else {
+            url.push_str(&format!("%{b:02X}"));
+        }
+    }
+    url
+}
+
+/// The URL of this cover's file for the OS's widget.
+fn os_artwork(img: &image::DynamicImage) -> Option<String> {
+    os_art_url(&encode_os_art(img)?)
+}
+
+fn os_art_url(jpeg: &[u8]) -> Option<String> {
+    let dir = crate::playlist::keet_config_dir()?.join("covers").join("now-playing");
+    Some(file_url(&write_os_art(&dir, jpeg)?, cfg!(target_os = "windows")))
+}
+
+/// What to give the OS for a track with no cover. macOS and Linux clear theirs
+/// when given none; souvlaki leaves Windows's thumbnail alone, and the last
+/// album's would stay on a track it does not belong to, so it gets a blank.
+pub fn no_art_url() -> Option<String> {
+    if !cfg!(target_os = "windows") {
+        return None;
+    }
+    os_art_url(&encode_os_art(&image::DynamicImage::new_rgb8(1, 1))?)
+}
+
 /// Try local sources only: embedded tag, sidecar file, on-disk cache (the
 /// config-dir cache, then any legacy cache an older Keet wrote next to the
 /// music). Returns None if no local cover exists (callers can then fall back
@@ -276,12 +367,13 @@ pub fn resolve_local(
     artist: Option<&str>,
     album: Option<&str>,
     size: CoverSize,
-) -> Option<CoverImage> {
+    os_art: bool,
+) -> Option<Resolved> {
     if let Some(bytes) = read_embedded(track_path) {
-        return decode_and_resize(&bytes, size);
+        return resolved(&bytes, size, os_art);
     }
     if let Some(bytes) = read_sidecar(track_path) {
-        return decode_and_resize(&bytes, size);
+        return resolved(&bytes, size, os_art);
     }
     let candidates = [
         cache_path_for(artist, album),
@@ -289,7 +381,7 @@ pub fn resolve_local(
     ];
     for p in candidates.into_iter().flatten() {
         if let Some(bytes) = read_cover_file(&p) {
-            return decode_and_resize(&bytes, size);
+            return resolved(&bytes, size, os_art);
         }
     }
     None
@@ -318,7 +410,7 @@ fn read_cover_file(path: &std::path::Path) -> Option<Vec<u8>> {
 /// next time. Requires both artist and album — returns None otherwise.
 /// Fetch the album's cover from iTunes and save it to the on-disk cover cache
 /// (which `resolve_local` reads first next time).
-pub fn resolve_remote(artist: &str, album: &str, size: CoverSize) -> crate::lyrics::Lookup<CoverImage> {
+pub fn resolve_remote(artist: &str, album: &str, size: CoverSize, os_art: bool) -> crate::lyrics::Lookup<Resolved> {
     use crate::lyrics::Lookup;
     let bytes = match fetch_itunes(artist, album) {
         Lookup::Found(b) => b,
@@ -331,8 +423,8 @@ pub fn resolve_remote(artist: &str, album: &str, size: CoverSize) -> crate::lyri
         }
         let _ = crate::playlist::write_atomic(&p, &bytes);
     }
-    match decode_and_resize(&bytes, size) {
-        Some(img) => Lookup::Found(img),
+    match resolved(&bytes, size, os_art) {
+        Some(found) => Lookup::Found(found),
         None => Lookup::NotFound,
     }
 }
@@ -478,12 +570,15 @@ pub(crate) fn urlencoded(s: &str) -> String {
 /// (~400 MB as RGBA) decoded — once per cover worker. 4096x4096 RGBA fits.
 const COVER_MAX_ALLOC: u64 = 64 * 1024 * 1024;
 
-fn decode_and_resize(bytes: &[u8], size: CoverSize) -> Option<CoverImage> {
+fn decode_image(bytes: &[u8]) -> Option<image::DynamicImage> {
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?;
     let mut limits = image::Limits::default();
     limits.max_alloc = Some(COVER_MAX_ALLOC);
     reader.limits(limits);
-    let img = reader.decode().ok()?;
+    reader.decode().ok()
+}
+
+fn fit_to_slot(img: &image::DynamicImage, size: CoverSize) -> Option<CoverImage> {
     // `thumbnail_exact` uses nearest-neighbor and allocates only the output
     // buffer. `resize_exact(_, _, Lanczos3)` allocates two intermediate f32
     // RGBA planes sized `dst × src` and `src × dst` — together ~5–8 MB for a
@@ -936,12 +1031,57 @@ mod viz_sixel_tests {
         image::DynamicImage::ImageRgb8(big)
             .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
             .unwrap();
-        assert!(decode_and_resize(&png, CoverSize::for_theme(crate::theme::ThemeKind::Classic)).is_none());
+        assert!(decode_image(&png).is_none());
         let mut small = Vec::new();
         image::DynamicImage::ImageRgb8(image::RgbImage::new(600, 600))
             .write_to(&mut std::io::Cursor::new(&mut small), image::ImageFormat::Png)
             .unwrap();
-        assert!(decode_and_resize(&small, CoverSize::for_theme(crate::theme::ThemeKind::Classic)).is_some());
+        let img = decode_image(&small).unwrap();
+        assert!(fit_to_slot(&img, CoverSize::for_theme(crate::theme::ThemeKind::Classic)).is_some());
+    }
+
+    #[test]
+    fn the_os_gets_a_small_jpeg_whatever_the_cover_is() {
+        let shape = |w, h| {
+            let jpeg = encode_os_art(&image::DynamicImage::new_rgba8(w, h)).unwrap();
+            assert_eq!(image::guess_format(&jpeg).unwrap(), image::ImageFormat::Jpeg);
+            let back = image::load_from_memory(&jpeg).unwrap();
+            (back.width(), back.height())
+        };
+        assert_eq!(shape(3000, 3000), (600, 600), "a scan comes down");
+        assert_eq!(shape(2000, 1000), (600, 300), "keeping its shape");
+        assert_eq!(shape(300, 300), (300, 300), "a small one is left its size");
+    }
+
+    #[test]
+    fn the_os_art_file_is_named_by_its_content_and_old_ones_go() {
+        let dir = std::env::temp_dir().join(format!("keet-os-art-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let first = write_os_art(&dir, b"one").unwrap();
+        assert_eq!(std::fs::read(&first).unwrap(), b"one");
+        // The same picture: the same file, not written again.
+        std::fs::write(&first, b"untouched").unwrap();
+        assert_eq!(write_os_art(&dir, b"one").unwrap(), first);
+        assert_eq!(std::fs::read(&first).unwrap(), b"untouched");
+        // Another: another name (a Linux desktop caches by URL). The first
+        // stays for now: another running Keet may have just named it.
+        let second = write_os_art(&dir, b"two").unwrap();
+        assert_ne!(second, first);
+        assert!(first.exists());
+        // Once it is old, the next new picture clears it.
+        let long_ago = std::time::SystemTime::now() - OS_ART_KEEP - std::time::Duration::from_secs(60);
+        std::fs::File::options().write(true).open(&first).unwrap().set_modified(long_ago).unwrap();
+        let third = write_os_art(&dir, b"three").unwrap();
+        assert!(!first.exists() && second.exists() && third.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_url_is_encoded_except_for_what_windows_takes_as_a_path() {
+        let unix = std::path::Path::new("/Users/a b/Café/x.jpg");
+        assert_eq!(file_url(unix, false), "file:///Users/a%20b/Caf%C3%A9/x.jpg");
+        let win = std::path::Path::new(r"C:\Users\a b\x.jpg");
+        assert_eq!(file_url(win, true), r"file://C:\Users\a b\x.jpg");
     }
 
     #[test]

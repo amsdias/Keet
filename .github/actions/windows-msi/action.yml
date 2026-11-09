@@ -1,0 +1,26 @@
+name: Build the Windows installer
+description: Build and validate the per-user MSI (wix/keet.wxs) around a built keet.exe.
+inputs:
+  bin:
+    description: The keet.exe to package
+    required: true
+  out:
+    description: The .msi to write
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: pwsh
+      run: |
+        # WiX 5: from 7 on, every command refuses to run until its Open Source
+        # Maintenance Fee EULA is accepted.
+        dotnet tool install wix --version 5.0.2 --tool-path "$env:RUNNER_TEMP\wix"
+        $wix = "$env:RUNNER_TEMP\wix\wix.exe"
+        # Cargo.toml's version (the release workflow writes the tag into it),
+        # less any pre-release suffix: an MSI version is numbers only.
+        $version = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"').Matches[0].Groups[1].Value -replace '-.*$', ''
+        & $wix build wix/keet.wxs -arch x64 -d "Version=$version" -d "Bin=${{ inputs.bin }}" -o "${{ inputs.out }}" -pdbtype none
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        # The ICE checks (per-user rules, component rules) Windows Installer ships.
+        & $wix msi validate "${{ inputs.out }}"
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }

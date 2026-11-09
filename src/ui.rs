@@ -120,7 +120,7 @@ pub(crate) fn draw_viz(f: &mut Frame, area: Rect, cx: &mut Ctx, block_was_intact
     let analyser = cx.analyser;
     let lines = match state.viz_mode() {
         VizMode::None => Vec::new(),
-        VizMode::VuMeter => render_vu_meter(state, style, w, rows, extras),
+        VizMode::VuMeter => render_vu_meter(state, &analyser.correlation, style, w, rows, extras),
         VizMode::SpectrumHorizontal => render_spectrum_horizontal(state, style, w, rows, extras),
         VizMode::SpectrumVertical => render_spectrum_vertical(state, style, w, rows, extras),
         VizMode::Oscilloscope => render_oscilloscope(analyser, style, w, rows),
@@ -204,6 +204,7 @@ impl DrawOnce {
 /// and the key list are shared screens.
 pub fn draw(f: &mut Frame, cx: &mut Ctx) {
     cx.ui.viz_drawn_at = None;
+    cx.ui.tab_next_step = None;
     // Not on the too-small screen, which cannot show it: reading takes the
     // next queued notice and starts its time, and it ran out unseen.
     cx.ui.frame_status = if cx.ui.too_small { None } else { cx.ui.active_status() };
@@ -315,7 +316,7 @@ fn draw_frame(f: &mut Frame, cx: &mut Ctx) {
     }
 
     // The panel with the keys is the one used last (it keeps its room first).
-    if matches!(ui.view_mode, ViewMode::Playlist | ViewMode::Lyrics) && ui.panel_recent.first() != Some(&ui.view_mode) {
+    if ui.view_mode.is_panel() && ui.panel_recent.first() != Some(&ui.view_mode) {
         let v = ui.view_mode;
         ui.panel_recent.retain(|&r| r != v);
         ui.panel_recent.insert(0, v);
@@ -453,7 +454,7 @@ pub(crate) fn eq_returns_to_stack(ui: &UiState) -> bool {
 /// `tui::withhold_images`). The frame loop repaints when this changes, so the
 /// images go when one opens and come back when it closes.
 pub(crate) fn overlay_open(ui: &UiState) -> bool {
-    let floating_panel = matches!(ui.view_mode, ViewMode::Playlist | ViewMode::Lyrics) && !ui.docked_shown.contains(&ui.view_mode);
+    let floating_panel = ui.view_mode.is_panel() && !ui.docked_shown.contains(&ui.view_mode);
     ui.input_mode.is_overlay()
         || floating_panel
         || ui.view_mode == ViewMode::Help
@@ -484,7 +485,7 @@ fn dock_room(state: &PlayerState, ui: &UiState, view: ViewMode, window: Rect) ->
     docked.push(view);
     let mut recent = vec![view];
     recent.extend(ui.panel_recent.iter().copied().filter(|&v| v != view));
-    crate::ui_hifi::dock_region(window, &docked)
+    crate::ui_hifi::dock_region(window, &crate::ui_hifi::sharing(&docked, &recent))
         .is_some_and(|r| crate::ui_hifi::dock_panels(&docked, &recent, r).iter().any(|&(v, _)| v == view))
 }
 
@@ -512,7 +513,8 @@ fn auto_dock_library(state: &PlayerState, ui: &mut UiState, area: Rect) {
     if base_view(ui) == pl {
         return;
     }
-    let others: Vec<ViewMode> = ui.docked.iter().copied().filter(|&v| v != pl).collect();
+    let others: Vec<ViewMode> =
+        crate::ui_hifi::sharing(&ui.docked, &ui.panel_recent).into_iter().filter(|&v| v != pl).collect();
     let want = hifi
         && !ui.library_auto_declined
         && crate::ui_hifi::library_fits(area, &others);
@@ -537,6 +539,7 @@ pub(crate) fn dock_min_width(item: Option<ViewMode>) -> u16 {
     match item {
         None => 40, // the visualization
         Some(ViewMode::Playlist) => 50,
+        Some(ViewMode::Tab) => 44,
         _ => 36,
     }
 }
@@ -552,6 +555,7 @@ pub fn docked_from_config(names: &[String]) -> (Vec<ViewMode>, Vec<String>) {
         let view = match name.to_ascii_lowercase().as_str() {
             "playlist" | "library" => ViewMode::Playlist,
             "lyrics" => ViewMode::Lyrics,
+            "tab" => ViewMode::Tab,
             _ => {
                 problems.push(format!("docked ({name:?} is not a panel)"));
                 continue;
@@ -568,12 +572,33 @@ pub fn docked_from_config(names: &[String]) -> (Vec<ViewMode>, Vec<String>) {
 const DOCK_MIN_ROWS: u16 = 6;
 
 /// Share `region` between the visualization (when `viz_on`) and the docked
-/// panels. Each gets its minimum width in priority order — the panel used
+/// panels. A docked tab goes UNDER the rest, at its box's height, when that
+/// leaves `DOCK_MIN_ROWS` above for them (a tab is wide and short: beside the
+/// visualization both were squeezed); else it shares the row as the others
+/// do. Each gets its minimum width in priority order — the panel used
 /// last, then the visualization, then the other panel — until the row is
 /// full; what does not fit is left out (a docked panel left out floats when
 /// opened). The spare width is shared in proportion to the minimums.
 pub(crate) fn dock(ui: &UiState, viz_on: bool, region: Rect) -> Dock {
     let docked: Vec<ViewMode> = ui.panel_recent.iter().copied().filter(|v| ui.docked.contains(v)).collect();
+    let tab_rows = crate::tab_panel::box_rows(ui);
+    let others: Vec<ViewMode> = docked.iter().copied().filter(|&v| v != ViewMode::Tab).collect();
+    if others.len() < docked.len()
+        && (viz_on || !others.is_empty())
+        && region.height >= tab_rows + DOCK_MIN_ROWS
+        && region.width >= dock_min_width(Some(ViewMode::Tab))
+    {
+        let top = Rect { height: region.height - tab_rows, ..region };
+        let mut out = dock_row(&others, viz_on, top);
+        out.panels.push((ViewMode::Tab, Rect { y: top.bottom(), height: tab_rows, ..region }));
+        return out;
+    }
+    dock_row(&docked, viz_on, region)
+}
+
+/// `dock`'s side-by-side split of one row of `region` among `docked` (in
+/// priority order) and the visualization.
+fn dock_row(docked: &[ViewMode], viz_on: bool, region: Rect) -> Dock {
     if docked.is_empty() || region.height < DOCK_MIN_ROWS {
         return Dock { viz: viz_on.then_some(region), panels: Vec::new() };
     }
@@ -596,11 +621,12 @@ pub(crate) fn dock(ui: &UiState, viz_on: bool, region: Rect) -> Dock {
     if chosen.is_empty() {
         return Dock { viz: viz_on.then_some(region), panels: Vec::new() };
     }
-    // Left to right: the visualization, the lyrics, the playlist.
+    // Left to right: the visualization, the lyrics, the tab, the playlist.
     let rank = |i: &Option<ViewMode>| match i {
         None => 0,
         Some(ViewMode::Lyrics) => 1,
-        _ => 2,
+        Some(ViewMode::Tab) => 2,
+        _ => 3,
     };
     chosen.sort_by_key(rank);
     let gaps = chosen.len().saturating_sub(1) as u16;
@@ -633,10 +659,10 @@ pub(crate) fn draw_docked(f: &mut Frame, cx: &mut Ctx, panels: &[(ViewMode, Rect
     let p = crate::theme::palette(kind);
     for &(view, at) in panels {
         let focused = cx.ui.focus == view;
-        let title = if view == ViewMode::Playlist {
-            crate::playlist_panel::title(kind, cx.ui, cx.playlist.len())
-        } else {
-            crate::lyrics_panel::title(kind, cx.ui)
+        let title = match view {
+            ViewMode::Playlist => crate::playlist_panel::title(kind, cx.ui, cx.playlist.len()),
+            ViewMode::Tab => crate::tab_panel::title(kind, cx.ui),
+            _ => crate::lyrics_panel::title(kind, cx.ui),
         };
         let title_style = if focused { p.bold.patch(p.accent) } else { p.dim };
         let block = if kind == crate::theme::ThemeKind::HiFi {
@@ -652,10 +678,10 @@ pub(crate) fn draw_docked(f: &mut Frame, cx: &mut Ctx, panels: &[(ViewMode, Rect
         f.render_widget(block, at);
         cx.ui.hits.push((at, Hit::Panel(view)));
         cx.ui.docked_shown.push(view);
-        if view == ViewMode::Playlist {
-            crate::playlist_panel::draw(f, cx, inner);
-        } else {
-            crate::lyrics_panel::draw(f, cx, inner);
+        match view {
+            ViewMode::Playlist => crate::playlist_panel::draw(f, cx, inner),
+            ViewMode::Tab => crate::tab_panel::draw(f, cx, inner),
+            _ => crate::lyrics_panel::draw(f, cx, inner),
         }
     }
 }
@@ -711,7 +737,7 @@ fn draw_view(f: &mut Frame, cx: &mut Ctx, view: ViewMode) {
     use crate::theme::ThemeKind;
     // The playlist and the lyrics: docked into the player's layout when
     // there is room for them there, else floating over it.
-    if matches!(view, ViewMode::Playlist | ViewMode::Lyrics) {
+    if view.is_panel() {
         draw_view(f, cx, ViewMode::Player);
         if cx.ui.docked_shown.contains(&view) {
             return;
@@ -727,6 +753,12 @@ fn draw_view(f: &mut Frame, cx: &mut Ctx, view: ViewMode) {
             let title = crate::playlist_panel::title(kind, cx.ui, cx.playlist.len());
             let (boxed, inner) = dialog_box(f, &mut cx.ui.hits, area.width.saturating_sub(4).min(160), h, &title, p);
             crate::playlist_panel::draw(f, cx, inner);
+            border_status(f, cx.ui, boxed, inner, p);
+        } else if view == ViewMode::Tab {
+            let title = crate::tab_panel::title(kind, cx.ui);
+            let rows = crate::tab_panel::box_rows(cx.ui).min(h);
+            let (boxed, inner) = dialog_box(f, &mut cx.ui.hits, area.width.saturating_sub(4).min(160), rows, &title, p);
+            crate::tab_panel::draw(f, cx, inner);
             border_status(f, cx.ui, boxed, inner, p);
         } else {
             let title = crate::lyrics_panel::title(kind, cx.ui);
@@ -1300,6 +1332,17 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
                 }
             }
 
+            // The tab panel's keys, never with Ctrl or Alt either.
+            if ui.view_mode == ViewMode::Tab && !k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+                if matches!(k.code, KeyCode::Esc | KeyCode::Char('g')) {
+                    ui.view_mode = ViewMode::Player;
+                    continue;
+                }
+                if crate::tab_panel::handle_key(ui, state.time_secs(), k.code) {
+                    continue;
+                }
+            }
+
             // `?` opens the key list from any view, and closes it; Esc closes
             // it too. Everything else still works underneath (space pauses).
             if matches!(k, KeyEvent { code: KeyCode::Char('?'), .. }) {
@@ -1542,7 +1585,7 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
                 KeyEvent { code: KeyCode::Down, .. } => state.prev(),
                 KeyEvent { code: KeyCode::Right, .. } => state.seek(10),
                 KeyEvent { code: KeyCode::Left, .. } => state.seek(-10),
-                KeyEvent { code: KeyCode::Char('v'), .. } => {
+                KeyEvent { code: KeyCode::Char(c @ ('v' | 'V')), .. } => {
                     // Hi-Fi renders a fixed VU panel and no switchable viz, so
                     // cycling here changed nothing on screen, only the hidden
                     // setting of the other themes. (The panel is fed whatever
@@ -1551,7 +1594,7 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
                         ui.set_status("Hi-Fi uses its VU panel — press T for another theme".to_string());
                         continue;
                     }
-                    state.cycle_viz_mode();
+                    state.cycle_viz_mode(c == 'v');
                     // Re-anchor the UI at the top of the screen (resize-repaint
                     // path): a taller viz then grows into the reclaimed rows
                     // instead of scrolling the whole screen up.
@@ -1588,6 +1631,22 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
                     // re-anchor as 'v' so growth never scrolls the screen.
                     ui.terminal_resized = true;
                 }
+                KeyEvent { code: KeyCode::Char('u'), .. } => {
+                    // HiFi's is a peak meter, whatever this says; another
+                    // mode would change a setting nothing shows.
+                    if state.theme_kind() == crate::theme::ThemeKind::HiFi {
+                        ui.set_status("Hi-Fi's meter is a peak meter — press T for another theme".to_string());
+                    } else if state.viz_mode() != VizMode::VuMeter {
+                        ui.set_status("u switches the VU meter — press v to show it".to_string());
+                    } else {
+                        let what = match state.cycle_vu_kind() {
+                            crate::state::VuKind::Dorrough => "Dorrough: RMS and peak",
+                            crate::state::VuKind::Vu => "VU: average, 0 VU at -8 dBFS",
+                            crate::state::VuKind::K14 => "K-14: RMS and peak, 0 at -14 dBFS",
+                        };
+                        ui.set_status(what.to_string());
+                    }
+                }
                 KeyEvent { code: KeyCode::Char('l'), .. } => match ui.view_mode {
                     ViewMode::Playlist => ui.view_mode = ViewMode::Player,
                     _ => open_view(ui, ViewMode::Playlist),
@@ -1595,6 +1654,10 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
                 KeyEvent { code: KeyCode::Char('y'), .. } => match ui.view_mode {
                     ViewMode::Lyrics => ui.view_mode = ViewMode::Player,
                     _ => open_view(ui, ViewMode::Lyrics),
+                },
+                KeyEvent { code: KeyCode::Char('g'), .. } => match ui.view_mode {
+                    ViewMode::Tab => ui.view_mode = ViewMode::Player,
+                    _ => open_view(ui, ViewMode::Tab),
                 },
                 KeyEvent { code: KeyCode::Char('s'), .. } => {
                     // The field is the playlist's: it opens there, where it
@@ -1699,7 +1762,7 @@ pub fn poll_input(state: &PlayerState, ui: &mut UiState, playlist: &mut Vec<Path
                     // are not drawn in it, and the one with the keys floated
                     // over it. The keys go back to the player; the dock
                     // stays for the way out.
-                    if on && matches!(ui.view_mode, ViewMode::Playlist | ViewMode::Lyrics) {
+                    if on && ui.view_mode.is_panel() {
                         ui.view_mode = ViewMode::Player;
                     }
                     ui.set_status(if on { "full window: on".into() } else { String::from("full window: off") });
@@ -1888,8 +1951,8 @@ fn set_pane(ui: &mut UiState, tree: bool) {
     }
 }
 
-/// The letters Keet binds as capitals (Shift+K, W, L, F, R, S, G, T).
-const SHIFT_BOUND: &[char] = &['k', 'w', 'l', 'f', 'r', 's', 'g', 't'];
+/// The letters Keet binds as capitals (Shift+K, W, L, F, R, S, G, T, V).
+const SHIFT_BOUND: &[char] = &['k', 'w', 'l', 'f', 'r', 's', 'g', 't', 'v'];
 
 /// A command letter with Shift as its capital: terminals report Shift+L as
 /// `L` or as `l` with Shift (matched form by form, Shift+L, Shift+F and the
@@ -1944,8 +2007,9 @@ const WHEEL_ROWS: usize = 3;
 /// A mouse event: a click or drag on a progress bar seeks; a click on a
 /// list row moves the cursor there and a double click plays it (in the tree,
 /// a double click on an album or artist folds or unfolds it); the wheel
-/// scrolls the list or the lyrics; with a dialog open, a click outside it
-/// closes it as Esc would.
+/// scrolls the list or the lyrics; a click on the visualization switches it
+/// (right click: back); with a dialog open, a click outside it closes it as
+/// Esc would.
 fn mouse(state: &PlayerState, ui: &mut UiState, playlist: &[PathBuf], m: event::MouseEvent) {
     use event::{MouseButton, MouseEventKind as K};
     // The too-small screen shows nothing to click (it keeps the last real
@@ -2017,6 +2081,15 @@ fn mouse(state: &PlayerState, ui: &mut UiState, playlist: &[PathBuf], m: event::
     if let (K::Down(MouseButton::Left), Some((_, Hit::Key(code, mods)))) = (m.kind, hit) {
         ui.pressed.push_back(KeyEvent::new(code, mods));
         return;
+    }
+    // A click on the visualization's space is `v`, a right click Shift+V
+    // (a docked panel in it is its own hit).
+    if let (K::Down(button @ (MouseButton::Left | MouseButton::Right)), Some((_, Hit::Viz))) = (m.kind, hit) {
+        if !overlay_open(ui) && panel_under.is_none() {
+            let back = button == MouseButton::Right;
+            ui.pressed.push_back(KeyEvent::new(KeyCode::Char(if back { 'V' } else { 'v' }), if back { KeyModifiers::SHIFT } else { KeyModifiers::NONE }));
+            return;
+        }
     }
     match m.kind {
         K::Down(MouseButton::Left) | K::Drag(MouseButton::Left) => {
@@ -2099,7 +2172,7 @@ fn mouse(state: &PlayerState, ui: &mut UiState, playlist: &[PathBuf], m: event::
                 Some((_, Hit::Tree { .. })) => Some(Wheel::Tree),
                 _ => {
                     let docked = panel_under;
-                    let floating = matches!(ui.view_mode, ViewMode::Playlist | ViewMode::Lyrics)
+                    let floating = ui.view_mode.is_panel()
                         && ui.hits[first..].iter().any(|(r, h)| *h == Hit::Dialog && at(r));
                     match docked.or(floating.then_some(ui.view_mode)) {
                         Some(ViewMode::Lyrics) => Some(Wheel::Lyrics),
@@ -2130,11 +2203,11 @@ fn mouse(state: &PlayerState, ui: &mut UiState, playlist: &[PathBuf], m: event::
 /// float it again. HiFi docks below its key bar only with the rows for it.
 fn toggle_dock(state: &PlayerState, ui: &mut UiState) {
     let v = ui.view_mode;
-    if !matches!(v, ViewMode::Playlist | ViewMode::Lyrics) {
-        ui.set_status("k docks the playlist (l) or the lyrics (y) while it is open".to_string());
+    if !v.is_panel() {
+        ui.set_status("k docks the playlist (l), the lyrics (y) or the tab (g) while it is open".to_string());
         return;
     }
-    let name = if v == ViewMode::Playlist { "playlist" } else { "lyrics" };
+    let name = panel_name(v);
     if let Some(i) = ui.docked.iter().position(|&d| d == v) {
         ui.docked.remove(i);
         decline_auto_dock(ui, v);
@@ -2162,16 +2235,24 @@ fn toggle_dock(state: &PlayerState, ui: &mut UiState) {
 fn close_docked(ui: &mut UiState) {
     let v = ui.view_mode;
     let Some(i) = ui.docked.iter().position(|&d| d == v) else {
-        ui.set_status("Shift+K closes a docked playlist or lyrics while it has the keys".to_string());
+        ui.set_status("Shift+K closes a docked playlist, lyrics or tab while it has the keys".to_string());
         return;
     };
     ui.docked.remove(i);
     decline_auto_dock(ui, v);
     ui.view_mode = ViewMode::Player;
-    let name = if v == ViewMode::Playlist { "playlist" } else { "lyrics" };
-    ui.set_status(format!("{name} closed"));
+    ui.set_status(format!("{} closed", panel_name(v)));
     // The layout changes: images move.
     ui.terminal_resized = true;
+}
+
+/// A panel's name in status messages.
+fn panel_name(v: ViewMode) -> &'static str {
+    match v {
+        ViewMode::Playlist => "playlist",
+        ViewMode::Tab => "tab",
+        _ => "lyrics",
+    }
 }
 
 /// The library left the dock by the user's hand (`k`, `Shift+K`): HiFi does
@@ -2215,7 +2296,11 @@ pub(crate) fn panel_footer_keys(ui: &UiState, view: ViewMode, upper: bool) -> Ve
 
 /// The key that opens (and focuses) a panel.
 fn panel_key(view: ViewMode) -> &'static str {
-    if view == ViewMode::Playlist { "l" } else { "y" }
+    match view {
+        ViewMode::Playlist => "l",
+        ViewMode::Tab => "g",
+        _ => "y",
+    }
 }
 
 /// Give `view` the keys — by its key, a tab, a click in a docked panel. A
@@ -2268,13 +2353,14 @@ fn toggle_key(view: ViewMode) -> Option<char> {
         ViewMode::Eq => Some('e'),
         ViewMode::Playlist => Some('l'),
         ViewMode::Lyrics => Some('y'),
+        ViewMode::Tab => Some('g'),
         _ => None,
     }
 }
 
 /// The view the key list and the EQ editor float over (the key list can be
 /// over the EQ editor).
-fn base_view(ui: &UiState) -> ViewMode {
+pub(crate) fn base_view(ui: &UiState) -> ViewMode {
     let v = under_help(ui);
     if v == ViewMode::Eq { ui.eq_return } else { v }
 }
@@ -2293,7 +2379,7 @@ fn close_dialog(ui: &mut UiState) {
         ui.set_status("Settings not saved".to_string());
     } else if quit_armed(ui) {
         ui.esc_quit_until = None;
-    } else if matches!(ui.view_mode, ViewMode::Playlist | ViewMode::Lyrics) {
+    } else if ui.view_mode.is_panel() {
         // Its field goes with it: left open, every key went on typing into
         // a search nobody could see.
         cancel_field(ui);
@@ -3850,6 +3936,49 @@ mod ui_tests {
     }
 
     #[test]
+    fn shift_v_and_a_right_click_switch_the_visualization_back() {
+        use event::{MouseButton, MouseEventKind as K};
+        let state = PlayerState::new();
+        let mut ui = test_ui(2);
+        let mut playlist = vec![p("/A/a.mp3"), p("/A/b.mp3")];
+        let start = state.viz_mode();
+        press(&state, &mut ui, &mut playlist, &[KeyCode::Char('v')]);
+        assert_eq!(state.viz_mode(), start.next());
+        press(&state, &mut ui, &mut playlist, &[KeyCode::Char('V')]);
+        assert_eq!(state.viz_mode(), start);
+        // The mouse, on the visualization's space only.
+        ui.hits.push((Rect::new(0, 10, 40, 10), Hit::Viz));
+        mouse(&state, &mut ui, &playlist, click(K::Down(MouseButton::Left), 5, 2));
+        press(&state, &mut ui, &mut playlist, &[]);
+        assert_eq!(state.viz_mode(), start, "a click outside it");
+        mouse(&state, &mut ui, &playlist, click(K::Down(MouseButton::Left), 5, 12));
+        press(&state, &mut ui, &mut playlist, &[]);
+        assert_eq!(state.viz_mode(), start.next());
+        mouse(&state, &mut ui, &playlist, click(K::Down(MouseButton::Right), 5, 12));
+        press(&state, &mut ui, &mut playlist, &[]);
+        assert_eq!(state.viz_mode(), start);
+        // With the visualization off its space is still there to click, in
+        // both themes that have one: right click from the first mode goes
+        // off, and a click comes back.
+        for theme in [crate::theme::ThemeKind::Classic, crate::theme::ThemeKind::Minimal] {
+            state.set_theme(theme);
+            state.viz_mode.store(VizMode::None.next() as u8, Ordering::Relaxed);
+            for (button, want) in [(MouseButton::Right, VizMode::None), (MouseButton::Left, VizMode::None.next())] {
+                frame(&state, &mut ui, &playlist, 100, 40);
+                let (r, _) = *ui.hits.iter().find(|(_, h)| *h == Hit::Viz).expect("the space is a target");
+                mouse(&state, &mut ui, &playlist, click(K::Down(button), r.x + r.width / 2, r.y + r.height / 2));
+                press(&state, &mut ui, &mut playlist, &[]);
+                assert_eq!(state.viz_mode(), want, "{theme:?} {button:?}");
+            }
+        }
+        // prev undoes next for every mode.
+        for m in 0..=10 {
+            let m = VizMode::from_u8(m);
+            assert_eq!(m.next().prev(), m);
+        }
+    }
+
+    #[test]
     fn a_removal_to_confirm_is_answered_by_the_next_key_whatever_it_is() {
         let state = PlayerState::new();
         let mut ui = test_ui(2);
@@ -4373,6 +4502,8 @@ mod ui_tests {
         let cache = crate::metadata::MetadataCache::new(playlist.len());
         let mut ui = UiState::new(playlist.clone(), cache);
         ui.set_lyrics(Some(crate::lyrics::parse_lyrics("[00:01.00]one\n[00:02.00]two\n[00:03.00]three")));
+        ui.tab = Some(std::sync::Arc::new(crate::tab_panel::tests::score(8)));
+        ui.tab_path = Some(PathBuf::from("/m/a track.gp"));
         let eq = crate::eq::builtin_presets().remove(0);
         let mut stats = StatsMonitor::new();
         let analyser = VizAnalyser::new(48_000);
@@ -4411,7 +4542,7 @@ mod ui_tests {
                     }
                 }
                 state.viz_fullscreen.store(false, Ordering::Relaxed);
-                for view in [ViewMode::Playlist, ViewMode::Lyrics, ViewMode::Eq, ViewMode::Help] {
+                for view in [ViewMode::Playlist, ViewMode::Lyrics, ViewMode::Tab, ViewMode::Eq, ViewMode::Help] {
                     ui.view_mode = view;
                     draw(&mut ui, w, h, &format!("{kind:?} {view:?}"));
                 }
@@ -4427,10 +4558,18 @@ mod ui_tests {
                 ui.input_mode = InputMode::Search(TextInput::with("track"));
                 draw(&mut ui, w, h, &format!("{kind:?} search"));
                 ui.input_mode = InputMode::Normal;
-                ui.docked = vec![ViewMode::Playlist, ViewMode::Lyrics];
-                for view in [ViewMode::Player, ViewMode::Playlist, ViewMode::Lyrics] {
-                    ui.view_mode = view;
-                    draw(&mut ui, w, h, &format!("{kind:?} docked, {view:?} has the keys"));
+                let dockings = [
+                    vec![ViewMode::Playlist, ViewMode::Lyrics],
+                    vec![ViewMode::Playlist, ViewMode::Lyrics, ViewMode::Tab],
+                    vec![ViewMode::Tab],
+                ];
+                for docked in dockings {
+                    ui.docked = docked;
+                    for view in [ViewMode::Player, ViewMode::Playlist, ViewMode::Lyrics, ViewMode::Tab] {
+                        ui.view_mode = view;
+                        let what = format!("{kind:?} docked {:?}, {view:?} has the keys", ui.docked);
+                        draw(&mut ui, w, h, &what);
+                    }
                 }
                 ui.docked.clear();
                 ui.view_mode = ViewMode::Playlist;
@@ -4723,24 +4862,61 @@ mod ui_tests {
     }
 
     #[test]
+    fn a_message_in_minimal_moves_nothing_below_the_tray() {
+        let (state, mut ui, playlist) = hifi(1);
+        state.set_theme(crate::theme::ThemeKind::Minimal);
+        state.viz_mode.store(VizMode::VuMeter as u8, Ordering::Relaxed);
+        let spots = |rows: &[String]| {
+            let at = |want: &str| rows.iter().position(|r| r.trim_start().starts_with(want));
+            (at("VU"), at("DORROUGH"), at("L "), at("corr"))
+        };
+        for h in [24u16, 30, 40] {
+            let before = spots(&tui::testing::rows(&frame(&state, &mut ui, &playlist, 100, h)));
+            assert!(before.1.is_some() && before.2.is_some(), "{h}: {before:?}");
+            ui.set_status("K-14: RMS and peak, 0 at -14 dBFS".to_string());
+            let rows = tui::testing::rows(&frame(&state, &mut ui, &playlist, 100, h));
+            assert!(rows.iter().any(|r| r.contains("K-14: RMS")), "{h}: {rows:?}");
+            assert_eq!(spots(&rows), before, "{h}");
+            ui.status_message = None;
+        }
+    }
+
+    #[test]
+    fn u_switches_the_vu_meter_only_where_it_shows() {
+        use crate::state::VuKind;
+        let (state, mut ui, mut playlist) = hifi(1);
+        press(&state, &mut ui, &mut playlist, &[KeyCode::Char('u')]);
+        assert_eq!(state.vu_kind(), VuKind::Dorrough, "HiFi's meter is its own");
+        state.set_theme(crate::theme::ThemeKind::Classic);
+        state.viz_mode.store(VizMode::Polar as u8, Ordering::Relaxed);
+        press(&state, &mut ui, &mut playlist, &[KeyCode::Char('u')]);
+        assert_eq!(state.vu_kind(), VuKind::Dorrough, "not on screen");
+        state.viz_mode.store(VizMode::VuMeter as u8, Ordering::Relaxed);
+        for want in [VuKind::Vu, VuKind::K14, VuKind::Dorrough] {
+            press(&state, &mut ui, &mut playlist, &[KeyCode::Char('u')]);
+            assert_eq!(state.vu_kind(), want);
+        }
+    }
+
+    #[test]
     fn hifi_is_a_stack_as_wide_as_the_window_with_a_fixed_meter() {
         let (state, mut ui, playlist) = hifi(1);
         // `b`: the LED dot matrix (the default) and the bars.
-        for (style, cell) in [(crate::state::VizStyle::Dots, '⣿'), (crate::state::VizStyle::Bars, '▊')] {
+        for (style, cell, end) in [(crate::state::VizStyle::Dots, '⣿', '⡇'), (crate::state::VizStyle::Bars, '█', '▊')] {
             state.viz_style.store(style as u8, Ordering::Relaxed);
             let rows = tui::testing::rows(&frame(&state, &mut ui, &playlist, 150, 40));
             assert!(rows[0].starts_with('╔') && rows[0].ends_with('╗'), "{}", rows[0]);
             // The meter unit under the transport: L, the dB scale between
-            // the channels, R; 40 cells each (in the meter's section, up to
+            // the channels, R; 42 cells each (in the meter's section, up to
             // the divider after it), ghosts at silence.
             let m = rows.iter().position(|r| r.starts_with("┌─ PEAK METER")).expect("the meter unit");
             assert!(rows[m].ends_with('┐'), "{}", rows[m]);
-            let segments = |r: &str| r.split('│').nth(1).unwrap_or("").chars().filter(|&c| c == cell).count();
+            let segments = |r: &str| r.split('│').nth(1).unwrap_or("").chars().filter(|&c| c == cell || c == end).count();
             assert!(rows[m + 2].starts_with("│  L "), "{}", rows[m + 2]);
-            assert!(rows[m + 3].contains("0dB"), "{}", rows[m + 3]);
+            assert!(rows[m + 3].contains("+4"), "{}", rows[m + 3]);
             assert!(rows[m + 4].starts_with("│  R "), "{}", rows[m + 4]);
-            assert_eq!(segments(&rows[m + 2]), crate::ui_hifi::METER_SEGMENTS, "{style:?} {}", rows[m + 2]);
-            assert_eq!(segments(&rows[m + 4]), crate::ui_hifi::METER_SEGMENTS, "{style:?} {}", rows[m + 4]);
+            assert_eq!(segments(&rows[m + 2]), crate::ui_hifi::METER_CELLS, "{style:?} {}", rows[m + 2]);
+            assert_eq!(segments(&rows[m + 4]), crate::ui_hifi::METER_CELLS, "{style:?} {}", rows[m + 4]);
             if style == crate::state::VizStyle::Bars {
                 // The EQ's bands are dots on rails.
                 assert!(rows.iter().any(|r| r.matches('●').count() == 10), "ten knobs on 0 dB");
@@ -4906,7 +5082,7 @@ mod ui_tests {
         ui.panel_recent = vec![ViewMode::Lyrics, ViewMode::Playlist];
         let placed = |ui: &UiState| {
             let mut v: Vec<(ViewMode, Rect)> = ui.hits.iter().filter_map(|(r, h)| match h {
-                Hit::Panel(v @ (ViewMode::Playlist | ViewMode::Lyrics)) => Some((*v, *r)),
+                Hit::Panel(v) if v.is_panel() => Some((*v, *r)),
                 _ => None,
             }).collect();
             // The box is a panel's first (its footer's focus hint is one too).
@@ -5221,6 +5397,111 @@ mod ui_tests {
         let (docked, problems) = docked_from_config(&names);
         assert_eq!(docked, vec![ViewMode::Playlist, ViewMode::Lyrics]);
         assert_eq!(problems, vec!["docked (\"eq\" is not a panel)".to_string()]);
+    }
+
+    #[test]
+    fn docked_tab_reads_back_from_config() {
+        let (docked, problems) = docked_from_config(&["tab".into()]);
+        assert_eq!((docked, problems), (vec![ViewMode::Tab], Vec::<String>::new()));
+    }
+
+    #[test]
+    fn three_docked_panels_share_by_priority() {
+        // Docked from config, never used yet: still placed.
+        let mut ui = test_ui(1);
+        ui.docked = vec![ViewMode::Playlist, ViewMode::Lyrics, ViewMode::Tab];
+        let row = |w: u16| Rect::new(0, 10, w, 20);
+        let kinds = |d: &Dock| {
+            let mut v: Vec<ViewMode> = d.panels.iter().map(|(p, _)| *p).collect();
+            if d.viz.is_some() {
+                v.insert(0, ViewMode::Player);
+            }
+            v
+        };
+        assert_eq!(kinds(&dock(&ui, false, row(300))).len(), 3, "every docked panel is placed");
+        // Classic, 160 wide, the tab used last: the tab, then the
+        // visualization, then what fits (the lyrics; the playlist does not).
+        ui.panel_recent = vec![ViewMode::Tab, ViewMode::Lyrics, ViewMode::Playlist];
+        assert_eq!(kinds(&dock(&ui, true, row(160))), [ViewMode::Player, ViewMode::Lyrics, ViewMode::Tab]);
+        assert_eq!(kinds(&dock(&ui, true, row(60))), [ViewMode::Tab]);
+        // Room for all four, the row filled.
+        let wide = dock(&ui, true, row(240));
+        assert_eq!(kinds(&wide).len(), 4);
+        assert_eq!(wide.panels.last().unwrap().1.right(), 240);
+    }
+
+    #[test]
+    fn a_docked_tab_goes_under_the_visualization_when_the_slot_has_the_rows() {
+        let mut ui = test_ui(1);
+        ui.docked = vec![ViewMode::Tab];
+        ui.panel_recent = vec![ViewMode::Tab, ViewMode::Lyrics];
+        let tab = crate::tab_panel::box_rows(&ui);
+        let tall = Rect::new(2, 10, 116, tab + DOCK_MIN_ROWS);
+        let d = dock(&ui, true, tall);
+        assert_eq!(d.viz, Some(Rect { height: DOCK_MIN_ROWS, ..tall }), "the visualization keeps the row's width, above");
+        assert_eq!(d.panels, vec![(ViewMode::Tab, Rect { y: tall.y + DOCK_MIN_ROWS, height: tab, ..tall })]);
+        // The lyrics docked too: they share the top with the visualization.
+        ui.docked.push(ViewMode::Lyrics);
+        let d = dock(&ui, true, tall);
+        assert_eq!(d.panels.iter().map(|&(v, r)| (v, r.y)).collect::<Vec<_>>(), [(ViewMode::Lyrics, tall.y), (ViewMode::Tab, tall.y + DOCK_MIN_ROWS)]);
+        // A row short: side by side, as before.
+        ui.docked = vec![ViewMode::Tab];
+        let short = Rect { height: tab + DOCK_MIN_ROWS - 1, ..tall };
+        let d = dock(&ui, true, short);
+        assert_eq!(d.panels[0].1.y, short.y);
+        assert!(d.viz.is_some_and(|v| v.height == short.height && v.right() < d.panels[0].1.x));
+        // Nothing to put above it (no visualization): the whole slot, as before.
+        assert_eq!(dock(&ui, false, tall).panels, vec![(ViewMode::Tab, tall)]);
+    }
+
+    #[test]
+    fn hifi_shows_the_tab_or_the_lyrics_not_both() {
+        let (state, mut ui, mut playlist) = hifi(40);
+        ui.set_lyrics(Some(crate::lyrics::parse_lyrics("[00:01.00]one\n[00:02.00]two")));
+        ui.tab = Some(std::sync::Arc::new(crate::tab_panel::tests::score(4)));
+        ui.tab_sync.marks = vec![(0, 1.0)];
+        ui.docked = vec![ViewMode::Playlist, ViewMode::Lyrics, ViewMode::Tab];
+        ui.panel_recent = vec![ViewMode::Tab, ViewMode::Lyrics, ViewMode::Playlist];
+        frame(&state, &mut ui, &playlist, 160, 60);
+        assert!(ui.docked_shown.contains(&ViewMode::Tab) && !ui.docked_shown.contains(&ViewMode::Lyrics), "{:?}", ui.docked_shown);
+        assert!(ui.docked_shown.contains(&ViewMode::Playlist));
+        // The lyrics used last: they show, the tab is hidden, still docked.
+        ui.panel_recent = vec![ViewMode::Lyrics, ViewMode::Tab, ViewMode::Playlist];
+        frame(&state, &mut ui, &playlist, 160, 60);
+        assert!(ui.docked_shown.contains(&ViewMode::Lyrics) && !ui.docked_shown.contains(&ViewMode::Tab), "{:?}", ui.docked_shown);
+        assert!(ui.docked.contains(&ViewMode::Tab));
+        // Hidden, it runs nothing: no tab looked for on a track change, no
+        // viz frame rate for its playhead.
+        ui.tab_audio = None;
+        assert_eq!(crate::tab_panel::wanted(&ui, &playlist), None);
+        assert!(!crate::tab_panel::moving(&ui));
+        // Its key makes it the panel used last: from the next frame it shows
+        // docked, in the lyrics' place, and looks for the track's tab again.
+        press(&state, &mut ui, &mut playlist, &[KeyCode::Char('g')]);
+        frame(&state, &mut ui, &playlist, 160, 60);
+        assert!(ui.docked_shown.contains(&ViewMode::Tab) && !ui.docked_shown.contains(&ViewMode::Lyrics), "{:?}", ui.docked_shown);
+        assert!(!overlay_open(&ui), "docked, not floating");
+        assert!(crate::tab_panel::wanted(&ui, &playlist).is_some());
+    }
+
+    #[test]
+    fn hifi_docks_the_tab_with_the_rows_of_its_box() {
+        let ui = test_ui(1);
+        assert_eq!(crate::ui_hifi::panel_rows(ViewMode::Tab), crate::tab_panel::box_rows(&ui), "six strings, as the box");
+    }
+
+    #[test]
+    fn k_docks_the_tab_panel_and_shift_k_closes_it() {
+        let (state, mut ui, mut playlist) = with_tab();
+        press(&state, &mut ui, &mut playlist, &[KeyCode::Char('g'), KeyCode::Char('k')]);
+        assert_eq!(ui.docked, vec![ViewMode::Tab]);
+        let text = tui::testing::rows(&frame(&state, &mut ui, &playlist, 120, 40)).join("\n");
+        assert!(ui.docked_shown.contains(&ViewMode::Tab), "{text}");
+        assert!(!overlay_open(&ui));
+        assert!(text.contains("k float"), "{text}");
+        press(&state, &mut ui, &mut playlist, &[KeyCode::Char('K')]);
+        assert!(ui.docked.is_empty());
+        assert_eq!(ui.view_mode, ViewMode::Player);
     }
 
     #[test]
@@ -7073,7 +7354,9 @@ mod ui_tests {
             ui.set_status("output moved to a device with a very long name, exclusive mode off".to_string());
             let rows = tui::testing::rows(&frame(&state, &mut ui, &playlist, 50, 30));
             let row = rows.iter().find(|r| r.contains("output moved")).unwrap_or_else(|| panic!("{kind:?}: {rows:#?}"));
-            assert!(row.trim_end().ends_with('…') && tui::width(row) <= 50, "{kind:?}: {row:?}");
+            // (Minimal's sits inside its tray's border.)
+            let text = row.trim_end().trim_end_matches('│').trim_end();
+            assert!(text.ends_with('…') && tui::width(row) <= 50, "{kind:?}: {row:?}");
         }
     }
 
@@ -7679,4 +7962,148 @@ mod ui_tests {
         assert_eq!(dock(&ui, true, row(200)).viz, Some(row(200)));
     }
 
+
+    /// A UI with the tab of `tab_panel::tests::score` loaded for `/m/0.flac`.
+    fn with_tab() -> (PlayerState, UiState, Vec<PathBuf>) {
+        let state = PlayerState::new();
+        state.output_rate.store(48_000, Ordering::Relaxed);
+        let playlist = vec![p("/m/0.flac")];
+        let mut ui = UiState::new(playlist.clone(), crate::metadata::MetadataCache::new(1));
+        ui.tab_audio = Some(playlist[0].clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        ui.tab_receiver = Some(rx);
+        tx.send((0, Ok((p("/m/0.gp"), crate::tab_panel::tests::score(4))))).unwrap();
+        assert!(crate::tab_panel::take_answer(&mut ui));
+        (state, ui, playlist)
+    }
+
+    #[test]
+    fn g_opens_the_tab_panel_and_g_hands_the_keys_back() {
+        let (state, mut ui, mut playlist) = with_tab();
+        press(&state, &mut ui, &mut playlist, &[KeyCode::Char('g')]);
+        assert_eq!(ui.view_mode, ViewMode::Tab);
+        assert!(overlay_open(&ui), "floating");
+        frame(&state, &mut ui, &playlist, 120, 40);
+        press(&state, &mut ui, &mut playlist, &[KeyCode::Char('g')]);
+        assert_eq!(ui.view_mode, ViewMode::Player);
+        press(&state, &mut ui, &mut playlist, &[KeyCode::Char('g'), KeyCode::Esc]);
+        assert_eq!(ui.view_mode, ViewMode::Player);
+        // In a focused playlist `g` is still its top.
+        ui.cursor = 0;
+        press(&state, &mut ui, &mut playlist, &[KeyCode::Char('l'), KeyCode::Char('g')]);
+        assert_eq!(ui.view_mode, ViewMode::Playlist);
+    }
+
+    #[test]
+    fn enter_marks_bar_one_and_it_is_kept_for_the_track() {
+        let (state, mut ui, mut playlist) = with_tab();
+        state.samples_played.store(48_000 * 2, Ordering::Relaxed);
+        let t = state.time_secs();
+        press(&state, &mut ui, &mut playlist, &[KeyCode::Char('g'), KeyCode::Enter]);
+        assert_eq!(ui.tab_sync.marks, vec![(0, t)]);
+        assert_eq!(ui.tab_syncs.get(&playlist[0], "0.gp").marks, vec![(0, t)]);
+        assert!(ui.tab_map.as_ref().unwrap().secs(0.0).is_some(), "the map follows the mark");
+    }
+
+    #[test]
+    fn up_down_change_the_part_and_left_right_still_seek() {
+        let (state, mut ui, mut playlist) = with_tab();
+        press(&state, &mut ui, &mut playlist, &[KeyCode::Char('g'), KeyCode::Down]);
+        assert_eq!(ui.tab_sync.part, 2, "the part with no notes is skipped");
+        assert_eq!(ui.tab_syncs.get(&playlist[0], "0.gp").part, 2);
+        press(&state, &mut ui, &mut playlist, &[KeyCode::Down]);
+        assert_eq!(ui.tab_sync.part, 0, "round");
+        press(&state, &mut ui, &mut playlist, &[KeyCode::Up]);
+        assert_eq!(ui.tab_sync.part, 2);
+        state.take_seek();
+        press(&state, &mut ui, &mut playlist, &[KeyCode::Right]);
+        assert_eq!(ui.view_mode, ViewMode::Tab, "the tab keeps the keys");
+        assert_eq!(ui.tab_sync.part, 2, "not a part change");
+        assert!(state.take_seek() > 0.0, "a seek");
+    }
+
+    #[test]
+    fn a_d_nudge_and_zero_clears() {
+        let (state, mut ui, mut playlist) = with_tab();
+        press(&state, &mut ui, &mut playlist, &[KeyCode::Char('g'), KeyCode::Char('d')]);
+        assert!((ui.tab_sync.nudge - 0.05).abs() < 1e-9);
+        press(&state, &mut ui, &mut playlist, &[KeyCode::Char('a'), KeyCode::Char('a')]);
+        assert!((ui.tab_sync.nudge + 0.05).abs() < 1e-9);
+        assert!((ui.tab_syncs.get(&playlist[0], "0.gp").nudge + 0.05).abs() < 1e-9, "kept");
+        press(&state, &mut ui, &mut playlist, &[KeyCode::Enter, KeyCode::Char('0')]);
+        assert!(ui.tab_sync.marks.is_empty());
+        assert_eq!(ui.tab_sync.nudge, 0.0);
+        assert_eq!(ui.tab_syncs.get(&playlist[0], "0.gp"), ui.tab_sync);
+        press(&state, &mut ui, &mut playlist, &[KeyCode::Char('n')]);
+        assert!(ui.tab_names);
+    }
+
+    #[test]
+    fn the_tab_keys_never_take_ctrl_or_alt() {
+        let (state, mut ui, mut playlist) = with_tab();
+        press(&state, &mut ui, &mut playlist, &[KeyCode::Char('g')]);
+        for (c, m) in [('d', KeyModifiers::CONTROL), ('a', KeyModifiers::ALT), ('0', KeyModifiers::CONTROL), ('n', KeyModifiers::ALT)] {
+            ui.pressed.push_back(KeyEvent::new(KeyCode::Char(c), m));
+        }
+        ui.pressed.push_back(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        poll_input(&state, &mut ui, &mut playlist);
+        assert_eq!((ui.tab_sync.nudge, ui.tab_sync.marks.len(), ui.tab_names), (0.0, 0, false));
+    }
+
+    #[test]
+    fn no_tab_file_says_where_it_looks() {
+        let state = PlayerState::new();
+        let playlist = vec![p("/m/0.flac")];
+        let mut ui = UiState::new(playlist.clone(), crate::metadata::MetadataCache::new(1));
+        ui.view_mode = ViewMode::Tab;
+        let buf = frame(&state, &mut ui, &playlist, 120, 40);
+        let text = tui::testing::rows(&buf).join("\n");
+        assert!(text.contains("beside the track"), "{text}");
+        // An unreadable one says why.
+        ui.tab_error = Some("not a Guitar Pro 7/8 file".into());
+        let text = tui::testing::rows(&frame(&state, &mut ui, &playlist, 120, 40)).join("\n");
+        assert!(text.contains("not a Guitar Pro 7/8 file"), "{text}");
+    }
+
+    #[test]
+    fn a_tab_not_found_is_looked_for_again_when_the_panel_reopens() {
+        let dir = std::env::temp_dir().join(format!("keet-tab-reopen-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = PlayerState::new();
+        let mut playlist = vec![dir.join("song.flac")];
+        let mut ui = UiState::new(playlist.clone(), crate::metadata::MetadataCache::new(1));
+        press(&state, &mut ui, &mut playlist, &[KeyCode::Char('g')]);
+        crate::tab_panel::step(&mut ui, &playlist);
+        let first = ui.tab_gen;
+        // The worker finds nothing.
+        let t0 = std::time::Instant::now();
+        while ui.tab_receiver.is_some() && t0.elapsed() < std::time::Duration::from_secs(5) {
+            crate::tab_panel::step(&mut ui, &playlist);
+        }
+        assert!(ui.tab.is_none() && ui.tab_error.is_none());
+        crate::tab_panel::step(&mut ui, &playlist);
+        assert_eq!(ui.tab_gen, first, "open: not looked for again and again");
+        press(&state, &mut ui, &mut playlist, &[KeyCode::Char('g')]);
+        crate::tab_panel::step(&mut ui, &playlist);
+        std::fs::write(dir.join("song.gp"), b"not a zip").unwrap();
+        press(&state, &mut ui, &mut playlist, &[KeyCode::Char('g')]);
+        crate::tab_panel::step(&mut ui, &playlist);
+        assert_eq!(ui.tab_gen, first + 1, "reopened: looked for again");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_tab_panel_waits_for_bar_one() {
+        let (state, mut ui, mut playlist) = with_tab();
+        press(&state, &mut ui, &mut playlist, &[KeyCode::Char('g')]);
+        let text = tui::testing::rows(&frame(&state, &mut ui, &playlist, 120, 40)).join("\n");
+        assert!(text.contains("when bar 1 starts"), "{text}");
+        let footer = text.lines().find(|l| l.contains("when bar 1 starts")).unwrap();
+        assert!(footer.find("g close").is_some_and(|i| i < footer.find("when bar 1 starts").unwrap()), "the way out first: {footer}");
+        assert!(text.contains("Lead Guitar"), "{text}");
+        assert!(text.contains("Tab · 0.gp"), "{text}");
+        press(&state, &mut ui, &mut playlist, &[KeyCode::Enter]);
+        let text = tui::testing::rows(&frame(&state, &mut ui, &playlist, 120, 40)).join("\n");
+        assert!(!text.contains("when bar 1 starts") && text.contains("bar starts now"), "{text}");
+    }
 }

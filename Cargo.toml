@@ -74,8 +74,15 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 # and drifted the frame. Already built as a ratatui dependency.
 unicode-segmentation = "1.13"
 
+# Raw deflate for the zip inside Guitar Pro 7/8 files (`gp::zip_entry`). Already
+# built for ureq's gzip; default features off keeps the pure-Rust backend.
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+
 # Pure-Rust Sixel encoder for terminals that don't speak Kitty/iTerm2 (Windows Terminal, foot, mlterm).
 icy_sixel = "0.7"
+
+# Read-only XML for the score inside Guitar Pro 7/8 files (`gp::parse_gpif`); no dependencies of its own.
+roxmltree = "0.21"
 
 # macOS CoreAudio bindings for sample rate switching
 [target.'cfg(target_os = "macos")'.dependencies]

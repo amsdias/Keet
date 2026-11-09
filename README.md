@@ -16,7 +16,7 @@ A high-performance, low-CPU terminal audio player with real-time spectrum visual
 - **ReplayGain**: Loudness normalization with peak-based clipping prevention (`--rg-mode track|album|off`)
 - **Crossfade**: Smooth equal-power crossfade between tracks (`--crossfade`)
 - **Pre/post-fader metering**: Toggle between raw signal and volume-adjusted visualization
-- **Media controls**: AirPods stalk controls, Bluetooth headphone buttons, keyboard media keys, OS seek bar / skip-by seeking (macOS/Windows/Linux)
+- **Media controls**: AirPods stalk controls, Bluetooth headphone buttons, keyboard media keys, OS seek bar / skip-by seeking, and the album art in the OS's now-playing widget (macOS/Windows/Linux)
 - **Real-time visualizations**: VU meter, horizontal/vertical spectrum, oscilloscope, lissajous (vector scope), polar spectrum (each channel's bands round a circle), spectrogram, a high-resolution pixel-image analysis spectrogram (Kitty graphics / Sixel), a galaxy that moves with the music, and cymatics (Chladni sand patterns of the dominant frequency) — toggleable bars/dots styles
 - **Album cover art**: Auto-decoded from embedded tags or sidecar files; rendered via Kitty / iTerm2 / Sixel graphics protocols, with truecolor half-block fallback (used automatically for WezTerm on Windows, where ConPTY drops Kitty graphics)
 - **Metadata display**: Reads artist/title/album/track number from ID3, Vorbis, and MP4 tags
@@ -45,6 +45,8 @@ A high-performance, low-CPU terminal audio player with real-time spectrum visual
 ```powershell
 winget install amsdias.Keet
 ```
+
+Or the `.msi` from the [releases page](https://github.com/amsdias/Keet/releases), which winget also uses for new installs. It installs for your user only (no admin prompt), puts `keet` on your PATH and adds Keet to the Start menu, opening in Windows Terminal when that is installed. The Start menu entry is also what lets Windows's media controls show Keet by name rather than "Unknown app". Uninstalling removes all three.
 
 **macOS and Linux** ([Homebrew](https://brew.sh)):
 
@@ -141,13 +143,15 @@ keet ~/Music/favorites.m3u
 | `Left` | Seek backward 10s |
 | `L` | Playlist (opens it, or gives a docked one the keys) |
 | `Y` | Lyrics (opens them, or gives docked ones the keys) |
-| `K` | Dock / float the playlist or lyrics that has the keys |
+| `G` | Guitar tab (opens it, or gives a docked one the keys) |
+| `K` | Dock / float the playlist, lyrics or tab that has the keys |
 | `Shift+K` | Close a docked panel |
 | `T` | Cycle UI theme (Classic → Minimal → Hi-Fi) |
-| `V` | Cycle visualization modes |
+| `V` / `Shift+V` | Next / previous visualization mode (or left / right click on it) |
 | `B` | Toggle visualization style (bars/dots) |
 | `Shift+F` | Toggle full-window visualization (drops the header, gives the viz every spare row) |
 | `Shift+L` | Toggle per-visualization detail: level history on the VU meter, frequency legend on either spectrum |
+| `u` | VU meter's type: Dorrough (RMS bar and peak dot on full scale's dB), VU (average, 0 VU at -8 dBFS), K-14 (RMS and peak, 0 at -14 dBFS) |
 | `E` | EQ editor (in Hi-Fi, the EQ unit in its stack takes the keys) |
 | `X` | Cycle effects presets |
 | `Shift+R` | Cycle repeat mode (Off → All → One) |
@@ -219,6 +223,24 @@ Press `Y` to open the lyrics, a panel floating over the running player (`K` dock
 
 Lyrics are loaded from a `.lrc` file beside the track first (`song.flac` → `song.lrc`; UTF-8, UTF-16 or Windows-1252), then from embedded tags (USLT/ID3v2, Vorbis comments, iTunes atoms), then fetched from [LRCLIB](https://lrclib.net) if not found. LRCLIB's answers are kept in `~/.config/keet/lyrics` (found lyrics for good, "none" for a day), so a track is not looked up again on every launch; set `save_lyrics_lrc` in `config.json` to also save synced ones beside the track, for other players too. A busy LRCLIB (rate limit) is retried once and shown as "lyrics unavailable", never as "no lyrics". LRCLIB matches by artist, title, and duration for accurate results. Synced lyrics (LRC format) are preferred over plain text.
 
+### Guitar Tabs
+
+Press `G` to open the tab panel: the guitar (or bass) part of a Guitar Pro file, drawn as tablature that scrolls with the song. Put the `.gp` file beside the track, named like it (`song.flac` → `song.gp`), or anywhere in the same folder with the song's title in its name (`Arctic_Monkeys_-_Do_I_Wanna_Know.gp`; the artist breaks ties). Only Guitar Pro 7/8 `.gp` files are read — what Songsterr Plus downloads. Keet never downloads tabs.
+
+The tab does not know where the recording's first bar falls: listen, and press `Enter` as bar 1 starts. From then on it follows the song, keeping to the recording's beat. If it drifts, press `Enter` again as a later bar starts (the nearest bar is marked); `Backspace` undoes the last mark. Marks, the nudge and the part are remembered for each track. Bluetooth and other output delay shows as a tab that runs early: `A`/`D` nudge it.
+
+| Key | Action |
+|-----|--------|
+| `Enter` | The bar starts now (the first press marks bar 1) |
+| `Backspace` | Undo the last mark |
+| `A` / `D` | Nudge the tab -/+0.05s |
+| `0` | Drop every mark and the nudge (`Backspace` brings them back) |
+| `Left` / `Right` | Previous/next part (guitar, bass…) |
+| `N` | Fret numbers / note names |
+| `Esc` / `G` | Close the tab (docked: hand the keys back) |
+
+`K` docks it, as for the library and the lyrics. In Hi-Fi the lyrics and the tab share the place beside the library: the one used last shows.
+
 ## Themes
 
 Three UI themes, cycled at runtime with `T`:
@@ -268,8 +290,9 @@ For a *persistent* default that applies on every launch (including with explicit
 | `theme` | `classic` \| `minimal` \| `hifi` |
 | `viz` | `none` \| `vu` \| `spectrum` \| `spectrum-vertical` \| `oscilloscope` \| `lissajous` \| `polar` \| `spectrogram` \| `analysis` \| `galaxy` \| `cymatics` |
 | `viz_fps` | frames per second while a visualization moves, `10`–`60` (default `30`); still screens redraw only when something changes |
-| `mouse` | `true` (default: click or drag the progress bar to seek, click a list row to select it and double-click to play it, the wheel scrolls lists and lyrics, a click outside a dialog closes it; Shift+drag still selects text in most terminals) \| `false`; `m` toggles it |
+| `mouse` | `true` (default: click or drag the progress bar to seek, click a list row to select it and double-click to play it, click the visualization to switch it (right click: back), the wheel scrolls lists and lyrics, a click outside a dialog closes it; Shift+drag still selects text in most terminals) \| `false`; `m` toggles it |
 | `viz_style` | `dots` (braille, default) \| `bars`; in Hi-Fi it picks the LED dot matrix or the segmented bars |
+| `vu_meter` | The VU visualization's meter: `dorrough` (default) \| `vu` \| `k14` |
 | `sixel_cell` | your terminal's cell size in pixels, `[width, height]`, for Sixel images (the analysis spectrogram, the cover). Keet never asks the terminal, so it assumes `[10, 20]` in Windows Terminal (which scales Sixel to its font) and `[8, 16]` elsewhere; set this when an image fills only part of its space. Never set it larger than the real cell: an image taller than its space makes the screen scroll on every frame |
 | `docked` | the panels docked into the player at startup: a list of `playlist` and/or `lyrics` (each shows only where the window has room for it; Hi-Fi docks the library by itself anyway) |
 | `rg_mode` | `track` \| `album` \| `off` |
@@ -550,6 +573,10 @@ src/
 ├── metadata.rs     Tag reading (artist, title, album, track #, lyrics, ReplayGain), background scan
 ├── lyrics.rs       LRC parser, LRCLIB API client, per-track sync offsets
 ├── lyrics_panel.rs  The lyrics panel, floating or docked
+├── gp.rs           Guitar Pro 7/8 reader (zip + GPIF XML), every limit a refusal
+├── tab.rs          The tab's score model, finding the .gp beside a track
+├── tab_sync.rs     Score time to song time (tempo map, bar marks, beat tracking)
+├── tab_panel.rs    The tab panel, floating or docked
 ├── cover.rs        Album cover decoding, Kitty/iTerm2/Sixel/half-block rendering
 ├── resume.rs       Resume state persistence (save/restore sessions)
 ├── welcome.rs      First-launch screen (animated ripples, folder prompt)

@@ -22,7 +22,7 @@ use crate::state::{PlayerState, VizStyle, SPECTRUM_BANDS};
 use std::collections::VecDeque;
 use crate::theme::{Rgb, ThemeKind};
 use crate::tui::LineBuf;
-use crate::viz::{fit_width, fmt_band_hz, viz_palette, Lines, VizPalette, BRAILLE_BITS, ISO_CENTERS};
+use crate::viz::{fit_width, fmt_band_hz, Lines, BRAILLE_BITS, ISO_CENTERS};
 use ratatui::style::Style;
 use ratatui::text::Line;
 
@@ -126,7 +126,7 @@ struct Cell {
 }
 
 fn polar_body(levels: &Levels, kind: ThemeKind, style: VizStyle, width: usize, rows: usize, extras: bool) -> Lines {
-    let vp = viz_palette(kind);
+    let dim = crate::theme::palette(kind).dim;
     // The circle's box is square on screen: `side` rows by twice as many
     // columns. Whichever of height or width runs out first sets it.
     let legend = extras && width >= 2 * (LEGEND_W + 4);
@@ -200,7 +200,7 @@ fn polar_body(levels: &Levels, kind: ThemeKind, style: VizStyle, width: usize, r
         }
     }
     if legend {
-        put_legend(&mut grid, x0, cols, side, &vp);
+        put_legend(&mut grid, x0, cols, side, dim);
     }
 
     let mut lines: Lines = grid.iter().map(|row| join_row(row)).collect();
@@ -238,12 +238,7 @@ const PALETTE: [(f32, Rgb); 6] = [
 /// The palette at `share` of the way out (0 = the hole's edge, 1 = full
 /// scale), blended between its stops.
 fn radial(share: f32) -> Rgb {
-    let s = share.clamp(0.0, 1.0);
-    let i = PALETTE.iter().rposition(|&(at, _)| at <= s).unwrap_or(0).min(PALETTE.len() - 2);
-    let ((a, ca), (b, cb)) = (PALETTE[i], PALETTE[i + 1]);
-    let f = ((s - a) / (b - a)).clamp(0.0, 1.0);
-    let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * f).round() as u8;
-    (mix(ca.0, cb.0), mix(ca.1, cb.1), mix(ca.2, cb.2))
+    crate::theme::ramp(&PALETTE, share)
 }
 
 /// A cell's colour: the palette where its outermost level dot lies; a trail
@@ -262,7 +257,7 @@ fn cell_colour(cell: &Cell, peak: bool) -> Rgb {
 /// The legend, in the blank cells round the circle: `L` and `R` under each
 /// half, and 100 Hz / 1 kHz / 10 kHz beside the circle at their bands' height
 /// on both sides.
-fn put_legend(grid: &mut [Vec<(char, Style)>], x0: usize, cols: usize, side: usize, vp: &VizPalette) {
+fn put_legend(grid: &mut [Vec<(char, Style)>], x0: usize, cols: usize, side: usize, dim: Style) {
     let width = grid.first().map_or(0, Vec::len);
     let write = |grid: &mut [Vec<(char, Style)>], y: usize, x: usize, text: &str| {
         let row = &mut grid[y];
@@ -271,7 +266,7 @@ fn put_legend(grid: &mut [Vec<(char, Style)>], x0: usize, cols: usize, side: usi
             return;
         }
         for (i, ch) in text.chars().enumerate() {
-            row[x + i] = (ch, vp.dim);
+            row[x + i] = (ch, dim);
         }
     };
     let bottom = side - 1;

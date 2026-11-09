@@ -116,6 +116,15 @@ jobs:
           cd dist
           Compress-Archive -Path ${{ matrix.bin }},LICENSE,THIRD_PARTY_LICENSES -DestinationPath ${{ matrix.out }}.zip
 
+      # Beside the zip, not instead of it: winget keeps a portable install on
+      # the zip (it upgrades with the same kind of installer), new ones get the MSI.
+      - name: Build MSI (Windows)
+        if: matrix.os == 'windows-latest'
+        uses: ./.github/actions/windows-msi
+        with:
+          bin: target/${{ matrix.target }}/release/${{ matrix.bin }}
+          out: dist/keet-${{ github.ref_name }}-windows-x86_64.msi
+
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -123,6 +132,7 @@ jobs:
           path: |
             dist/*.tar.gz
             dist/*.zip
+            dist/*.msi
 
   # One job creates the release with every archive. Each matrix job used to
   # create it on its own: four racing creations of the same release.
@@ -145,3 +155,4 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/*.zip
+            dist/*.msi

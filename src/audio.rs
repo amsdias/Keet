@@ -1552,52 +1552,47 @@ impl OutputRenderer {
                 src_idx += source_channels;
             }
 
-            chunk.commit_all();
-
             // Track playback position (frames consumed from ring buffer)
             let consumed_frames = samples_to_read / source_channels;
             self.state.samples_played.fetch_add(consumed_frames as u64, Ordering::Relaxed);
 
-            // Tap played stereo samples into viz buffer (best-effort, drop if full)
-            // Pre-fader mode: undo volume gain so viz shows raw signal levels
+            // What is playing now clips: the producer's own flag looks at audio
+            // that plays seconds from now, at the volume of the moment it passed.
+            if gain > 1.0 && first.iter().chain(second).any(|s| s.abs() * gain > 1.0) {
+                self.state.clipping.store(true, Ordering::Relaxed);
+            }
+
+            // Tap played stereo samples into viz buffer (best-effort, drop if full).
+            // Taken BEFORE the clamp when the volume can clip: the meters show how
+            // far over 0 dB an overboost goes (the analyser clamps for everything
+            // else). Pre-fader mode: the signal as it left the chain.
             let frames_written = out_idx.checked_div(channels).unwrap_or(0);
             let viz_samples = frames_written * 2; // stereo
             let pre_fader = self.state.is_pre_fader();
-            let viz_scale = if pre_fader && gain > 0.0 { 1.0 / gain } else { 1.0 };
             if viz_samples > 0 {
-                if channels == 2 && viz_scale == 1.0 && viz_samples <= data.len() {
-                    // Fast path: post-fader stereo bulk copy
+                if channels == 2 && !pre_fader && gain <= 1.0 && viz_samples <= data.len() {
+                    // Fast path: post-fader stereo bulk copy, nothing clipped
                     let _ = self.viz_producer.push_partial_slice(&data[..viz_samples]);
                 } else if self.viz_producer.slots() >= viz_samples {
                     if let Ok(mut vchunk) = self.viz_producer.write_chunk(viz_samples) {
                         let (vfirst, vsecond) = vchunk.as_mut_slices();
-                        let viz_total = vfirst.len() + vsecond.len();
-
-                        // Scaled path: extract L/R, apply viz_scale
-                        let mut vi = 0;
-                        for f in 0..frames_written {
-                            let di = f * channels;
-                            if di >= data.len() { break; }
-                            let l = data[di] * viz_scale;
-                            let r = if channels >= 2 && di + 1 < data.len() {
-                                data[di + 1] * viz_scale
-                            } else {
-                                l
-                            };
-                            for &val in &[l, r] {
-                                if vi >= viz_total { break; }
-                                if vi < vfirst.len() {
-                                    vfirst[vi] = val;
-                                } else {
-                                    vsecond[vi - vfirst.len()] = val;
+                        let viz_gain = if pre_fader { 1.0 } else { gain };
+                        let mut src = first.iter().chain(second);
+                        let mut dst = vfirst.iter_mut().chain(vsecond);
+                        for _ in 0..frames_written {
+                            let (Some(&l), Some(&r)) = (src.next(), src.next()) else { break };
+                            let (l, r) = if channels == 1 { let m = (l + r) * 0.5; (m, m) } else { (l, r) };
+                            for val in [l, r] {
+                                if let Some(slot) = dst.next() {
+                                    *slot = val * viz_gain;
                                 }
-                                vi += 1;
                             }
                         }
                         vchunk.commit_all();
                     }
                 }
             }
+            chunk.commit_all();
 
             // Fill remainder with silence
             data[out_idx..].fill(0.0);
@@ -1912,6 +1907,40 @@ mod tests {
         assert_eq!(<i32 as OutputSample>::from_f32(1.0), i32::MAX);
         assert_eq!(<cpal::I24 as OutputSample>::from_f32(1.0).inner(), 8_388_607);
         assert_eq!(<i16 as OutputSample>::from_f32(-1.0), i16::MIN);
+    }
+
+    #[test]
+    fn the_meters_get_the_level_before_the_output_clamp() {
+        let run = |volume: u32, pre_fader: bool, chans: usize| {
+            let st = Arc::new(PlayerState::new());
+            st.volume.store(volume, Ordering::Relaxed);
+            st.pre_fader.store(pre_fader, Ordering::Relaxed);
+            let (mut p, c) = rtrb::RingBuffer::<f32>::new(16);
+            let (vp, mut vc) = rtrb::RingBuffer::<f32>::new(16);
+            p.push_entire_slice(&[0.8, -0.4]).unwrap();
+            let mut r = OutputRenderer::new(c, vp, Arc::clone(&st), chans);
+            let mut out = vec![0.0f32; chans];
+            r.render_f32(&mut out);
+            let tap: Vec<f32> = std::iter::from_fn(|| vc.pop().ok()).collect();
+            (out, tap, st.is_clipping())
+        };
+        // 150%: the output stops at full scale, the tap and the lamp know better.
+        let (out, tap, clipped) = run(150, false, 2);
+        assert_eq!(out, [1.0, -0.6]);
+        assert!((tap[0] - 1.2).abs() < 1e-6 && (tap[1] + 0.6).abs() < 1e-6, "{tap:?}");
+        assert!(clipped);
+        // Pre-fader reads the signal itself, not the clipped output over the gain.
+        let (out, tap, _) = run(150, true, 2);
+        assert_eq!(out, [1.0, -0.6]);
+        assert_eq!(tap, [0.8, -0.4]);
+        // A mono device: the fold, both channels.
+        let (_, tap, _) = run(150, false, 1);
+        assert!((tap[0] - 0.3).abs() < 1e-6 && tap[0] == tap[1], "{tap:?}");
+        // At 100% nothing is over, and a boost that fits lights nothing.
+        let (out, tap, clipped) = run(100, false, 2);
+        assert_eq!((out.as_slice(), tap.as_slice(), clipped), (&[0.8, -0.4][..], &[0.8, -0.4][..], false));
+        let (_, _, clipped) = run(120, false, 2);
+        assert!(!clipped, "0.8 at 120% is 0.96");
     }
 
     #[test]

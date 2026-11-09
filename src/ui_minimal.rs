@@ -268,20 +268,29 @@ fn draw_player(f: &mut Frame, cx: &mut Ctx) {
     // Above the visualisation, not below it: the viz block changes height with
     // the mode (VU is a few rows, the analysis spectrogram many), which dragged
     // the tray up and down the screen every time it changed.
-    if cx.ui.frame_status.is_some() {
-        if !fullscreen {
+    if fullscreen {
+        if cx.ui.frame_status.is_some() {
+            crate::ui::draw_status_line(f, cx.ui, tui::rows(area, y, 1), p);
             y += 1;
         }
-        crate::ui::draw_status_line(f, cx.ui, tui::rows(area, y, 1), p);
-        y += 1;
-    } else if !fullscreen {
+    } else {
         y += 1;
         let tray = Rect { x: area.x + 2, y: area.y + y as u16, width: term_w.saturating_sub(4) as u16, height: 3 }.intersection(area);
         let block = Block::bordered().border_style(p.rule).padding(Padding::horizontal(1));
-        let keys = slim_cmd_bar_inner(p, term_w.saturating_sub(8));
-        // Inside the tray's border and padding.
-        keys.register(&mut cx.ui.hits, tray.x + 2, tray.y + 1);
-        f.render_widget(Paragraph::new(keys.line).block(block), tray);
+        // A message takes the keys' place in the tray: everything below stays
+        // where it is (replacing the tray, it moved the block and the panels
+        // up two rows for as long as it showed).
+        if cx.ui.frame_status.is_some() {
+            f.render_widget(block, tray);
+            // (The line brings its own two-column indent.)
+            let inner = Rect { x: tray.x + 1, y: tray.y + 1, width: tray.width.saturating_sub(3), height: 1 }.intersection(area);
+            crate::ui::draw_status_line(f, cx.ui, inner, p);
+        } else {
+            let keys = slim_cmd_bar_inner(p, term_w.saturating_sub(8));
+            // Inside the tray's border and padding.
+            keys.register(&mut cx.ui.hits, tray.x + 2, tray.y + 1);
+            f.render_widget(Paragraph::new(keys.line).block(block), tray);
+        }
         y += 3;
     }
 
@@ -293,6 +302,10 @@ fn draw_player(f: &mut Frame, cx: &mut Ctx) {
     // moves the cursor under it).
     let extras = state.viz_extras();
     let viz_on = viz_mode != VizMode::None;
+    // The whole space, so a click switches the visualization even when it
+    // is off (docked panels register over their part of it).
+    let space = if fullscreen { y } else { y + 1 };
+    cx.ui.hits.push((tui::rows(area, space, crate::viz::viz_rows_available(term_h, space, 1)), Hit::Viz));
     if fullscreen {
         if viz_on {
             let viz_avail = crate::viz::viz_rows_available(term_h, y, 1);
@@ -309,7 +322,7 @@ fn draw_player(f: &mut Frame, cx: &mut Ctx) {
     let region = tui::indent(tui::rows(area, top, crate::viz::viz_rows_available(term_h, top, 1)), 2);
     let dock = crate::ui::dock(cx.ui, viz_on, region);
     if let Some(r) = dock.viz {
-        tui::draw_lines(f.buffer_mut(), tui::rows(area, label_y, 1), &[tui::line(format!("  {}", viz_section_label(viz_mode)), p.dim)]);
+        tui::draw_lines(f.buffer_mut(), tui::rows(area, label_y, 1), &[tui::line(format!("  {}", viz_section_label(viz_mode, state.vu_kind())), p.dim)]);
         let r = Rect { x: area.x, width: r.right() - area.x, ..r };
         let avail = r.height as usize;
         let body = crate::viz::viz_body_rows(viz_mode, avail, false, extras);
@@ -452,10 +465,14 @@ fn slim_cmd_bar_inner(p: &Palette, width: usize) -> crate::hints::Bar {
     crate::hints::bar(KEYS, &crate::ui::key_look(crate::theme::ThemeKind::Minimal, p), width)
 }
 
-fn viz_section_label(mode: VizMode) -> &'static str {
+fn viz_section_label(mode: VizMode, meter: crate::state::VuKind) -> &'static str {
     match mode {
         VizMode::None => "",
-        VizMode::VuMeter => "VU",
+        VizMode::VuMeter => match meter {
+            crate::state::VuKind::Dorrough => "DORROUGH",
+            crate::state::VuKind::Vu => "VU",
+            crate::state::VuKind::K14 => "K-14",
+        },
         VizMode::SpectrumHorizontal => "SPECTRUM",
         VizMode::SpectrumVertical => "SPECTRUM",
         VizMode::Oscilloscope => "OSCILLOSCOPE",

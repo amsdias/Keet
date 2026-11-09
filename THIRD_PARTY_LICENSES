@@ -5,7 +5,7 @@ Keet is licensed under the GNU Affero General Public License v3.0 or later
 (see LICENSE). It is built with the open-source crates below, under these
 licences:
 
-  MIT License: 203
+  MIT License: 204
   Mozilla Public License 2.0: 15
   Apache License 2.0: 6
   Community Data License Agreement Permissive 2.0: 1
@@ -3722,6 +3722,34 @@ The MIT License (MIT)
 
 Copyright (c) 2016-2022 Florian Dehau
 Copyright (c) 2023-2025 The Ratatui Developers
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+--------------------------------------------------------------------------------
+MIT License
+Used by:
+  roxmltree 0.21.2 (https://github.com/RazrFalcon/roxmltree)
+
+The MIT License (MIT)
+
+Copyright (c) 2018 Yevhenii Reizner
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

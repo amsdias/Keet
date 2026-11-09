@@ -391,10 +391,19 @@ fn draw_top(f: &mut Frame, cx: &mut Ctx, p: &Palette, budget: usize) -> usize {
     y + 2
 }
 
-fn viz_title(mode: VizMode) -> &'static str {
+/// The meter `u` has chosen, by name.
+fn meter_title(meter: crate::state::VuKind) -> &'static str {
+    match meter {
+        crate::state::VuKind::Dorrough => "Dorrough meter",
+        crate::state::VuKind::Vu => "VU meter",
+        crate::state::VuKind::K14 => "K-14 meter",
+    }
+}
+
+fn viz_title(mode: VizMode, meter: crate::state::VuKind) -> &'static str {
     match mode {
         VizMode::None => "",
-        VizMode::VuMeter => "VU meter",
+        VizMode::VuMeter => meter_title(meter),
         VizMode::SpectrumHorizontal | VizMode::SpectrumVertical => "Spectrum",
         VizMode::Oscilloscope => "Oscilloscope",
         VizMode::Lissajous => "Vectorscope",
@@ -406,10 +415,10 @@ fn viz_title(mode: VizMode) -> &'static str {
     }
 }
 
-fn viz_next_name(mode: VizMode) -> &'static str {
+fn viz_next_name(mode: VizMode, meter: crate::state::VuKind) -> &'static str {
     match mode.next() {
         VizMode::None => "off",
-        VizMode::VuMeter => "VU meter",
+        VizMode::VuMeter => meter_title(meter),
         VizMode::SpectrumHorizontal => "spectrum",
         VizMode::SpectrumVertical => "spectrum ↕",
         VizMode::Oscilloscope => "oscilloscope",
@@ -504,19 +513,23 @@ fn player_body(f: &mut Frame, cx: &mut Ctx, p: &Palette, block_was_intact: bool,
     let mut y = top_n;
     if ruled {
         let rule = if viz_mode == VizMode::None {
-            titled_rule(p, "Visualization off", &format!("v {}", viz_next_name(viz_mode)), term_w)
+            titled_rule(p, "Visualization off", &format!("v {}", viz_next_name(viz_mode, state.vu_kind())), term_w)
         } else {
             let style = if viz_mode == VizMode::SpectrogramAnalysis {
                 if matches!(viz_style, VizStyle::Dots) { "linear" } else { "log" }
             } else {
                 match viz_style { VizStyle::Dots => "bars", VizStyle::Bars => "dots" }
             };
-            let hint = format!("v {} · b {style}", viz_next_name(viz_mode));
-            titled_rule(p, viz_title(viz_mode), &hint, term_w)
+            let meter = if viz_mode == VizMode::VuMeter { format!(" · u {}", state.vu_kind().next().label()) } else { String::new() };
+            let hint = format!("v {} · b {style}{meter}", viz_next_name(viz_mode, state.vu_kind()));
+            titled_rule(p, viz_title(viz_mode, state.vu_kind()), &hint, term_w)
         };
         tui::draw_lines(f.buffer_mut(), tui::rows(area, y, 1), &[rule]);
         y += 1;
     }
+    // The whole slot, so a click switches the visualization even when it
+    // is off (docked panels register over their part of it).
+    cx.ui.hits.push((tui::rows(area, y, if fullscreen { avail } else { slot }), Hit::Viz));
     if fullscreen {
         let block = tui::rows(area, y + pad, body);
         crate::ui::draw_viz(f, block, cx, block_was_intact);

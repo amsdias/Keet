@@ -35,9 +35,11 @@ const METER_H: u16 = 7;
 /// The EQ unit's rows besides its sliders: its borders, the three label
 /// rows, the band readout, the headroom row and the key row.
 const EQ_FIXED: u16 = 2 + 3 + 3;
-/// The peak meter's length in segments, whatever the window's width (only a
-/// window too narrow for it shrinks it).
-pub const METER_SEGMENTS: usize = 40;
+/// The peak meter's length in cells, whatever the window's width (only a
+/// window too narrow for it shrinks it): `METER_BLOCKS` blocks of three.
+pub const METER_CELLS: usize = 42;
+/// A meter's blocks, like a real one's LEDs: 12 up to 0 dB, 2 past it.
+const METER_BLOCKS: usize = 14;
 /// Columns before the meter's segments ("  L ") and after them.
 const METER_LEAD: u16 = 4;
 const METER_TRAIL: u16 = 2;
@@ -96,9 +98,25 @@ pub fn stack(area: Rect, need: u16) -> Stack {
 }
 
 /// The rows a docked panel needs under the key bar: the library showing
-/// five tracks, the lyrics their current line.
+/// five tracks, the lyrics their current line, the tab six strings.
 pub fn panel_rows(view: ViewMode) -> u16 {
-    if view == ViewMode::Playlist { DOCK_ROWS } else { LYRICS_DOCK_ROWS }
+    match view {
+        ViewMode::Playlist => DOCK_ROWS,
+        ViewMode::Tab => TAB_DOCK_ROWS,
+        _ => LYRICS_DOCK_ROWS,
+    }
+}
+
+/// The docked panels HiFi's dock can show: the library and ONE more — the
+/// lyrics and the tab share that place, the one used last (first in
+/// `recent`) shows, the other is hidden, not undocked.
+pub fn sharing(docked: &[ViewMode], recent: &[ViewMode]) -> Vec<ViewMode> {
+    let hidden = [ViewMode::Lyrics, ViewMode::Tab]
+        .into_iter()
+        .filter(|v| docked.contains(v))
+        .max_by_key(|v| recent.iter().position(|r| r == v).unwrap_or(usize::MAX));
+    let both = docked.contains(&ViewMode::Lyrics) && docked.contains(&ViewMode::Tab);
+    docked.iter().copied().filter(|&v| !(both && Some(v) == hidden)).collect()
 }
 
 /// The columns a docked panel needs (every theme's, `ui::dock_min_width`).
@@ -117,7 +135,7 @@ pub fn dock_need(docked: &[ViewMode], width: u16) -> u16 {
 /// Whether HiFi's EQ unit is in the stack in a window `area` as `ui` has it
 /// (a docked panel needs its rows too).
 pub fn eq_fits(area: Rect, ui: &UiState) -> bool {
-    stack(area, dock_need(&ui.docked, area.width)).eq.is_some()
+    stack(area, dock_need(&sharing(&ui.docked, &ui.panel_recent), area.width)).eq.is_some()
 }
 
 /// Whether the library docks by itself in `area`: the EQ and five tracks
@@ -137,18 +155,23 @@ pub fn library_fits(area: Rect, others: &[ViewMode]) -> bool {
 /// the library back at its five tracks, else the panel used last alone.
 pub fn dock_panels(docked: &[ViewMode], recent: &[ViewMode], region: Rect) -> Vec<(ViewMode, Rect)> {
     let fits = |v: ViewMode, r: Rect| r.height >= panel_rows(v) && r.width >= panel_cols(v);
+    let docked = sharing(docked, recent);
     let order: Vec<ViewMode> = recent.iter().copied().filter(|v| docked.contains(v)).collect();
-    if order.len() == 2 && fits(ViewMode::Playlist, region) && fits(ViewMode::Lyrics, region) {
-        let lyrics_w = (region.width * 3 / 10).clamp(panel_cols(ViewMode::Lyrics), LYRICS_MAX_W);
-        if region.width >= panel_cols(ViewMode::Playlist) + 1 + lyrics_w {
-            let library = Rect { width: region.width - lyrics_w - 1, ..region };
-            let lyrics = Rect { x: library.right() + 1, width: lyrics_w, ..region };
-            return vec![(ViewMode::Playlist, library), (ViewMode::Lyrics, lyrics)];
-        }
-        if region.height >= DOCK_ROWS + LYRICS_DOCK_ROWS {
-            let library = Rect { height: DOCK_ROWS, ..region };
-            let lyrics = Rect { y: library.bottom(), height: region.height - DOCK_ROWS, ..region };
-            return vec![(ViewMode::Playlist, library), (ViewMode::Lyrics, lyrics)];
+    // The lyrics or the tab, beside or under the library.
+    let other = order.iter().copied().find(|&v| v != ViewMode::Playlist);
+    if let (2, Some(other)) = (order.len(), other) {
+        if fits(ViewMode::Playlist, region) && fits(other, region) {
+            let other_w = (region.width * 3 / 10).clamp(panel_cols(other), LYRICS_MAX_W);
+            if region.width >= panel_cols(ViewMode::Playlist) + 1 + other_w {
+                let library = Rect { width: region.width - other_w - 1, ..region };
+                let beside = Rect { x: library.right() + 1, width: other_w, ..region };
+                return vec![(ViewMode::Playlist, library), (other, beside)];
+            }
+            if region.height >= DOCK_ROWS + panel_rows(other) {
+                let library = Rect { height: DOCK_ROWS, ..region };
+                let under = Rect { y: library.bottom(), height: region.height - DOCK_ROWS, ..region };
+                return vec![(ViewMode::Playlist, library), (other, under)];
+            }
         }
     }
     order.into_iter().find(|&v| fits(v, region)).map(|v| vec![(v, region)]).unwrap_or_default()
@@ -157,7 +180,7 @@ pub fn dock_panels(docked: &[ViewMode], recent: &[ViewMode], region: Rect) -> Ve
 fn draw_player(f: &mut Frame, cx: &mut Ctx) {
     let p = palette(ThemeKind::HiFi);
     let area = f.area();
-    let s = stack(area, dock_need(&cx.ui.docked, area.width));
+    let s = stack(area, dock_need(&sharing(&cx.ui.docked, &cx.ui.panel_recent), area.width));
     draw_transport(f, cx, s.transport, p);
     draw_meters(f, cx, s.meters, p);
     cx.ui.eq_in_stack = s.eq.is_some();
@@ -324,55 +347,79 @@ fn clock_text(secs: f64, total: f64) -> String {
     format!("{:0digits$}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
 }
 
-/// A clock's digits three rows tall, in half and full blocks (a seven-
-/// segment display's shapes), a column between characters: "02:34" is 17
-/// columns. Bold accent.
+/// A clock's digits three rows tall in braille, a seven-segment display in
+/// dots two thick, a column between characters: "02:34" is 17 columns. Bold accent.
 fn big_clock(time: &str, p: &Palette) -> [Line<'static>; 3] {
-    fn glyph(c: char) -> [&'static str; 3] {
-        match c {
-            '0' => ["█▀█", "█ █", "█▄█"],
-            '1' => ["  █", "  █", "  █"],
-            '2' => ["▀▀█", "█▀▀", "█▄▄"],
-            '3' => ["▀▀█", "▀▀█", "▄▄█"],
-            '4' => ["█ █", "▀▀█", "  █"],
-            '5' => ["█▀▀", "▀▀█", "▄▄█"],
-            '6' => ["█▀▀", "█▀█", "█▄█"],
-            '7' => ["▀▀█", "  █", "  █"],
-            '8' => ["█▀█", "█▀█", "█▄█"],
-            '9' => ["█▀█", "▀▀█", "▄▄█"],
-            ':' => ["▄", " ", "▀"],
-            _ => [" ", " ", " "],
-        }
+    // Segments A (top), B, C (right, down), D (bottom), E, F (left, up), G (middle).
+    fn segments(c: char) -> Option<u8> {
+        let on = match c {
+            '0' => "ABCDEF",
+            '1' => "BC",
+            '2' => "ABGED",
+            '3' => "ABGCD",
+            '4' => "FGBC",
+            '5' => "AFGCD",
+            '6' => "AFGEDC",
+            '7' => "ABC",
+            '8' => "ABCDEFG",
+            '9' => "ABCDFG",
+            _ => return None,
+        };
+        Some(on.bytes().fold(0, |m, b| m | 1 << (b - b'A')))
     }
+    // Whether a digit's dot is lit: 6 dot columns by 12 dot rows.
+    fn lit(seg: u8, col: usize, row: usize) -> bool {
+        let (top, mid, bottom) = (row < 2, (5..7).contains(&row), row >= 10);
+        let (left, right) = (col < 2, col >= 4);
+        let (upper, lower) = (row < 7, row >= 5);
+        [top, right && upper, right && lower, bottom, left && lower, left && upper, mid]
+            .iter().enumerate().any(|(i, &on)| on && seg & (1 << i) != 0)
+    }
+    let cell = |mask: u8| if mask == 0 { ' ' } else { braille(mask) };
     let style = p.accent.patch(p.bold);
-    let rows: [String; 3] = std::array::from_fn(|r| time.chars().map(|c| glyph(c)[r]).collect::<Vec<_>>().join(" "));
-    rows.map(|r| tui::line(r, style))
+    std::array::from_fn(|r| {
+        let row = |w: usize, on: &dyn Fn(usize, usize) -> bool| -> String {
+            (0..w).map(|x| {
+                let mask = (0..4).flat_map(|dy| (0..2).map(move |dx| (dx, dy)))
+                    .filter(|&(dx, dy)| on(x * 2 + dx, r * 4 + dy))
+                    .fold(0, |m, (dx, dy)| m | DOTS[dy][dx]);
+                cell(mask)
+            }).collect()
+        };
+        let parts: Vec<String> = time.chars().map(|c| match (c, segments(c)) {
+            (_, Some(seg)) => row(3, &|col, y| lit(seg, col, y)),
+            // The colon: two dots of two by two.
+            (':', _) => row(1, &|_, y| (3..5).contains(&y) || (7..9).contains(&y)),
+            _ => " ".to_string(),
+        }).collect();
+        tui::line(parts.join(" "), style)
+    })
 }
 
 /// How the meter unit's inside, `w` columns, is shared: the peak meter
-/// (fixed at `METER_SEGMENTS` while the window allows), the signal lamps
+/// (fixed at `METER_CELLS` while the window allows), the signal lamps
 /// (what is left, dropped below `SIGNAL_MIN_W`) and the volume gauge, a
 /// divider between each two.
 #[derive(Debug, PartialEq)]
 struct MeterLayout {
-    segments: usize,
+    cells: usize,
     vu_w: u16,
     signal_w: u16,
     vol_w: u16,
 }
 
 fn meter_layout(w: u16) -> MeterLayout {
-    let vu_full = METER_LEAD + METER_SEGMENTS as u16 + METER_TRAIL;
+    let vu_full = METER_LEAD + METER_CELLS as u16 + METER_TRAIL;
     if w >= vu_full + 1 + SIGNAL_MIN_W + 1 + VOL_W {
-        MeterLayout { segments: METER_SEGMENTS, vu_w: vu_full, signal_w: w - vu_full - VOL_W - 2, vol_w: VOL_W }
+        MeterLayout { cells: METER_CELLS, vu_w: vu_full, signal_w: w - vu_full - VOL_W - 2, vol_w: VOL_W }
     } else if w >= vu_full + 1 + VOL_W {
-        MeterLayout { segments: METER_SEGMENTS, vu_w: w - 1 - VOL_W, signal_w: 0, vol_w: VOL_W }
+        MeterLayout { cells: METER_CELLS, vu_w: w - 1 - VOL_W, signal_w: 0, vol_w: VOL_W }
     } else {
         // Too narrow for the whole meter: it shrinks, and the gauge goes
         // when not even eight segments are left beside it.
         let vol_w = if w >= METER_LEAD + 8 + METER_TRAIL + 1 + VOL_W { VOL_W } else { 0 };
         let vu_w = w.saturating_sub(if vol_w > 0 { vol_w + 1 } else { 0 });
-        MeterLayout { segments: (vu_w.saturating_sub(METER_LEAD + METER_TRAIL) as usize).max(1), vu_w, signal_w: 0, vol_w }
+        MeterLayout { cells: (vu_w.saturating_sub(METER_LEAD + METER_TRAIL) as usize).max(1), vu_w, signal_w: 0, vol_w }
     }
 }
 
@@ -427,16 +474,16 @@ fn draw_meters(f: &mut Frame, cx: &mut Ctx, r: Rect, p: &Palette) {
     let [(lp, lp_dot), (rp, rp_dot)] = [0, 1].map(|c| (meter_frac(meter.level_db[c]), meter_frac(meter.hold_db[c])));
     // `b`: the LED dot matrix (Dots, the default) or the segmented bars.
     let dots = state.viz_style() == crate::state::VizStyle::Dots;
-    let bar = |peak: f32, hold: f32| if dots { vu_dots(peak, hold, m.segments, p) } else { vu_bar(peak, hold, m.segments, p) };
+    let bar = |peak: f32, hold: f32| if dots { vu_dots(peak, hold, m.cells, p) } else { vu_bar(peak, hold, m.cells, p) };
     let channel = |label: &str, bar: Line<'static>| {
         let mut l = LineBuf::new();
         l.push_str("  ").styled(label, p.dim).reset().push(' ').append(bar);
         l.into_line()
     };
     let mut scale = LineBuf::new();
-    scale.spaces(METER_LEAD as usize).append(render_db_scale(m.segments, p));
+    scale.spaces(METER_LEAD as usize).append(render_db_scale(m.cells, p));
     let mut clip = LineBuf::new();
-    clip.spaces((METER_LEAD as usize + m.segments).saturating_sub(6)).append(clip_lamp(state.is_clipping(), p));
+    clip.spaces((METER_LEAD as usize + m.cells).saturating_sub(6)).append(clip_lamp(state.is_clipping(), p));
     let vu = [
         Line::default(),
         channel("L", bar(lp, lp_dot)),
@@ -584,28 +631,11 @@ fn ghost_dots(zone: Zone, p: &Palette) -> (char, Style) {
     }
 }
 
-/// The peak meter as dots: two dot columns a cell (80 steps in 40 cells),
-/// in the zones' colours; the peak hold one bright dot column past the level.
+/// The peak meter as dots: blocks of `⣿` closed by a `⡇`, whose missing dot
+/// column is the gap (`meter_blocks_line`).
 fn vu_dots(peak: f32, peak_dot: f32, cells: usize, p: &Palette) -> Line<'static> {
-    let n = cells.max(1);
-    let lit = (peak.clamp(0.0, 1.0) * (2 * n) as f32) as usize;
-    let hold = ((peak_dot.clamp(0.0, 1.0) * (2 * n) as f32) as usize).min(2 * n - 1);
-    let mut bar = LineBuf::new();
-    for i in 0..n {
-        let zone = Zone::of(i as f32 / n as f32);
-        let on = lit.saturating_sub(2 * i).min(2);
-        let held = peak_dot > 0.0 && hold >= lit && hold / 2 == i;
-        let (glyph, style) = if on > 0 {
-            let mask = dot_columns(on) | if held { dot_columns(hold % 2 + 1) & !dot_columns(hold % 2) } else { 0 };
-            (braille(mask), zone.lit(p))
-        } else if held {
-            (braille(dot_columns(hold % 2 + 1) & !dot_columns(hold % 2)), if zone == Zone::Normal { p.fg } else { zone.lit(p) })
-        } else {
-            ghost_dots(zone, p)
-        };
-        bar.style(style).push(glyph);
-    }
-    bar.into_line()
+    let unlit = |glyph: char, zone: Zone| if crate::term::no_color() { (' ', Style::new()) } else { (glyph, zone.ghost(p)) };
+    meter_blocks_line(peak, peak_dot, cells, ('⣿', '⡇'), &unlit, p)
 }
 
 /// A level (0 to 1) as `cells` of dots, two dot columns each, amber.
@@ -707,22 +737,36 @@ fn clip_lamp(clipping: bool, p: &Palette) -> Line<'static> {
 /// segment (`ghost`); amber, orange from -6 dB, red from -3 dB (`Zone`);
 /// the peak hold a lit segment past the level. `peak` and `peak_dot` are
 /// positions on the scale (`meter_frac`).
-fn vu_bar(peak: f32, peak_dot: f32, segments: usize, p: &Palette) -> Line<'static> {
-    let n = segments.max(1);
-    let lit = (peak.clamp(0.0, 1.0) * n as f32) as usize;
-    // At full scale the hold is the last segment (n was past the end: it
-    // vanished exactly when the track hit 0 dB).
-    let dot = ((peak_dot.clamp(0.0, 1.0) * n as f32) as usize).min(n - 1);
+fn vu_bar(peak: f32, peak_dot: f32, cells: usize, p: &Palette) -> Line<'static> {
+    meter_blocks_line(peak, peak_dot, cells, ('█', '▊'), &|glyph, zone| ghost(glyph, zone, p), p)
+}
+
+/// How `cells` divide into blocks: (blocks, cells each). Too narrow for all
+/// of them, it keeps one a cell.
+fn meter_blocks(cells: usize) -> (usize, usize) {
+    if cells >= METER_BLOCKS { (METER_BLOCKS, cells / METER_BLOCKS) } else { (cells.max(1), 1) }
+}
+
+/// The meter's blocks, lit whole like LEDs: one lights as the level enters it,
+/// so a level at exactly 0 dB lights none of the red and anything over does.
+/// The peak hold is the block it is in. `glyphs`: a block's cells and its last.
+fn meter_blocks_line(peak: f32, peak_dot: f32, cells: usize, glyphs: (char, char), unlit: &dyn Fn(char, Zone) -> (char, Style), p: &Palette) -> Line<'static> {
+    let (n, w) = meter_blocks(cells);
+    let entered = |frac: f32| (frac.clamp(0.0, 1.0) * n as f32 - 1e-3).ceil().max(0.0) as usize;
+    let (lit, hold) = (entered(peak), entered(peak_dot));
     let mut bar = LineBuf::new();
     for i in 0..n {
         let zone = Zone::of(i as f32 / n as f32);
-        if i < lit {
-            bar.style(zone.lit(p)).push('▊');
-        } else if i == dot && peak_dot > 0.0 {
-            bar.style(if zone == Zone::Normal { p.fg } else { zone.lit(p) }).push('▊');
-        } else {
-            let (glyph, style) = ghost('▊', zone, p);
-            bar.style(style).push(glyph);
+        for c in 0..w {
+            let glyph = if c + 1 == w { glyphs.1 } else { glyphs.0 };
+            if i < lit {
+                bar.style(zone.lit(p)).push(glyph);
+            } else if i + 1 == hold {
+                bar.style(if zone == Zone::Normal { p.fg } else { zone.lit(p) }).push(glyph);
+            } else {
+                let (g, style) = unlit(glyph, zone);
+                bar.style(style).push(g);
+            }
         }
     }
     bar.into_line()
@@ -740,9 +784,9 @@ enum Zone {
 impl Zone {
     /// The zone of a position on the scale (`meter_frac`).
     fn of(frac: f32) -> Zone {
-        if frac >= meter_frac(-3.0) {
+        if frac >= 12.0 / METER_BLOCKS as f32 {
             Zone::Hot
-        } else if frac >= meter_frac(-6.0) {
+        } else if frac >= 8.0 / METER_BLOCKS as f32 {
             Zone::Warm
         } else {
             Zone::Normal
@@ -787,14 +831,15 @@ fn ghost(glyph: char, zone: Zone, p: &Palette) -> (char, Style) {
 /// take the LINEAR peak against this dB scale: -6 dB lit half the bar, and
 /// near the top every 50 ms of decay dropped three segments.
 pub fn meter_frac(db: f32) -> f32 {
-    const SCALE: [(f32, f32); 7] = [(-40.0, 0.0), (-30.0, 0.2), (-20.0, 0.4), (-12.0, 0.6), (-6.0, 0.75), (-3.0, 0.85), (0.0, 1.0)];
+    // (dB, the block it ends), each label on a block's edge.
+    const SCALE: [(f32, f32); 8] = [(-40.0, 0.0), (-30.0, 2.0), (-20.0, 4.0), (-12.0, 6.0), (-6.0, 8.0), (-3.0, 10.0), (0.0, 12.0), (4.0, 14.0)];
     if db <= SCALE[0].0 {
         return 0.0;
     }
     for w in SCALE.windows(2) {
         let ((d0, f0), (d1, f1)) = (w[0], w[1]);
         if db <= d1 {
-            return f0 + (db - d0) / (d1 - d0) * (f1 - f0);
+            return (f0 + (db - d0) / (d1 - d0) * (f1 - f0)) / METER_BLOCKS as f32;
         }
     }
     1.0
@@ -1189,6 +1234,8 @@ fn eq_keys(p: &Palette, focused: bool, width: usize) -> crate::hints::Bar {
 pub const DOCK_ROWS: u16 = 10;
 /// Rows the docked lyrics need: the current line and the key row.
 pub const LYRICS_DOCK_ROWS: u16 = 4;
+/// Rows the docked tab needs: its box for six strings, as it floats.
+pub const TAB_DOCK_ROWS: u16 = crate::tab_panel::rows_for(6);
 /// The docked lyrics' widest beside the library (their narrowest is
 /// `panel_cols`).
 const LYRICS_MAX_W: u16 = 64;
@@ -1210,19 +1257,22 @@ fn repeat_short(mode: crate::state::RepeatMode) -> &'static str {
 }
 
 fn render_db_scale(meter_w: usize, p: &Palette) -> Line<'static> {
-    let labels: &[(&str, f32, bool /*red*/)] = &[
-        ("-∞", 0.00, false),
-        ("-30", 0.20, false),
-        ("-20", 0.40, false),
-        ("-12", 0.60, false),
-        ("-6",  0.75, false),
-        ("-3",  0.85, false),
-        ("0dB", 1.00, true),
+    // The label and the block it starts at (`meter_frac`); the unit comes first.
+    let labels: &[(&str, usize, bool /*red*/)] = &[
+        ("dB", 0, false),
+        ("-30", 2, false),
+        ("-20", 4, false),
+        ("-12", 6, false),
+        ("-6", 8, false),
+        ("-3", 10, false),
+        ("0", 12, false),
+        ("+4", 14, true),
     ];
+    let (blocks, block_w) = meter_blocks(meter_w);
     let mut out = LineBuf::new();
     let mut placed: usize = 0;
     for (i, (label, frac, red)) in labels.iter().enumerate() {
-        let target = (frac * meter_w as f32) as usize;
+        let target = frac * blocks / METER_BLOCKS * block_w;
         let lw = tui::width(label);
         // For first label, place at column 0; for last, anchor flush to meter_w end.
         let last = i == labels.len() - 1;
@@ -1386,17 +1436,17 @@ mod hifi_tests {
     #[test]
     fn the_peak_meter_keeps_its_length_however_wide_the_window() {
         for w in [80u16, 120, 200, 400] {
-            assert_eq!(meter_layout(w).segments, METER_SEGMENTS, "{w} columns");
+            assert_eq!(meter_layout(w).cells, METER_CELLS, "{w} columns");
         }
         // Wide: the signal lamps get what is left.
         let wide = meter_layout(200);
         assert_eq!(wide.vu_w + 1 + wide.signal_w + 1 + wide.vol_w, 200);
         // Without room for the lamps, they go, not the meter.
         let mid = meter_layout(60);
-        assert_eq!((mid.segments, mid.signal_w, mid.vol_w), (METER_SEGMENTS, 0, VOL_W));
+        assert_eq!((mid.cells, mid.signal_w, mid.vol_w), (METER_CELLS, 0, VOL_W));
         // HiFi's narrowest window: the meter shrinks, the gauge stays.
         let narrow = meter_layout(32);
-        assert!(narrow.segments >= 8 && narrow.segments < METER_SEGMENTS, "{narrow:?}");
+        assert!(narrow.cells >= 8 && narrow.cells < METER_CELLS, "{narrow:?}");
         assert_eq!(narrow.vu_w + 1 + narrow.vol_w, 32);
         for w in 0..300 {
             let m = meter_layout(w);
@@ -1408,33 +1458,37 @@ mod hifi_tests {
     #[test]
     fn the_meter_is_segmented_with_ghosts_for_the_unlit() {
         let p = palette(ThemeKind::HiFi);
-        let bar = vu_bar(0.5, 0.75, 40, p);
-        assert_eq!(bar.cols(), 40);
-        // Every cell a segment: 20 lit, the peak hold at 30, the rest ghosts.
-        assert!(tui::plain(&bar).chars().all(|c| c == '▊'), "{}", tui::plain(&bar));
-        let styles: Vec<Style> = bar.spans.iter().flat_map(|s| s.content.chars().map(move |_| s.style)).collect();
-        assert!(styles[..20].iter().all(|&s| s == p.accent));
-        assert_eq!((styles[29], styles[30], styles[31]), (p.rule, p.warn, Style::new().fg(GHOST_WARM)));
-        // Amber, orange from -6 dB (0.75 on the scale), red from -3 dB
-        // (0.85); the ghosts in each zone's dark colour.
-        let loud = vu_bar(1.0, 1.0, 40, p);
-        let lit: Vec<Style> = loud.spans.iter().flat_map(|s| s.content.chars().map(move |_| s.style)).collect();
-        assert_eq!((lit[29], lit[30], lit[33], lit[34], lit[39]), (p.accent, p.warn, p.warn, p.danger, p.danger));
-        assert_eq!((styles[32], styles[39]), (Style::new().fg(GHOST_WARM), Style::new().fg(GHOST_HOT)));
+        let bar = vu_bar(0.5, 11.0 / 14.0, 42, p);
+        assert_eq!(bar.cols(), 42);
+        // Blocks of three cells closed by a gap: 7 lit, the peak hold the 11th.
+        let c = cells(&bar);
+        assert!(c.chunks(3).all(|b| b[0].0 == '█' && b[1].0 == '█' && b[2].0 == '▊'), "{}", tui::plain(&bar));
+        assert!(c[..21].iter().all(|x| x.1 == p.accent));
+        assert_eq!((c[21].1, c[30].1, c[33].1), (p.rule, p.warn, Style::new().fg(GHOST_WARM)));
+        // Amber, orange from -6 dB (the 9th block), red over 0 dB (the 13th);
+        // the ghosts in each zone's dark colour.
+        let lit = cells(&vu_bar(1.0, 1.0, 42, p));
+        assert_eq!((lit[23].1, lit[24].1, lit[35].1, lit[36].1, lit[41].1), (p.accent, p.warn, p.warn, p.danger, p.danger));
+        assert_eq!((c[33].1, c[41].1), (Style::new().fg(GHOST_WARM), Style::new().fg(GHOST_HOT)));
         assert_ne!(p.warn.fg, p.danger.fg, "red is not the orange");
         // Silence lights nothing.
-        let quiet = vu_bar(0.0, 0.0, 40, p);
+        let quiet = vu_bar(0.0, 0.0, 42, p);
         assert!(quiet.spans.iter().all(|s| [Zone::Normal, Zone::Warm, Zone::Hot].iter().any(|z| s.style == z.ghost(p))));
     }
 
     #[test]
     fn the_meter_reads_on_its_db_scale() {
         // The positions of the scale's labels.
-        for (db, frac) in [(-60.0, 0.0), (-40.0, 0.0), (-30.0, 0.2), (-20.0, 0.4), (-12.0, 0.6), (-6.0, 0.75), (-3.0, 0.85), (0.0, 1.0), (3.0, 1.0)] {
-            assert!((meter_frac(db) - frac).abs() < 1e-6, "{db} dB → {}", meter_frac(db));
+        for (db, block) in [(-60.0, 0.0), (-40.0, 0.0), (-30.0, 2.0), (-20.0, 4.0), (-12.0, 6.0), (-6.0, 8.0), (-3.0, 10.0), (0.0, 12.0), (4.0, 14.0), (9.0, 14.0)] {
+            assert!((meter_frac(db) * 14.0 - block).abs() < 1e-4, "{db} dB → {}", meter_frac(db));
         }
         // Between labels, linear in dB.
-        assert!((meter_frac(-9.0) - 0.675).abs() < 1e-6);
+        assert!((meter_frac(-9.0) * 14.0 - 7.0).abs() < 1e-4);
+        let scale = tui::plain(&render_db_scale(42, palette(ThemeKind::HiFi)));
+        assert!(scale.starts_with("dB"), "{scale}");
+        for (label, col) in [("-30 ", 6), ("-6 ", 24), (" 0 ", 35), ("+4", 40)] {
+            assert_eq!(scale.find(label), Some(col), "{scale}");
+        }
     }
 
     #[test]
@@ -1563,8 +1617,14 @@ mod hifi_tests {
     #[test]
     fn the_big_clock_is_three_rows_of_seven_segment_digits() {
         let p = palette(ThemeKind::HiFi);
-        let rows: Vec<String> = big_clock("02:34", p).iter().map(tui::plain).collect();
-        assert_eq!(rows, ["█▀█ ▀▀█ ▄ ▀▀█ █ █", "█ █ █▀▀   ▀▀█ ▀▀█", "█▄█ █▄▄ ▀ ▄▄█   █"]);
+        let rows: Vec<String> = big_clock("8", p).iter().map(tui::plain).collect();
+        assert_eq!(rows, ["⣿⠛⣿", "⣿⠶⣿", "⣿⣤⣿"]);
+        let rows: Vec<String> = big_clock("1", p).iter().map(tui::plain).collect();
+        assert_eq!(rows, ["  ⣿", "  ⣿", "  ⣿"]);
+        let rows: Vec<String> = big_clock("0:", p).iter().map(tui::plain).collect();
+        assert_eq!(rows, ["⣿⠛⣿ ⣀", "⣿ ⣿ ⣉", "⣿⣤⣿ ⠉"]);
+        assert!(big_clock("02:34", p).iter().all(|l| tui::plain(l).chars().all(|c| c == ' ' || ('\u{2800}'..='\u{28FF}').contains(&c))), "dots only");
+        assert_eq!(big_clock("02:34", p)[0].cols(), 17);
         assert_eq!(big_clock("1:02:34", p)[0].cols(), 23);
         // Every digit three columns, every row as wide.
         let all: Vec<usize> = big_clock("0123456789", p).iter().map(|l| l.cols()).collect();
@@ -1643,26 +1703,42 @@ mod hifi_tests {
     }
 
     #[test]
-    fn the_dot_meter_has_two_steps_a_cell() {
+    fn only_an_overboost_lights_the_red() {
         let p = palette(ThemeKind::HiFi);
-        // 41 of 80 dot columns: 20 cells full, the 21st its left column.
-        let c = cells(&vu_dots(41.0 / 80.0, 0.0, 40, p));
-        assert_eq!(c.len(), 40);
-        assert!(c[..20].iter().all(|&(g, s)| g == '⣿' && s == p.accent));
-        assert_eq!(c[20], ('⡇', p.accent));
-        assert_eq!(c[21], ('⣿', p.rule), "a ghost");
-        // The peak hold: one bright dot column; the hot zones keep their colours.
-        let c = cells(&vu_dots(0.25, 61.0 / 80.0, 40, p));
-        assert_eq!(c[30], ('⢸', p.warn));
-        let c = cells(&vu_dots(1.0, 1.0, 40, p));
-        assert_eq!((c[29].1, c[30].1, c[34].1), (p.accent, p.warn, p.danger));
-        // A hold at full scale is the last dot column (it was past the end).
-        let c = cells(&vu_dots(0.25, 1.0, 40, p));
-        assert_eq!(c[39], ('⢸', p.danger));
-        let c = cells(&vu_bar(0.25, 1.0, 40, p));
-        assert_eq!(c[39], ('▊', p.danger), "the bars' hold too");
-        // Silence: ghosts only.
-        assert!(cells(&vu_dots(0.0, 0.0, 40, p)).iter().all(|&(g, _)| g == '⣿'));
+        let zero = meter_frac(0.0);
+        for hold in [zero, 0.5] {
+            for bar in [vu_bar(zero, hold, 42, p), vu_dots(zero, hold, 42, p)] {
+                assert!(!cells(&bar).iter().any(|&(_, s)| s == p.danger), "0 dB, hold {hold}");
+            }
+        }
+        let barely = meter_frac(0.1);
+        assert_eq!(cells(&vu_bar(barely, barely, 42, p)).iter().filter(|c| c.1 == p.danger).count(), 3, "one block");
+        let over = meter_frac(20.0 * 1.5f32.log10());
+        assert_eq!(cells(&vu_bar(over, over, 42, p)).iter().filter(|c| c.1 == p.danger).count(), 6, "150%: +3.5 dB, both");
+    }
+
+    #[test]
+    fn the_dot_meter_is_blocks_with_a_dot_column_for_a_gap() {
+        let p = palette(ThemeKind::HiFi);
+        // Half a block in is the whole block: 3 lit.
+        let c = cells(&vu_dots(2.5 / 14.0, 0.0, 42, p));
+        assert_eq!(c.len(), 42);
+        assert!(c[..9].chunks(3).all(|b| b == [('⣿', p.accent), ('⣿', p.accent), ('⡇', p.accent)]));
+        assert_eq!(&c[9..12], &[('⣿', p.rule), ('⣿', p.rule), ('⡇', p.rule)], "a ghost, the same shape");
+        // The peak hold: its block, bright; the hot zones keep their colours.
+        let c = cells(&vu_dots(0.25, 11.0 / 14.0, 42, p));
+        assert_eq!((c[30], c[33].1), (('⣿', p.warn), Style::new().fg(GHOST_WARM)));
+        let c = cells(&vu_dots(1.0, 1.0, 42, p));
+        assert_eq!((c[23].1, c[24].1, c[36].1), (p.accent, p.warn, p.danger));
+        // A hold at the end of the scale is the last block, in both styles.
+        for bar in [vu_dots(0.25, 1.0, 42, p), vu_bar(0.25, 1.0, 42, p)] {
+            assert_eq!(cells(&bar)[41].1, p.danger);
+        }
+        // Silence: ghosts only. Narrower, the blocks shrink before their number does.
+        assert!(cells(&vu_dots(0.0, 0.0, 42, p)).iter().all(|&(_, s)| s != p.accent));
+        assert_eq!(meter_blocks(28), (14, 2));
+        assert_eq!(meter_blocks(14), (14, 1));
+        assert_eq!(meter_blocks(9), (9, 1));
     }
 
     #[test]

@@ -19,7 +19,8 @@ use crate::state::{
     PlayerState, VizMode, VizStyle, SPECTRUM_BANDS, FFT_SIZE, VIZ_DECAY,
     BAR_DECAY, GRAVITY, DOT_GRAVITY, ATTACK, VIZ_ATTACK, HOLD_TIME,
 };
-use crate::theme::{palette as theme_palette, ThemeKind};
+use crate::state::VuKind;
+use crate::theme::{level_colour, palette as theme_palette, ThemeKind};
 use crate::tui::LineBuf;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
@@ -36,29 +37,6 @@ const CYAN: Style = Style::new().fg(Color::Cyan);
 const MAGENTA: Style = Style::new().fg(Color::Magenta);
 const DIM: Style = Style::new().add_modifier(Modifier::DIM);
 
-/// Per-theme color set used by the viz renderers. `low/mid/hot` map onto the
-/// classic green→yellow→red gradient; non-Classic themes collapse them onto
-/// the active palette so the spectrum/VU adopt the theme's identity.
-pub(crate) struct VizPalette {
-    pub(crate) low: Style,
-    pub(crate) mid: Style,
-    pub(crate) hot: Style,
-    pub(crate) dim: Style,
-}
-
-pub(crate) fn viz_palette(kind: ThemeKind) -> VizPalette {
-    let p = theme_palette(kind);
-    match kind {
-        // The signal colour for the body, caution for the loud top rows:
-        // one meaning per colour (theme.rs).
-        ThemeKind::Classic => VizPalette { low: p.accent, mid: p.accent, hot: p.warn, dim: p.dim },
-        // Monochrome: the warm-cyan accent for content, danger only for clip/hot.
-        ThemeKind::Minimal => VizPalette { low: p.accent, mid: p.accent, hot: p.danger, dim: p.dim },
-        // Amber gradient: dim→fg→accent→danger.
-        ThemeKind::HiFi => VizPalette { low: p.fg, mid: p.accent, hot: p.danger, dim: p.dim },
-    }
-}
-
 /// ISO ⅓-octave centre frequency of each spectrum band. Drives both the band
 /// energies and the frequency legend, so the labels cannot drift from the bins.
 pub(crate) const ISO_CENTERS: [f32; SPECTRUM_BANDS] = [
@@ -67,24 +45,6 @@ pub(crate) const ISO_CENTERS: [f32; SPECTRUM_BANDS] = [
     2000.0, 2500.0, 3150.0, 4000.0, 5000.0, 6300.0, 8000.0, 10000.0, 12500.0, 16000.0,
     20000.0,
 ];
-
-/// Per-band color for the spectrum ribbon. Classic draws every band in its
-/// signal colour; Minimal/HiFi project onto a 3-stop ramp (low→mid→hot) sized
-/// to the band index so the visual identity stays consistent with the rest of
-/// the theme.
-fn band_color(idx: usize, vp: &VizPalette, kind: ThemeKind) -> Style {
-    if matches!(kind, ThemeKind::Classic) {
-        // One signal colour across the bands: the old colour per frequency
-        // range meant nothing (theme.rs, one meaning per colour).
-        vp.low
-    } else {
-        // Map idx in 0..SPECTRUM_BANDS onto the 3 ramp stops.
-        let third = SPECTRUM_BANDS / 3;
-        if idx < third { vp.low }
-        else if idx < third * 2 { vp.mid }
-        else { vp.hot }
-    }
-}
 
 // --- Lightweight process stats (replaces sysinfo dependency) ---
 
@@ -339,6 +299,8 @@ pub struct VizAnalyser {
     peak_hold_timer: [u8; SPECTRUM_BANDS],
     smoothed_peak_l: f32,
     smoothed_peak_r: f32,
+    vu_l: VuDetector,
+    vu_r: VuDetector,
     vu_peak_hold_l: f32,
     vu_peak_hold_r: f32,
     /// Seconds each VU dot still hangs before it falls.
@@ -469,6 +431,8 @@ impl VizAnalyser {
             peak_hold_timer: [0; SPECTRUM_BANDS],
             smoothed_peak_l: 0.0,
             smoothed_peak_r: 0.0,
+            vu_l: VuDetector::default(),
+            vu_r: VuDetector::default(),
             vu_peak_hold_l: 0.0,
             vu_peak_hold_r: 0.0,
             vu_peak_timer_l: 0.0,
@@ -502,18 +466,25 @@ impl VizAnalyser {
 
         let frames = samples.len() / channels;
         let alpha = Correlation::alpha(self.sample_rate);
+        let vu_weights = VuWeights::at(self.sample_rate);
         for f in 0..frames {
+            // The meters read past full scale (an overboost, see the tap in
+            // audio.rs); everything else sees the signal as it is played.
             let l_raw = samples[f * channels];
-            let l = l_raw.abs();
-            peak_l = peak_l.max(l);
+            peak_l = peak_l.max(l_raw.abs());
+            self.vu_l.push(l_raw, &vu_weights);
+            let l_raw = l_raw.clamp(-1.0, 1.0);
             let r_raw = if channels >= 2 {
                 let r = samples[f * channels + 1];
                 peak_r = peak_r.max(r.abs());
+                self.vu_r.push(r, &vu_weights);
+                let r = r.clamp(-1.0, 1.0);
                 self.ch_l.sample_buffer.push_back(l_raw);
                 self.ch_r.sample_buffer.push_back(r);
                 r
             } else {
                 peak_r = peak_l;
+                self.vu_r.push(samples[f * channels], &vu_weights);
                 self.ch_l.sample_buffer.push_back(l_raw);
                 self.ch_r.sample_buffer.push_back(l_raw);
                 l_raw
@@ -539,11 +510,12 @@ impl VizAnalyser {
         let (l, r) = (self.smoothed_peak_l, self.smoothed_peak_r);
         self.smoothed_peak_l = vu_smooth(l, peak_l, steps);
         self.smoothed_peak_r = vu_smooth(r, peak_r, steps);
-        state.set_peaks(self.smoothed_peak_l, self.smoothed_peak_r);
+        let meter = state.vu_kind();
+        state.set_peaks(self.vu_l.level(meter), self.vu_r.level(meter));
 
-        // VU peak dots: hang for HOLD_TIME frames' worth, then fall.
-        vu_dot(self.smoothed_peak_l, &mut self.vu_peak_hold_l, &mut self.vu_peak_timer_l, steps);
-        vu_dot(self.smoothed_peak_r, &mut self.vu_peak_hold_r, &mut self.vu_peak_timer_r, steps);
+        // VU peak dots: the true peak, then each meter's own hang and fall.
+        vu_dot(peak_l, &mut self.vu_peak_hold_l, &mut self.vu_peak_timer_l, steps, meter);
+        vu_dot(peak_r, &mut self.vu_peak_hold_r, &mut self.vu_peak_timer_r, steps, meter);
         state.set_vu_dots(self.vu_peak_hold_l, self.vu_peak_hold_r);
 
         // Process FFT for each channel when enough samples collected
@@ -664,7 +636,7 @@ impl VizAnalyser {
         // The galaxy moves by the audio this call covered, like the meter.
         if state.shown_viz() == VizMode::Galaxy {
             let secs = frames as f32 / self.sample_rate.max(1) as f32;
-            let level = (self.smoothed_peak_l + self.smoothed_peak_r) / 2.0;
+            let level = ((self.smoothed_peak_l + self.smoothed_peak_r) / 2.0).min(1.0);
             let bands: [f32; SPECTRUM_BANDS] =
                 std::array::from_fn(|i| (self.ch_l.smoothed[i] + self.ch_r.smoothed[i]) / 2.0);
             self.galaxy.update(secs, level, &bands);
@@ -778,23 +750,25 @@ const VU_MAX_ROWS: usize = 40;
 const VU_MAX_THICKNESS: usize = 7;
 /// Level history for the full-window strip, newest last.
 const VU_HISTORY: usize = 512;
-/// Height of the bars alone: both channels at the thickness cap, the gap, and
-/// the permanent scale row.
-const VU_BARS_ROWS: usize = 2 * VU_MAX_THICKNESS + 2;
+/// Height of the bars alone: both channels at the thickness cap, the scale
+/// between them and the correlation row with a blank above it.
+const VU_BARS_ROWS: usize = 2 * VU_MAX_THICKNESS + 3;
 
 
 /// How the VU meter spends `rows`.
 ///
-/// Two peak values plus two hold dots is all the data there is, so extra height
-/// cannot be filled by drawing them larger indefinitely. It buys weight first
-/// (thickness, capped), then a dB ruler, and everything beyond that goes to a
+/// Two levels plus two hold dots is all the data there is, so extra height
+/// cannot be filled by drawing them larger indefinitely. It buys a dB ruler and
+/// the correlation first, then weight (thickness, capped), and everything beyond that goes to a
 /// level-over-time strip — the one part of a tall VU meter that shows something
 /// a single row could not.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct VuLayout {
     thickness: usize,
-    gap: usize,
     ruler: usize,
+    /// The blank row that keeps the correlation off the R bar.
+    gap: usize,
+    correlation: usize,
     history: usize,
     /// Rows the budget gave us that nothing wants — only when the history strip
     /// is switched off and the block was sized for it.
@@ -805,41 +779,41 @@ struct VuLayout {
 impl VuLayout {
     /// Every row the layout accounts for; must equal the budget it was given.
     fn total(self) -> usize {
-        self.thickness * 2 + self.gap + self.ruler + self.history + self.blank
+        self.thickness * 2 + self.ruler + self.gap + self.correlation + self.history + self.blank
     }
 }
 
 fn vu_layout(rows: usize, extras: bool) -> VuLayout {
     if rows == 0 {
-        return VuLayout { thickness: 0, gap: 0, ruler: 0, history: 0, blank: 0 };
+        return VuLayout { thickness: 0, ruler: 0, gap: 0, correlation: 0, history: 0, blank: 0 };
     }
     if rows < 4 {
-        // Natural size: one row per channel, and the spacer between them.
-        let gap = if rows >= 3 { rows - 2 } else { 0 };
-        let thickness = if rows == 1 { 0 } else { 1 };
-        // rows == 1 has no room for two channels; give the single row to L.
+        // Natural size: one row per channel, the scale between them when it fits.
+        let ruler = usize::from(rows >= 3);
+        // rows == 1 has no room for two channels.
         return VuLayout {
-            thickness: thickness.max(if rows == 1 { 0 } else { 1 }),
-            gap,
-            ruler: 0,
+            thickness: usize::from(rows >= 2),
+            ruler,
+            gap: 0,
+            correlation: 0,
             history: 0,
-            blank: if rows == 1 { 1 } else { 0 },
+            blank: usize::from(rows == 1) + rows.saturating_sub(3),
         };
     }
-    // The scale is permanent from here up: a meter without one is just a
-    // moving bar, and it costs a single row.
+    // The scale is permanent from here up, between the channels: a meter
+    // without one is just a moving bar, and it costs a single row. It also
+    // keeps the braille bars from running together into one thick meter.
     let ruler = 1;
-    // A blank row between the channels in both styles: without it the two
-    // braille bars ran together and read as one thick meter.
-    let gap = 1;
-    let body = rows - ruler - gap;
+    let correlation = usize::from(rows >= 5);
+    let gap = correlation;
+    let body = rows - ruler - gap - correlation;
     // Snap down to odd: 1, 3, 5, 7. An even block has no middle row, so the
     // channel label would have to sit off-centre.
     let raw = (body / 2).clamp(1, VU_MAX_THICKNESS);
     let thickness = if raw.is_multiple_of(2) { raw - 1 } else { raw };
-    let spare = rows - (thickness * 2 + gap + ruler);
+    let spare = rows - (thickness * 2 + ruler + gap + correlation);
     let history = if extras { spare } else { 0 };
-    VuLayout { thickness, gap, ruler, history, blank: spare - history }
+    VuLayout { thickness, ruler, gap, correlation, history, blank: spare - history }
 }
 
 /// Push this frame's levels onto the history ring and read it back.
@@ -878,37 +852,158 @@ fn vu_push_history(l: f32, r: f32, want: bool) -> Vec<(f32, f32)> {
     })
 }
 
-/// Marks for the dB scale: label and its column on a `bar_width` bar.
-///
-/// The bar is linear in amplitude, so a decibel sits at 10^(dB/20) of its
-/// length — 0 dB at the far right, -6 dB halfway, -20 dB at a tenth. Marks are
-/// dropped from the quiet end first when they would collide, since that end is
-/// where a linear bar crowds them together.
-fn vu_scale_marks(bar_width: usize) -> Vec<(usize, &'static str)> {
-    const DB: [(f32, &str); 6] = [
-        (-40.0, "-40"), (-20.0, "-20"), (-12.0, "-12"),
-        (-6.0, "-6"), (-3.0, "-3"), (0.0, "0"),
-    ];
-    let mut out: Vec<(usize, &'static str)> = Vec::new();
-    for (db, text) in DB.iter().rev() {
-        let frac = 10f32.powf(db / 20.0);
-        let col = ((frac * bar_width as f32).round() as usize)
-            .min(bar_width.saturating_sub(text.len()));
-        // Walking loud-to-quiet, keep a mark only if it clears the one already
-        // placed to its right.
-        if out.last().is_some_and(|(c, _): &(usize, &str)| col + text.len() + 1 > *c) {
-            continue;
-        }
-        out.push((col, text));
+/// Where 0 dBFS sits on a dB-scaled VU bar; past it, the few dB an overboost can reach.
+const VU_ZERO: f32 = 0.9;
+const VU_TOP_DB: f32 = 4.0;
+/// A real VU's needle: +3 VU ends the scale, and it is linear in amplitude.
+const VU_NEEDLE_ZERO: f32 = 0.7079;
+/// 0 VU's level (a sine's peak at -8 dBFS), as an amplitude. Studios align to
+/// -18, for tracks still to be mixed; finished masters read about -7 to -14
+/// (14 tracks measured), past a scale ending at -15: the needle stayed pinned.
+const VU_REF: f32 = 0.3981;
+
+/// Time to 99% of a step, rising and falling: a VU's, and the RMS bar's (the
+/// K-Meter guide, Katz; Dorrough's dealers quote the same 600 ms).
+const VU_SECS: f32 = 0.3;
+const RMS_SECS: f32 = 0.6;
+/// The RMS bar's window (the K-Meter guide's 1024 samples, about this at 48 kHz).
+const RMS_WINDOW_SECS: f32 = 0.02;
+/// The peak dot's fall once its hold ends: 26 dB in 3 s (Katz).
+const VU_DOT_FALL_DB_S: f32 = 8.67;
+/// Dorrough's dot: livelier than K-14's, but not the real one's. Spec listings
+/// give no hold and "Peak Decay Period, 180 mS, from full-scale to all LEDs off",
+/// fine for LEDs and hopeless at 30 frames a second: 7 dB a frame, 3 dB jumps 23
+/// times a second, 30% of frames hidden inside the bar (14 tracks measured), and
+/// it looked to be in two places at once. These: under 1 jump a second, never hidden.
+const DORROUGH_DOT_HANG_SECS: f32 = 0.1;
+const DORROUGH_DOT_FALL_DB_S: f32 = 30.0;
+
+/// Per-sample weights of `VuDetector`'s one-pole stages at a rate.
+struct VuWeights {
+    rectified: f32,
+    power: f32,
+    rms: f32,
+}
+
+impl VuWeights {
+    fn at(rate: u32) -> Self {
+        let weight = |tau: f32| 1.0 - (-1.0 / (tau * rate.max(1) as f32)).exp();
+        let to_99 = std::f32::consts::LN_10 * 2.0;
+        VuWeights { rectified: weight(VU_SECS / to_99), power: weight(RMS_WINDOW_SECS), rms: weight(RMS_SECS / to_99) }
     }
-    out.reverse();
+}
+
+/// One channel's bar readings. Both keep moving whichever is shown, so `u`
+/// never lands on a stale level.
+/// shortcut: one pole, so no ~1% needle overshoot; add a second if the VU reads too tame.
+#[derive(Default)]
+struct VuDetector {
+    rectified: f32,
+    power: f32,
+    rms: f32,
+}
+
+impl VuDetector {
+    fn push(&mut self, x: f32, w: &VuWeights) {
+        let f = crate::eq::flush_denormal;
+        self.rectified = f(self.rectified + w.rectified * (x.abs() - self.rectified));
+        self.power = f(self.power + w.power * (x * x - self.power));
+        self.rms = f(self.rms + w.rms * (self.power.sqrt() - self.rms));
+    }
+
+    /// The bar's level, calibrated so a sine reads its peak (AES-17): both
+    /// the bar and the dot then say the same for a tone.
+    fn level(&self, meter: VuKind) -> f32 {
+        match meter {
+            VuKind::Vu => self.rectified * std::f32::consts::FRAC_PI_2,
+            VuKind::Dorrough | VuKind::K14 => self.rms * std::f32::consts::SQRT_2,
+        }
+    }
+}
+
+impl VuKind {
+    /// Where a level (linear, 1 = full scale) sits on the bar, 0 to 1.
+    fn pos(self, level: f32) -> f32 {
+        match self {
+            VuKind::Vu => (level.max(0.0) / VU_REF * VU_NEEDLE_ZERO).min(1.0),
+            // Linear in dB, as Dorrough's and Katz's LEDs are.
+            VuKind::Dorrough | VuKind::K14 => {
+                let db = 20.0 * level.max(1e-5).log10();
+                if db <= 0.0 {
+                    ((db + 40.0) / 40.0).max(0.0) * VU_ZERO
+                } else {
+                    (VU_ZERO + (1.0 - VU_ZERO) * db / VU_TOP_DB).min(1.0)
+                }
+            }
+        }
+    }
+
+    /// Whether it has a peak dot: a VU's needle is all it has.
+    fn shows_peak(self) -> bool {
+        self != VuKind::Vu
+    }
+
+    /// The dot after a peak: seconds it hangs, then dB a second it falls.
+    fn dot_ballistics(self) -> (f32, f32) {
+        match self {
+            VuKind::Dorrough => (DORROUGH_DOT_HANG_SECS, DORROUGH_DOT_FALL_DB_S),
+            VuKind::Vu | VuKind::K14 => (HOLD_TIME as f32 * VU_FRAME_SECS, VU_DOT_FALL_DB_S),
+        }
+    }
+
+    /// The scale's marks (dBFS, label), most wanted first: a narrow bar keeps those.
+    fn marks(self) -> &'static [(f32, &'static str)] {
+        match self {
+            VuKind::Dorrough => &[(0.0, "0"), (4.0, "+4"), (-6.0, "-6"), (-3.0, "-3"), (-12.0, "-12"), (-20.0, "-20"), (-30.0, "-30")],
+            VuKind::Vu => &[(-8.0, "0"), (-5.0, "+3"), (-11.0, "-3"), (-18.0, "-10"), (-28.0, "-20"), (-13.0, "-5"), (-15.0, "-7"), (-10.0, "-2"), (-9.0, "-1"), (-7.0, "+1"), (-6.0, "+2")],
+            VuKind::K14 => &[(-14.0, "0"), (0.0, "+14"), (4.0, "+18"), (-10.0, "+4"), (-6.0, "+8"), (-20.0, "-6"), (-24.0, "-10"), (-34.0, "-20")],
+        }
+    }
+
+    /// Where on the bar the colour ramp reaches yellow and where its last
+    /// colour starts: past full scale on the dB scale (only an overboost gets
+    /// there), past 0 on a VU's (its red arc), past +4 on a K-meter (Katz's amber ends there).
+    fn ramp_knots(self) -> (f32, f32) {
+        match self {
+            VuKind::Dorrough => (0.45, VU_ZERO),
+            VuKind::Vu => (0.3548, VU_NEEDLE_ZERO), // -6 VU, 0 VU
+            VuKind::K14 => (0.585, 0.675),          // 0 and +4 on the K scale
+        }
+    }
+
+    /// A position on the bar as a position on the colour ramp.
+    fn ramp_at(self, pos: f32) -> f32 {
+        let (yellow, red) = self.ramp_knots();
+        if pos <= yellow {
+            pos / yellow * 0.45
+        } else if pos <= red {
+            0.45 + (pos - yellow) / (red - yellow) * 0.45
+        } else {
+            0.9 + (pos - red) / (1.0 - red) * 0.1
+        }
+    }
+}
+
+/// Marks for the scale: label and its column on a `bar_width` bar, the unit
+/// first (the title above names the meter). Each is placed if it clears the
+/// ones placed before it.
+fn vu_scale_marks(bar_width: usize, meter: VuKind) -> Vec<(usize, &'static str)> {
+    let mut out: Vec<(usize, &'static str)> = vec![(0, "dB")];
+    for &(dbfs, text) in meter.marks() {
+        let at = meter.pos(10f32.powf(dbfs / 20.0));
+        let col = ((at * bar_width as f32).round() as usize).min(bar_width.saturating_sub(text.len()));
+        if out.iter().all(|&(c, t)| col + text.len() < c || c + t.len() < col) {
+            out.push((col, text));
+        }
+    }
+    out.sort();
     out
 }
 
-/// The permanent dB scale under the bars.
-fn vu_scale_row(bar_width: usize, label_w: usize, vp: &VizPalette) -> Line<'static> {
+/// The permanent scale between the bars; what is past the ramp's last colour in it.
+fn vu_scale_row(bar_width: usize, label_w: usize, meter: VuKind, kind: ThemeKind) -> Line<'static> {
     let mut cells = vec![' '; bar_width];
-    for (col, text) in vu_scale_marks(bar_width) {
+    for (col, text) in vu_scale_marks(bar_width, meter) {
         for (i, ch) in text.chars().enumerate() {
             if let Some(slot) = cells.get_mut(col + i) {
                 *slot = ch;
@@ -917,14 +1012,53 @@ fn vu_scale_row(bar_width: usize, label_w: usize, vp: &VizPalette) -> Line<'stat
     }
     let mut line = LineBuf::new();
     line.spaces(2 + label_w);
-    line.style(vp.dim);
-    line.push_str(&cells.into_iter().collect::<String>());
+    // Two more: the mark there (a `0`, a `+4`) is the last that is not over.
+    let over = (((meter.ramp_knots().1 * bar_width as f32).round() as usize) + 2).min(bar_width);
+    line.style(theme_palette(kind).dim).push_str(&cells[..over].iter().collect::<String>());
+    line.style(level_colour(kind, 1.0)).push_str(&cells[over..].iter().collect::<String>());
+    line.into_line()
+}
+
+/// The stereo correlation as a small bar: filled from the centre, right when
+/// the channels agree, left when they cancel; then the number, then the warning.
+fn vu_correlation_row(c: &Correlation, width: usize, label_w: usize, style: VizStyle, kind: ThemeKind) -> Line<'static> {
+    const MAX_CELLS: usize = 21;
+    let value = c.value();
+    let dim = theme_palette(kind).dim;
+    let (fill, rest) = match style { VizStyle::Dots => ('⣿', '⠤'), VizStyle::Bars => ('█', '▏') };
+    let mut line = LineBuf::new();
+    line.spaces(2 + label_w).style(dim).push_str("corr ");
+    // Odd, so the centre is a cell. What goes round it takes 16 columns.
+    let n = (width.saturating_sub(16).min(MAX_CELLS).saturating_sub(1)) | 1;
+    if n >= 5 {
+        line.push_str("-1 ");
+        let centre = n / 2;
+        for i in 0..n {
+            let x = (i as f32 - centre as f32) / centre as f32;
+            // Half a cell's worth lights the cell.
+            let half = 0.5 / centre as f32;
+            if i == centre {
+                line.style(dim).push('┼');
+            } else if value > 0.0 && x > 0.0 && x - half <= value {
+                line.style(level_colour(kind, 0.0)).push(fill);
+            } else if value < 0.0 && x < 0.0 && x + half >= value {
+                line.style(level_colour(kind, 1.0)).push(fill);
+            } else {
+                line.style(dim).push(rest);
+            }
+        }
+        line.style(dim).push_str(" +1 ");
+    }
+    line.style(dim).push_str(&format!("{value:+.2}"));
+    if c.mono_risk() {
+        line.style(level_colour(kind, 1.0)).push_str("  MONO RISK");
+    }
     line.into_line()
 }
 
 /// The level-over-time strip: newest at the right, filled from the bottom.
 fn vu_history_lines(hist: &[(f32, f32)], w: usize, rows: usize, style: VizStyle,
-                    vp: &VizPalette) -> Lines {
+                    meter: VuKind, kind: ThemeKind) -> Lines {
     // The strip is drawn in the same alphabet as the bars above it — braille in
     // Dots, blocks in Bars — or the two halves of the meter read as different
     // visualizations stacked on top of each other.
@@ -942,8 +1076,9 @@ fn vu_history_lines(hist: &[(f32, f32)], w: usize, rows: usize, style: VizStyle,
         let mut line = LineBuf::new();
         line.spaces(2 + w.saturating_sub(shown.len()));
         for &(l, r) in shown {
-            let level = l.max(r).clamp(0.0, 1.0);
-            line.style(if level >= 0.8 { vp.hot } else if level >= 0.6 { vp.mid } else { vp.low });
+            let level = meter.pos(l.max(r));
+            // The colour where this cell's lit part ends.
+            line.style(level_colour(kind, meter.ramp_at(level.min(row_top))));
             if level >= row_top {
                 line.push(full);
             } else if level > row_bottom {
@@ -1000,12 +1135,20 @@ fn vu_smooth(level: f32, peak: f32, steps: f32) -> f32 {
     }
 }
 
-/// A VU peak dot over `steps` tuning frames: jump to a new peak, hang for
-/// HOLD_TIME frames' worth of seconds, then fall at DOT_GRAVITY per frame.
-fn vu_dot(level: f32, hold: &mut f32, timer: &mut f32, steps: f32) {
+/// A VU peak dot over `steps` tuning frames: jump to a new peak, hang, then
+/// fall in dB, as `meter` says (the scale is in dB, and a linear fall dropped
+/// off its end all at once).
+fn vu_dot(level: f32, hold: &mut f32, timer: &mut f32, steps: f32, meter: VuKind) {
+    let (hang, fall_db_s) = meter.dot_ballistics();
+    let fall = |hold: &mut f32, steps: f32| {
+        *hold *= 10f32.powf(-fall_db_s * steps * VU_FRAME_SECS / 20.0);
+        if *hold < 1e-4 {
+            *hold = 0.0;
+        }
+    };
     if level >= *hold {
         *hold = level;
-        *timer = HOLD_TIME as f32 * VU_FRAME_SECS;
+        *timer = hang;
     } else if *timer > 0.0 {
         *timer -= steps * VU_FRAME_SECS;
         // The hold ran out partway through this call: the rest of it is
@@ -1013,53 +1156,59 @@ fn vu_dot(level: f32, hold: &mut f32, timer: &mut f32, steps: f32) {
         if *timer < 0.0 {
             let fall_steps = -*timer / VU_FRAME_SECS;
             *timer = 0.0;
-            *hold = (*hold - DOT_GRAVITY * fall_steps).max(0.0);
+            fall(hold, fall_steps);
         }
     } else {
-        *hold = (*hold - DOT_GRAVITY * steps).max(0.0);
+        fall(hold, steps);
     }
 }
 
 /// See `render_vu_meter_body`; this enforces the width half of the renderer contract
 /// (`fit_width`).
-pub fn render_vu_meter(state: &PlayerState, style: VizStyle, width: usize, rows: usize, extras: bool) -> Lines {
-    fit_width(render_vu_meter_body(state, style, width, rows, extras), width)
+pub fn render_vu_meter(state: &PlayerState, correlation: &Correlation, style: VizStyle, width: usize, rows: usize, extras: bool) -> Lines {
+    fit_width(render_vu_meter_body(state, correlation, style, width, rows, extras), width)
 }
 
-fn render_vu_meter_body(state: &PlayerState, style: VizStyle, width: usize, rows: usize,
+fn render_vu_meter_body(state: &PlayerState, correlation: &Correlation, style: VizStyle, width: usize, rows: usize,
                        extras: bool) -> Lines {
     let (left, right) = state.get_peaks();
-    let (dot_l, dot_r) = state.get_vu_dots();
+    let meter = state.vu_kind();
+    let (dot_l, dot_r) = if meter.shows_peak() { state.get_vu_dots() } else { (0.0, 0.0) };
     // Fill the width: 2-space pad + "L " label (2) + 2-col safety margin = 6 overhead.
     let bar_width = width.saturating_sub(6).max(10);
-    let vp = viz_palette(state.theme_kind());
+    let kind = state.theme_kind();
 
-    fn make_bar(level: f32, dot_val: f32, label: &str, width: usize, style: VizStyle, vp: &VizPalette) -> Line<'static> {
-        let full = (level.clamp(0.0, 1.0) * width as f32) as usize;
-        let dot_idx = (dot_val.clamp(0.0, 1.0) * width as f32) as usize;
-
-        let yellow_start = width * 6 / 10 + 1;
-        let red_start = width * 8 / 10 + 1;
+    // `below`: the R bar, under the scale. Braille has no middle row, so each
+    // bar's unlit guide and hold mark sit just off the cell's middle toward the
+    // scale, mirrored: the same distance from it both ways (`⣀` in both sat
+    // against it above and a cell away below).
+    let make_bar = |level: f32, dot_val: f32, label: &str, below: bool| -> Line<'static> {
+        let width = bar_width;
+        let dim = theme_palette(kind).dim;
+        let full = (meter.pos(level) * width as f32) as usize;
+        // The cell the position ends in: a hold exactly at 0 dB stays out of the red.
+        let dot_idx = ((meter.pos(dot_val) * width as f32).ceil() as usize).saturating_sub(1);
 
         let mut bar = LineBuf::new();
-        bar.push_str("  ").styled(label, vp.dim).reset().push(' ');
-        let (fill, rest) = match style { VizStyle::Dots => ('⣿', '⣀'), VizStyle::Bars => ('█', '▏') };
-        let dot = match style { VizStyle::Dots => '⠅', VizStyle::Bars => '▏' };
+        bar.push_str("  ").styled(label, dim).reset().push(' ');
+        let (fill, rest, dot) = match (style, below) {
+            (VizStyle::Dots, false) => ('⣿', '⠤', '⠅'),
+            (VizStyle::Dots, true) => ('⣿', '⠒', '⡂'),
+            (VizStyle::Bars, _) => ('█', '▏', '▏'),
+        };
         for i in 0..width {
-            let color = if i >= red_start { vp.hot }
-                        else if i >= yellow_start { vp.mid }
-                        else { vp.low };
+            let color = level_colour(kind, meter.ramp_at((i as f32 + 0.5) / width as f32));
             if i < full {
                 bar.style(color).push(fill);
             } else if i == dot_idx && dot_idx > 0 {
                 // The peak hold: a bright mark in the zone's colour.
                 bar.style(color).push(dot);
             } else {
-                bar.style(vp.dim).push(rest);
+                bar.style(dim).push(rest);
             }
         }
         bar.into_line()
-    }
+    };
 
     let lay = vu_layout(rows, extras);
     let hist = vu_push_history(left, right, lay.history > 0);
@@ -1070,21 +1219,26 @@ fn render_vu_meter_body(state: &PlayerState, style: VizStyle, width: usize, rows
         let mid = lay.thickness / 2;
         for i in 0..lay.thickness {
             let label = if i == mid { "L" } else { " " };
-            lines.push(make_bar(left, dot_l, label, bar_width, style, &vp));
+            lines.push(make_bar(left, dot_l, label, false));
         }
-        for _ in 0..lay.gap {
-            lines.push(Line::default());
+        for _ in 0..lay.ruler {
+            lines.push(vu_scale_row(bar_width, 2, meter, kind));
         }
         for i in 0..lay.thickness {
             let label = if i == mid { "R" } else { " " };
-            lines.push(make_bar(right, dot_r, label, bar_width, style, &vp));
+            lines.push(make_bar(right, dot_r, label, true));
         }
     }
-    for _ in 0..lay.ruler {
-        lines.push(vu_scale_row(bar_width, 2, &vp));
+    for _ in 0..lay.gap {
+        lines.push(Line::default());
+    }
+    for _ in 0..lay.correlation {
+        lines.push(vu_correlation_row(correlation, bar_width, 2, style, kind));
     }
     if lay.history > 0 {
-        lines.extend(vu_history_lines(&hist, bar_width + 2, lay.history, style, &vp));
+        // Its first row is the blank that keeps the strip off the correlation.
+        lines.push(Line::default());
+        lines.extend(vu_history_lines(&hist, bar_width + 2, lay.history - 1, style, meter, kind));
     }
     // The layout is the contract: return exactly the rows we were given.
     lines.truncate(rows);
@@ -1115,7 +1269,6 @@ fn render_spectrum_horizontal_body(state: &PlayerState, style: VizStyle, width: 
     let spec_l = state.get_spectrum();
     let spec_r = state.get_spectrum_r();
     let kind = state.theme_kind();
-    let vp = viz_palette(kind);
     let cw = spectrum_cell_w(width);
     let cols = spectrum_col_count(width, cw);
     let groups = spectrum_columns(cols);
@@ -1134,18 +1287,18 @@ fn render_spectrum_horizontal_body(state: &PlayerState, style: VizStyle, width: 
     for r in 0..n {
         let lo = (n - 1 - r) as f32 / n as f32;
         let hi = (n - r) as f32 / n as f32;
+        let color = level_colour(kind, (lo + hi) / 2.0);
         let mut line = LineBuf::new();
         line.spaces(indent);
         for &g in &groups {
-            let (level, src) = spectrum_group(&spec_l, g);
-            h_cell(&mut line, level, lo, hi, style, band_color(src, &vp, kind), true, cw);
+            h_cell(&mut line, spectrum_group(&spec_l, g), lo, hi, style, color, true, cw);
         }
         lines.push(line.into_line());
     }
 
     for i in 0..centre {
         if legend && i == 0 {
-            lines.push(spectrum_legend_row(&groups, cw, indent, &vp));
+            lines.push(spectrum_legend_row(&groups, cw, indent, theme_palette(kind).dim));
         } else {
             lines.push(Line::default());
         }
@@ -1156,11 +1309,11 @@ fn render_spectrum_horizontal_body(state: &PlayerState, style: VizStyle, width: 
     for r in 0..n {
         let lo = r as f32 / n as f32;
         let hi = (r + 1) as f32 / n as f32;
+        let color = level_colour(kind, (lo + hi) / 2.0);
         let mut line = LineBuf::new();
         line.spaces(indent);
         for &g in &groups {
-            let (level, src) = spectrum_group(&spec_r, g);
-            h_cell(&mut line, level, lo, hi, style, band_color(src, &vp, kind), false, cw);
+            h_cell(&mut line, spectrum_group(&spec_r, g), lo, hi, style, color, false, cw);
         }
         lines.push(line.into_line());
     }
@@ -1236,14 +1389,7 @@ fn render_spectrum_vertical_body(state: &PlayerState, style: VizStyle, width: us
     let indent = spectrum_indent(width, groups.len(), cw);
     let mut lines: Lines = Vec::with_capacity(rows);
 
-    let vp = viz_palette(state.theme_kind());
-    // Top rows are "hot" (loud), bottom rows are quiet. Keyed off the row's
-    // position in the range rather than a fixed 8-entry table, so the ramp
-    // holds at any height: the top quarter is hot, the next quarter mid.
-    let row_color = |row: usize| -> Style {
-        let frac = row as f32 / height as f32;
-        if frac < 0.25 { vp.hot } else if frac < 0.5 { vp.mid } else { vp.low }
-    };
+    let kind = state.theme_kind();
 
     let partials = match style {
         VizStyle::Bars => LOWER_BLOCKS,
@@ -1255,11 +1401,11 @@ fn render_spectrum_vertical_body(state: &PlayerState, style: VizStyle, width: us
         line.spaces(indent);
         let row_bottom = (height - 1 - row) as f32 / height as f32;
         let row_top = (height - row) as f32 / height as f32;
-        let color = row_color(row);
+        let color = level_colour(kind, (row_bottom + row_top) / 2.0);
 
         for &g in &groups {
-            let (level, _) = spectrum_group(&spectrum, g);
-            let (dot, _) = spectrum_group(&dots, g);
+            let level = spectrum_group(&spectrum, g);
+            let dot = spectrum_group(&dots, g);
             let dot_in_row = dot >= row_bottom && dot < row_top;
             let bar_partial = level > row_bottom && level < row_top;
             let bar_full = level >= row_top;
@@ -1292,7 +1438,7 @@ fn render_spectrum_vertical_body(state: &PlayerState, style: VizStyle, width: us
         lines.push(line.into_line());
     }
     if legend {
-        lines.push(spectrum_legend_row(&groups, cw, indent, &vp));
+        lines.push(spectrum_legend_row(&groups, cw, indent, theme_palette(kind).dim));
     }
     lines
 }
@@ -1337,10 +1483,10 @@ fn spectrum_group_src(group: (usize, usize)) -> usize {
 }
 
 /// Peak of a band group, and the source band that represents it.
-fn spectrum_group(spec: &[f32; SPECTRUM_BANDS], group: (usize, usize)) -> (f32, usize) {
+fn spectrum_group(spec: &[f32; SPECTRUM_BANDS], group: (usize, usize)) -> f32 {
     let (lo, hi) = group;
     let peak = spec[lo..hi].iter().copied().fold(0.0f32, f32::max);
-    (peak, spectrum_group_src(group))
+    peak
 }
 
 /// Short label for a band centre, in at most three columns and never
@@ -1381,7 +1527,7 @@ fn spectrum_indent(width: usize, cols: usize, cw: usize) -> usize {
 /// octave ladder uses. Labels name the band actually under them, taken from the
 /// same `ISO_CENTERS` table that defines the bins, so they cannot drift.
 fn spectrum_legend_row(groups: &[(usize, usize)], cw: usize, indent: usize,
-                       vp: &VizPalette) -> Line<'static> {
+                       dim: Style) -> Line<'static> {
     let width = groups.len() * cw;
     let mut cells = vec![' '; width];
     let mut next_free = 0usize;
@@ -1398,7 +1544,7 @@ fn spectrum_legend_row(groups: &[(usize, usize)], cw: usize, indent: usize,
         next_free = col + text.len() + 1;
     }
     let mut line = LineBuf::new();
-    line.spaces(indent).style(vp.dim).push_str(&cells.into_iter().collect::<String>());
+    line.spaces(indent).style(dim).push_str(&cells.into_iter().collect::<String>());
     line.into_line()
 }
 
@@ -1437,7 +1583,7 @@ fn viz_max_rows(mode: VizMode, fullscreen: bool, extras: bool) -> usize {
         // Without the history strip the meter has nothing to do with extra
         // rows, so it stops asking for them rather than reserving blanks.
         // The meter's own structure sets this: two bars at the odd thickness
-        // cap, the gap between them, and the scale. History on must never make
+        // cap, the scale between them, and the correlation. History on must never make
         // the block SMALLER than history off, or the toggle shrinks the meter.
         VizMode::VuMeter => match (extras, fullscreen) {
             (false, _) => VU_BARS_ROWS,
@@ -2811,9 +2957,9 @@ mod analysis_tests {
         let dot = |calls: usize| {
             let steps = 2.0 / calls as f32 / VU_FRAME_SECS;
             let (mut hold, mut timer) = (1.0f32, 0.0f32);
-            vu_dot(1.0, &mut hold, &mut timer, steps);
+            vu_dot(1.0, &mut hold, &mut timer, steps, VuKind::K14);
             for _ in 0..calls {
-                vu_dot(0.0, &mut hold, &mut timer, steps);
+                vu_dot(0.0, &mut hold, &mut timer, steps, VuKind::K14);
             }
             hold
         };
@@ -2910,7 +3056,7 @@ mod analysis_tests {
                     for term_h in 0..48usize {
                         let rows = viz_body_rows(mode, term_h, true, extras);
                         let lines = match mode {
-                            VizMode::VuMeter => render_vu_meter(&state, style, term_w, rows, extras),
+                            VizMode::VuMeter => render_vu_meter(&state, &analyser.correlation, style, term_w, rows, extras),
                             VizMode::SpectrumHorizontal =>
                                 render_spectrum_horizontal(&state, style, term_w, rows, extras),
                             VizMode::SpectrumVertical =>
@@ -3025,16 +3171,244 @@ mod analysis_tests {
         assert_eq!(fmt_band_hz(16000.0), "16k");
     }
 
+    /// `secs` of a 1 kHz sine of peak `amp` through the analyser in 10 ms blocks,
+    /// and the bar's level at each block's end.
+    fn vu_run(a: &mut VizAnalyser, st: &PlayerState, amp: f32, secs: f32) -> Vec<(f32, f32)> {
+        let block: Vec<f32> = (0..480).flat_map(|i| {
+            let s = amp * (i as f32 * 2.0 * std::f32::consts::PI * 1000.0 / 48_000.0).sin();
+            [s, s]
+        }).collect();
+        let mut out = Vec::new();
+        let mut t = 0.0;
+        while t < secs {
+            a.process(&block, 2, st);
+            t += 0.01;
+            out.push((t, st.get_peaks().0));
+        }
+        out
+    }
+
+    #[test]
+    fn each_meter_reads_and_moves_as_its_standard_says() {
+        for (meter, secs, zero_at_dbfs) in [(VuKind::Vu, VU_SECS, -8.0f32), (VuKind::K14, RMS_SECS, -14.0), (VuKind::Dorrough, RMS_SECS, 0.0)] {
+            let st = PlayerState::new();
+            st.vu_kind.store(meter as u8, Ordering::Relaxed);
+            let mut a = VizAnalyser::new(48_000);
+            // A sine at the scale's 0 reads 0 there, and rises to 99% in its time.
+            let amp = 10f32.powf(zero_at_dbfs / 20.0);
+            let rise = vu_run(&mut a, &st, amp, 2.0);
+            let settled = rise.last().unwrap().1;
+            assert!((settled / amp - 1.0).abs() < 0.01, "{meter:?}: reads {settled} for {amp}");
+            let at_99 = rise.iter().find(|&&(_, v)| v >= 0.99 * amp).unwrap().0;
+            assert!((at_99 - secs).abs() < 0.1 * secs, "{meter:?}: 99% in {at_99} s, wants {secs}");
+            // And falls to 1% in the same time, within what the block size allows.
+            let fall = vu_run(&mut a, &st, 0.0, 2.0);
+            let at_1 = fall.iter().find(|&&(_, v)| v <= 0.01 * amp).unwrap().0;
+            assert!((at_1 - secs).abs() < 0.15 * secs, "{meter:?}: 1% in {at_1} s, wants {secs}");
+        }
+    }
+
+    #[test]
+    fn a_short_burst_barely_moves_the_bar_and_the_dot_catches_it() {
+        let st = PlayerState::new();
+        let mut a = VizAnalyser::new(48_000);
+        // 5 ms at full scale, in one block.
+        let mut burst = vec![0.0f32; 3200];
+        for i in 0..240 {
+            let s = (i as f32 * 2.0 * std::f32::consts::PI * 1000.0 / 48_000.0).sin();
+            burst[i * 2] = s;
+            burst[i * 2 + 1] = s;
+        }
+        a.process(&burst, 2, &st);
+        assert!(st.get_peaks().0 < 0.1, "{}", st.get_peaks().0);
+        assert!(st.get_vu_dots().0 > 0.99, "{}", st.get_vu_dots().0);
+    }
+
+    #[test]
+    fn the_dot_falls_in_db_and_has_no_vu_needle() {
+        // 1 s after the hold: 8.67 dB lower.
+        let (mut hold, mut timer) = (1.0f32, 0.0f32);
+        vu_dot(0.0, &mut hold, &mut timer, 1.0 / VU_FRAME_SECS, VuKind::K14);
+        assert!((20.0 * hold.log10() + VU_DOT_FALL_DB_S).abs() < 0.01, "{hold}");
+        // K-14's hangs longer; Dorrough's is short, then falls 1 dB per 30 fps
+        // frame, however the time is cut up: at the real meter's 7 dB a frame
+        // it looked to be in two places at once.
+        let (mut hold, mut timer) = (0.0f32, 0.0f32);
+        vu_dot(1.0, &mut hold, &mut timer, 1.0, VuKind::K14);
+        assert_eq!(timer, 0.5);
+        for calls in [1, 6, 18] {
+            let (mut hold, mut timer) = (0.0f32, 0.0f32);
+            vu_dot(1.0, &mut hold, &mut timer, 1.0, VuKind::Dorrough);
+            assert_eq!(timer, DORROUGH_DOT_HANG_SECS);
+            let secs = DORROUGH_DOT_HANG_SECS + 1.0 / 30.0;
+            for _ in 0..calls {
+                vu_dot(0.0, &mut hold, &mut timer, secs / calls as f32 / VU_FRAME_SECS, VuKind::Dorrough);
+            }
+            assert!((20.0 * hold.log10() + 1.0).abs() < 0.01, "{calls}: {hold}");
+        }
+        let st = PlayerState::new();
+        st.set_peaks(VU_REF, VU_REF);
+        st.set_vu_dots(1.0, 1.0);
+        let shows = |st: &PlayerState| crate::tui::plain(&render_vu_meter(st, &Correlation::default(), VizStyle::Dots, 106, 3, false)[0]).contains('⠅');
+        assert!(shows(&st), "Dorrough's dot");
+        st.vu_kind.store(VuKind::Vu as u8, Ordering::Relaxed);
+        assert!(!shows(&st), "a VU has only its needle");
+    }
+
+    #[test]
+    fn every_meter_labels_its_own_scale_and_colours_it_from_its_own_zero() {
+        for meter in [VuKind::Dorrough, VuKind::Vu, VuKind::K14] {
+            for bar in [10usize, 12, 24, 54, 120, 300] {
+                let marks = vu_scale_marks(bar, meter);
+                assert_eq!(marks[0], (0, "dB"), "{meter:?} bar={bar}: the unit starts it");
+                assert!(marks.iter().any(|m| m.1 == "0"), "{meter:?} bar={bar}: {marks:?}");
+                for pair in marks.windows(2) {
+                    assert!(pair[0].0 + pair[0].1.len() < pair[1].0, "{meter:?} bar={bar}: {marks:?}");
+                }
+                for (c, t) in &marks {
+                    assert!(c + t.len() <= bar, "{meter:?} bar={bar}: {t} runs off");
+                }
+            }
+        }
+        let wide = |meter| vu_scale_marks(120, meter).iter().map(|m| m.1).collect::<Vec<_>>();
+        assert_eq!(wide(VuKind::Vu), ["dB", "-20", "-10", "-7", "-5", "-3", "-2", "-1", "0", "+1", "+2", "+3"]);
+        assert_eq!(wide(VuKind::K14), ["dB", "-20", "-10", "-6", "0", "+4", "+8", "+14", "+18"]);
+        // The knots are where the scale says.
+        let at = |m: VuKind, db: f32| m.pos(10f32.powf(db / 20.0));
+        for (m, yellow, red) in [(VuKind::Dorrough, -20.0, 0.0), (VuKind::Vu, -14.0, -8.0), (VuKind::K14, -14.0, -10.0)] {
+            assert!((m.ramp_knots().0 - at(m, yellow)).abs() < 1e-3, "{m:?}");
+            assert!((m.ramp_knots().1 - at(m, red)).abs() < 1e-3, "{m:?}");
+            assert!((m.ramp_at(m.ramp_knots().1) - 0.9).abs() < 1e-5);
+        }
+        // Dorrough's ramp is the bar itself: its last colour is past full scale.
+        for p in [0.1f32, 0.45, 0.7, 0.9, 0.95] {
+            assert!((VuKind::Dorrough.ramp_at(p) - p).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn the_guides_sit_the_same_distance_from_the_scale_on_both_sides() {
+        let st = PlayerState::new();
+        st.set_vu_dots(0.5, 0.5);
+        let c = Correlation::default();
+        let rows: Vec<String> = render_vu_meter(&st, &c, VizStyle::Dots, 60, 5, false).iter().map(crate::tui::plain).collect();
+        // L, the scale, R, a blank, the correlation.
+        assert!(rows[0].contains('⠤') && rows[0].contains('⠅') && !rows[0].contains('⠒'), "{rows:?}");
+        assert!(rows[1].contains("dB"), "{rows:?}");
+        assert!(rows[2].contains('⠒') && rows[2].contains('⡂') && !rows[2].contains('⠤'), "{rows:?}");
+        assert_eq!(rows[3], "", "{rows:?}");
+        assert!(rows[4].contains("corr"), "{rows:?}");
+        // Mirror images in the braille grid: dot rows 3 and 2; 1, 3 and 2, 4.
+        let row_of = |c: char, bits: u32| (c as u32 - 0x2800) & bits != 0;
+        assert!(row_of('⠤', 0x24) && row_of('⠒', 0x12));
+        assert!(row_of('⠅', 0x05) && row_of('⡂', 0x42));
+    }
+
+    #[test]
+    fn the_correlation_bar_fills_from_the_centre() {
+        let filled = |sign: f32| {
+            let mut c = Correlation::default();
+            let alpha = Correlation::alpha(48_000);
+            for i in 0..48_000 {
+                let a = (i as f32 * 0.1).sin();
+                c.push(a, a * sign, alpha);
+            }
+            c.advance(2.0);
+            crate::tui::plain(&vu_correlation_row(&c, 100, 2, VizStyle::Bars, ThemeKind::Classic))
+        };
+        let mono = filled(1.0);
+        let (left, right) = mono.split_once('┼').unwrap();
+        assert!(right.starts_with("██████████ +1 +1.00"), "{mono}");
+        assert!(!left.contains('█'), "{mono}");
+        let out = filled(-1.0);
+        let (left, right) = out.split_once('┼').unwrap();
+        assert!(left.ends_with("██████████"), "{out}");
+        assert!(!right.contains('█') && out.contains("-1.00") && out.contains("MONO RISK"), "{out}");
+        // A narrow bar keeps the number.
+        let tiny = crate::tui::plain(&vu_correlation_row(&Correlation::default(), 10, 2, VizStyle::Bars, ThemeKind::Classic));
+        assert!(tiny.contains("corr +0.00") && !tiny.contains('┼'), "{tiny}");
+    }
+
+    #[test]
+    fn the_spectrums_take_their_colour_from_the_level() {
+        let st = PlayerState::new();
+        let kind = st.theme_kind();
+        st.set_spectrum(&[1.0; SPECTRUM_BANDS]);
+        st.set_spectrum_r(&[1.0; SPECTRUM_BANDS]);
+        let colours = |lines: &[Line<'static>]| -> Vec<Option<Style>> {
+            lines.iter().map(|l| l.spans.iter().find(|s| s.content.contains('█')).map(|s| s.style)).collect()
+        };
+        // Grows upward: the top row is the end of the ramp, each one its own colour.
+        let v = colours(&render_spectrum_vertical(&st, VizStyle::Bars, 120, 8, false));
+        assert_eq!(v[0], Some(level_colour(kind, 15.0 / 16.0)));
+        assert_eq!(v[7], Some(level_colour(kind, 1.0 / 16.0)));
+        assert!(v.windows(2).all(|w| w[0] != w[1]), "{v:?}");
+        // Two channels, mirrored: the loudest rows are the outer ones.
+        let h = colours(&render_spectrum_horizontal(&st, VizStyle::Bars, 120, 8, false));
+        assert_eq!(h[0], h[7]);
+        assert_eq!(h[3], h[4]);
+        assert_eq!(h[0], Some(level_colour(kind, 7.0 / 8.0)));
+    }
+
+    #[test]
+    fn the_vu_scale_sits_between_the_channels() {
+        let st = PlayerState::new();
+        st.set_peaks(0.5, 0.5);
+        for rows in [3usize, 7, 9] {
+            let lines = render_vu_meter(&st, &Correlation::default(), VizStyle::Bars, 106, rows, false);
+            let text: Vec<String> = lines.iter().map(crate::tui::plain).collect();
+            let at = text.iter().position(|r| r.contains("dB")).unwrap_or_else(|| panic!("{rows}: {text:?}"));
+            assert!(text[..at].iter().any(|r| r.contains("L ")), "{rows}: {text:?}");
+            assert!(text[at + 1..].iter().any(|r| r.contains("R ")), "{rows}: {text:?}");
+        }
+    }
+
+    #[test]
+    fn the_vu_bar_keeps_its_last_tenth_for_an_overboost() {
+        let m = VuKind::Dorrough;
+        assert!((m.pos(1.0) - 0.9).abs() < 1e-6);
+        assert!((m.pos(0.1) - 0.45).abs() < 1e-5, "-20 dB, linear in dB below 0");
+        assert!((m.pos(1.5) - 0.988).abs() < 1e-3, "150% of full scale: +3.5 dB");
+        assert_eq!(m.pos(4.0), 1.0, "and it stops at the end of the bar");
+        let st = PlayerState::new();
+        let hot = level_colour(st.theme_kind(), 1.0);
+        let red = |left: f32| {
+            st.set_peaks(left, 0.0);
+            st.set_vu_dots(left, 0.0);
+            render_vu_meter(&st, &Correlation::default(), VizStyle::Bars, 106, 2, false)[0].spans.iter()
+                .any(|s| s.style == hot && s.content.contains('█'))
+        };
+        assert!(!red(1.0), "0 dB is not over");
+        assert!(red(1.5));
+    }
+
+    #[test]
+    fn the_analyser_reads_peaks_past_full_scale_and_plays_the_rest_clipped() {
+        let st = PlayerState::new();
+        let mut a = VizAnalyser::new(48_000);
+        // A second of it: the VU's attack takes a few frames.
+        a.process(&[1.5f32, -0.5].repeat(48_000), 2, &st);
+        assert!(st.get_peaks().0 > 1.0, "{:?}", st.get_peaks());
+        assert_eq!(st.get_vu_dots().0, 1.5, "the dot is the true peak");
+        assert!(a.waveform_buf.iter().all(|&(l, r)| l == 1.0 && r == -0.5));
+    }
+
     #[test]
     fn the_db_scale_runs_loud_to_quiet_and_ends_at_full_scale() {
         for bar in [12usize, 24, 54, 120, 300] {
-            let marks = vu_scale_marks(bar);
+            let marks = vu_scale_marks(bar, VuKind::Dorrough);
             assert!(!marks.is_empty(), "bar={bar} got no scale");
-            // 0 dB is full scale, so it always survives the thinning and sits
-            // hard against the right-hand end.
+            // 0 dB is full scale, so it always survives the thinning; +4, the
+            // overboost's top, ends the scale when there is room for both.
+            let zero = marks.iter().find(|m| m.1 == "0").unwrap_or_else(|| panic!("bar={bar}: no 0 dB"));
+            assert_eq!(zero.0, ((0.9 * bar as f32).round() as usize).min(bar - 1), "bar={bar}");
             let (col, text) = *marks.last().unwrap();
-            assert_eq!(text, "0");
-            assert_eq!(col, bar - 1, "bar={bar}: 0 dB must end the scale");
+            if bar >= 40 {
+                assert_eq!((col, text), (bar - 2, "+4"), "bar={bar}");
+            } else {
+                assert_eq!(text, "0");
+            }
+            assert_eq!(marks[0], (0, "dB"), "bar={bar}: the unit starts it");
             // Quieter marks sit further left, and none overlap.
             for pair in marks.windows(2) {
                 assert!(pair[0].0 + pair[0].1.len() < pair[1].0,
@@ -3232,10 +3606,11 @@ mod analysis_tests {
         let tall = vu_layout(24, true);
         assert_eq!(tall.thickness, VU_MAX_THICKNESS);
         assert!(tall.history > 0, "tall meter must show level history");
-        // The channels never touch, in either style.
+        // The scale sits between the channels, so they never touch.
         for rows in 3..40usize {
-            assert_eq!(vu_layout(rows, false).gap, 1, "rows={rows}");
+            assert_eq!(vu_layout(rows, false).ruler, 1, "rows={rows}");
         }
+        assert_eq!((vu_layout(4, false).correlation, vu_layout(5, false).correlation), (0, 1), "only with its blank row");
     }
 
     #[test]

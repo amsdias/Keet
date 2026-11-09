@@ -196,6 +196,43 @@ pub fn base_hue(kind: ThemeKind) -> f32 {
     }
 }
 
+/// A colour `at` the way along stops (position, colour), blended between them.
+pub fn ramp(stops: &[(f32, Rgb)], at: f32) -> Rgb {
+    let s = at.clamp(0.0, 1.0);
+    let i = stops.iter().rposition(|&(p, _)| p <= s).unwrap_or(0).min(stops.len() - 2);
+    let ((a, ca), (b, cb)) = (stops[i], stops[i + 1]);
+    let f = ((s - a) / (b - a)).clamp(0.0, 1.0);
+    let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * f).round() as u8;
+    (mix(ca.0, cb.0), mix(ca.1, cb.1), mix(ca.2, cb.2))
+}
+
+/// Level displays, from silence to the top. The last colour starts just past
+/// 0.9, where 0 dB sits on the VU bar: on it, only an overboost reaches it.
+const LED_RAMP: [(f32, Rgb); 6] = [
+    (0.00, (120, 225, 70)),  // lime
+    (0.45, (245, 235, 70)),  // yellow
+    (0.70, (240, 180, 55)),  // amber
+    (0.89, (235, 130, 40)),  // orange
+    (0.91, (222, 56, 28)),   // red
+    (1.00, (222, 56, 28)),
+];
+const NEON_RAMP: [(f32, Rgb); 6] = [
+    (0.00, (120, 232, 214)), // mint
+    (0.35, (80, 150, 240)),  // blue
+    (0.65, (120, 95, 245)),  // indigo
+    (0.89, (190, 70, 215)),  // orchid
+    (0.91, (240, 70, 130)),  // hot pink
+    (1.00, (240, 70, 130)),
+];
+
+/// A level display's colour `at` (0 to 1) of its height or length: LEDs in
+/// Classic, Minimal its own from its cyan. (HiFi draws no viz mode.)
+pub fn level_colour(kind: ThemeKind, at: f32) -> Style {
+    let stops = if kind == ThemeKind::Minimal { &NEON_RAMP } else { &LED_RAMP };
+    let (r, g, b) = ramp(stops, at);
+    Style::new().fg(Color::Rgb(r, g, b))
+}
+
 /// HSV (hue in degrees, saturation and value 0..=1) to RGB.
 pub fn hsv(h: f32, s: f32, v: f32) -> Rgb {
     let c = v * s;

@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The Windows installer: per user (no admin prompt), into %LOCALAPPDATA%\Programs\Keet,
+  with `keet` on the user's PATH and a Start menu shortcut. Uninstalling removes all of it.
+  Built by .github/actions/windows-msi (WiX 5):
+    wix build wix/keet.wxs -arch x64 -d Version=2.0.4 -d Bin=path\to\keet.exe -o keet.msi
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <!-- The UpgradeCode ties every version together (upgrades, winget): never change it. -->
+  <Package Name="Keet" Manufacturer="Angelo Dias" Version="$(var.Version)"
+           UpgradeCode="4A5DCF1D-A4AD-45FA-B212-F829BD4534C4" Scope="perUser">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Keet is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="keet.ico" SourceFile="$(sys.SOURCEFILEDIR)../assets/icon.ico" />
+    <Property Id="ARPPRODUCTICON" Value="keet.ico" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/amsdias/Keet" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/amsdias/Keet/issues" />
+
+    <!-- Windows Terminal's command alias. Started through it, Keet runs in a tab with
+         WT_SESSION set and draws Sixel; a shortcut to keet.exe itself goes through the
+         default-terminal handoff, which sets none (microsoft/terminal#13392). -->
+    <Property Id="WT_EXE" Secure="yes">
+      <DirectorySearch Id="WindowsApps" Path="[LocalAppDataFolder]Microsoft\WindowsApps" Depth="0">
+        <FileSearch Name="wt.exe" />
+      </DirectorySearch>
+    </Property>
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="ProgramsDir" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="Keet">
+          <!-- A per-user component's key path must be an HKCU value, and every folder
+               it makes in the profile must be removed on uninstall (ICE38, ICE64). With
+               files beside that value its GUID cannot be generated: keep this one. -->
+          <Component Id="Main" Guid="0AF573AB-21CF-451B-95CF-9BA4FE2C3A37">
+            <File Id="keet.exe" Source="$(var.Bin)" />
+            <File Id="LICENSE" Source="$(sys.SOURCEFILEDIR)../LICENSE" />
+            <File Id="THIRD_PARTY_LICENSES" Source="$(sys.SOURCEFILEDIR)../THIRD_PARTY_LICENSES" />
+            <Environment Id="PathEntry" Name="PATH" Value="[INSTALLFOLDER]" Part="last" Action="set" System="no" />
+            <RemoveFolder Id="RemoveInstallFolder" On="uninstall" />
+            <RemoveFolder Id="RemoveProgramsDir" Directory="ProgramsDir" On="uninstall" />
+            <RegistryValue Root="HKCU" Key="Software\amsdias\Keet" Name="Installed" Type="integer" Value="1" KeyPath="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <!-- One shortcut or the other. Its app ID is the one Keet sets (media_keys::set_app_id):
+         Windows's media flyout takes Keet's name and icon from this shortcut, and says
+         "Unknown app" without it. -->
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Component Id="ShortcutViaTerminal" Condition="WT_EXE">
+        <Shortcut Id="KeetViaTerminal" Name="Keet" Description="Terminal audio player"
+                  Target="[WT_EXE]" Arguments="&quot;[INSTALLFOLDER]keet.exe&quot;" Icon="keet.ico">
+          <ShortcutProperty Key="System.AppUserModel.ID" Value="amsdias.Keet" />
+        </Shortcut>
+        <RegistryValue Root="HKCU" Key="Software\amsdias\Keet" Name="ShortcutViaTerminal" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+      <Component Id="ShortcutDirect" Condition="NOT WT_EXE">
+        <Shortcut Id="KeetDirect" Name="Keet" Description="Terminal audio player"
+                  Target="[INSTALLFOLDER]keet.exe" Icon="keet.ico">
+          <ShortcutProperty Key="System.AppUserModel.ID" Value="amsdias.Keet" />
+        </Shortcut>
+        <RegistryValue Root="HKCU" Key="Software\amsdias\Keet" Name="ShortcutDirect" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+  </Package>
+</Wix>

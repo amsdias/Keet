@@ -156,7 +156,7 @@ impl BiquadCoeffs {
 
     /// 2nd-order high-pass (RBJ cookbook) — the "low cut". Q > 0.707 adds a
     /// resonant bump at the corner, like an analog filter's emphasis.
-    fn high_pass(freq: f64, q: f64, sample_rate: f64) -> Self {
+    pub(crate) fn high_pass(freq: f64, q: f64, sample_rate: f64) -> Self {
         let w0 = 2.0 * std::f64::consts::PI * freq / sample_rate;
         let (sin_w0, cos_w0) = w0.sin_cos();
         let alpha = sin_w0 / (2.0 * q);

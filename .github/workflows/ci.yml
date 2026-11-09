@@ -7,6 +7,9 @@ on:
   pull_request:
     branches:
       - main
+  # Run by hand (Actions → CI → Run workflow): in the private repo the only
+  # way the jobs below run.
+  workflow_dispatch:
 
 # Read-only token: nothing here writes to the repository.
 permissions:
@@ -27,8 +30,9 @@ jobs:
     name: Test (${{ matrix.os }})
     # Only in the public repo: Actions there are free, and every change lands
     # there. The private copy would spend its minutes (macOS counts 10x) on
-    # the same runs. Jobs that need this one are skipped with it.
-    if: github.repository == 'amsdias/Keet'
+    # the same runs, so there only a manual run (workflow_dispatch) runs them.
+    # Jobs that need this one are skipped with it.
+    if: github.repository == 'amsdias/Keet' || github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -58,7 +62,7 @@ jobs:
   # Linux-only lint never saw it.
   clippy:
     name: Clippy (${{ matrix.os }})
-    if: github.repository == 'amsdias/Keet' # as test
+    if: github.repository == 'amsdias/Keet' || github.event_name == 'workflow_dispatch' # as test
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -129,6 +133,21 @@ jobs:
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
+
+      # Here too, so a broken installer shows before a tag does.
+      - name: Build MSI (Windows)
+        if: matrix.os == 'windows-latest'
+        uses: ./.github/actions/windows-msi
+        with:
+          bin: target/${{ matrix.target }}/release/${{ matrix.bin }}
+          out: keet-windows-x86_64.msi
+
+      - name: Upload MSI (Windows)
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: keet-windows-x86_64.msi
+          path: keet-windows-x86_64.msi
 
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

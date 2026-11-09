@@ -108,6 +108,63 @@ pub enum VizStyle {
     Dots = 1,
 }
 
+/// What the VU visualization reads and how its scale is drawn (`u`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VuKind {
+    /// RMS bar and peak dot, on full scale's dB.
+    Dorrough = 0,
+    /// A real VU: rectified average, no dot, 0 at -8 dBFS.
+    Vu = 1,
+    /// RMS bar and peak dot, 0 at -14 dBFS.
+    K14 = 2,
+}
+
+impl VuKind {
+    /// From a `config.json` value.
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "dorrough" => Some(VuKind::Dorrough),
+            "vu" => Some(VuKind::Vu),
+            "k14" | "k-14" => Some(VuKind::K14),
+            _ => None,
+        }
+    }
+
+    /// Its `config.json` name.
+    pub fn name(self) -> &'static str {
+        match self {
+            VuKind::Dorrough => "dorrough",
+            VuKind::Vu => "vu",
+            VuKind::K14 => "k14",
+        }
+    }
+
+    /// As it reads on screen.
+    pub fn label(self) -> &'static str {
+        match self {
+            VuKind::Dorrough => "Dorrough",
+            VuKind::Vu => "VU",
+            VuKind::K14 => "K-14",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            VuKind::Dorrough => VuKind::Vu,
+            VuKind::Vu => VuKind::K14,
+            VuKind::K14 => VuKind::Dorrough,
+        }
+    }
+
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => VuKind::Vu,
+            2 => VuKind::K14,
+            _ => VuKind::Dorrough,
+        }
+    }
+}
+
 impl VizStyle {
     /// From a `config.json` value: `dots` or `bars`.
     pub fn from_str(s: &str) -> Option<Self> {
@@ -219,6 +276,15 @@ impl VizMode {
             VizMode::Galaxy => VizMode::Cymatics,
             VizMode::Cymatics => VizMode::None,
         }
+    }
+
+    /// The mode `next` came from (Shift+V, a right click on the visualization).
+    pub fn prev(self) -> Self {
+        let mut m = self;
+        while m.next() != self {
+            m = m.next();
+        }
+        m
     }
 
     pub fn from_u8(value: u8) -> Self {
@@ -462,6 +528,8 @@ pub struct PlayerState {
 
     // Visualization style (bars vs dots)
     pub(crate) viz_style: AtomicU8,
+    /// The VU visualization's meter (`VuKind`).
+    pub(crate) vu_kind: AtomicU8,
     /// Full-window viz: the header is dropped and the visualization takes every
     /// row the frame can spare. Relaxed — UI-thread state with no ordering
     /// relationship to anything else.
@@ -606,6 +674,7 @@ impl PlayerState {
             show_stats: AtomicBool::new(false),
             crossfade_secs: AtomicU32::new(0),
             viz_style: AtomicU8::new(VizStyle::Dots as u8),
+            vu_kind: AtomicU8::new(VuKind::Dorrough as u8),
             viz_fullscreen: AtomicBool::new(false),
             viz_extras: AtomicBool::new(false),
             viz_fps: AtomicU32::new(DEFAULT_VIZ_FPS),
@@ -745,9 +814,10 @@ impl PlayerState {
         VizMode::from_u8(self.viz_mode.load(Ordering::Relaxed))
     }
 
-    pub fn cycle_viz_mode(&self) {
+    pub fn cycle_viz_mode(&self, forward: bool) {
         let current = self.viz_mode();
-        self.viz_mode.store(current.next() as u8, Ordering::Relaxed);
+        let to = if forward { current.next() } else { current.prev() };
+        self.viz_mode.store(to as u8, Ordering::Relaxed);
     }
 
     /// Move the selected preset by `dir` (+1/-1), wrapping. Selecting a preset
@@ -972,6 +1042,16 @@ impl PlayerState {
         next
     }
 
+    pub fn vu_kind(&self) -> VuKind {
+        VuKind::from_u8(self.vu_kind.load(Ordering::Relaxed))
+    }
+
+    pub fn cycle_vu_kind(&self) -> VuKind {
+        let next = self.vu_kind().next();
+        self.vu_kind.store(next as u8, Ordering::Relaxed);
+        next
+    }
+
     pub fn viz_style(&self) -> VizStyle {
         VizStyle::from_u8(self.viz_style.load(Ordering::Relaxed))
     }
@@ -1188,6 +1268,15 @@ impl PlayerState {
     }
 }
 
+/// The tab worker's answer: its load's generation, and the file and its
+/// score, or why not (empty: no file).
+pub type TabAnswer = (u64, Result<(PathBuf, crate::tab::Score), String>);
+/// The beat worker's answer: the load's generation, the track's onset curve.
+pub type BeatAnswer = (u64, Result<Vec<f32>, String>);
+/// What the tracker's corrections were worked out from: the tab load's
+/// generation, the marks, and whether the onsets were in.
+pub type TrackerKey = (u64, Vec<(usize, f64)>, bool);
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ViewMode {
     Player,
@@ -1196,6 +1285,15 @@ pub enum ViewMode {
     Eq,
     /// Every key, by view (`?`).
     Help,
+    /// The guitar tab (`g`).
+    Tab,
+}
+
+impl ViewMode {
+    /// A panel (floating, or docked), as opposed to the player or a dialog.
+    pub fn is_panel(self) -> bool {
+        matches!(self, ViewMode::Playlist | ViewMode::Lyrics | ViewMode::Tab)
+    }
 }
 
 /// Something on screen the mouse acts on (`UiState::hits`, rebuilt by every
@@ -1221,6 +1319,9 @@ pub enum Hit {
     EqBand(usize),
     /// A preset in HiFi's EQ unit's list: a click selects it.
     EqPreset(usize),
+    /// The visualization's space, drawn or off (empty): a click is `v`, a
+    /// right click Shift+V.
+    Viz,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -1406,6 +1507,39 @@ pub struct UiState {
     /// and abort their slow LRCLIB fetch if the counter has advanced (i.e. user skipped).
     pub lyrics_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
 
+    /// The playing track's guitar tab (`tab_panel`), read by `spawn_tab_worker`.
+    pub tab: Option<std::sync::Arc<crate::tab::Score>>,
+    /// Its file.
+    pub tab_path: Option<PathBuf>,
+    /// Why it could not be read (None: read, looking, or no file).
+    pub tab_error: Option<String>,
+    /// The track the tab above was looked for (another one playing: look again).
+    pub tab_audio: Option<PathBuf>,
+    /// The user's part, marks and nudge for this track and tab file.
+    pub tab_sync: crate::tab_sync::TrackSync,
+    /// Score time to song time, rebuilt when the score or the sync changes.
+    pub tab_map: Option<crate::tab_sync::TimeMap>,
+    pub tab_syncs: crate::tab_sync::SyncStore,
+    /// What `0` cleared: the next Backspace puts it back; a new mark or another track forgets it.
+    pub tab_cleared: Option<crate::tab_sync::TrackSync>,
+    /// `n`: note names instead of fret numbers.
+    pub tab_names: bool,
+    /// The bars `r` loops (`tab_panel::TabLoop`); not kept between tabs.
+    pub tab_loop: crate::tab_panel::TabLoop,
+    /// Song seconds at which the tab drawn last moves a cell (`tab_panel::next_step`);
+    /// None when no tab was drawn.
+    pub tab_next_step: Option<f64>,
+    pub tab_receiver: Option<std::sync::mpsc::Receiver<TabAnswer>>,
+    /// Bumped by every load: an answer for an older one is dropped.
+    pub tab_gen: u64,
+    /// The kick-drum onsets of a track (`tab_sync::onset_curve`), with the
+    /// track they belong to: decoded once, tracked again on every mark change.
+    pub tab_onsets: Option<(PathBuf, Vec<f32>)>,
+    pub tab_beat_receiver: Option<std::sync::mpsc::Receiver<BeatAnswer>>,
+    /// The tracker's corrections with what they came from: a nudge or a part
+    /// switch reuses them, a mark change or the onsets' arrival does not.
+    pub tab_corrections: Option<(TrackerKey, Vec<(f64, f64)>)>,
+
     /// Currently-resolved album cover (half-block pre-rendered lines if decoded).
     pub cover: Option<crate::cover::CoverImage>,
     /// Emit-on-change bookkeeping for the cover slot, mirroring
@@ -1418,7 +1552,11 @@ pub struct UiState {
     /// Theme changed, so the cover must be re-decoded for the new slot size.
     /// Main consumes this and respawns the cover worker.
     pub cover_resize_pending: bool,
-    pub cover_receiver: Option<std::sync::mpsc::Receiver<Option<crate::cover::CoverImage>>>,
+    pub cover_receiver: Option<std::sync::mpsc::Receiver<Option<crate::cover::Resolved>>>,
+    /// Whether the OS has a now-playing widget to give the cover to.
+    pub os_art: bool,
+    /// The file the OS's widget shows for this track (`cover::Resolved`).
+    pub art_url: Option<String>,
     pub cover_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub cover_enabled: bool,
     /// Visible playlist rows from the last render — used by PageUp/PageDown.
@@ -1632,11 +1770,30 @@ impl UiState {
             lyrics_auto_scroll: true,
             lyrics_offset: 0.0,
             lyrics_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            tab: None,
+            tab_path: None,
+            tab_error: None,
+            tab_audio: None,
+            tab_sync: Default::default(),
+            tab_map: None,
+            // Loaded here, before anything can save over the file.
+            tab_syncs: crate::tab_sync::SyncStore::load(),
+            tab_names: false,
+            tab_loop: Default::default(),
+            tab_next_step: None,
+            tab_receiver: None,
+            tab_gen: 0,
+            tab_onsets: None,
+            tab_cleared: None,
+            tab_beat_receiver: None,
+            tab_corrections: None,
             cover: None,
             cover_block_intact: false,
             cover_dirty_frame: true,
             cover_resize_pending: false,
             cover_receiver: None,
+            os_art: false,
+            art_url: None,
             cover_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             cover_enabled: true,
             last_visible_rows: 20,
@@ -1654,7 +1811,7 @@ impl UiState {
             library_auto_docked: false,
             library_auto_declined: false,
             library_auto_set_up: false,
-            panel_recent: vec![ViewMode::Playlist, ViewMode::Lyrics],
+            panel_recent: vec![ViewMode::Playlist, ViewMode::Lyrics, ViewMode::Tab],
             docked_shown: Vec::new(),
             eq_in_stack: false,
             hifi_meter: Default::default(),

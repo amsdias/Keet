@@ -441,12 +441,12 @@ impl Player {
     /// widget. The cache supplies them once the scan has reached this track;
     /// until then the display name stands in for the title (the same fallback
     /// the UI itself uses).
-    fn publish_now_playing(&mut self) {
+    fn publish_now_playing(&mut self, position_secs: f64) {
         if let Some(ref mut mc) = self.media_controls {
             let (mk_artist, mk_album) = self.ui.metadata_cache.artist_album(self.ui.current);
             let mk_title = self.ui.metadata_cache.title(self.ui.current).unwrap_or_else(|| self.filename.clone());
-            media_keys::update_metadata(mc, &mk_title, mk_artist.as_deref(), mk_album.as_deref(), self.state.total_secs());
-            media_keys::update_playback(mc, self.state.is_paused(), 0.0);
+            media_keys::update_metadata(mc, &mk_title, mk_artist.as_deref(), mk_album.as_deref(), self.state.total_secs(), self.ui.art_url.as_deref());
+            media_keys::update_playback(mc, self.state.is_paused(), position_secs);
         }
     }
 
@@ -540,6 +540,7 @@ impl Player {
         let dur = { let t = state.total_secs(); if t > 0.0 { Some(t as u32) } else { None } };
         let lyrics_path = self.playlist[self.ui.current].clone();
         spawn_lyrics_worker(&mut self.ui, lyrics_path.clone(), dur);
+        self.ui.art_url = None;
         spawn_cover_worker(&mut self.ui, lyrics_path, cover::CoverSize::for_theme(state.theme_kind()));
 
         // Visualization analyzer (created before the startup wait so the frame
@@ -578,7 +579,7 @@ impl Player {
             thread::sleep(Duration::from_millis(20));
         }
 
-        self.publish_now_playing();
+        self.publish_now_playing(0.0);
         self.last_ui = Instant::now();
         Flow::Continue
     }
@@ -866,7 +867,18 @@ impl Player {
             &self.state,
             self.ui.viz_on_screen(),
             now.duration_since(self.last_playing) < VIZ_SETTLE || meter_falling,
+            crate::tab_panel::moving(&self.ui),
         );
+        // A tab loop (`r`) seeks back at its end.
+        if let Some(by) = crate::tab_panel::loop_seek(&mut self.ui, self.state.time_secs()) {
+            self.state.seek_to_offset(by);
+            self.ui.dirty = true;
+        }
+        // The tab steps a cell at a time: drawn when it steps, not on the
+        // next frame after (by turns 2 or 3 frames a cell: uneven).
+        if self.tab_step() == Some(Duration::ZERO) {
+            self.ui.dirty = true;
+        }
         if self.ui.dirty || self.ui.terminal_resized || self.full_repaint || self.last_ui.elapsed() >= interval {
             self.ui.dirty = false;
             self.render_frame();
@@ -889,10 +901,19 @@ impl Player {
         let wait = if ui::input_waiting(&self.ui) || self.ui.dirty {
             Duration::ZERO
         } else {
-            loop_wait(interval.saturating_sub(self.last_ui.elapsed()), self.ui.esc_quit_until, Instant::now())
+            let frame_left = interval.saturating_sub(self.last_ui.elapsed());
+            loop_wait(self.tab_step().map_or(frame_left, |t| frame_left.min(t)), self.ui.esc_quit_until, Instant::now())
         };
         let _ = crate::input::poll(wait);
         Flow::Continue
+    }
+
+    /// Time until a tab moving with the song steps a cell (the frame drawn
+    /// last says when), while playing.
+    fn tab_step(&self) -> Option<Duration> {
+        let next = [self.ui.tab_next_step, crate::tab_panel::loop_end(&self.ui)].into_iter().flatten().reduce(f64::min);
+        let t = next.filter(|_| crate::tab_panel::moving(&self.ui) && !self.state.is_paused())?;
+        Some(Duration::from_secs_f64((t - self.state.time_secs()).max(0.0)))
     }
 
     /// The quit key: clear the frame, save the session, and — in exclusive
@@ -967,10 +988,11 @@ impl Player {
 
         let dur = { let t = state.total_secs(); if t > 0.0 { Some(t as u32) } else { None } };
         spawn_lyrics_worker(ui, new_path.clone(), dur);
+        ui.art_url = None;
         spawn_cover_worker(ui, new_path, cover::CoverSize::for_theme(state.theme_kind()));
 
         self.track_info = self.build_track_info();
-        self.publish_now_playing();
+        self.publish_now_playing(0.0);
         self.save();
     }
 
@@ -1264,15 +1286,31 @@ impl Player {
             }
         }
 
+        // The tab panel: a tab to look for (opened, or another track), and
+        // the worker's answer.
+        if crate::tab_panel::step(&mut self.ui, &self.playlist) {
+            self.ui.dirty = true;
+        }
+
         // Check if background cover fetch has completed
-        if let Some(ref rx) = self.ui.cover_receiver {
-            if let Ok(cover) = rx.try_recv() {
-                self.ui.cover = cover;
-                self.ui.cover_receiver = None;
-                // The renderers draw the cover per frame, emit-on-change:
-                // a newly arrived image needs exactly one repaint.
-                self.ui.cover_dirty_frame = true;
-                self.ui.dirty = true;
+        let cover = self.ui.cover_receiver.as_ref().and_then(|rx| rx.try_recv().ok());
+        if let Some(cover) = cover {
+            let art = match &cover {
+                Some(found) => found.art_url.clone(),
+                None if self.ui.os_art => cover::no_art_url(),
+                None => None,
+            };
+            self.ui.cover = cover.map(|found| found.image);
+            self.ui.cover_receiver = None;
+            // The renderers draw the cover per frame, emit-on-change:
+            // a newly arrived image needs exactly one repaint.
+            self.ui.cover_dirty_frame = true;
+            self.ui.dirty = true;
+            // The OS's widget has had the track since it started; a theme
+            // switch re-decoding the same cover sends it nothing new.
+            if art != self.ui.art_url {
+                self.ui.art_url = art;
+                self.publish_now_playing(self.state.time_secs());
             }
         }
 
@@ -1446,8 +1484,14 @@ fn loop_wait(frame_left: Duration, quit_until: Option<Instant>, now: Instant) ->
 /// keeps moving, at `PAUSED_GALAXY_FRAME` at most; the cymatics plate
 /// stands still when paused (its shimmer runs on playing time). The
 /// analysis spectrogram keeps its own cadence, one column per frame, which
-/// keeps its scrolling even.
-fn frame_interval(state: &PlayerState, viz_on_screen: bool, playing_recently: bool) -> Duration {
+/// keeps its scrolling even. A tab moving with the song (`tab_moving`) is
+/// drawn at the visualization's rate too, or it jumps 4 times a second.
+fn frame_interval(state: &PlayerState, viz_on_screen: bool, playing_recently: bool, tab_moving: bool) -> Duration {
+    let still = frame_interval_viz(state, viz_on_screen, playing_recently);
+    if tab_moving && playing_recently && still == IDLE_FRAME { state.viz_frame() } else { still }
+}
+
+fn frame_interval_viz(state: &PlayerState, viz_on_screen: bool, playing_recently: bool) -> Duration {
     // What is on screen, not the setting: HiFi's slot is always the VU panel
     // (a galaxy chosen in another theme kept a paused HiFi at full rate).
     let mode = state.shown_viz();
@@ -1480,6 +1524,7 @@ fn default_values(
         .filter_map(|v| match v {
             ViewMode::Playlist => Some("playlist"),
             ViewMode::Lyrics => Some("lyrics"),
+            ViewMode::Tab => Some("tab"),
             _ => None,
         })
         .collect();
@@ -1488,6 +1533,7 @@ fn default_values(
         ("theme", json!(state.theme_kind().name())),
         ("viz", json!(state.viz_mode().config_name())),
         ("viz_style", json!(state.viz_style().name())),
+        ("vu_meter", json!(state.vu_kind().name())),
         ("crossfeed", json!(crossfeed)),
         ("rg_mode", json!(state.rg_mode().name().to_ascii_lowercase())),
         ("mouse", json!(state.mouse.load(Ordering::Relaxed))),
@@ -1547,17 +1593,19 @@ mod tests {
         let st = PlayerState::new();
         st.viz_mode.store(VizMode::Galaxy as u8, Ordering::Relaxed);
         st.toggle_viz_style();
+        st.cycle_vu_kind();
         let mut ui = UiState::new(Vec::new(), crate::metadata::MetadataCache::new(0));
-        ui.docked = vec![ViewMode::Lyrics, ViewMode::Playlist];
+        ui.docked = vec![ViewMode::Lyrics, ViewMode::Playlist, ViewMode::Tab];
         let values = default_values(&st, &ui, None, "Medium");
         let text = serde_json::Value::Object(values.into_iter().map(|(k, v)| (k.to_string(), v)).collect());
         let c = crate::config::parse_for_tests(&text.to_string());
         assert!(c.problems.is_empty(), "{:?}", c.problems);
         assert_eq!(c.viz.as_deref().and_then(VizMode::from_str), Some(VizMode::Galaxy));
         assert_eq!(c.viz_style.as_deref().and_then(state::VizStyle::from_str), Some(st.viz_style()));
+        assert_eq!(c.vu_meter.as_deref().and_then(state::VuKind::from_str), Some(st.vu_kind()));
         assert_eq!(c.theme.as_deref().and_then(theme::ThemeKind::from_str), Some(st.theme_kind()));
         assert_eq!(c.rg_mode.as_deref().and_then(state::RgMode::from_str), Some(st.rg_mode()));
-        assert_eq!(c.docked, Some(vec!["lyrics".to_string(), "playlist".to_string()]));
+        assert_eq!(c.docked, Some(vec!["lyrics".to_string(), "playlist".to_string(), "tab".to_string()]));
         assert_eq!(c.crossfeed.as_deref(), Some("Medium"));
         assert_eq!(c.eq, None, "a Custom EQ is not saved");
         // Mouse reporting, which `m` turns off (to select text): saved too,
@@ -1584,33 +1632,42 @@ mod tests {
     fn a_still_screen_draws_slowly_and_a_moving_one_at_the_viz_rate() {
         let st = PlayerState::new();
         st.viz_mode.store(VizMode::SpectrumVertical as u8, Ordering::Relaxed);
-        assert_eq!(frame_interval(&st, true, true), st.viz_frame());
+        assert_eq!(frame_interval(&st, true, true, false), st.viz_frame());
         // Paused long enough to have settled, or another view: still.
-        assert_eq!(frame_interval(&st, true, false), IDLE_FRAME);
-        assert_eq!(frame_interval(&st, false, true), IDLE_FRAME);
-        assert_eq!(frame_interval(&st, false, true), IDLE_FRAME);
+        assert_eq!(frame_interval(&st, true, false, false), IDLE_FRAME);
+        assert_eq!(frame_interval(&st, false, true, false), IDLE_FRAME);
+        assert_eq!(frame_interval(&st, false, true, false), IDLE_FRAME);
         // No visualization: still.
         st.viz_mode.store(VizMode::None as u8, Ordering::Relaxed);
-        assert_eq!(frame_interval(&st, true, true), IDLE_FRAME);
+        assert_eq!(frame_interval(&st, true, true, false), IDLE_FRAME);
         // Paused, the galaxy keeps turning, at 10 fps at most (at the full
         // rate it took a fifth of a core at 200x60); the plate settles and
         // stands still like the rest.
         st.viz_mode.store(VizMode::Galaxy as u8, Ordering::Relaxed);
-        assert_eq!(frame_interval(&st, true, false), PAUSED_GALAXY_FRAME);
-        assert_eq!(frame_interval(&st, true, true), st.viz_frame(), "playing: the full rate");
+        assert_eq!(frame_interval(&st, true, false, false), PAUSED_GALAXY_FRAME);
+        assert_eq!(frame_interval(&st, true, true, false), st.viz_frame(), "playing: the full rate");
         st.set_viz_fps(5);
-        assert_eq!(frame_interval(&st, true, false), st.viz_frame(), "a rate under the cap is kept");
+        assert_eq!(frame_interval(&st, true, false, false), st.viz_frame(), "a rate under the cap is kept");
         st.set_viz_fps(state::DEFAULT_VIZ_FPS);
         st.viz_mode.store(VizMode::Cymatics as u8, Ordering::Relaxed);
-        assert_eq!(frame_interval(&st, true, false), IDLE_FRAME);
-        assert_eq!(frame_interval(&st, true, true), st.viz_frame());
+        assert_eq!(frame_interval(&st, true, false, false), IDLE_FRAME);
+        assert_eq!(frame_interval(&st, true, true, false), st.viz_frame());
         // HiFi never draws them (its slot is the VU panel): paused, still.
         st.set_theme(crate::theme::ThemeKind::HiFi);
         for mode in [VizMode::Galaxy, VizMode::Cymatics] {
             st.viz_mode.store(mode as u8, Ordering::Relaxed);
-            assert_eq!(frame_interval(&st, true, false), IDLE_FRAME, "HiFi, {mode:?}");
-            assert_eq!(frame_interval(&st, true, true), st.viz_frame(), "HiFi playing, {mode:?}: the VU moves");
+            assert_eq!(frame_interval(&st, true, false, false), IDLE_FRAME, "HiFi, {mode:?}");
+            assert_eq!(frame_interval(&st, true, true, false), st.viz_frame(), "HiFi playing, {mode:?}: the VU moves");
         }
+    }
+
+    #[test]
+    fn a_moving_tab_keeps_the_frame_rate() {
+        let st = PlayerState::new();
+        st.viz_mode.store(VizMode::None as u8, Ordering::Relaxed);
+        assert_eq!(frame_interval(&st, false, true, true), st.viz_frame(), "playing: it scrolls smoothly");
+        assert_eq!(frame_interval(&st, false, false, true), IDLE_FRAME, "paused: it stands still");
+        assert_eq!(frame_interval(&st, false, true, false), IDLE_FRAME);
     }
 
     #[test]
