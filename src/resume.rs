@@ -6,7 +6,7 @@ use crate::playlist::keet_config_dir;
 
 /// Every field has a default: a state.json missing one (hand-edited, or
 /// written by an older Keet) loses only that field, not the whole session.
-/// No sources at all still ends in "No saved paths found".
+/// No sources on disk opens the folder picker, as no session does.
 #[derive(Serialize, Deserialize)]
 pub struct ResumeState {
     #[serde(default)]

@@ -47,7 +47,7 @@ A high-performance, low-CPU terminal audio player with real-time spectrum visual
 winget install amsdias.Keet
 ```
 
-Or the `.msi` from the [releases page](https://github.com/amsdias/Keet/releases) (from 2.1.0). It installs for your user only (no admin prompt), puts `keet` on your PATH and adds Keet to the Start menu, opening in Windows Terminal when that is installed. The Start menu entry is also what lets Windows's media controls show Keet by name rather than "Unknown app". Uninstalling removes all three.
+Or the `.msi` from the [releases page](https://github.com/amsdias/Keet/releases) (from 2.1.0). It installs for your user only (no admin prompt), puts `keet` on your PATH and adds Keet to the Start menu. The Start menu entry is also what lets Windows's media controls show Keet by name rather than "Unknown app". Uninstalling removes all three.
 
 **macOS and Linux** ([Homebrew](https://brew.sh)):
 

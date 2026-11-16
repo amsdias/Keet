@@ -17,15 +17,6 @@
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/amsdias/Keet" />
     <Property Id="ARPHELPLINK" Value="https://github.com/amsdias/Keet/issues" />
 
-    <!-- Windows Terminal's command alias. Started through it, Keet runs in a tab with
-         WT_SESSION set and draws Sixel; a shortcut to keet.exe itself goes through the
-         default-terminal handoff, which sets none (microsoft/terminal#13392). -->
-    <Property Id="WT_EXE" Secure="yes">
-      <DirectorySearch Id="WindowsApps" Path="[LocalAppDataFolder]Microsoft\WindowsApps" Depth="0">
-        <FileSearch Name="wt.exe" />
-      </DirectorySearch>
-    </Property>
-
     <StandardDirectory Id="LocalAppDataFolder">
       <Directory Id="ProgramsDir" Name="Programs">
         <Directory Id="INSTALLFOLDER" Name="Keet">
@@ -45,18 +36,13 @@
       </Directory>
     </StandardDirectory>
 
-    <!-- One shortcut or the other. Its app ID is the one Keet sets (media_keys::set_app_id):
-         Windows's media flyout takes Keet's name and icon from this shortcut, and says
-         "Unknown app" without it. -->
+    <!-- Its app ID is the one Keet sets (media_keys::set_app_id): Windows's media flyout
+         takes Keet's name and icon from this shortcut, and says "Unknown app" without it.
+         It runs keet.exe itself: Windows Terminal's wt.exe is an app execution alias, which
+         the installer's file search cannot see, and the direct shortcut draws Sixel anyway
+         (tested on Windows 11, v2.1.0). -->
     <StandardDirectory Id="ProgramMenuFolder">
-      <Component Id="ShortcutViaTerminal" Condition="WT_EXE">
-        <Shortcut Id="KeetViaTerminal" Name="Keet" Description="Terminal audio player"
-                  Target="[WT_EXE]" Arguments="&quot;[INSTALLFOLDER]keet.exe&quot;" Icon="keet.ico">
-          <ShortcutProperty Key="System.AppUserModel.ID" Value="amsdias.Keet" />
-        </Shortcut>
-        <RegistryValue Root="HKCU" Key="Software\amsdias\Keet" Name="ShortcutViaTerminal" Type="integer" Value="1" KeyPath="yes" />
-      </Component>
-      <Component Id="ShortcutDirect" Condition="NOT WT_EXE">
+      <Component Id="ShortcutDirect">
         <Shortcut Id="KeetDirect" Name="Keet" Description="Terminal audio player"
                   Target="[INSTALLFOLDER]keet.exe" Icon="keet.ico">
           <ShortcutProperty Key="System.AppUserModel.ID" Value="amsdias.Keet" />

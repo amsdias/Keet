@@ -916,10 +916,14 @@ fn build_resume_state(
         state::RepeatMode::One => "one",
     };
     let eq_bands = player_state.eq_bands_array();
+    // Absolute, or a session started as `keet .` resumes against whatever
+    // folder the next launch runs in (a Start menu shortcut's is not it).
+    // Keet never changes its working directory, so this is the folder typed.
+    let abs = |p: &std::path::Path| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf()).to_string_lossy().into_owned();
     ResumeState {
-        source_paths: ui.source_paths.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
+        source_paths: ui.source_paths.iter().map(|p| abs(p)).collect(),
         track_path: playlist.get(ui.current)
-            .map(|p| p.to_string_lossy().into_owned())
+            .map(|p| abs(p))
             .unwrap_or_default(),
         position_secs: player_state.time_secs(),
         shuffle: ui.shuffle,
@@ -1142,39 +1146,39 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Saved sources gone from disk: said on the status line once the UI runs
     // (stderr printed here is wiped by the first frame).
     let mut missing_saved: Vec<String> = Vec::new();
+    // The picker comes up with no session, and when none of the session's
+    // sources is on disk (a drive unplugged, or a relative path saved by an
+    // older Keet and resumed from another folder, as a Start menu shortcut
+    // does): exiting closed the shortcut's window before the error could be read.
+    let mut picked = false;
     let (source_paths, shuffle, repeat_mode) = if opts.resume {
-        // Try resume from saved state
-        match resume_state_loaded.as_ref() {
-            Some(rs) => {
-                let paths: Vec<PathBuf> = rs.source_paths.iter()
-                    .filter_map(|s| {
-                        let p = PathBuf::from(s);
-                        if p.exists() { Some(p) } else {
-                            missing_saved.push(s.clone());
-                            None
-                        }
-                    })
-                    .collect();
-                if paths.is_empty() {
-                    // Before the UI: stderr is where this belongs, and Keet exits.
-                    for s in &missing_saved {
-                        eprintln!("Saved path not found: {s}");
+        let resumed = resume_state_loaded.as_ref().and_then(|rs| {
+            let paths: Vec<PathBuf> = rs.source_paths.iter()
+                .filter_map(|s| {
+                    let p = PathBuf::from(s);
+                    if p.exists() { Some(p) } else {
+                        missing_saved.push(s.clone());
+                        None
                     }
-                    eprintln!("No saved paths found");
-                    std::process::exit(1);
-                }
-                let rm = match rs.repeat_mode.as_deref() {
-                    Some("one") => state::RepeatMode::One,
-                    Some("all") => state::RepeatMode::All,
-                    Some("off") => state::RepeatMode::Off,
-                    _ => if rs.repeat { state::RepeatMode::All } else { state::RepeatMode::Off },
-                };
-                // Typed --shuffle / --repeat win over the session's.
-                let rm = if opts.repeat { state::RepeatMode::All } else { rm };
-                (paths, rs.shuffle || opts.shuffle, rm)
-            }
+                })
+                .collect();
+            if paths.is_empty() { return None; }
+            let rm = match rs.repeat_mode.as_deref() {
+                Some("one") => state::RepeatMode::One,
+                Some("all") => state::RepeatMode::All,
+                Some("off") => state::RepeatMode::Off,
+                _ => if rs.repeat { state::RepeatMode::All } else { state::RepeatMode::Off },
+            };
+            // Typed --shuffle / --repeat win over the session's.
+            let rm = if opts.repeat { state::RepeatMode::All } else { rm };
+            Some((paths, rs.shuffle || opts.shuffle, rm))
+        });
+        match resumed {
+            Some(r) => r,
             None => {
-                // The configured theme colours the screen (no session to take one from).
+                picked = true;
+                // The configured theme colours the screen (the session's
+                // theme is restored later, with its other settings).
                 let kind = opts.theme
                     .or_else(|| config::load().theme.as_deref().and_then(theme::ThemeKind::from_str))
                     .unwrap_or(theme::ThemeKind::Classic);
@@ -1248,6 +1252,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let resume_position = resume_state_loaded
         .as_ref()
         .map_or(0, |rs| apply_resume_state(&state, rs, &eq_presets, &fx_presets, &cf_presets));
+    // A folder from the picker does not start at the old session's place.
+    let resume_position = if picked { 0 } else { resume_position };
     // Resolve the launch theme: --theme flag → config.json default → resumed
     // last-session theme → Classic. The config default applies on every launch
     // (including with explicit source paths), unlike the resume theme.
